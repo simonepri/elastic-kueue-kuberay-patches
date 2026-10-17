@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-training-job
+  labels:
+    kueue.x-k8s.io/queue-name: team-queue
+spec:
+  parallelism: 4
+  completions: 4
+  template:
+    metadata:
+      name: train-worker
+    spec:
+      containers:
+        - name: worker
+          image: busybox:latest
+          command: ["sleep", "300"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+      restartPolicy: Never

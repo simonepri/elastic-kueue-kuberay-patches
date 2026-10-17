@@ -1,0 +1,6 @@
+[tools]
+go = "1.27.2"
+kind = "0.32.0"
+kubectl = "1.36.3"
+"aqua:kyverno/chainsaw" = "0.2.15"
+helm = "4.3.0"

@@ -1,0 +1,30 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 03-collaborative-partial-preemption
+spec:
+  description: >
+    Verifies that when a high-priority workload requires quota currently borrowed by a lower-priority
+    RayData pipeline, collaborative partial preemption reclaims the necessary workers voluntarily,
+    preventing Kueue from evicting the entire Ray cluster and destroying in-memory pipeline state.
+  steps:
+    - name: setup-priority-queues
+      try:
+        - apply:
+            file: 00-queues-and-priorities.yaml
+    - name: run-low-priority-ray-pipeline
+      try:
+        - apply:
+            file: 01-low-priority-ray.yaml
+        - assert:
+            file: 01-assert-ray-active.yaml
+    - name: submit-high-priority-preemptor
+      try:
+        - apply:
+            file: 02-high-priority-job.yaml
+    - name: assert-collaborative-drain-and-survival
+      try:
+        - assert:
+            file: 03-assert-ray-partially-drained-and-surviving.yaml
+        - assert:
+            file: 04-assert-high-priority-admitted.yaml

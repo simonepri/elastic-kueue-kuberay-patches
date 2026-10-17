@@ -1,0 +1,5 @@
+apiVersion: karpenter.sh/v1
+kind: NodeClaim
+metadata:
+  labels:
+    setu.kueue.x-k8s.io/managed-by-controller: "true"

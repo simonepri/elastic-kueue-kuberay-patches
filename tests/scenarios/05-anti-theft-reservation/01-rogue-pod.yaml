@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rogue-competing-pod
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: rogue
+      image: busybox:latest
+      command: ["sleep", "300"]
+  nodeSelector:
+    topology.kubernetes.io/zone: us-west-2a

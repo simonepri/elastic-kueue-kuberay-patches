@@ -1,0 +1,29 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: spot-ray-cluster
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        nodeSelector:
+          karpenter.sh/capacity-type: on-demand
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+  workerGroupSpecs:
+    - groupName: spot-workers
+      rayStartParams: {}
+      replicas: 4
+      template:
+        spec:
+          nodeSelector:
+            karpenter.sh/capacity-type: spot
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0

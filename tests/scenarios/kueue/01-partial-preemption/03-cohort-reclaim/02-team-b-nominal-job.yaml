@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: team-b-nominal-job
+  labels:
+    kueue.x-k8s.io/queue-name: lq-team-b
+    kueue.x-k8s.io/priority-class: pc-cohort-high
+spec:
+  parallelism: 4
+  completions: 4
+  template:
+    spec:
+      terminationGracePeriodSeconds: 0
+      priorityClassName: pc-cohort-high
+      containers:
+        - name: train
+          image: busybox:latest
+          command: ["sleep", "60"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+      restartPolicy: Never

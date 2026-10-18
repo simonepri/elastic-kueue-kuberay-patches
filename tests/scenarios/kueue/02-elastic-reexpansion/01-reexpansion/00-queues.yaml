@@ -1,0 +1,59 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pc-reexpand-low
+value: 100
+globalDefault: false
+description: "Low priority for elastic background workload"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pc-reexpand-high
+value: 1000
+globalDefault: false
+description: "High priority for urgent preemptor workload"
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: pc-reexpand-low
+value: 100
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: pc-reexpand-high
+value: 1000
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: reexpand-flavor
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: reexpand-cluster-queue
+spec:
+  namespaceSelector: {}
+  preemption:
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: reexpand-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "64"
+            - name: "memory"
+              nominalQuota: "256Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "8"
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: reexpand-local-queue
+spec:
+  clusterQueue: reexpand-cluster-queue

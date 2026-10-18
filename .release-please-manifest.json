@@ -1,4 +1,6 @@
 {
   "kueue": "0.1.0",
-  "kuberay": "0.1.0"
+  "kuberay": "0.1.0",
+  "patches/kueue": "1.0.0",
+  "patches/kuberay": "1.0.0"
 }

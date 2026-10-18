@@ -67,12 +67,18 @@ for p in $(ls -1 ../../patches/kuberay/*.patch | sort); do
 done
 """
 
+[tasks.patch]
+description = "Apply all patches to third_party dependencies"
+depends = ["patch:kueue", "patch:kuberay"]
+
 [tasks."build:kueue"]
 description = "Build patched Kueue image with ko"
 depends = ["patch:kueue"]
 run = """
 cd third_party/kueue
-KO_DOCKER_REPO=kind.local ko build --local --tags="$KUEUE_IMAGE_TAG,latest" ./cmd/kueue
+KUEUE_IMG=$(KO_DOCKER_REPO=kind.local ko build --local ./cmd/kueue)
+echo "$KUEUE_IMG" > ../../.kueue-image.txt
+echo "Built Kueue image: $KUEUE_IMG"
 """
 
 [tasks."build:kuberay"]
@@ -80,7 +86,9 @@ description = "Build patched KubeRay image with ko"
 depends = ["patch:kuberay"]
 run = """
 cd third_party/kuberay/ray-operator
-KO_DOCKER_REPO=kind.local ko build --local --tags="$KUBERAY_IMAGE_TAG,latest" .
+KUBERAY_IMG=$(KO_DOCKER_REPO=kind.local ko build --local .)
+echo "$KUBERAY_IMG" > ../../../.kuberay-image.txt
+echo "Built KubeRay image: $KUBERAY_IMG"
 """
 
 [tasks.build]
@@ -97,32 +105,38 @@ if ! kind get clusters | grep -q "^$CLUSTER_NAME$"; then
   kind create cluster --config kind-config.yaml --name "$CLUSTER_NAME"
 fi
 
-# 2. Install base CRDs
-echo "Installing CRDs..."
-kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml
+# 2. Install base CRDs (Karpenter & KubeRay first)
+echo "Installing base CRDs..."
 kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayclusters.yaml
 kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodeclaims.yaml
 kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodepools.yaml
 
-# 3. Sideload patched images into Kind
-echo "Loading images into Kind..."
-kind load docker-image kind.local/kueue:$KUEUE_IMAGE_TAG --name "$CLUSTER_NAME" || true
-kind load docker-image kind.local/ray-operator:$KUBERAY_IMAGE_TAG --name "$CLUSTER_NAME" || true
-
-# 4. Deploy KubeRay operator if not present
+# 3. Deploy KubeRay operator before Kueue webhooks are registered
 if ! kubectl get deployment kuberay-operator -n default >/dev/null 2>&1; then
+  echo "Installing KubeRay operator..."
   helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
   helm repo update
   helm install kuberay-operator kuberay/kuberay-operator --version $KUBERAY_UPSTREAM -n default
 fi
 
-# 5. Point deployments to patched images
-kubectl set image deployment/kueue-controller-manager -n kueue-system manager=kind.local/kueue:$KUEUE_IMAGE_TAG
-kubectl set image deployment/kuberay-operator -n default kuberay-operator=kind.local/ray-operator:$KUBERAY_IMAGE_TAG
+# 4. Install Kueue manifests
+echo "Installing Kueue manifests..."
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml
 
-# 6. Wait for rollouts
-kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=90s
-kubectl rollout status deployment/kuberay-operator -n default --timeout=90s
+# 5. Sideload patched images into Kind
+KUEUE_IMG=$(cat .kueue-image.txt)
+KUBERAY_IMG=$(cat .kuberay-image.txt)
+echo "Loading images into Kind..."
+kind load docker-image "$KUEUE_IMG" --name "$CLUSTER_NAME"
+kind load docker-image "$KUBERAY_IMG" --name "$CLUSTER_NAME"
+
+# 6. Point deployments to patched images
+kubectl set image deployment/kueue-controller-manager -n kueue-system manager="$KUEUE_IMG"
+kubectl set image deployment/kuberay-operator -n default kuberay-operator="$KUBERAY_IMG"
+
+# 7. Wait for rollouts
+kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=120s
+kubectl rollout status deployment/kuberay-operator -n default --timeout=120s
 echo "Cluster $CLUSTER_NAME is ready with patched controllers!"
 """
 
@@ -137,13 +151,10 @@ fi
 
 # 2. Install base CRDs
 echo "Installing CRDs..."
-kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml
 kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayclusters.yaml
 kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodeclaims.yaml
 kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodepools.yaml
 
-# 3. Deploy standard official upstream Kueue and KubeRay
-kubectl set image deployment/kueue-controller-manager -n kueue-system manager=registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM
 if ! kubectl get deployment kuberay-operator -n default >/dev/null 2>&1; then
   helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
   helm repo update
@@ -152,8 +163,11 @@ else
   kubectl set image deployment/kuberay-operator -n default kuberay-operator=quay.io/kuberay/operator:$KUBERAY_UPSTREAM
 fi
 
-kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=90s
-kubectl rollout status deployment/kuberay-operator -n default --timeout=90s
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml
+kubectl set image deployment/kueue-controller-manager -n kueue-system manager=registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM
+
+kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=120s
+kubectl rollout status deployment/kuberay-operator -n default --timeout=120s
 echo "Cluster $CLUSTER_NAME is running STOCK UNPATCHED upstream controllers."
 """
 

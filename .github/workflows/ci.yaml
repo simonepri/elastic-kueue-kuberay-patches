@@ -65,7 +65,7 @@ jobs:
         uses: ko-build/setup-ko@v0.8
 
       - name: Set up Chainsaw
-        uses: kyverno/action-install-chainsaw@v0.2.12
+        uses: kyverno/action-install-chainsaw@v0.2.15
 
       - name: Install Mise
         uses: jdx/mise-action@v2

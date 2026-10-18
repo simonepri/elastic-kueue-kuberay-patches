@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ray-worker-busy
+  labels:
+    ray.io/cluster: stateful-ray-cluster
+    ray.io/group: workers
+    ray.io/actor-state: busy
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: worker
+      image: busybox:latest
+      command: ["sleep", "3600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ray-worker-idle
+  labels:
+    ray.io/cluster: stateful-ray-cluster
+    ray.io/group: workers
+    ray.io/actor-state: idle
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: worker
+      image: busybox:latest
+      command: ["sleep", "3600"]

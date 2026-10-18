@@ -98,6 +98,118 @@ When [Renovate](renovate.json) detects an upstream release, it opens a PR updati
 
 ---
 
+## Deployment & Installation
+
+You can deploy the patched controllers into any existing Kubernetes cluster using either Helm or official manifests with image overrides.
+
+### 1. KubeRay Operator
+
+Deploy the patched KubeRay operator with the official Helm chart:
+
+```bash
+helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+helm repo update
+
+helm install kuberay-operator kuberay/kuberay-operator \
+  --version v1.2.2 \
+  --namespace default \
+  --set image.repository=ghcr.io/simonepri/kuberay-operator \
+  --set image.tag=v1.2.2-p0.1.0
+```
+
+#### Required RBAC Permissions
+The patched operator requires permissions to watch `ConfigMap` resources (for spot interruption notices) and Kueue `ClusterQueue` / `LocalQueue` resources (for ScaleGate quota clamping):
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kuberay-operator-extra
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["kueue.x-k8s.io"]
+    resources: ["clusterqueues", "localqueues"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kuberay-operator-extra
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kuberay-operator-extra
+subjects:
+  - kind: ServiceAccount
+    name: kuberay-operator
+    namespace: default
+```
+
+---
+
+### 2. Kueue Controller Manager
+
+Deploy Kueue using either Helm or the official release manifests:
+
+**Using Helm:**
+```bash
+helm install kueue oci://registry.k8s.io/charts/kueue \
+  --version v0.10.1 \
+  --namespace kueue-system --create-namespace \
+  --set controllerManager.manager.image.repository=ghcr.io/simonepri/kueue \
+  --set controllerManager.manager.image.tag=v0.10.1-p0.1.0
+```
+
+**Using Official Manifests:**
+```bash
+curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/v0.10.1/manifests.yaml" | \
+  sed -e "s|registry.k8s.io/kueue/kueue:v0.10.1|ghcr.io/simonepri/kueue:v0.10.1-p0.1.0|g" | \
+  kubectl apply --server-side -f -
+```
+
+#### Required RBAC for Karpenter JIT AdmissionCheck
+When using the in-tree Karpenter AdmissionCheck controller for JIT gang pre-provisioning, grant Kueue permission to manage `karpenter.sh/v1` `NodeClaim` resources:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kueue-karpenter-nodeclaims
+rules:
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodeclaims", "nodeclaims/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kueue-karpenter-nodeclaims
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kueue-karpenter-nodeclaims
+subjects:
+  - kind: ServiceAccount
+    name: kueue-controller-manager
+    namespace: kueue-system
+```
+
+#### Configure Karpenter AdmissionCheck
+To enable JIT gang pre-provisioning, define the AdmissionCheck and associate it with your `ClusterQueue`:
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: AdmissionCheck
+metadata:
+  name: karpenter-provision
+spec:
+  controllerName: kyield.io/admission-check
+```
+
+---
+
 ## Quickstart & Local Testing
 
 This repository uses [`mise`](https://mise.jdx.dev) to manage dependencies (`go`, `kind`, `kubectl`, `chainsaw`, `helm`, `ko`, `colima`, `docker-cli`).

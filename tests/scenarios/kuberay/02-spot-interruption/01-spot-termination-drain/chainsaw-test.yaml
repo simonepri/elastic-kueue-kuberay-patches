@@ -1,0 +1,24 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 04-spot-interruption-graceful-handling
+spec:
+  description: >
+    Verifies that when a Spot worker node receives an interruption notice, the workload
+    scales down its active podSet count rather than failing Kueue's 5-minute recoveryTimeout
+    countdown, preventing the eviction of the Head Pod and surviving workers.
+  steps:
+    - name: setup-spot-cluster
+      try:
+        - apply:
+            file: 00-spot-raycluster.yaml
+        - assert:
+            file: 00-assert-running.yaml
+    - name: simulate-spot-interruption
+      try:
+        - apply:
+            file: 01-spot-interruption-event.yaml
+    - name: assert-cluster-survives-without-eviction
+      try:
+        - assert:
+            file: 02-assert-cluster-healthy.yaml

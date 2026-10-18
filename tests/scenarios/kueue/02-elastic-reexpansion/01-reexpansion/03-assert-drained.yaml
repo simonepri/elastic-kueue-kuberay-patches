@@ -1,0 +1,8 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: elastic-reexpand-cluster
+spec:
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 6

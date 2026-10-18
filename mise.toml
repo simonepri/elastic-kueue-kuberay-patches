@@ -52,9 +52,10 @@ description = "Apply patches to third_party/kueue"
 depends = ["clone:kueue"]
 run = """
 cd third_party/kueue
-for p in $(ls -1 ../../patches/kueue/*.patch | sort); do
+shopt -s nullglob
+for p in ../../patches/kueue/*.patch; do
   echo "Applying patch $p..."
-  git apply --check "$p" && git apply --whitespace=nowarn "$p" || true
+  git apply --whitespace=nowarn "$p" || true
 done
 """
 
@@ -63,9 +64,10 @@ description = "Apply patches to third_party/kuberay"
 depends = ["clone:kuberay"]
 run = """
 cd third_party/kuberay
-for p in $(ls -1 ../../patches/kuberay/*.patch | sort); do
+shopt -s nullglob
+for p in ../../patches/kuberay/*.patch; do
   echo "Applying patch $p..."
-  git apply --check "$p" && git apply --whitespace=nowarn "$p" || true
+  git apply --whitespace=nowarn "$p" || true
 done
 """
 
@@ -202,5 +204,5 @@ description = "Tear down the local Kind cluster"
 run = "kind delete cluster --name $CLUSTER_NAME"
 
 [tasks.test]
-description = "Run full 9-scenario Chainsaw test suite"
+description = "Run full scenario test suite"
 run = "chainsaw test tests/scenarios/ --cleanup-timeout 60s"

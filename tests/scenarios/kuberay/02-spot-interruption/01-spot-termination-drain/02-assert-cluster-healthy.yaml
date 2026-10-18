@@ -1,8 +1,0 @@
-apiVersion: ray.io/v1
-kind: RayCluster
-metadata:
-  name: spot-ray-cluster
-spec:
-  workerGroupSpecs:
-    - groupName: spot-workers
-      replicas: 3

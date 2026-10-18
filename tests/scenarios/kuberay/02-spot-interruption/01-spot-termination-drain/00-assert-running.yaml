@@ -1,6 +1,0 @@
-apiVersion: ray.io/v1
-kind: RayCluster
-metadata:
-  name: spot-ray-cluster
-status:
-  desiredWorkerReplicas: 4

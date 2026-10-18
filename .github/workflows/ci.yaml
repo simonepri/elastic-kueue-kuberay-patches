@@ -31,18 +31,20 @@ jobs:
         run: |
           git clone --depth 1 --branch ${{ steps.versions.outputs.kueue }} https://github.com/kubernetes-sigs/kueue.git /tmp/kueue
           cd /tmp/kueue
-          for patch in $(ls -1 $GITHUB_WORKSPACE/patches/kueue/*.patch | sort); do
+          shopt -s nullglob
+          for patch in $GITHUB_WORKSPACE/patches/kueue/*.patch; do
             echo "Applying $patch..."
-            git apply --check "$patch" || (echo "Failed to apply $patch" && exit 1)
+            git apply --whitespace=nowarn "$patch" || (echo "Failed to apply $patch" && exit 1)
           done
 
       - name: Validate KubeRay Patches
         run: |
           git clone --depth 1 --branch ${{ steps.versions.outputs.kuberay }} https://github.com/ray-project/kuberay.git /tmp/kuberay
           cd /tmp/kuberay
-          for patch in $(ls -1 $GITHUB_WORKSPACE/patches/kuberay/*.patch | sort); do
+          shopt -s nullglob
+          for patch in $GITHUB_WORKSPACE/patches/kuberay/*.patch; do
             echo "Applying $patch..."
-            git apply --check "$patch" || (echo "Failed to apply $patch" && exit 1)
+            git apply --whitespace=nowarn "$patch" || (echo "Failed to apply $patch" && exit 1)
           done
 
   integration-tests:

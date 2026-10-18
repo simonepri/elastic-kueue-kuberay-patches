@@ -35,6 +35,8 @@ metadata:
   name: minviable-cluster-queue
 spec:
   namespaceSelector: {}
+  preemption:
+    withinClusterQueue: LowerPriority
   resourceGroups:
     - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
       flavors:

@@ -5,7 +5,7 @@ metadata:
 spec:
   terminationGracePeriodSeconds: 0
   tolerations:
-    - key: kyield.io/claimed-by
+    - key: karpenter.sh/claimed-by
       value: intended-gang-workload
       effect: NoSchedule
   nodeName: simulated-gpu-node-01

@@ -8,7 +8,7 @@ kind: AdmissionCheck
 metadata:
   name: karpenter-provision
 spec:
-  controllerName: kyield.io/admission-check
+  controllerName: kueue.x-k8s.io/karpenter
 ---
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: ClusterQueue

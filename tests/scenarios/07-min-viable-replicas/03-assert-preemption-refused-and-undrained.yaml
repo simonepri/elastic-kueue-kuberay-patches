@@ -6,9 +6,10 @@ spec:
   workerGroupSpecs:
     - groupName: workers
       replicas: 8
-status:
-  conditions:
-    - type: ScaleGateClamped
-      status: "True"
-    - type: PartialPreemptionRefused
-      status: "True"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: massive-preemptor-job
+spec:
+  suspend: true

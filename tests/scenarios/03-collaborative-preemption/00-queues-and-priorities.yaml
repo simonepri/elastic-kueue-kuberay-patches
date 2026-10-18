@@ -28,7 +28,7 @@ spec:
   namespaceSelector: {}
   preemption:
     reclaimWithinCohort: Any
-    withinClusterQueue: Never
+    withinClusterQueue: LowerPriority
   resourceGroups:
     - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
       flavors:

@@ -9,7 +9,7 @@ metadata:
     karpenter.sh/nodepool: default
 spec:
   taints:
-    - key: kyield.io/claimed-by
+    - key: karpenter.sh/claimed-by
       value: intended-gang-workload
       effect: NoSchedule
 ---
@@ -18,7 +18,7 @@ kind: NodeClaim
 metadata:
   name: test-claimed-nodeclaim
   labels:
-    kyield.io/gang-id: gang-xyz
+    kueue.x-k8s.io/gang-id: gang-xyz
 spec:
   nodeClassRef:
     group: karpenter.k8s.aws
@@ -29,6 +29,6 @@ spec:
       operator: In
       values: ["linux"]
   taints:
-    - key: kyield.io/claimed-by
+    - key: karpenter.sh/claimed-by
       value: intended-gang-workload
       effect: NoSchedule

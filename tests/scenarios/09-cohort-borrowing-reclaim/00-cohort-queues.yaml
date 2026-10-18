@@ -36,6 +36,9 @@ metadata:
 spec:
   cohort: shared-cohort
   namespaceSelector: {}
+  preemption:
+    reclaimWithinCohort: Any
+    withinClusterQueue: LowerPriority
   resourceGroups:
     - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
       flavors:
@@ -56,6 +59,9 @@ metadata:
 spec:
   cohort: shared-cohort
   namespaceSelector: {}
+  preemption:
+    reclaimWithinCohort: Any
+    withinClusterQueue: LowerPriority
   resourceGroups:
     - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
       flavors:

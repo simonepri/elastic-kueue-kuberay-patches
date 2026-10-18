@@ -2,4 +2,4 @@ apiVersion: karpenter.sh/v1
 kind: NodeClaim
 metadata:
   labels:
-    kyield.io/managed-by-controller: "true"
+    karpenter.sh/managed-by: kueue

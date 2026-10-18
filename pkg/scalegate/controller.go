@@ -3,8 +3,10 @@ package scalegate
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -55,24 +57,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	maxAllowedQuota, err := r.resolveAvailableQuota(ctx, rc.GetNamespace(), queueName)
-	if err != nil {
-		logger.V(2).Info("could not resolve available quota for queue", "queue", queueName, "error", err)
-		return ctrl.Result{}, nil
-	}
-
 	workerGroups, found, err := unstructured.NestedSlice(rc.Object, "spec", "workerGroupSpecs")
 	if !found || err != nil || len(workerGroups) == 0 {
 		return ctrl.Result{}, nil
 	}
 
 	clamped := false
-	targetLimit := int64(maxAllowedQuota)
 	for i, wg := range workerGroups {
 		wgMap, ok := wg.(map[string]interface{})
 		if !ok {
 			continue
 		}
+		workerUnit := r.extractWorkerUnitResources(wgMap)
+		maxAllowedQuota, err := r.resolveAvailableQuota(ctx, rc.GetNamespace(), queueName, workerUnit)
+		if err != nil {
+			logger.V(2).Info("could not resolve available quota for queue", "queue", queueName, "error", err)
+			continue
+		}
+
+		targetLimit := int64(maxAllowedQuota)
 		replicas, _ := wgMap["replicas"].(int64)
 		maxReplicas, _ := wgMap["maxReplicas"].(int64)
 
@@ -104,6 +107,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				if !ok {
 					continue
 				}
+				workerUnit := r.extractWorkerUnitResources(wgMap)
+				maxAllowedQuota, qErr := r.resolveAvailableQuota(ctx, rc.GetNamespace(), queueName, workerUnit)
+				if qErr != nil {
+					continue
+				}
+				targetLimit := int64(maxAllowedQuota)
 				replicas, _ := wgMap["replicas"].(int64)
 				maxReplicas, _ := wgMap["maxReplicas"].(int64)
 				if maxReplicas > targetLimit {
@@ -151,7 +160,58 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return ctrl.Result{}, nil
 }
 
-func (r *Reconciler) resolveAvailableQuota(ctx context.Context, namespace, queueName string) (int, error) {
+func (r *Reconciler) extractWorkerUnitResources(wgMap map[string]interface{}) map[string]int64 {
+	unit := make(map[string]int64)
+	containers, _, _ := unstructured.NestedSlice(wgMap, "template", "spec", "containers")
+	for _, c := range containers {
+		cMap, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		reqs, _, _ := unstructured.NestedMap(cMap, "resources", "requests")
+		if reqs == nil {
+			continue
+		}
+		for resName, val := range reqs {
+			var amount int64
+			if s, ok := val.(string); ok {
+				q, err := resource.ParseQuantity(s)
+				if err == nil {
+					if resName == "cpu" {
+						amount = q.MilliValue()
+					} else {
+						amount = q.Value()
+					}
+				}
+			} else if num, ok := val.(int64); ok {
+				amount = num
+			}
+			if amount > 0 {
+				unit[resName] += amount
+			}
+		}
+	}
+	return unit
+}
+
+func (r *Reconciler) parseResourceValue(resName string, raw interface{}) int64 {
+	if raw == nil {
+		return 0
+	}
+	s := fmt.Sprint(raw)
+	q, err := resource.ParseQuantity(s)
+	if err == nil {
+		if resName == "cpu" {
+			return q.MilliValue()
+		}
+		return q.Value()
+	}
+	var num int64
+	_, _ = fmt.Sscanf(s, "%d", &num)
+	return num
+}
+
+func (r *Reconciler) resolveAvailableQuota(ctx context.Context, namespace, queueName string, workerUnit map[string]int64) (int, error) {
 	cq := &unstructured.Unstructured{}
 	cq.SetGroupVersionKind(clusterQueueGVK)
 	if err := r.Get(ctx, client.ObjectKey{Name: queueName}, cq); err != nil {
@@ -166,11 +226,14 @@ func (r *Reconciler) resolveAvailableQuota(ctx context.Context, namespace, queue
 	}
 
 	cohort, _, _ := unstructured.NestedString(cq.Object, "spec", "cohort")
-
 	rGroups, found, _ := unstructured.NestedSlice(cq.Object, "spec", "resourceGroups")
 	if !found {
 		return 4, nil
 	}
+
+	minAllowedReplicas := int64(math.MaxInt64)
+	matchedAnyResource := false
+
 	for _, rg := range rGroups {
 		rgMap, ok := rg.(map[string]interface{})
 		if !ok {
@@ -188,26 +251,40 @@ func (r *Reconciler) resolveAvailableQuota(ctx context.Context, namespace, queue
 				if !ok {
 					continue
 				}
-				if resMap["name"] == "nvidia.com/gpu" {
-					nominalStr := fmt.Sprint(resMap["nominalQuota"])
-					var nominal int
-					_, _ = fmt.Sscanf(nominalStr, "%d", &nominal)
+				resName, _ := resMap["name"].(string)
+				nominalVal := r.parseResourceValue(resName, resMap["nominalQuota"])
+				totalLimit := nominalVal
+				if cohort != "" && resMap["borrowingLimit"] != nil {
+					borrowVal := r.parseResourceValue(resName, resMap["borrowingLimit"])
+					if borrowVal > 0 {
+						totalLimit += borrowVal
+					}
+				}
 
-					totalLimit := nominal
-					if cohort != "" && resMap["borrowingLimit"] != nil {
-						borrowStr := fmt.Sprint(resMap["borrowingLimit"])
-						var borrow int
-						if _, err := fmt.Sscanf(borrowStr, "%d", &borrow); err == nil && borrow > 0 {
-							totalLimit += borrow
-						}
+				if totalLimit <= 0 {
+					continue
+				}
+
+				// If worker requests this resource specifically (GPU, CPU, Memory, etc.)
+				if reqVal, ok := workerUnit[resName]; ok && reqVal > 0 {
+					replicasForRes := totalLimit / reqVal
+					if replicasForRes < minAllowedReplicas {
+						minAllowedReplicas = replicasForRes
 					}
-					if totalLimit > 0 {
-						return totalLimit, nil
+					matchedAnyResource = true
+				} else if len(workerUnit) == 0 {
+					// Fallback if no worker requests defined: treat 1 unit = 1 replica
+					if totalLimit < minAllowedReplicas {
+						minAllowedReplicas = totalLimit
 					}
-					return 4, nil
+					matchedAnyResource = true
 				}
 			}
 		}
+	}
+
+	if matchedAnyResource && minAllowedReplicas != math.MaxInt64 && minAllowedReplicas > 0 {
+		return int(minAllowedReplicas), nil
 	}
 	return 4, nil
 }

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -46,6 +47,16 @@ var (
 		Version: "v1beta1",
 		Kind:    "LocalQueue",
 	}
+	priorityClassGVK = schema.GroupVersionKind{
+		Group:   "scheduling.k8s.io",
+		Version: "v1",
+		Kind:    "PriorityClass",
+	}
+	workloadPriorityClassGVK = schema.GroupVersionKind{
+		Group:   "kueue.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "WorkloadPriorityClass",
+	}
 )
 
 type Reconciler struct {
@@ -80,12 +91,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	// Check if this is a high-priority pending workload waiting for quota
-	priority, _, _ := unstructured.NestedInt64(wl.Object, "spec", "priority")
-	if priority < 500 {
-		return ctrl.Result{}, nil
-	}
-
+	// Workload must be pending admission
 	isAdmitted := false
 	conditions, _, _ := unstructured.NestedSlice(wl.Object, "status", "conditions")
 	for _, c := range conditions {
@@ -105,13 +111,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	neededGPUs := r.extractWorkloadGPUs(wl)
-	if neededGPUs <= 0 {
+	preemptorPriority := r.getWorkloadPriority(ctx, wl)
+	workloadDemands := r.extractWorkloadDemands(wl)
+	if len(workloadDemands) == 0 {
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("high priority workload pending quota, evaluating collaborative preemption",
-		"workload", wl.GetName(), "neededGPUs", neededGPUs, "queue", queueName, "namespace", wl.GetNamespace())
+	logger.Info("pending workload evaluating collaborative preemption & fair sharing",
+		"workload", wl.GetName(), "priority", preemptorPriority, "queue", queueName, "namespace", wl.GetNamespace())
 
 	// List candidate RayClusters in the same namespace
 	rayList := &unstructured.UnstructuredList{}
@@ -137,20 +144,80 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				minReplicas = 1
 			}
 
-			// Determine reclaim amount based on cohort borrowing vs local queue
+			workerUnit := r.extractWorkerUnitResources(wgMap)
+			victimPriority := r.getRayClusterPriority(ctx, &rc)
 			victimQueue := rc.GetLabels()["kueue.x-k8s.io/queue-name"]
-			nominalQuota := int64(r.getNominalQuota(ctx, rc.GetNamespace(), victimQueue))
 
 			var reclaimAmount int64
-			if replicas > nominalQuota {
-				borrowed := replicas - nominalQuota
-				if int64(neededGPUs) < borrowed {
-					reclaimAmount = int64(neededGPUs)
-				} else {
-					reclaimAmount = borrowed
+			reason := ""
+			bottleneckRes := ""
+
+			isCrossQueue := (queueName != victimQueue)
+
+			if isCrossQueue {
+				// Cohort Borrowing Reclaim:
+				// Evaluate each demanded resource independently.
+				// If the victim is borrowing above its queues nominal quota on resource r,
+				// calculate the borrowed excess in worker units.
+				for resName, demandVal := range workloadDemands {
+					unitVal, ok := workerUnit[resName]
+					if !ok || unitVal <= 0 {
+						continue
+					}
+					neededForRes := (demandVal + unitVal - 1) / unitVal
+					nominalForRes := r.getNominalQuota(ctx, rc.GetNamespace(), victimQueue, resName, unitVal)
+					if replicas > nominalForRes {
+						borrowed := replicas - nominalForRes
+						reclaimForRes := borrowed
+						if neededForRes < borrowed {
+							reclaimForRes = neededForRes
+						}
+						if reclaimForRes > reclaimAmount {
+							reclaimAmount = reclaimForRes
+							bottleneckRes = resName
+							reason = "cohort-reclaim"
+						}
+					}
+				}
+				if reclaimAmount <= 0 {
+					continue
 				}
 			} else {
-				reclaimAmount = int64(neededGPUs)
+				// Intra-Queue Evaluation:
+				neededWorkers, bRes := r.calculateNeededWorkers(workloadDemands, workerUnit)
+				if neededWorkers <= 0 {
+					continue
+				}
+				bottleneckRes = bRes
+				workerUnitAmount := workerUnit[bottleneckRes]
+				nominalQuota := r.getNominalQuota(ctx, rc.GetNamespace(), victimQueue, bottleneckRes, workerUnitAmount)
+
+				if preemptorPriority > victimPriority {
+					// Strict Priority Preemption
+					reclaimAmount = neededWorkers
+					reason = "priority-preemption"
+				} else if preemptorPriority == victimPriority {
+					// Fair Sharing among equals:
+					// Total nominal quota in the queue is shared equally among active/pending pipelines
+					fairShare := nominalQuota / 2
+					if fairShare < minReplicas {
+						fairShare = minReplicas
+					}
+					if replicas > fairShare {
+						excess := replicas - fairShare
+						if neededWorkers < excess {
+							reclaimAmount = neededWorkers
+						} else {
+							reclaimAmount = excess
+						}
+						reason = "fair-share"
+					} else {
+						continue
+					}
+				} else {
+					// Lower priority cannot preempt higher priority
+					continue
+				}
 			}
 
 			if reclaimAmount <= 0 {
@@ -167,7 +234,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 			newReplicas := replicas - reclaimAmount
 			logger.Info("collaborative partial drain on victim RayCluster",
-				"rayCluster", rc.GetName(), "from", replicas, "to", newReplicas)
+				"rayCluster", rc.GetName(), "from", replicas, "to", newReplicas, "resource", bottleneckRes, "reason", reason)
 
 			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 				latest := &unstructured.Unstructured{}
@@ -224,6 +291,250 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *Reconciler) getWorkloadPriority(ctx context.Context, wl *unstructured.Unstructured) int64 {
+	p, found, _ := unstructured.NestedInt64(wl.Object, "spec", "priority")
+	if found {
+		return p
+	}
+	pClassName, found, _ := unstructured.NestedString(wl.Object, "spec", "priorityClassName")
+	if found && pClassName != "" {
+		return r.resolvePriorityValue(ctx, pClassName)
+	}
+	return 0
+}
+
+func (r *Reconciler) getRayClusterPriority(ctx context.Context, rc *unstructured.Unstructured) int64 {
+	wlList := &unstructured.UnstructuredList{}
+	wlList.SetGroupVersionKind(workloadGVK)
+	if err := r.List(ctx, wlList, client.InNamespace(rc.GetNamespace())); err == nil {
+		for _, wl := range wlList.Items {
+			owners, found, _ := unstructured.NestedSlice(wl.Object, "metadata", "ownerReferences")
+			if !found {
+				continue
+			}
+			for _, o := range owners {
+				if oMap, ok := o.(map[string]interface{}); ok && oMap["kind"] == "RayCluster" && oMap["name"] == rc.GetName() {
+					return r.getWorkloadPriority(ctx, &wl)
+				}
+			}
+		}
+	}
+
+	if pClass := rc.GetLabels()["kueue.x-k8s.io/priority-class"]; pClass != "" {
+		return r.resolvePriorityValue(ctx, pClass)
+	}
+
+	wgs, found, _ := unstructured.NestedSlice(rc.Object, "spec", "workerGroupSpecs")
+	if found && len(wgs) > 0 {
+		if wgMap, ok := wgs[0].(map[string]interface{}); ok {
+			pClass, _, _ := unstructured.NestedString(wgMap, "template", "spec", "priorityClassName")
+			if pClass != "" {
+				return r.resolvePriorityValue(ctx, pClass)
+			}
+		}
+	}
+	return 0
+}
+
+func (r *Reconciler) resolvePriorityValue(ctx context.Context, name string) int64 {
+	wpc := &unstructured.Unstructured{}
+	wpc.SetGroupVersionKind(workloadPriorityClassGVK)
+	if err := r.Get(ctx, client.ObjectKey{Name: name}, wpc); err == nil {
+		val, found, _ := unstructured.NestedInt64(wpc.Object, "value")
+		if found {
+			return val
+		}
+	}
+
+	pc := &unstructured.Unstructured{}
+	pc.SetGroupVersionKind(priorityClassGVK)
+	if err := r.Get(ctx, client.ObjectKey{Name: name}, pc); err == nil {
+		val, found, _ := unstructured.NestedInt64(pc.Object, "value")
+		if found {
+			return val
+		}
+	}
+	return 0
+}
+
+func (r *Reconciler) extractWorkerUnitResources(wgMap map[string]interface{}) map[string]int64 {
+	unit := make(map[string]int64)
+	containers, _, _ := unstructured.NestedSlice(wgMap, "template", "spec", "containers")
+	for _, c := range containers {
+		cMap, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		reqs, _, _ := unstructured.NestedMap(cMap, "resources", "requests")
+		if reqs == nil {
+			continue
+		}
+		for resName, val := range reqs {
+			var amount int64
+			if s, ok := val.(string); ok {
+				q, err := resource.ParseQuantity(s)
+				if err == nil {
+					if resName == "cpu" {
+						amount = q.MilliValue()
+					} else {
+						amount = q.Value()
+					}
+				}
+			} else if num, ok := val.(int64); ok {
+				amount = num
+			}
+			if amount > 0 {
+				unit[resName] += amount
+			}
+		}
+	}
+	if len(unit) == 0 {
+		unit["workers"] = 1
+	}
+	return unit
+}
+
+func (r *Reconciler) extractWorkloadDemands(wl *unstructured.Unstructured) map[string]int64 {
+	podSets, found, _ := unstructured.NestedSlice(wl.Object, "spec", "podSets")
+	if !found {
+		return nil
+	}
+	demands := make(map[string]int64)
+	for _, ps := range podSets {
+		psMap, ok := ps.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		count, _ := psMap["count"].(int64)
+		if count <= 0 {
+			count = 1
+		}
+		containers, _, _ := unstructured.NestedSlice(psMap, "template", "spec", "containers")
+		for _, c := range containers {
+			cMap, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			reqs, _, _ := unstructured.NestedMap(cMap, "resources", "requests")
+			if reqs == nil {
+				continue
+			}
+			for resName, val := range reqs {
+				var amount int64
+				if s, ok := val.(string); ok {
+					q, err := resource.ParseQuantity(s)
+					if err == nil {
+						if resName == "cpu" {
+							amount = q.MilliValue()
+						} else {
+							amount = q.Value()
+						}
+					}
+				} else if num, ok := val.(int64); ok {
+					amount = num
+				}
+				if amount > 0 {
+					demands[resName] += amount * count
+				}
+			}
+		}
+	}
+	if len(demands) == 0 {
+		demands["workers"] = 1
+	}
+	return demands
+}
+
+func (r *Reconciler) calculateNeededWorkers(demands, workerUnit map[string]int64) (int64, string) {
+	maxWorkers := int64(0)
+	bottleneck := "workers"
+
+	for resName, demandVal := range demands {
+		if unitVal, ok := workerUnit[resName]; ok && unitVal > 0 {
+			w := (demandVal + unitVal - 1) / unitVal
+			if w > maxWorkers {
+				maxWorkers = w
+				bottleneck = resName
+			}
+		}
+	}
+
+	if maxWorkers == 0 {
+		if d, ok := demands["workers"]; ok {
+			return d, "workers"
+		}
+		return 1, "workers"
+	}
+	return maxWorkers, bottleneck
+}
+
+func (r *Reconciler) parseResourceValue(resName string, raw interface{}) int64 {
+	if raw == nil {
+		return 0
+	}
+	s := fmt.Sprint(raw)
+	q, err := resource.ParseQuantity(s)
+	if err == nil {
+		if resName == "cpu" {
+			return q.MilliValue()
+		}
+		return q.Value()
+	}
+	var num int64
+	_, _ = fmt.Sscanf(s, "%d", &num)
+	return num
+}
+
+func (r *Reconciler) getNominalQuota(ctx context.Context, namespace, queueName, resName string, workerUnitAmount int64) int64 {
+	cq := &unstructured.Unstructured{}
+	cq.SetGroupVersionKind(clusterQueueGVK)
+	if err := r.Get(ctx, client.ObjectKey{Name: queueName}, cq); err != nil {
+		lq := &unstructured.Unstructured{}
+		lq.SetGroupVersionKind(localQueueGVK)
+		if errLq := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: queueName}, lq); errLq == nil {
+			targetCq, _, _ := unstructured.NestedString(lq.Object, "spec", "clusterQueue")
+			if targetCq != "" {
+				_ = r.Get(ctx, client.ObjectKey{Name: targetCq}, cq)
+			}
+		}
+	}
+	rGroups, found, _ := unstructured.NestedSlice(cq.Object, "spec", "resourceGroups")
+	if !found {
+		return 4
+	}
+	for _, rg := range rGroups {
+		rgMap, ok := rg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		flavors, _, _ := unstructured.NestedSlice(rgMap, "flavors")
+		for _, fl := range flavors {
+			flMap, ok := fl.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			resources, _, _ := unstructured.NestedSlice(flMap, "resources")
+			for _, res := range resources {
+				resMap, ok := res.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				name, _ := resMap["name"].(string)
+				if name == resName || resName == "workers" {
+					nominal := r.parseResourceValue(name, resMap["nominalQuota"])
+					if workerUnitAmount > 0 {
+						return nominal / workerUnitAmount
+					}
+					if nominal > 0 {
+						return nominal
+					}
+				}
+			}
+		}
+	}
+	return 4
 }
 
 func (r *Reconciler) reconcileRayReexpansion(ctx context.Context) bool {
@@ -310,53 +621,6 @@ func (r *Reconciler) reconcileRayReexpansion(ctx context.Context) bool {
 	return hasTracked
 }
 
-func (r *Reconciler) getNominalQuota(ctx context.Context, namespace, queueName string) int {
-	cq := &unstructured.Unstructured{}
-	cq.SetGroupVersionKind(clusterQueueGVK)
-	if err := r.Get(ctx, client.ObjectKey{Name: queueName}, cq); err != nil {
-		lq := &unstructured.Unstructured{}
-		lq.SetGroupVersionKind(localQueueGVK)
-		if errLq := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: queueName}, lq); errLq == nil {
-			targetCq, _, _ := unstructured.NestedString(lq.Object, "spec", "clusterQueue")
-			if targetCq != "" {
-				_ = r.Get(ctx, client.ObjectKey{Name: targetCq}, cq)
-			}
-		}
-	}
-	rGroups, found, _ := unstructured.NestedSlice(cq.Object, "spec", "resourceGroups")
-	if !found {
-		return 4
-	}
-	for _, rg := range rGroups {
-		rgMap, ok := rg.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		flavors, _, _ := unstructured.NestedSlice(rgMap, "flavors")
-		for _, fl := range flavors {
-			flMap, ok := fl.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			resources, _, _ := unstructured.NestedSlice(flMap, "resources")
-			for _, res := range resources {
-				resMap, ok := res.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				if resMap["name"] == "nvidia.com/gpu" {
-					var nominal int
-					_, _ = fmt.Sscanf(fmt.Sprint(resMap["nominalQuota"]), "%d", &nominal)
-					if nominal > 0 {
-						return nominal
-					}
-				}
-			}
-		}
-	}
-	return 4
-}
-
 func (r *Reconciler) publishCondition(ctx context.Context, namespace, name, condType, status, reason, message string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &unstructured.Unstructured{}
@@ -383,33 +647,6 @@ func (r *Reconciler) publishCondition(ctx context.Context, namespace, name, cond
 		_ = unstructured.SetNestedSlice(latest.Object, filtered, "status", "conditions")
 		return r.Status().Update(ctx, latest)
 	})
-}
-
-func (r *Reconciler) extractWorkloadGPUs(wl *unstructured.Unstructured) int {
-	podSets, found, _ := unstructured.NestedSlice(wl.Object, "spec", "podSets")
-	if !found {
-		return 0
-	}
-	total := 0
-	for _, ps := range podSets {
-		psMap, ok := ps.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		count, _ := psMap["count"].(int64)
-		containers, _, _ := unstructured.NestedSlice(psMap, "template", "spec", "containers")
-		for _, c := range containers {
-			cMap, ok := c.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			reqs, _, _ := unstructured.NestedMap(cMap, "resources", "requests")
-			if reqs != nil && reqs["nvidia.com/gpu"] != nil {
-				total += int(count)
-			}
-		}
-	}
-	return total
 }
 
 func (r *Reconciler) updateRayWorkloadPodCount(ctx context.Context, namespace, rayClusterName string, newWorkers int64) {

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    "patches/kueue": {
+      "component": "kueue",
+      "release-type": "simple",
+      "skip-changelog": true,
+      "bump-minor-pre-major": true,
+      "initial-version": "0.1.0"
+    },
+    "patches/kuberay": {
+      "component": "kuberay",
+      "release-type": "simple",
+      "skip-changelog": true,
+      "bump-minor-pre-major": true,
+      "initial-version": "0.1.0"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: dynamic-ray-pipeline
+status:
+  desiredWorkerReplicas: 2

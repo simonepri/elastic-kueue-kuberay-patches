@@ -1,0 +1,28 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 01-cold-start-gang-preprovisioning
+spec:
+  description: >
+    Verifies that a gang-scheduled batch workload submitted to Kueue triggers JIT
+    pre-provisioning of Karpenter NodeClaims with anti-theft taints before Kueue admits the workload,
+    preventing the 15-minute waitForPodsReady timeout failure.
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+        - assert:
+            file: 00-assert-queues.yaml
+    - name: submit-gang-job
+      try:
+        - apply:
+            file: 01-job.yaml
+    - name: assert-preprovisioning-triggered
+      try:
+        - assert:
+            file: 02-assert-nodeclaims.yaml
+    - name: assert-nodes-ready-and-workload-admitted
+      try:
+        - assert:
+            file: 03-assert-admission.yaml

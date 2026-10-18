@@ -1,0 +1,41 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: fragile-ray-cluster
+  labels:
+    kueue.x-k8s.io/queue-name: minviable-local-queue
+    kueue.x-k8s.io/priority-class: pc-minviable-low
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        priorityClassName: pc-minviable-low
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 8
+      minReplicas: 4
+      maxReplicas: 16
+      rayStartParams: {}
+      template:
+        spec:
+          priorityClassName: pc-minviable-low
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"

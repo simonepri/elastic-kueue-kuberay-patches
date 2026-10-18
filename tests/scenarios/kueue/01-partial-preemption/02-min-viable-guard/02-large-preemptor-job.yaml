@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: massive-preemptor-job
+  labels:
+    kueue.x-k8s.io/queue-name: minviable-local-queue
+    kueue.x-k8s.io/priority-class: pc-minviable-high
+spec:
+  parallelism: 6
+  completions: 6
+  template:
+    spec:
+      terminationGracePeriodSeconds: 0
+      priorityClassName: pc-minviable-high
+      containers:
+        - name: train
+          image: busybox:latest
+          command: ["sleep", "60"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+      restartPolicy: Never

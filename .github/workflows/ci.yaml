@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, release-please--branches--main ]
+  pull_request:
+    branches: [ main, release-please--branches--main ]
+
+jobs:
+  validate-patches:
+    name: Validate Upstream Patch Rebase
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Extract Target Upstream Versions
+        id: versions
+        run: |
+          KUEUE_VER=$(grep "KUEUE_UPSTREAM =" mise.toml | cut -d "\"" -f 2)
+          KUBERAY_VER=$(grep "KUBERAY_UPSTREAM =" mise.toml | cut -d "\"" -f 2)
+          echo "kueue=$KUEUE_VER" >> $GITHUB_OUTPUT
+          echo "kuberay=$KUBERAY_VER" >> $GITHUB_OUTPUT
+
+      - name: Validate Kueue Patches
+        run: |
+          git clone --depth 1 --branch ${{ steps.versions.outputs.kueue }} https://github.com/kubernetes-sigs/kueue.git /tmp/kueue
+          cd /tmp/kueue
+          shopt -s nullglob
+          for patch in $GITHUB_WORKSPACE/patches/kueue/*.patch; do
+            echo "Applying $patch..."
+            git apply --whitespace=nowarn "$patch" || (echo "Failed to apply $patch" && exit 1)
+          done
+
+      - name: Validate KubeRay Patches
+        run: |
+          git clone --depth 1 --branch ${{ steps.versions.outputs.kuberay }} https://github.com/ray-project/kuberay.git /tmp/kuberay
+          cd /tmp/kuberay
+          shopt -s nullglob
+          for patch in $GITHUB_WORKSPACE/patches/kuberay/*.patch; do
+            echo "Applying $patch..."
+            git apply --whitespace=nowarn "$patch" || (echo "Failed to apply $patch" && exit 1)
+          done
+
+  integration-tests:
+    name: Chainsaw Integration Tests
+    needs: [validate-patches]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Install Ko
+        uses: ko-build/setup-ko@v0.8
+
+      - name: Set up Chainsaw
+        uses: kyverno/action-install-chainsaw@v0.2.12
+
+      - name: Install Mise
+        uses: jdx/mise-action@v2
+
+      - name: Spin up Cluster and Deploy Patched Controllers
+        run: mise run cluster:up
+
+      - name: Run Scenario Tests
+        run: mise run test

@@ -1,0 +1,12 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: dynamic-ray-pipeline
+spec:
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 4
+status:
+  conditions:
+    - type: ScaleGateClamped
+      status: "True"

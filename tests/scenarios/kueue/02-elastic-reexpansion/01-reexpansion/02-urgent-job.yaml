@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reexpand-urgent-job
+  labels:
+    kueue.x-k8s.io/queue-name: reexpand-local-queue
+    kueue.x-k8s.io/priority-class: pc-reexpand-high
+spec:
+  parallelism: 2
+  completions: 2
+  template:
+    spec:
+      terminationGracePeriodSeconds: 0
+      priorityClassName: pc-reexpand-high
+      containers:
+        - name: train
+          image: busybox:latest
+          command: ["sleep", "5"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+      restartPolicy: Never

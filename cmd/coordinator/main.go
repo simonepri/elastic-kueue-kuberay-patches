@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/simonepri/k8s-elastic-scale-lab/pkg/actorprotect"
 	"github.com/simonepri/k8s-elastic-scale-lab/pkg/nodesim"
 	"github.com/simonepri/k8s-elastic-scale-lab/pkg/preemption"
 	"github.com/simonepri/k8s-elastic-scale-lab/pkg/preprovisioner"
@@ -85,6 +86,14 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create spotinterruption controller")
+		os.Exit(1)
+	}
+
+	if err = (&actorprotect.Reconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create actorprotect controller")
 		os.Exit(1)
 	}
 

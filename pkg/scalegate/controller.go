@@ -1,15 +1,15 @@
 package scalegate
 
 import (
-	"fmt"
 	"context"
+	"fmt"
 
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/util/retry"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -131,7 +131,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 }
 
 func (r *Reconciler) resolveAvailableQuota(ctx context.Context, namespace, queueName string) (int, error) {
-	logger := log.FromContext(ctx)
 	cq := &unstructured.Unstructured{}
 	cq.SetGroupVersionKind(clusterQueueGVK)
 	// Try getting ClusterQueue directly or resolve via LocalQueue
@@ -141,16 +140,14 @@ func (r *Reconciler) resolveAvailableQuota(ctx context.Context, namespace, queue
 		if errLq := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: queueName}, lq); errLq == nil {
 			targetCq, _, _ := unstructured.NestedString(lq.Object, "spec", "clusterQueue")
 			if targetCq != "" {
-				if errCq := r.Get(ctx, client.ObjectKey{Name: targetCq}, cq); errCq != nil {
-					logger.Error(errCq, "failed to get target ClusterQueue", "targetCq", targetCq)
-				}
+				_ = r.Get(ctx, client.ObjectKey{Name: targetCq}, cq)
 			}
-		} else {
-			logger.Error(errLq, "failed to get LocalQueue", "localQueue", queueName, "namespace", namespace)
 		}
 	}
 
-	// Extract nominal quota
+	cohort, _, _ := unstructured.NestedString(cq.Object, "spec", "cohort")
+
+	// Extract nominal quota and borrowingLimit
 	rGroups, found, _ := unstructured.NestedSlice(cq.Object, "spec", "resourceGroups")
 	if !found {
 		return 4, nil // fallback safe default
@@ -173,10 +170,20 @@ func (r *Reconciler) resolveAvailableQuota(ctx context.Context, namespace, queue
 					continue
 				}
 				if resMap["name"] == "nvidia.com/gpu" {
-					valStr := fmt.Sprint(resMap["nominalQuota"])
-					var q int
-					if _, err := fmt.Sscanf(valStr, "%d", &q); err == nil && q > 0 {
-						return q, nil
+					nominalStr := fmt.Sprint(resMap["nominalQuota"])
+					var nominal int
+					_, _ = fmt.Sscanf(nominalStr, "%d", &nominal)
+
+					totalLimit := nominal
+					if cohort != "" && resMap["borrowingLimit"] != nil {
+						borrowStr := fmt.Sprint(resMap["borrowingLimit"])
+						var borrow int
+						if _, err := fmt.Sscanf(borrowStr, "%d", &borrow); err == nil && borrow > 0 {
+							totalLimit += borrow
+						}
+					}
+					if totalLimit > 0 {
+						return totalLimit, nil
 					}
 					return 4, nil
 				}

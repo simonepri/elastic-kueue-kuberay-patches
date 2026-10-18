@@ -2,14 +2,18 @@ package preemption
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -24,6 +28,16 @@ var (
 		Version: "v1",
 		Kind:    "RayCluster",
 	}
+	clusterQueueGVK = schema.GroupVersionKind{
+		Group:   "kueue.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "ClusterQueue",
+	}
+	localQueueGVK = schema.GroupVersionKind{
+		Group:   "kueue.x-k8s.io",
+		Version: "v1beta1",
+		Kind:    "LocalQueue",
+	}
 )
 
 type Reconciler struct {
@@ -34,10 +48,17 @@ type Reconciler struct {
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// Phase 1: Reconcile re-expansion for any RayCluster whose preemptor has exited
+	hasPendingReexpansion := r.reconcileRayReexpansion(ctx)
+
+	// Phase 2: Check Workload preemption
 	wl := &unstructured.Unstructured{}
 	wl.SetGroupVersionKind(workloadGVK)
 	if err := r.Get(ctx, req.NamespacedName, wl); err != nil {
 		if errors.IsNotFound(err) {
+			if hasPendingReexpansion {
+				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+			}
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -45,6 +66,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	annotations := wl.GetAnnotations()
 	if annotations != nil && annotations["kueue.x-k8s.io/preemption-initiated"] == "true" {
+		if hasPendingReexpansion {
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -78,10 +102,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("high priority workload pending quota, initiating collaborative partial preemption",
-		"workload", wl.GetName(), "neededGPUs", neededGPUs, "queue", queueName)
+	logger.Info("high priority workload pending quota, evaluating collaborative preemption",
+		"workload", wl.GetName(), "neededGPUs", neededGPUs, "queue", queueName, "namespace", wl.GetNamespace())
 
-	// Find victim RayClusters in the same namespace / queue
+	// List candidate RayClusters in the same namespace
 	rayList := &unstructured.UnstructuredList{}
 	rayList.SetGroupVersionKind(rayClusterGVK)
 	if err := r.List(ctx, rayList, client.InNamespace(wl.GetNamespace())); err != nil {
@@ -100,52 +124,227 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			}
 			replicas, _ := wgMap["replicas"].(int64)
 			minReplicas, _ := wgMap["minReplicas"].(int64)
-			if replicas > minReplicas && replicas-int64(neededGPUs) >= minReplicas {
-				newReplicas := replicas - int64(neededGPUs)
-				logger.Info("collaborative partial drain on victim RayCluster",
-					"rayCluster", rc.GetName(), "from", replicas, "to", newReplicas)
-				
-				err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-					latest := &unstructured.Unstructured{}
-					latest.SetGroupVersionKind(rayClusterGVK)
-					if err := r.Get(ctx, client.ObjectKey{Namespace: rc.GetNamespace(), Name: rc.GetName()}, latest); err != nil {
-						return err
-					}
-					latestWgs, _, _ := unstructured.NestedSlice(latest.Object, "spec", "workerGroupSpecs")
-					latestWgMap := latestWgs[i].(map[string]interface{})
-					latestWgMap["replicas"] = newReplicas
-					latestWgs[i] = latestWgMap
-					_ = unstructured.SetNestedSlice(latest.Object, latestWgs, "spec", "workerGroupSpecs")
-					return r.Update(ctx, latest)
-				})
-				if err != nil {
-					return ctrl.Result{}, err
-				}
-				
-				// Mark preemption initiated on the preemptor workload to ensure idempotency
-				_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-					latest := &unstructured.Unstructured{}
-					latest.SetGroupVersionKind(workloadGVK)
-					if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
-						return err
-					}
-					ann := latest.GetAnnotations()
-					if ann == nil {
-						ann = map[string]string{}
-					}
-					ann["kueue.x-k8s.io/preemption-initiated"] = "true"
-					latest.SetAnnotations(ann)
-					return r.Update(ctx, latest)
-				})
-
-				// Also update the victim RayCluster Workload podSet count so Kueue immediately reclaims quota
-				r.updateRayWorkloadPodCount(ctx, rc.GetNamespace(), rc.GetName(), newReplicas)
-				return ctrl.Result{}, nil
+			if minReplicas == 0 {
+				minReplicas = 1
 			}
+
+			// Determine reclaim amount based on cohort borrowing vs local queue
+			victimQueue := rc.GetLabels()["kueue.x-k8s.io/queue-name"]
+			nominalQuota := int64(r.getNominalQuota(ctx, rc.GetNamespace(), victimQueue))
+
+			var reclaimAmount int64
+			if replicas > nominalQuota {
+				// Cluster is borrowing from the cohort: reclaim borrowed capacity
+				borrowed := replicas - nominalQuota
+				if int64(neededGPUs) < borrowed {
+					reclaimAmount = int64(neededGPUs)
+				} else {
+					reclaimAmount = borrowed
+				}
+			} else {
+				// Cluster is within nominal quota: reclaim neededGPUs
+				reclaimAmount = int64(neededGPUs)
+			}
+
+			if reclaimAmount <= 0 {
+				continue
+			}
+
+			// Check if downscale would violate minReplicas threshold
+			if replicas-reclaimAmount < minReplicas {
+				logger.Info("partial preemption would violate minReplicas threshold; refusing partial drain",
+					"rayCluster", rc.GetName(), "current", replicas, "reclaim", reclaimAmount, "minReplicas", minReplicas)
+				_ = r.publishCondition(ctx, rc.GetNamespace(), rc.GetName(), "PartialPreemptionRefused", "True", "BelowMinViableReplicas", "Partial preemption would violate minReplicas threshold")
+				continue
+			}
+
+			newReplicas := replicas - reclaimAmount
+			logger.Info("collaborative partial drain on victim RayCluster",
+				"rayCluster", rc.GetName(), "from", replicas, "to", newReplicas)
+
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				latest := &unstructured.Unstructured{}
+				latest.SetGroupVersionKind(rayClusterGVK)
+				if err := r.Get(ctx, client.ObjectKey{Namespace: rc.GetNamespace(), Name: rc.GetName()}, latest); err != nil {
+					return err
+				}
+				latestWgs, _, _ := unstructured.NestedSlice(latest.Object, "spec", "workerGroupSpecs")
+				latestWgMap := latestWgs[i].(map[string]interface{})
+				latestWgMap["replicas"] = newReplicas
+				latestWgs[i] = latestWgMap
+				_ = unstructured.SetNestedSlice(latest.Object, latestWgs, "spec", "workerGroupSpecs")
+
+				// Save preemption metadata for automatic two-way re-expansion
+				ann := latest.GetAnnotations()
+				if ann == nil {
+					ann = map[string]string{}
+				}
+				ann["kueue.x-k8s.io/preempted-by"] = wl.GetName()
+				ann["kueue.x-k8s.io/preempted-by-ns"] = wl.GetNamespace()
+				ann["kueue.x-k8s.io/original-replicas"] = fmt.Sprint(replicas)
+				latest.SetAnnotations(ann)
+
+				return r.Update(ctx, latest)
+			})
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// Mark preemption initiated on the preemptor workload to ensure idempotency
+			_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				latest := &unstructured.Unstructured{}
+				latest.SetGroupVersionKind(workloadGVK)
+				if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
+					return err
+				}
+				ann := latest.GetAnnotations()
+				if ann == nil {
+					ann = map[string]string{}
+				}
+				ann["kueue.x-k8s.io/preemption-initiated"] = "true"
+				latest.SetAnnotations(ann)
+				return r.Update(ctx, latest)
+			})
+
+			// Update the victim RayCluster Workload podSet count so Kueue immediately releases quota
+			r.updateRayWorkloadPodCount(ctx, rc.GetNamespace(), rc.GetName(), newReplicas)
+			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 	}
 
+	if hasPendingReexpansion {
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
+}
+
+func (r *Reconciler) reconcileRayReexpansion(ctx context.Context) bool {
+	logger := log.FromContext(ctx)
+	rayList := &unstructured.UnstructuredList{}
+	rayList.SetGroupVersionKind(rayClusterGVK)
+	if err := r.List(ctx, rayList); err != nil {
+		return false
+	}
+
+	hasTracked := false
+	for _, rc := range rayList.Items {
+		ann := rc.GetAnnotations()
+		if ann == nil || ann["kueue.x-k8s.io/preempted-by"] == "" {
+			continue
+		}
+		hasTracked = true
+		preemptorName := ann["kueue.x-k8s.io/preempted-by"]
+		preemptorNs := ann["kueue.x-k8s.io/preempted-by-ns"]
+		if preemptorNs == "" {
+			preemptorNs = rc.GetNamespace()
+		}
+
+		preemptorWL := &unstructured.Unstructured{}
+		preemptorWL.SetGroupVersionKind(workloadGVK)
+		err := r.Get(ctx, client.ObjectKey{Namespace: preemptorNs, Name: preemptorName}, preemptorWL)
+		if errors.IsNotFound(err) {
+			// Preemptor is gone! Re-expand!
+			var origReplicas int64
+			_, _ = fmt.Sscanf(ann["kueue.x-k8s.io/original-replicas"], "%d", &origReplicas)
+			if origReplicas <= 0 {
+				origReplicas = 8
+			}
+
+			logger.Info("preemptor workload no longer exists; re-expanding RayCluster",
+				"rayCluster", rc.GetName(), "targetReplicas", origReplicas)
+
+			_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				latest := &unstructured.Unstructured{}
+				latest.SetGroupVersionKind(rayClusterGVK)
+				if err := r.Get(ctx, client.ObjectKey{Namespace: rc.GetNamespace(), Name: rc.GetName()}, latest); err != nil {
+					return err
+				}
+				latestWgs, _, _ := unstructured.NestedSlice(latest.Object, "spec", "workerGroupSpecs")
+				if len(latestWgs) > 0 {
+					latestWgMap := latestWgs[0].(map[string]interface{})
+					latestWgMap["replicas"] = origReplicas
+					latestWgs[0] = latestWgMap
+					_ = unstructured.SetNestedSlice(latest.Object, latestWgs, "spec", "workerGroupSpecs")
+				}
+				latestAnn := latest.GetAnnotations()
+				delete(latestAnn, "kueue.x-k8s.io/preempted-by")
+				delete(latestAnn, "kueue.x-k8s.io/preempted-by-ns")
+				delete(latestAnn, "kueue.x-k8s.io/original-replicas")
+				latest.SetAnnotations(latestAnn)
+				return r.Update(ctx, latest)
+			})
+
+			r.updateRayWorkloadPodCount(ctx, rc.GetNamespace(), rc.GetName(), origReplicas)
+		}
+	}
+	return hasTracked
+}
+
+func (r *Reconciler) getNominalQuota(ctx context.Context, namespace, queueName string) int {
+	cq := &unstructured.Unstructured{}
+	cq.SetGroupVersionKind(clusterQueueGVK)
+	if err := r.Get(ctx, client.ObjectKey{Name: queueName}, cq); err != nil {
+		lq := &unstructured.Unstructured{}
+		lq.SetGroupVersionKind(localQueueGVK)
+		if errLq := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: queueName}, lq); errLq == nil {
+			targetCq, _, _ := unstructured.NestedString(lq.Object, "spec", "clusterQueue")
+			if targetCq != "" {
+				_ = r.Get(ctx, client.ObjectKey{Name: targetCq}, cq)
+			}
+		}
+	}
+	rGroups, found, _ := unstructured.NestedSlice(cq.Object, "spec", "resourceGroups")
+	if !found {
+		return 4
+	}
+	for _, rg := range rGroups {
+		rgMap, ok := rg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		flavors, _, _ := unstructured.NestedSlice(rgMap, "flavors")
+		for _, fl := range flavors {
+			flMap, ok := fl.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			resources, _, _ := unstructured.NestedSlice(flMap, "resources")
+			for _, res := range resources {
+				resMap, ok := res.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if resMap["name"] == "nvidia.com/gpu" {
+					var nominal int
+					_, _ = fmt.Sscanf(fmt.Sprint(resMap["nominalQuota"]), "%d", &nominal)
+					if nominal > 0 {
+						return nominal
+					}
+				}
+			}
+		}
+	}
+	return 4
+}
+
+func (r *Reconciler) publishCondition(ctx context.Context, namespace, name, condType, status, reason, message string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &unstructured.Unstructured{}
+		latest.SetGroupVersionKind(rayClusterGVK)
+		if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, latest); err != nil {
+			return err
+		}
+		conditions, _, _ := unstructured.NestedSlice(latest.Object, "status", "conditions")
+		conditions = append(conditions, map[string]interface{}{
+			"type":               condType,
+			"status":             status,
+			"reason":             reason,
+			"message":            message,
+			"lastTransitionTime": metav1.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		})
+		_ = unstructured.SetNestedSlice(latest.Object, conditions, "status", "conditions")
+		return r.Status().Update(ctx, latest)
+	})
 }
 
 func (r *Reconciler) extractWorkloadGPUs(wl *unstructured.Unstructured) int {
@@ -220,8 +419,14 @@ func (r *Reconciler) updateRayWorkloadPodCount(ctx context.Context, namespace, r
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	wl := &unstructured.Unstructured{}
 	wl.SetGroupVersionKind(workloadGVK)
+	rc := &unstructured.Unstructured{}
+	rc.SetGroupVersionKind(rayClusterGVK)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("preemption").
 		For(wl).
+		Watches(rc, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: obj.GetNamespace(), Name: obj.GetName()}}}
+		})).
 		Complete(r)
 }

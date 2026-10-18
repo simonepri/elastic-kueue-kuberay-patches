@@ -1,0 +1,12 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: fragile-ray-cluster
+spec:
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 8
+status:
+  conditions:
+    - type: PartialPreemptionRefused
+      status: "True"

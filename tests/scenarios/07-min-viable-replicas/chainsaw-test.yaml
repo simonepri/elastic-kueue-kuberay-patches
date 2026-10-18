@@ -1,0 +1,28 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 07-min-viable-replicas
+spec:
+  description: >
+    Verifies that when partial preemption would shrink an elastic distributed cluster
+    below its declared minReplicas threshold (rendering the pipeline mathematically
+    inoperable), partial drain is safely refused and the cluster is preserved intact.
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-raycluster
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+        - assert:
+            file: 01-assert-ray-active.yaml
+    - name: submit-massive-preemptor
+      try:
+        - apply:
+            file: 02-large-preemptor-job.yaml
+    - name: assert-preemption-refused
+      try:
+        - assert:
+            file: 03-assert-preemption-refused-and-undrained.yaml

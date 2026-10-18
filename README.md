@@ -17,8 +17,6 @@ When running distributed Ray and batch ML training alongside dynamic cloud autos
 
 **Kyield solves this by teaching distributed clusters to *yield* capacity cooperatively instead of dying.**
 
-
-
 ---
 
 ## 2. Test Scenarios (Kyverno Chainsaw Suite)
@@ -50,7 +48,7 @@ Every scenario is tested against a live Kubernetes v1.36+ cluster using declarat
 # 1. Install toolchain
 mise install
 
-# 2. Build Kyield binary
+# 2. Build production binary (bin/kyield) and test fixture (bin/test-nodesim)
 make build
 
 # 3. Create Kind cluster and install CRDs
@@ -63,16 +61,18 @@ make test
 
 ---
 
-## 4. Upstream Retirement Roadmap
+## 4. Upstream Retirement Roadmap & Issue Traceability
 
-Kyield is explicitly designed as a "thinning-out" shim that evaporates into upstream projects over time:
+Kyield is explicitly architected as a temporary "thinning-out" shim that evaporates into upstream projects as the following KEPs, issues, and PRs graduate:
 
-1. **`pkg/preprovisioner`**: Retires once Kueue's Dynamic Resource Allocation (DRA) or Karpenter's native AdmissionCheck driver stabilizes in v1.37+.
-2. **`pkg/scalegate`**: Retires when KubeRay supports the Kueue Elastic Workload protocol ([KubeRay #1850](https://github.com/ray-project/kuberay)).
-3. **`pkg/preemption`**: Retires when Kueue introduces a selective/partial preemption callback API for elastic frameworks.
-4. **`pkg/spotinterruption`**: Retires when KubeRay's native spot drain controller graduates.
-5. **`pkg/actorprotect`**: Retires when KubeRay's internal autoscaler directly synchronizes actor placement with pod deletion scoring.
-6. **`pkg/nodesim`**: Test-only simulation controller enabled strictly via `--enable-node-simulator` flag.
+| Kyield Component | Upstream Project | Tracking Issues & KEPs | Retirement Condition |
+| :--- | :--- | :--- | :--- |
+| **`pkg/preprovisioner`** | **Kueue** & **Karpenter** | • [kubernetes-sigs/kueue#5133](https://github.com/kubernetes-sigs/kueue/issues/5133) (Kueue & Karpenter Support)<br/>• [kubernetes-sigs/kueue#3419](https://github.com/kubernetes-sigs/kueue/issues/3419) (ProvisioningRequest v1 API)<br/>• [kubernetes-sigs/kueue#3249](https://github.com/kubernetes-sigs/kueue/issues/3249) (External AdmissionCheck Controller)<br/>• [kubernetes-sigs/kueue#17156](https://github.com/kubernetes-sigs/kueue/issues/17156) (Admit when provisioned nodes are usable)<br/>• [kubernetes-sigs/karpenter#4878](https://github.com/kubernetes-sigs/karpenter/issues/4878) (Capacity Reservation / ProvisioningRequest) | Native Karpenter driver for Kueue `ProvisioningRequest` or dynamic DRA capacity check graduates. |
+| **`pkg/scalegate`** | **KubeRay** & **Kueue** | • [ray-project/kuberay#1850](https://github.com/ray-project/kuberay/issues/1850) (Kueue gang scheduling & quota management)<br/>• [ray-project/kuberay#5233](https://github.com/ray-project/kuberay/issues/5233) (ScaleGate signal on RayCluster for quota limits)<br/>• [kubernetes-sigs/kueue#7569](https://github.com/kubernetes-sigs/kueue/issues/7569) (Ray autoscaler vs Kueue admission model) | KubeRay implements native Kueue Elastic Workload protocol clamping autoscaler within nominal quota. |
+| **`pkg/preemption`** | **Kueue** | • [kubernetes-sigs/kueue#975](https://github.com/kubernetes-sigs/kueue/issues/975) (Partial preemption of workloads & RayCluster)<br/>• [kubernetes-sigs/kueue#8651](https://github.com/kubernetes-sigs/kueue/issues/8651) (ElasticJobsViaWorkloadSlices for Ray)<br/>• [kubernetes-sigs/kueue#9891](https://github.com/kubernetes-sigs/kueue/issues/9891) (Automatic scale-up/re-expansion for elastic jobs)<br/>• [kubernetes-sigs/kueue#10167](https://github.com/kubernetes-sigs/kueue/issues/10167) (RayCluster scheduling gates & preemption) | Kueue supports selective partial preemption callbacks and dynamic slice re-expansion natively. |
+| **`pkg/spotinterruption`** | **KubeRay** | • [ray-project/kuberay#5233](https://github.com/ray-project/kuberay/issues/5233) (Fast fallback on Spot capacity exhaustion)<br/>• [ray-project/kuberay#5325](https://github.com/ray-project/kuberay/issues/5325) (scaleStrategy.workersToDelete downscale sync)<br/>• [ray-project/kuberay#4570](https://github.com/ray-project/kuberay/pull/4570) (Replicas and workersToDelete synchronization) | KubeRay operator natively watches cloud Spot interruption events and adjusts `workerGroupSpec`. |
+| **`pkg/actorprotect`** | **Kubernetes** & **KubeRay** | • [Kubernetes KEP-2258](https://github.com/kubernetes/enhancements/tree/master/keps/sig-apps/2258-pod-deletion-cost) (Pod Deletion Cost)<br/>• [ray-project/kuberay#5325](https://github.com/ray-project/kuberay/issues/5325) (Stateful actor-aware scale-down) | KubeRay autoscaler directly annotates busy actor pods or coordinates with K8s pod deletion costs. |
+| **`cmd/test-nodesim`** | **Testing Harness** | Test-only virtual Kubelet fixture for local Kind/CI execution. Compiled separately as `bin/test-nodesim`. | Replaced by cloud provider emulators (e.g. Floci) during hardware integration runs. |
 
 ---
 

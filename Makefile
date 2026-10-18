@@ -4,7 +4,7 @@ MISE := mise -C . exec --
 
 .PHONY: help
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*63898' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: kind-up cluster-up
 cluster-up kind-up: ## Create the local Kind cluster with K8s 1.36 and feature gates
@@ -30,14 +30,19 @@ vet: ## Run go vet
 	$(MISE) go vet ./...
 
 .PHONY: build
-build: fmt vet ## Build the Kyield binary
+build: fmt vet ## Build the production Kyield binary and test fixture binary
 	mkdir -p bin
 	$(MISE) go build -o bin/kyield ./cmd/coordinator
 	ln -sf kyield bin/coordinator
+	$(MISE) go build -o bin/test-nodesim ./cmd/test-nodesim
 
 .PHONY: run
-run: build ## Run Kyield locally against current kubecontext with node simulation
-	./bin/kyield --enable-node-simulator
+run: build ## Run Kyield locally against current kubecontext
+	./bin/kyield
+
+.PHONY: run-test-sim
+run-test-sim: build ## Run test-nodesim virtual kubelet fixture
+	./bin/test-nodesim
 
 .PHONY: test
 test: ## Run the full 9-scenario Chainsaw test suite

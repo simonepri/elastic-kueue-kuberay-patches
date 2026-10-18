@@ -13,7 +13,6 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/simonepri/k8s-elastic-scale-lab/pkg/actorprotect"
-	"github.com/simonepri/k8s-elastic-scale-lab/pkg/nodesim"
 	"github.com/simonepri/k8s-elastic-scale-lab/pkg/preemption"
 	"github.com/simonepri/k8s-elastic-scale-lab/pkg/preprovisioner"
 	"github.com/simonepri/k8s-elastic-scale-lab/pkg/scalegate"
@@ -32,12 +31,10 @@ func init() {
 func main() {
 	var metricsAddr string
 	var probeAddr string
-	var enableNodeSim bool
 	var enableLeaderElection bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableNodeSim, "enable-node-simulator", false, "Enable the simulated node controller for local test environments (Kind/Minikube)")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for high-availability deployments")
 
 	opts := zap.Options{Development: true}
@@ -76,17 +73,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if enableNodeSim {
-		setupLog.Info("enabling node simulator for local testing")
-		if err = (&nodesim.Reconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create nodesim controller")
-			os.Exit(1)
-		}
-	}
-
 	if err = (&preemption.Reconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -120,7 +106,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting Kyield coordinator", "metricsAddr", metricsAddr, "probeAddr", probeAddr, "nodeSim", enableNodeSim)
+	setupLog.Info("starting Kyield coordinator (production)", "metricsAddr", metricsAddr, "probeAddr", probeAddr)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running Kyield coordinator")
 		os.Exit(1)

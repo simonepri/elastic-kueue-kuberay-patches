@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spot-interruption-notice
+  labels:
+    test.k8s.io/event: spot-interrupted
+    target-cluster: spot-ray-cluster
+data:
+  workerGroup: spot-workers
+  interruptedReplicas: "1"

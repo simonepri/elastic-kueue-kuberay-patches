@@ -2,14 +2,13 @@ apiVersion: kueue.x-k8s.io/v1beta1
 kind: ResourceFlavor
 metadata:
   name: gpu-flavor
-spec: {}
 ---
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: AdmissionCheck
 metadata:
   name: karpenter-provision
 spec:
-  controllerName: setu.kueue.x-k8s.io/admission-check
+  controllerName: kyield.io/admission-check
 ---
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: ClusterQueue
@@ -17,20 +16,19 @@ metadata:
   name: training-queue
 spec:
   namespaceSelector: {}
-  admissionChecksStrategy:
-    admissionChecks:
-      - name: karpenter-provision
+  admissionChecks:
+    - karpenter-provision
   resourceGroups:
     - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
       flavors:
         - name: gpu-flavor
           resources:
             - name: "cpu"
-              nominalQuota: 100
+              nominalQuota: "32"
             - name: "memory"
-              nominalQuota: 500Gi
+              nominalQuota: "128Gi"
             - name: "nvidia.com/gpu"
-              nominalQuota: 32
+              nominalQuota: "4"
 ---
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: LocalQueue

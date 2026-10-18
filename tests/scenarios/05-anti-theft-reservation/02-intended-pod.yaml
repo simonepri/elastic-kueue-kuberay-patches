@@ -5,13 +5,11 @@ metadata:
 spec:
   terminationGracePeriodSeconds: 0
   tolerations:
-    - key: kueue.x-k8s.io/claimed-by
-      operator: Equal
-      value: training-workload-xyz
+    - key: kyield.io/claimed-by
+      value: intended-gang-workload
       effect: NoSchedule
+  nodeName: simulated-gpu-node-01
   containers:
-    - name: worker
+    - name: train
       image: busybox:latest
-      command: ["sleep", "300"]
-  nodeSelector:
-    topology.kubernetes.io/zone: us-west-2a
+      command: ["sleep", "60"]

@@ -8,5 +8,7 @@ spec:
       replicas: 8
 status:
   conditions:
+    - type: ScaleGateClamped
+      status: "True"
     - type: PartialPreemptionRefused
       status: "True"

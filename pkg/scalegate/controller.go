@@ -67,19 +67,28 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	clamped := false
+	targetLimit := int64(maxAllowedQuota)
 	for i, wg := range workerGroups {
 		wgMap, ok := wg.(map[string]interface{})
 		if !ok {
 			continue
 		}
 		replicas, _ := wgMap["replicas"].(int64)
-		if replicas > int64(maxAllowedQuota) {
-			logger.Info("clamping RayCluster replicas to Kueue quota",
-				"cluster", rc.GetName(), "requested", replicas, "clamped", maxAllowedQuota)
-			wgMap["replicas"] = int64(maxAllowedQuota)
-			workerGroups[i] = wgMap
+		maxReplicas, _ := wgMap["maxReplicas"].(int64)
+
+		if maxReplicas > targetLimit {
+			logger.Info("clamping RayCluster maxReplicas to Kueue quota",
+				"cluster", rc.GetName(), "requestedMax", maxReplicas, "clamped", targetLimit)
+			wgMap["maxReplicas"] = targetLimit
 			clamped = true
 		}
+		if replicas > targetLimit {
+			logger.Info("clamping RayCluster replicas to Kueue quota",
+				"cluster", rc.GetName(), "requestedReplicas", replicas, "clamped", targetLimit)
+			wgMap["replicas"] = targetLimit
+			clamped = true
+		}
+		workerGroups[i] = wgMap
 	}
 
 	if clamped {
@@ -96,10 +105,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 					continue
 				}
 				replicas, _ := wgMap["replicas"].(int64)
-				if replicas > int64(maxAllowedQuota) {
-					wgMap["replicas"] = int64(maxAllowedQuota)
-					wgs[i] = wgMap
+				maxReplicas, _ := wgMap["maxReplicas"].(int64)
+				if maxReplicas > targetLimit {
+					wgMap["maxReplicas"] = targetLimit
 				}
+				if replicas > targetLimit {
+					wgMap["replicas"] = targetLimit
+				}
+				wgs[i] = wgMap
 			}
 			_ = unstructured.SetNestedSlice(latest.Object, wgs, "spec", "workerGroupSpecs")
 			return r.Update(ctx, latest)
@@ -115,14 +128,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				return err
 			}
 			conditions, _, _ := unstructured.NestedSlice(latest.Object, "status", "conditions")
-			conditions = append(conditions, map[string]interface{}{
+			filteredConditions := []interface{}{}
+			for _, cond := range conditions {
+				if cMap, ok := cond.(map[string]interface{}); ok {
+					if cMap["type"] != "ScaleGateClamped" {
+						filteredConditions = append(filteredConditions, cond)
+					}
+				}
+			}
+			filteredConditions = append(filteredConditions, map[string]interface{}{
 				"type":               "ScaleGateClamped",
 				"status":             "True",
 				"reason":             "KueueQuotaCapped",
-				"message":            "Worker replicas clamped to available Kueue ClusterQueue quota",
+				"message":            "Worker replicas and maxReplicas clamped to available Kueue ClusterQueue quota",
 				"lastTransitionTime": metav1.Now().UTC().Format("2006-01-02T15:04:05Z"),
 			})
-			_ = unstructured.SetNestedSlice(latest.Object, conditions, "status", "conditions")
+			_ = unstructured.SetNestedSlice(latest.Object, filteredConditions, "status", "conditions")
 			return r.Status().Update(ctx, latest)
 		})
 	}
@@ -133,7 +154,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 func (r *Reconciler) resolveAvailableQuota(ctx context.Context, namespace, queueName string) (int, error) {
 	cq := &unstructured.Unstructured{}
 	cq.SetGroupVersionKind(clusterQueueGVK)
-	// Try getting ClusterQueue directly or resolve via LocalQueue
 	if err := r.Get(ctx, client.ObjectKey{Name: queueName}, cq); err != nil {
 		lq := &unstructured.Unstructured{}
 		lq.SetGroupVersionKind(localQueueGVK)
@@ -147,10 +167,9 @@ func (r *Reconciler) resolveAvailableQuota(ctx context.Context, namespace, queue
 
 	cohort, _, _ := unstructured.NestedString(cq.Object, "spec", "cohort")
 
-	// Extract nominal quota and borrowingLimit
 	rGroups, found, _ := unstructured.NestedSlice(cq.Object, "spec", "resourceGroups")
 	if !found {
-		return 4, nil // fallback safe default
+		return 4, nil
 	}
 	for _, rg := range rGroups {
 		rgMap, ok := rg.(map[string]interface{})

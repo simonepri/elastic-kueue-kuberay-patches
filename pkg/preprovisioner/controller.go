@@ -1,7 +1,6 @@
 package preprovisioner
 
 import (
-	"k8s.io/client-go/util/retry"
 	"context"
 	"fmt"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -18,9 +18,10 @@ import (
 
 const (
 	AdmissionCheckName = "karpenter-provision"
-	AntiTheftTaintKey  = "kueue.x-k8s.io/claimed-by"
-	GangIDLabelKey     = "setu.kueue.x-k8s.io/gang-id"
-	ManagedLabelKey    = "setu.kueue.x-k8s.io/managed-by-controller"
+	AntiTheftTaintKey  = "kyield.io/claimed-by"
+	GangIDLabelKey     = "kyield.io/gang-id"
+	ManagedLabelKey    = "kyield.io/managed-by-controller"
+	WorkloadLabelKey   = "kyield.io/workload"
 )
 
 var (
@@ -126,7 +127,6 @@ func (r *Reconciler) extractResourceRequirements(wl *unstructured.Unstructured) 
 		}
 		count, _ := psMap["count"].(int64)
 		totalPods += int(count)
-		// Extract requests from containers
 		containers, _, _ := unstructured.NestedSlice(psMap, "template", "spec", "containers")
 		for _, c := range containers {
 			cMap, ok := c.(map[string]interface{})
@@ -155,9 +155,9 @@ func (r *Reconciler) createTaintedNodeClaims(ctx context.Context, wl *unstructur
 				"metadata": map[string]interface{}{
 					"name": claimName,
 					"labels": map[string]interface{}{
-						ManagedLabelKey: "true",
-						GangIDLabelKey:  gangID,
-						"kueue.x-k8s.io/workload": wl.GetName(),
+						ManagedLabelKey:  "true",
+						GangIDLabelKey:   gangID,
+						WorkloadLabelKey: wl.GetName(),
 					},
 				},
 				"spec": map[string]interface{}{
@@ -193,7 +193,7 @@ func (r *Reconciler) createTaintedNodeClaims(ctx context.Context, wl *unstructur
 func (r *Reconciler) getExistingNodeClaims(ctx context.Context, workloadName string) ([]unstructured.Unstructured, error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(nodeClaimGVK)
-	if err := r.List(ctx, list, client.MatchingLabels{"kueue.x-k8s.io/workload": workloadName}); err != nil {
+	if err := r.List(ctx, list, client.MatchingLabels{WorkloadLabelKey: workloadName}); err != nil {
 		return nil, err
 	}
 	return list.Items, nil

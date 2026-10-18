@@ -15,6 +15,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+const (
+	AnnotationProcessed = "kyield.io/spot-interruption-processed"
+)
+
 var (
 	rayClusterGVK = schema.GroupVersionKind{
 		Group:   "ray.io",
@@ -39,7 +43,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	if cm.Labels["test.k8s.io/event"] != "spot-interrupted" {
+	if cm.Labels["test.k8s.io/event"] != "spot-interrupted" && cm.Labels["kyield.io/event"] != "spot-interrupted" {
+		return ctrl.Result{}, nil
+	}
+
+	if cm.Annotations != nil && cm.Annotations[AnnotationProcessed] == "true" {
 		return ctrl.Result{}, nil
 	}
 
@@ -49,13 +57,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	groupName := cm.Data["workerGroup"]
+	targetPod := cm.Data["interruptedPod"]
 	var interrupted int64 = 1
 	if val, ok := cm.Data["interruptedReplicas"]; ok {
 		fmt.Sscanf(val, "%d", &interrupted)
 	}
 
 	logger.Info("handling spot interruption for cluster",
-		"cluster", targetCluster, "group", groupName, "interrupted", interrupted)
+		"cluster", targetCluster, "group", groupName, "interrupted", interrupted, "targetPod", targetPod)
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &unstructured.Unstructured{}
@@ -77,9 +86,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				curReplicas, _ := wgMap["replicas"].(int64)
 				if curReplicas > interrupted {
 					newReplicas := curReplicas - interrupted
-					logger.Info("contracting workerGroup replicas to match surviving capacity",
+					logger.Info("contracting workerGroup replicas and maxReplicas to match surviving capacity",
 						"cluster", targetCluster, "old", curReplicas, "new", newReplicas)
 					wgMap["replicas"] = newReplicas
+					wgMap["maxReplicas"] = newReplicas
+
+					if targetPod != "" {
+						strategy, _, _ := unstructured.NestedMap(wgMap, "scaleStrategy")
+						if strategy == nil {
+							strategy = map[string]interface{}{}
+						}
+						toDelete, _, _ := unstructured.NestedStringSlice(strategy, "workersToDelete")
+						toDelete = append(toDelete, targetPod)
+						strategy["workersToDelete"] = toDelete
+						wgMap["scaleStrategy"] = strategy
+					}
+
 					wgs[i] = wgMap
 					modified = true
 				}
@@ -95,6 +117,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
+	// Mark processed for idempotency
+	_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latestCm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, req.NamespacedName, latestCm); err != nil {
+			return err
+		}
+		ann := latestCm.GetAnnotations()
+		if ann == nil {
+			ann = map[string]string{}
+		}
+		ann[AnnotationProcessed] = "true"
+		latestCm.SetAnnotations(ann)
+		return r.Update(ctx, latestCm)
+	})
 
 	return ctrl.Result{}, nil
 }

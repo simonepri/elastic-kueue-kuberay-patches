@@ -17,6 +17,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+const (
+	AnnotationPreemptionInitiated = "kyield.io/preemption-initiated"
+	AnnotationPreemptedBy         = "kyield.io/preempted-by"
+	AnnotationPreemptedByNs       = "kyield.io/preempted-by-ns"
+	AnnotationOriginalReplicas    = "kyield.io/original-replicas"
+	AnnotationOriginalMaxReplicas = "kyield.io/original-max-replicas"
+)
+
 var (
 	workloadGVK = schema.GroupVersionKind{
 		Group:   "kueue.x-k8s.io",
@@ -48,7 +56,7 @@ type Reconciler struct {
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Phase 1: Reconcile re-expansion for any RayCluster whose preemptor has exited
+	// Phase 1: Reconcile re-expansion for any RayCluster whose preemptor has finished or exited
 	hasPendingReexpansion := r.reconcileRayReexpansion(ctx)
 
 	// Phase 2: Check Workload preemption
@@ -65,7 +73,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	annotations := wl.GetAnnotations()
-	if annotations != nil && annotations["kueue.x-k8s.io/preemption-initiated"] == "true" {
+	if annotations != nil && annotations[AnnotationPreemptionInitiated] == "true" {
 		if hasPendingReexpansion {
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
@@ -123,6 +131,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				continue
 			}
 			replicas, _ := wgMap["replicas"].(int64)
+			maxReplicas, _ := wgMap["maxReplicas"].(int64)
 			minReplicas, _ := wgMap["minReplicas"].(int64)
 			if minReplicas == 0 {
 				minReplicas = 1
@@ -134,7 +143,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 			var reclaimAmount int64
 			if replicas > nominalQuota {
-				// Cluster is borrowing from the cohort: reclaim borrowed capacity
 				borrowed := replicas - nominalQuota
 				if int64(neededGPUs) < borrowed {
 					reclaimAmount = int64(neededGPUs)
@@ -142,7 +150,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 					reclaimAmount = borrowed
 				}
 			} else {
-				// Cluster is within nominal quota: reclaim neededGPUs
 				reclaimAmount = int64(neededGPUs)
 			}
 
@@ -171,17 +178,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				latestWgs, _, _ := unstructured.NestedSlice(latest.Object, "spec", "workerGroupSpecs")
 				latestWgMap := latestWgs[i].(map[string]interface{})
 				latestWgMap["replicas"] = newReplicas
+				latestWgMap["maxReplicas"] = newReplicas
 				latestWgs[i] = latestWgMap
 				_ = unstructured.SetNestedSlice(latest.Object, latestWgs, "spec", "workerGroupSpecs")
 
-				// Save preemption metadata for automatic two-way re-expansion
+				// Save preemption metadata under kyield.io domain
 				ann := latest.GetAnnotations()
 				if ann == nil {
 					ann = map[string]string{}
 				}
-				ann["kueue.x-k8s.io/preempted-by"] = wl.GetName()
-				ann["kueue.x-k8s.io/preempted-by-ns"] = wl.GetNamespace()
-				ann["kueue.x-k8s.io/original-replicas"] = fmt.Sprint(replicas)
+				ann[AnnotationPreemptedBy] = wl.GetName()
+				ann[AnnotationPreemptedByNs] = wl.GetNamespace()
+				ann[AnnotationOriginalReplicas] = fmt.Sprint(replicas)
+				ann[AnnotationOriginalMaxReplicas] = fmt.Sprint(maxReplicas)
 				latest.SetAnnotations(ann)
 
 				return r.Update(ctx, latest)
@@ -190,7 +199,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				return ctrl.Result{}, err
 			}
 
-			// Mark preemption initiated on the preemptor workload to ensure idempotency
+			// Mark preemption initiated on the preemptor workload
 			_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 				latest := &unstructured.Unstructured{}
 				latest.SetGroupVersionKind(workloadGVK)
@@ -201,12 +210,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				if ann == nil {
 					ann = map[string]string{}
 				}
-				ann["kueue.x-k8s.io/preemption-initiated"] = "true"
+				ann[AnnotationPreemptionInitiated] = "true"
 				latest.SetAnnotations(ann)
 				return r.Update(ctx, latest)
 			})
 
-			// Update the victim RayCluster Workload podSet count so Kueue immediately releases quota
 			r.updateRayWorkloadPodCount(ctx, rc.GetNamespace(), rc.GetName(), newReplicas)
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
@@ -229,12 +237,12 @@ func (r *Reconciler) reconcileRayReexpansion(ctx context.Context) bool {
 	hasTracked := false
 	for _, rc := range rayList.Items {
 		ann := rc.GetAnnotations()
-		if ann == nil || ann["kueue.x-k8s.io/preempted-by"] == "" {
+		if ann == nil || ann[AnnotationPreemptedBy] == "" {
 			continue
 		}
 		hasTracked = true
-		preemptorName := ann["kueue.x-k8s.io/preempted-by"]
-		preemptorNs := ann["kueue.x-k8s.io/preempted-by-ns"]
+		preemptorName := ann[AnnotationPreemptedBy]
+		preemptorNs := ann[AnnotationPreemptedByNs]
 		if preemptorNs == "" {
 			preemptorNs = rc.GetNamespace()
 		}
@@ -242,15 +250,35 @@ func (r *Reconciler) reconcileRayReexpansion(ctx context.Context) bool {
 		preemptorWL := &unstructured.Unstructured{}
 		preemptorWL.SetGroupVersionKind(workloadGVK)
 		err := r.Get(ctx, client.ObjectKey{Namespace: preemptorNs, Name: preemptorName}, preemptorWL)
+
+		shouldReexpand := false
 		if errors.IsNotFound(err) {
-			// Preemptor is gone! Re-expand!
+			shouldReexpand = true
+		} else if err == nil {
+			conditions, _, _ := unstructured.NestedSlice(preemptorWL.Object, "status", "conditions")
+			for _, c := range conditions {
+				if cMap, ok := c.(map[string]interface{}); ok {
+					if cMap["type"] == "Finished" && cMap["status"] == "True" {
+						shouldReexpand = true
+						break
+					}
+				}
+			}
+		}
+
+		if shouldReexpand {
 			var origReplicas int64
-			_, _ = fmt.Sscanf(ann["kueue.x-k8s.io/original-replicas"], "%d", &origReplicas)
+			_, _ = fmt.Sscanf(ann[AnnotationOriginalReplicas], "%d", &origReplicas)
 			if origReplicas <= 0 {
 				origReplicas = 8
 			}
+			var origMaxReplicas int64
+			_, _ = fmt.Sscanf(ann[AnnotationOriginalMaxReplicas], "%d", &origMaxReplicas)
+			if origMaxReplicas <= 0 {
+				origMaxReplicas = origReplicas
+			}
 
-			logger.Info("preemptor workload no longer exists; re-expanding RayCluster",
+			logger.Info("preemptor workload no longer consuming quota; re-expanding RayCluster",
 				"rayCluster", rc.GetName(), "targetReplicas", origReplicas)
 
 			_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -263,13 +291,15 @@ func (r *Reconciler) reconcileRayReexpansion(ctx context.Context) bool {
 				if len(latestWgs) > 0 {
 					latestWgMap := latestWgs[0].(map[string]interface{})
 					latestWgMap["replicas"] = origReplicas
+					latestWgMap["maxReplicas"] = origMaxReplicas
 					latestWgs[0] = latestWgMap
 					_ = unstructured.SetNestedSlice(latest.Object, latestWgs, "spec", "workerGroupSpecs")
 				}
 				latestAnn := latest.GetAnnotations()
-				delete(latestAnn, "kueue.x-k8s.io/preempted-by")
-				delete(latestAnn, "kueue.x-k8s.io/preempted-by-ns")
-				delete(latestAnn, "kueue.x-k8s.io/original-replicas")
+				delete(latestAnn, AnnotationPreemptedBy)
+				delete(latestAnn, AnnotationPreemptedByNs)
+				delete(latestAnn, AnnotationOriginalReplicas)
+				delete(latestAnn, AnnotationOriginalMaxReplicas)
 				latest.SetAnnotations(latestAnn)
 				return r.Update(ctx, latest)
 			})
@@ -335,14 +365,22 @@ func (r *Reconciler) publishCondition(ctx context.Context, namespace, name, cond
 			return err
 		}
 		conditions, _, _ := unstructured.NestedSlice(latest.Object, "status", "conditions")
-		conditions = append(conditions, map[string]interface{}{
+		filtered := []interface{}{}
+		for _, cond := range conditions {
+			if cMap, ok := cond.(map[string]interface{}); ok {
+				if cMap["type"] != condType {
+					filtered = append(filtered, cond)
+				}
+			}
+		}
+		filtered = append(filtered, map[string]interface{}{
 			"type":               condType,
 			"status":             status,
 			"reason":             reason,
 			"message":            message,
 			"lastTransitionTime": metav1.Now().UTC().Format("2006-01-02T15:04:05Z"),
 		})
-		_ = unstructured.SetNestedSlice(latest.Object, conditions, "status", "conditions")
+		_ = unstructured.SetNestedSlice(latest.Object, filtered, "status", "conditions")
 		return r.Status().Update(ctx, latest)
 	})
 }

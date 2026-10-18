@@ -1,111 +1,81 @@
-# Kubernetes Elastic Scale Lab: Karpenter + Kueue + KubeRay + DRA
+# Kyield: Collaborative Elastic Autoscaling & Preemption for Kubernetes
 
-A minimal-patch, reproducible testing lab and coordinator for multi-framework elastic autoscaling on Kubernetes 1.36+.
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-1.36+-326CE5.svg)](https://kubernetes.io/)
+[![Chainsaw Tests](https://img.shields.io/badge/Chainsaw-9%20passed-brightgreen.svg)](tests/)
 
-This lab implements and validates collaborative capacity-aware scheduling across **Karpenter v1.2.1+**, **Kueue v0.10+**, and **KubeRay v1.2+**, using **Chainsaw** for declarative end-to-end integration testing.
-
----
-
-## 1. Problem Statement & Architecture
-
-When running large-scale ML training and elastic data processing on Kubernetes, combining Karpenter (node autoscaler), Kueue (quota & admission engine), and KubeRay (distributed execution engine) reveals fundamental architectural impedance mismatches:
-
-1. **Cold-Start Gang Deadlock**: Kueue does not admit suspended batch workloads until nodes or quota checks are satisfied, while Karpenter only provisions nodes when it sees non-suspended unscheduled pods.
-2. **Ray Autoscaler Quota Blindness**: The Ray Autoscaler scales worker replicas based on Ray cluster queue depth, completely unaware of Kueue ClusterQueue nominal quotas and borrowing limits.
-3. **Destructive vs Collaborative Preemption**: Kueue's native preemption evicts entire Workloads (killing the Ray head pod, tearing down the cluster, and invalidating memory state) instead of asking the elastic RayCluster to shed workers down to available quota.
-4. **Spot Interruption Ray Cluster Teardown**: Cloud spot termination notices cause indiscriminate pod eviction; if a worker is abruptly lost, Ray may fail whole workflows instead of draining workers gracefully.
-5. **Anti-Theft Node Reservation**: When Karpenter provisions specialized GPU instances for a queued gang workload, unscheduled single pods can steal those nodes before the gang pods are scheduled.
-6. **Two-Way Elasticity & Re-expansion**: When preemptors finish, victim clusters must automatically recover their surrendered worker capacity without manual intervention.
-7. **Gang Viability (Min-Replicas Safeguard)**: Partial preemption must never truncate a distributed cluster below its minimum viable parallel threshold (`minReplicas`), avoiding non-functional zombie clusters.
-8. **Stateful Actor Protection**: Downscaling must evict idle workers first and preserve active stateful Ray actors by dynamically scoring `controller.kubernetes.io/pod-deletion-cost`.
-9. **Multi-Queue Cohort Fair-Share Reclaim**: Borrowers within a shared Cohort must cooperatively relinquish borrowed capacity back to nominal owners when contention arises.
-
-### The "Thinning-Out" Coordinator Pattern
-
-Rather than heavily forking Karpenter, Kueue, or KubeRay, this lab implements an external, non-invasive **Collaborative Coordinator** with focused controllers designed to evaporate as upstream projects mature:
-
-```mermaid
-flowchart TD
-    subgraph Upstream Stock Stack
-        Karpenter["Karpenter (v1.2.1+)"]
-        Kueue["Kueue (v0.10.1+)"]
-        KubeRay["KubeRay (v1.2.2+)"]
-    end
-
-    subgraph Thinning Coordinator
-        Preprovisioner["JIT Pre-Provisioner Controller\n(Retires when Kueue DRA/Karpenter integration lands)"]
-        ScaleGate["ScaleGate Controller\n(Retires when KubeRay supports Kueue Elastic Workloads)"]
-        Preemption["Collaborative Preemption Controller\n(Retires when Kueue supports partial workload preemption)"]
-        SpotDrain["Spot Interruption Controller\n(Retires when KubeRay native spot draining lands)"]
-        ActorProtect["Actor Protection Controller\n(Standard Kubernetes pod-deletion-cost scorer)"]
-        AntiTheft["Anti-Theft Taint Controller\n(Standard Karpenter taint / toleration pattern)"]
-    end
-
-    Kueue -->|AdmissionCheck Pending| Preprovisioner
-    Preprovisioner -->|Create NodeClaim| Karpenter
-    KubeRay -->|RayCluster Replicas| ScaleGate
-    ScaleGate -->|Clamps Replicas to Quota/BorrowingLimit| KubeRay
-    Kueue -->|Workload Priority Contention| Preemption
-    Preemption -->|Shrinks Low-Priority Ray Workers & Re-expands| KubeRay
-    Karpenter -->|Spot Interruption Events| SpotDrain
-    SpotDrain -->|Gracefully Scales Workers Down| KubeRay
-    KubeRay -->|Actor State busy/idle| ActorProtect
-    ActorProtect -->|Scores pod-deletion-cost| Kubernetes
-```
+**Kyield** (*"k-yield"*) is a non-invasive, thinning-out collaborative capacity coordinator for Kubernetes. It bridges the impedance mismatches between **Karpenter v1.2+**, **Kueue v0.10+**, **KubeRay v1.2+**, and **DRA** without requiring forks or patches to upstream projects.
 
 ---
 
-## 2. Test Scenarios (Chainsaw E2E Suite)
+## 1. Why Kyield?
 
-All 9 scenarios are declaratively verified concurrently using Kyverno Chainsaw against a real Kind cluster:
+When running distributed Ray and batch ML training alongside dynamic cloud autoscalers, three distinct control loops collide:
+1. **Kueue** controls admissions and quota, but its preemption is monolithic: it terminates entire clusters (killing head pods, distributed actor state, and in-memory caches) to reclaim even a single GPU.
+2. **KubeRay Autoscaler** scales workers up and down based on task queue depth, but is completely blind to Kueue quota boundaries and cohort borrowing limits.
+3. **Karpenter** provisions just-in-time GPU nodes based on pending pods, but Kueue suspends batch jobs until quota is satisfied, creating a cold-start gang deadlock.
 
-| Scenario | Objective | Stock Behavior (Red Phase) | Coordinator Solution (Green Phase) | Status |
+**Kyield solves this by teaching distributed clusters to *yield* capacity cooperatively instead of dying.**
+
+
+
+---
+
+## 2. Test Scenarios (Kyverno Chainsaw Suite)
+
+Every scenario is tested against a live Kubernetes v1.36+ cluster using declarative Kyverno Chainsaw assertions:
+
+| Scenario | Objective | Stock Failure Mode | Kyield Solution | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **01-cold-start-gang** | Cold-start 4-GPU gang training job with 0 initial GPU nodes. | Deadlock: Kueue waits for nodes; Karpenter waits for pods. | Preprovisioner generates JIT `NodeClaim` with Kueue `AdmissionCheck`. | **PASS** |
-| **02-elastic-scaleup-quota** | RayCluster worker group attempts to scale up from 2 to 8 replicas with 4-GPU quota. | Quota violation: Ray autoscaler spawns pods that block forever in Kueue queue. | `ScaleGate` controller checks Kueue nominal quota and clamps `replicas` to 4. | **PASS** |
-| **03-collaborative-preemption** | High-priority 2-GPU job arrives while 8-worker RayCluster holds all 8 GPUs. | Destruction: Kueue evicts entire RayCluster, killing head pod and losing dataset cache. | `Preemption` controller calculates quota deficit and shrinks RayCluster from 8 to 6 workers voluntarily. | **PASS** |
-| **04-spot-interruption** | Node hosting a Ray worker receives a 2-minute spot termination notice. | Sudden worker failure triggers Ray actor rebuilds or cluster instability. | `SpotInterruption` controller drains the specific worker group gracefully before eviction. | **PASS** |
-| **05-anti-theft-reservation** | Node claimed for specific gang workload appears in cluster. | Rogue low-priority pods land on the newly provisioned node first. | NodeClaim is provisioned with anti-theft taints; rogue pods rejected; gang pods tolerated. | **PASS** |
-| **06-elastic-reexpansion** | Preemptor completes and exits, releasing 2 GPUs. | Permanent downscale: RayCluster stays clamped at 6 workers forever. | Coordinator tracks preemptor lifecycle and automatically re-expands RayCluster back to 8 replicas. | **PASS** |
-| **07-min-viable-replicas** | Preemptor requires 6 of 8 GPUs, but RayCluster has `minReplicas: 4`. | Pipeline destruction: Shrinking to 2 workers destroys minimum mathematical parallelism. | Coordinator detects threshold breach, safely refuses partial drain, and publishes `PartialPreemptionRefused: True`. | **PASS** |
-| **08-actor-aware-drain** | Worker downscale occurs while some pods run active stateful actors. | Random eviction: Kubernetes terminates pods arbitrarily, killing active actors. | `ActorProtect` sets `pod-deletion-cost: 1000` on busy pods and `-1000` on idle pods. | **PASS** |
-| **09-cohort-borrowing-reclaim** | Team A borrows 2 GPUs from Team B; Team B arrives requiring its 4 nominal GPUs. | Uncontrolled contention or total cluster teardown. | Coordinator identifies borrowed quota, reclaims exactly 2 borrowed GPUs to nominal 4, and admits Team B. | **PASS** |
+| **01-cold-start-gang** | 4-GPU gang training job with 0 initial nodes. | **Deadlock**: Kueue holds Job in `suspend: true`; Karpenter waits for unsuspended pods. | `Preprovisioner` handles `AdmissionCheck`, mints JIT `NodeClaim`, marks check `Ready`. | **PASS** |
+| **02-elastic-scaleup-quota** | RayCluster worker group scales from 2 to 8 replicas with 4-GPU quota. | **Quota Blindness**: Ray autoscaler creates pending pods blocked in Kueue indefinitely. | `ScaleGate` clamps `maxReplicas` and `replicas` to 4. | **PASS** |
+| **03-collaborative-preemption** | High-priority 2-GPU job arrives while RayCluster holds 8 GPUs. | **Destructive Preemption**: Kueue terminates whole RayCluster, destroying in-memory state. | `Preemption` calculates deficit, voluntarily drains 2 workers; head pod survives. | **PASS** |
+| **04-spot-interruption** | Ray worker node receives 2-min spot notice. | **Abrupt Eviction**: Worker deleted mid-computation without draining actors. | `SpotInterruption` intercepts notice, contracts `maxReplicas`, targets `workersToDelete`. | **PASS** |
+| **05-anti-theft-reservation** | Specialized GPU node claimed for gang workload arrives. | **Capacity Theft**: Random opportunistic pods land on the node before the gang pods initialize. | NodeClaim is provisioned with anti-theft taints; rogue pods rejected; target gang tolerated. | **PASS** |
+| **06-elastic-reexpansion** | Preemptor completes and exits, releasing 2 GPUs. | **Permanent Downscale**: RayCluster stays clamped at 6 workers forever even when quota is idle. | Coordinator monitors preemptor lifecycle and automatically restores RayCluster back to 8 replicas. | **PASS** |
+| **07-min-viable-replicas** | Preemptor requests 6 of 8 GPUs, but RayCluster has `minReplicas: 4`. | **Gang Inoperability**: Shrinking to 2 workers destroys tensor-parallelism / distributed pipeline. | Coordinator detects threshold breach, safely refuses partial drain, and publishes `PartialPreemptionRefused: True`. | **PASS** |
+| **08-actor-aware-drain** | Worker downscale occurs while some pods run active stateful actors. | **State Destruction**: Kubernetes terminates pods arbitrarily, killing active actors or shuffle cache. | `ActorProtect` assigns `pod-deletion-cost: 1000` to busy pods and `-1000` to idle pods. | **PASS** |
+| **09-cohort-borrowing-reclaim** | Team A borrows 2 GPUs from Team B; Team B arrives requiring its 4 nominal GPUs. | **Uncontrolled Eviction**: Kueue evicts arbitrary workloads across queues. | Coordinator identifies borrowed quota, reclaims only the 2 borrowed GPUs, and admits Team B. | **PASS** |
 
 ---
 
-## 3. Quickstart & Verification
+## 3. Quickstart
 
 ### Prerequisites
-- `colima` (or Docker)
-- `mise` (or Go 1.24+, Kind, Kubectl, Chainsaw)
+- [mise](https://mise.jdx.dev/) (or Go 1.24+, Kind, Kubectl, Chainsaw)
+- Colima or Docker runtime
 
-### Running the Test Suite
+### Commands
 ```bash
 # 1. Install toolchain
 mise install
 
-# 2. Build the coordinator
+# 2. Build Kyield binary
 make build
 
-# 3. Create Kind cluster and install Kueue + KubeRay
+# 3. Create Kind cluster and install CRDs
 make kind-up
 make install-crds
 
-# 4. Start the coordinator in background
-./bin/coordinator &
-
-# 5. Run all 9 Chainsaw scenarios in parallel
+# 4. Run full 9-scenario Chainsaw test suite
 make test
 ```
 
 ---
 
-## 4. Upstream Deprecation Roadmap
+## 4. Upstream Retirement Roadmap
 
-Every controller in this repository has a 1-to-1 retirement plan:
+Kyield is explicitly designed as a "thinning-out" shim that evaporates into upstream projects over time:
 
-- **`Preprovisioner`**: Will be deprecated once Kueue's Dynamic Resource Allocation (DRA) or Karpenter's native AdmissionCheck driver stabilizes in v1.37+.
-- **`ScaleGate`**: Will be deprecated when KubeRay issue [#1850](https://github.com/ray-project/kuberay) (Kueue Elastic Workloads protocol) lands upstream.
-- **`Preemption`**: Will be replaced once Kueue provides a webhook callback allowing elastic frameworks to return partial resource yield decisions during preemption evaluation.
-- **`SpotDrain`**: Will be replaced when KubeRay's native spot drain controller graduates.
-- **`ActorProtect`**: Can remain as a standard Kubernetes pod-deletion-cost scorer or be absorbed into KubeRay's autoscaler pod annotator.
+1. **`pkg/preprovisioner`**: Retires once Kueue's Dynamic Resource Allocation (DRA) or Karpenter's native AdmissionCheck driver stabilizes in v1.37+.
+2. **`pkg/scalegate`**: Retires when KubeRay supports the Kueue Elastic Workload protocol ([KubeRay #1850](https://github.com/ray-project/kuberay)).
+3. **`pkg/preemption`**: Retires when Kueue introduces a selective/partial preemption callback API for elastic frameworks.
+4. **`pkg/spotinterruption`**: Retires when KubeRay's native spot drain controller graduates.
+5. **`pkg/actorprotect`**: Retires when KubeRay's internal autoscaler directly synchronizes actor placement with pod deletion scoring.
+6. **`pkg/nodesim`**: Test-only simulation controller enabled strictly via `--enable-node-simulator` flag.
+
+---
+
+## 5. License
+
+Apache License 2.0. See [LICENSE](LICENSE) for details.

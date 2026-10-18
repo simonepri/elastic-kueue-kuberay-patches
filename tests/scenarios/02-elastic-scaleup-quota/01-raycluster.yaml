@@ -3,9 +3,7 @@ kind: RayCluster
 metadata:
   name: dynamic-ray-pipeline
   labels:
-    kueue.x-k8s.io/queue-name: ray-local-queue
-  annotations:
-    kueue.x-k8s.io/elastic-job: "true"
+    kueue.x-k8s.io/queue-name: capped-local-queue
 spec:
   rayVersion: "2.38.0"
   headGroupSpec:
@@ -22,10 +20,10 @@ spec:
                 memory: "4Gi"
   workerGroupSpecs:
     - groupName: workers
-      rayStartParams: {}
       replicas: 2
       minReplicas: 1
-      maxReplicas: 10
+      maxReplicas: 8
+      rayStartParams: {}
       template:
         spec:
           containers:
@@ -35,4 +33,6 @@ spec:
                 requests:
                   cpu: "2"
                   memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
                   nvidia.com/gpu: "1"

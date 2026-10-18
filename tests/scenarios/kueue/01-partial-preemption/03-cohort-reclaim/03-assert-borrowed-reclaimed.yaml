@@ -1,0 +1,8 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: borrowing-ray-cluster
+spec:
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 4

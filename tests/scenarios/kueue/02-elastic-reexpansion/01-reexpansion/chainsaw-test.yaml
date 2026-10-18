@@ -1,0 +1,37 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 06-elastic-reexpansion
+spec:
+  description: >
+    Verifies two-way elasticity: after yielding workers to a high-priority job,
+    the RayCluster automatically re-expands to its original target replica count
+    once the high-priority job completes and releases its quota.
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-raycluster
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+        - assert:
+            file: 01-assert-ray-active.yaml
+    - name: submit-preemptor
+      try:
+        - apply:
+            file: 02-urgent-job.yaml
+    - name: assert-preempted-drain
+      try:
+        - assert:
+            file: 03-assert-drained.yaml
+    - name: delete-preemptor-and-reexpand
+      try:
+        - delete:
+            ref:
+              apiVersion: batch/v1
+              kind: Job
+              name: reexpand-urgent-job
+        - assert:
+            file: 04-assert-reexpanded.yaml

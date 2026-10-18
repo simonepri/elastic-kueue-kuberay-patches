@@ -1,0 +1,43 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-data-pipeline
+  labels:
+    kueue.x-k8s.io/queue-name: shared-local-queue
+    kueue.x-k8s.io/priority-class: priority-low
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        priorityClassName: priority-low
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: workers
+      rayStartParams: {}
+      replicas: 8
+      minReplicas: 4
+      maxReplicas: 16
+      template:
+        spec:
+          priorityClassName: priority-low
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"

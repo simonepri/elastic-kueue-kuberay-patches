@@ -99,6 +99,30 @@ echo "Built KubeRay image: $KUBERAY_IMG"
 description = "Build all patched controller images"
 depends = ["build:kueue", "build:kuberay"]
 
+[tasks."publish:kueue"]
+description = "Build and publish patched Kueue image to GHCR"
+depends = ["patch:kueue"]
+run = """
+cd third_party/kueue
+TAG="${KUEUE_UPSTREAM}-p${KUEUE_PATCH_VERSION}"
+echo "Publishing Kueue image ghcr.io/simonepri/kueue:$TAG..."
+KO_DOCKER_REPO=ghcr.io/simonepri/kueue ko build --bare -t "$TAG" -t latest ./cmd/kueue
+"""
+
+[tasks."publish:kuberay"]
+description = "Build and publish patched KubeRay image to GHCR"
+depends = ["patch:kuberay"]
+run = """
+cd third_party/kuberay/ray-operator
+TAG="${KUBERAY_UPSTREAM}-p${KUBERAY_PATCH_VERSION}"
+echo "Publishing KubeRay image ghcr.io/simonepri/kuberay-operator:$TAG..."
+KO_DOCKER_REPO=ghcr.io/simonepri/kuberay-operator ko build --bare -t "$TAG" -t latest .
+"""
+
+[tasks.publish]
+description = "Build and publish all patched images to GHCR"
+depends = ["publish:kueue", "publish:kuberay"]
+
 [tasks."cluster:up"]
 description = "Spin up Kind cluster and deploy patched controllers directly"
 depends = ["build"]

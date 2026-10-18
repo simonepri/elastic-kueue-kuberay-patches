@@ -29,6 +29,22 @@
       ],
       "automerge": true,
       "automergeType": "pr"
+    },
+    {
+      "description": "Use feat(kueue) commit type for Kueue upstream updates to trigger Release Please",
+      "matchPackageNames": [
+        "kubernetes-sigs/kueue"
+      ],
+      "semanticCommitType": "feat",
+      "semanticCommitScope": "kueue"
+    },
+    {
+      "description": "Use feat(kuberay) commit type for KubeRay upstream updates to trigger Release Please",
+      "matchPackageNames": [
+        "ray-project/kuberay"
+      ],
+      "semanticCommitType": "feat",
+      "semanticCommitScope": "kuberay"
     }
   ],
   "customManagers": [

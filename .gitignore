@@ -1,0 +1,10 @@
+bin/
+/tmp/
+.DS_Store
+*.log
+
+# Cloned upstream sources for ko build
+third_party/kueue/
+third_party/kuberay/
+
+.*-image.txt

@@ -1,0 +1,31 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 09-cohort-borrowing-reclaim
+spec:
+  description: >
+    Verifies multi-queue Cohort fair-share borrowing and collaborative reclaim:
+    Team A borrows idle capacity up to borrowingLimit; when Team B arrives requesting
+    its nominal quota, Team A cooperatively relinquishes borrowed capacity back to 4 replicas
+    allowing Team B to start immediately without destroying Team A.
+  steps:
+    - name: setup-cohort-queues
+      try:
+        - apply:
+            file: 00-cohort-queues.yaml
+    - name: submit-borrowing-cluster
+      try:
+        - apply:
+            file: 01-borrowing-raycluster.yaml
+        - assert:
+            file: 01-assert-borrowing-allowed.yaml
+    - name: submit-team-b-job
+      try:
+        - apply:
+            file: 02-team-b-nominal-job.yaml
+    - name: assert-reclaimed-and-admitted
+      try:
+        - assert:
+            file: 03-assert-borrowed-reclaimed.yaml
+        - assert:
+            file: 04-assert-team-b-admitted.yaml

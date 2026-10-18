@@ -1,0 +1,204 @@
+[tools]
+go = "1.23.6"
+kind = "0.27.0"
+kubectl = "1.32.2"
+"aqua:kyverno/chainsaw" = "0.2.12"
+helm = "3.17.1"
+ko = "0.17.1"
+colima = "0.8.1"
+docker-cli = "28.0.1"
+
+[env]
+CLUSTER_NAME = "elastic-scale-lab"
+
+# Upstream versions
+# renovate: datasource=github-releases depName=kubernetes-sigs/kueue
+KUEUE_UPSTREAM = "v0.10.1"
+# renovate: datasource=github-releases depName=ray-project/kuberay
+KUBERAY_UPSTREAM = "v1.2.2"
+# renovate: datasource=github-releases depName=kubernetes-sigs/karpenter
+KARPENTER_UPSTREAM = "v1.2.1"
+
+# Internal patchset versions (tracks release-please manifests)
+KUEUE_PATCH_VERSION = "0.1.0"
+KUBERAY_PATCH_VERSION = "0.1.0"
+
+# Derived full image tags: <upstream>-p<patch_version>
+KUEUE_IMAGE_TAG = "{{env.KUEUE_UPSTREAM}}-p{{env.KUEUE_PATCH_VERSION}}"
+KUBERAY_IMAGE_TAG = "{{env.KUBERAY_UPSTREAM}}-p{{env.KUBERAY_PATCH_VERSION}}"
+
+[tasks."clone:kueue"]
+description = "Clone upstream Kueue at target version"
+run = """
+if [ ! -d third_party/kueue/.git ]; then
+  mkdir -p third_party
+  echo "Cloning Kueue $KUEUE_UPSTREAM..."
+  git clone --depth 1 --branch "$KUEUE_UPSTREAM" https://github.com/kubernetes-sigs/kueue.git third_party/kueue
+fi
+"""
+
+[tasks."clone:kuberay"]
+description = "Clone upstream KubeRay at target version"
+run = """
+if [ ! -d third_party/kuberay/.git ]; then
+  mkdir -p third_party
+  echo "Cloning KubeRay $KUBERAY_UPSTREAM..."
+  git clone --depth 1 --branch "$KUBERAY_UPSTREAM" https://github.com/ray-project/kuberay.git third_party/kuberay
+fi
+"""
+
+[tasks."patch:kueue"]
+description = "Apply patches to third_party/kueue"
+depends = ["clone:kueue"]
+run = """
+cd third_party/kueue
+for p in ../../patches/kueue/*.patch; do
+  [ -f "$p" ] || continue
+  echo "Applying patch $p..."
+  git apply --whitespace=nowarn "$p" || true
+done
+"""
+
+[tasks."patch:kuberay"]
+description = "Apply patches to third_party/kuberay"
+depends = ["clone:kuberay"]
+run = """
+cd third_party/kuberay
+for p in ../../patches/kuberay/*.patch; do
+  [ -f "$p" ] || continue
+  echo "Applying patch $p..."
+  git apply --whitespace=nowarn "$p" || true
+done
+"""
+
+[tasks.patch]
+description = "Apply all patches to third_party dependencies"
+depends = ["patch:kueue", "patch:kuberay"]
+
+[tasks."build:kueue"]
+description = "Build patched Kueue image with ko"
+depends = ["patch:kueue"]
+run = """
+cd third_party/kueue
+KO_DOCKER_REPO=kind.local ko build --local --image-refs=../../.kueue-image.txt ./cmd/kueue
+KUEUE_IMG=$(cat ../../.kueue-image.txt)
+echo "Built Kueue image: $KUEUE_IMG"
+"""
+
+[tasks."build:kuberay"]
+description = "Build patched KubeRay image with ko"
+depends = ["patch:kuberay"]
+run = """
+cd third_party/kuberay/ray-operator
+KO_DOCKER_REPO=kind.local ko build --local --image-refs=../../../.kuberay-image.txt .
+KUBERAY_IMG=$(cat ../../../.kuberay-image.txt)
+echo "Built KubeRay image: $KUBERAY_IMG"
+"""
+
+[tasks.build]
+description = "Build all patched controller images"
+depends = ["build:kueue", "build:kuberay"]
+
+[tasks."cluster:up"]
+description = "Spin up Kind cluster and deploy patched controllers directly"
+depends = ["build"]
+run = """
+# 1. Ensure container runtime is running (starts Colima on macOS if docker daemon is inactive)
+if ! docker info >/dev/null 2>&1; then
+  if command -v colima >/dev/null 2>&1; then
+    echo "Starting Colima runtime..."
+    colima start --cpu 4 --memory 8 || true
+  fi
+fi
+
+# 2. Create Kind cluster if not already running
+if ! kind get clusters | grep -q "^$CLUSTER_NAME$"; then
+  echo "Creating Kind cluster $CLUSTER_NAME..."
+  kind create cluster --config kind-config.yaml --name "$CLUSTER_NAME"
+fi
+
+# 3. Sideload patched images into Kind first
+KUEUE_IMG=$(cat .kueue-image.txt)
+KUBERAY_IMG=$(cat .kuberay-image.txt)
+echo "Loading images into Kind..."
+kind load docker-image "$KUEUE_IMG" --name "$CLUSTER_NAME"
+kind load docker-image "$KUBERAY_IMG" --name "$CLUSTER_NAME"
+
+# 4. Install CRDs
+echo "Installing base CRDs..."
+kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayclusters.yaml
+kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodeclaims.yaml
+kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodepools.yaml
+
+# 5. Install KubeRay operator directly with patched image and ko entrypoint
+echo "Installing KubeRay operator with patched image..."
+helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
+helm repo update
+helm template kuberay-operator kuberay/kuberay-operator \
+  --version $KUBERAY_UPSTREAM \
+  --set image.repository="${KUBERAY_IMG%:*}" \
+  --set image.tag="${KUBERAY_IMG##*:}" \
+  -n default | \
+  sed -e "s| - /manager| - /ko-app/ray-operator|g" | \
+  kubectl apply --server-side -f -
+
+# 6. Install Kueue manifests directly patched with sed (image, ko entrypoint, and IfNotPresent for Kind)
+echo "Installing Kueue manifests with patched image..."
+curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml" | \
+  sed -e "s|registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM|$KUEUE_IMG|g" \
+      -e "s|imagePullPolicy: Always|imagePullPolicy: IfNotPresent|g" \
+      -e "s| - /manager| - /ko-app/kueue|g" | \
+  kubectl apply --server-side -f -
+
+# 7. Wait for rollouts
+kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=180s
+kubectl rollout status deployment/kuberay-operator -n default --timeout=180s
+echo "Cluster $CLUSTER_NAME is ready with patched controllers!"
+"""
+
+[tasks."cluster:stock"]
+description = "Spin up Kind cluster using official unpatched upstream images"
+run = """
+# 1. Ensure container runtime is running (starts Colima on macOS if docker daemon is inactive)
+if ! docker info >/dev/null 2>&1; then
+  if command -v colima >/dev/null 2>&1; then
+    echo "Starting Colima runtime..."
+    colima start --cpu 4 --memory 8 || true
+  fi
+fi
+
+# 2. Create Kind cluster if not already running
+if ! kind get clusters | grep -q "^$CLUSTER_NAME$"; then
+  echo "Creating Kind cluster $CLUSTER_NAME..."
+  kind create cluster --config kind-config.yaml --name "$CLUSTER_NAME"
+fi
+
+# 3. Install base CRDs
+echo "Installing CRDs..."
+kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayclusters.yaml
+kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodeclaims.yaml
+kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodepools.yaml
+
+if ! kubectl get deployment kuberay-operator -n default >/dev/null 2>&1; then
+  helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
+  helm repo update
+  helm install kuberay-operator kuberay/kuberay-operator --version $KUBERAY_UPSTREAM -n default
+else
+  kubectl set image deployment/kuberay-operator -n default kuberay-operator=quay.io/kuberay/operator:$KUBERAY_UPSTREAM
+fi
+
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml
+kubectl set image deployment/kueue-controller-manager -n kueue-system manager=registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM
+
+kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=120s
+kubectl rollout status deployment/kuberay-operator -n default --timeout=120s
+echo "Cluster $CLUSTER_NAME is running STOCK UNPATCHED upstream controllers."
+"""
+
+[tasks."cluster:down"]
+description = "Tear down the local Kind cluster"
+run = "kind delete cluster --name $CLUSTER_NAME"
+
+[tasks.test]
+description = "Run full scenario test suite"
+run = "chainsaw test tests/scenarios/ --cleanup-timeout 60s"

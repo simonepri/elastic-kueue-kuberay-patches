@@ -1,0 +1,41 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: borrowing-ray-cluster
+  labels:
+    kueue.x-k8s.io/queue-name: lq-team-a
+    kueue.x-k8s.io/priority-class: pc-cohort-low
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        priorityClassName: pc-cohort-low
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 6
+      minReplicas: 2
+      maxReplicas: 8
+      rayStartParams: {}
+      template:
+        spec:
+          priorityClassName: pc-cohort-low
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"

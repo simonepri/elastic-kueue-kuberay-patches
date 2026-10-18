@@ -1,0 +1,11 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Configuration
+metadata:
+  name: elastic-scale-tests
+spec:
+  timeouts:
+    apply: 15s
+    assert: 20s
+    error: 10s
+    delete: 15s
+    cleanup: 45s

@@ -1,12 +1,12 @@
 [tools]
-go = "1.23.6"
-kind = "0.27.0"
-kubectl = "1.32.2"
-"aqua:kyverno/chainsaw" = "0.2.12"
-helm = "3.17.1"
-ko = "0.17.1"
-colima = "0.8.1"
-docker-cli = "28.0.1"
+go = "1.27.2"
+kind = "0.33.0"
+kubectl = "1.37.1"
+"aqua:kyverno/chainsaw" = "0.2.15"
+helm = "3.22.1"
+ko = "0.19.1"
+colima = "0.10.3"
+docker-cli = "28.5.2"
 
 [env]
 CLUSTER_NAME = "elastic-scale-lab"

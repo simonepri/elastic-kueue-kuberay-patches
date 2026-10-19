@@ -165,11 +165,13 @@ helm template kuberay-operator kuberay/kuberay-operator \
   --set image.repository="${KUBERAY_IMG%:*}" \
   --set image.tag="${KUBERAY_IMG##*:}" \
   --set leaderElectionEnabled=false \
+  --set resources.limits.cpu=2 \
+  --set resources.limits.memory=2Gi \
+  --set resources.requests.cpu=500m \
+  --set resources.requests.memory=512Mi \
   -n default | \
   sed -e "s| - /manager| - /ko-app/ray-operator|g" | \
   kubectl apply --server-side --force-conflicts -f -
-
-kubectl set resources deployment/kuberay-operator -n default --limits=cpu=2,memory=2Gi --requests=cpu=500m,memory=512Mi
 
 cat << EOF | kubectl apply --server-side --force-conflicts -f -
 apiVersion: rbac.authorization.k8s.io/v1
@@ -263,13 +265,17 @@ kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.c
 kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodeclaims.yaml
 kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodepools.yaml
 
-if ! kubectl get deployment kuberay-operator -n default >/dev/null 2>&1; then
-  helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
-  helm repo update
-  helm install kuberay-operator kuberay/kuberay-operator --version $KUBERAY_UPSTREAM -n default
-else
-  kubectl set image deployment/kuberay-operator -n default kuberay-operator=quay.io/kuberay/operator:$KUBERAY_UPSTREAM
-fi
+helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
+helm repo update
+helm template kuberay-operator kuberay/kuberay-operator \
+  --version $KUBERAY_UPSTREAM \
+  --set leaderElectionEnabled=false \
+  --set resources.limits.cpu=2 \
+  --set resources.limits.memory=2Gi \
+  --set resources.requests.cpu=500m \
+  --set resources.requests.memory=512Mi \
+  -n default | \
+  kubectl apply --server-side --force-conflicts -f -
 
 kubectl apply --server-side --force-conflicts -f https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml
 kubectl set image deployment/kueue-controller-manager -n kueue-system manager=registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM

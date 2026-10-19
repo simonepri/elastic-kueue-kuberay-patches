@@ -5,6 +5,8 @@
     ":automergePr",
     ":enablePreCommit"
   ],
+  "platformAutomerge": true,
+  "automergeStrategy": "squash",
   "labels": [
     "dependencies",
     "renovate"

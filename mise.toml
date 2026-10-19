@@ -20,8 +20,8 @@ KUBERAY_UPSTREAM = "v1.7.1"
 KARPENTER_UPSTREAM = "v1.15.0"
 
 # Internal patchset versions (tracks release-please manifests)
-KUEUE_PATCH_VERSION = "0.1.0"
-KUBERAY_PATCH_VERSION = "0.1.0"
+KUEUE_PATCH_VERSION = "0.2.0"
+KUBERAY_PATCH_VERSION = "0.2.0"
 
 # Derived full image tags: <upstream>-p<patch_version>
 KUEUE_IMAGE_TAG = "{{env.KUEUE_UPSTREAM}}-p{{env.KUEUE_PATCH_VERSION}}"

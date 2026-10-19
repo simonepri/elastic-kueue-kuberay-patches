@@ -91,8 +91,8 @@ Images published by this repository use a compound tag format:
 $$\text{Image Tag} = \langle\text{upstream-version}\rangle\text{-p}\langle\text{patch-version}\rangle$$
 
 Examples:
-- `ghcr.io/simonepri/kueue:v0.20.2-p0.1.0`
-- `ghcr.io/simonepri/kuberay-operator:v1.7.1-p0.1.0`
+- `ghcr.io/simonepri/kueue:v0.20.2-p0.2.0`
+- `ghcr.io/simonepri/kuberay-operator:v1.7.1-p0.2.0`
 
 When [Renovate](renovate.json) detects an upstream release, it opens a PR updating the upstream baseline. Once merged, [Release Please](release-please-config.json) increments the patch version independently.
 
@@ -114,7 +114,7 @@ helm install kuberay-operator kuberay/kuberay-operator \
   --version v1.7.1 \
   --namespace default \
   --set image.repository=ghcr.io/simonepri/kuberay-operator \
-  --set image.tag=v1.7.1-p0.1.0
+  --set image.tag=v1.7.1-p0.2.0
 ```
 
 #### Required RBAC Permissions
@@ -159,13 +159,13 @@ helm install kueue oci://registry.k8s.io/charts/kueue \
   --version v0.20.2 \
   --namespace kueue-system --create-namespace \
   --set controllerManager.manager.image.repository=ghcr.io/simonepri/kueue \
-  --set controllerManager.manager.image.tag=v0.20.2-p0.1.0
+  --set controllerManager.manager.image.tag=v0.20.2-p0.2.0
 ```
 
 **Using Official Manifests:**
 ```bash
 curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/v0.20.2/manifests.yaml" | \
-  sed -e "s|registry.k8s.io/kueue/kueue:v0.20.2|ghcr.io/simonepri/kueue:v0.20.2-p0.1.0|g" | \
+  sed -e "s|registry.k8s.io/kueue/kueue:v0.20.2|ghcr.io/simonepri/kueue:v0.20.2-p0.2.0|g" | \
   kubectl apply --server-side -f -
 ```
 

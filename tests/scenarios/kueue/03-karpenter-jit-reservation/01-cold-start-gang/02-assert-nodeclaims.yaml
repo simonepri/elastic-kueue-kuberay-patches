@@ -3,3 +3,7 @@ kind: NodeClaim
 metadata:
   labels:
     karpenter.sh/managed-by: kueue
+spec:
+  taints:
+    - effect: NoSchedule
+      key: karpenter.sh/claimed-by

@@ -4,15 +4,30 @@ metadata:
   name: 05-anti-theft-node-reservation
 spec:
   description: >
-    Verifies that Karpenter NodeClaims pre-provisioned for a Kueue gang are protected by
-    anti-theft taints, preventing competing pending workloads from hijacking warm capacity.
+    Verifies that Karpenter NodeClaims dynamically pre-provisioned by Kueue's Karpenter
+    controller are assigned anti-theft taints (karpenter.sh/claimed-by) preventing rogue workloads
+    from stealing capacity, and that the workload is admitted once nodes are ready.
   steps:
-    - name: simulate-preprovisioned-tainted-node
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-gang-workload
+      try:
+        - apply:
+            file: 01-gang-workload.yaml
+    - name: assert-nodeclaim-created-with-anti-theft-taint
+      try:
+        - assert:
+            file: 02-assert-tainted-nodeclaim.yaml
+    - name: assert-admission-granted
+      try:
+        - assert:
+            file: 03-assert-admitted.yaml
+    - name: spawn-competing-rogue-pod
       try:
         - apply:
             file: 00-nodeclaim-and-node.yaml
-    - name: spawn-competing-rogue-pod
-      try:
         - apply:
             file: 01-rogue-pod.yaml
         - assert:

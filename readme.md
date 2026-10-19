@@ -3,9 +3,9 @@
 [![CI](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/ci.yaml/badge.svg)](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/ci.yaml)
 [![Release Please](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml/badge.svg)](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.10.1-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.10.1)
-[![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.2.2-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.2.2)
-[![Tested on Karpenter](https://img.shields.io/badge/tested%20on%20karpenter-v1.2.1-blue)](https://github.com/kubernetes-sigs/karpenter/releases/tag/v1.2.1)
+[![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.20.2-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.2)
+[![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.7.1-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.7.1)
+[![Tested on Karpenter](https://img.shields.io/badge/tested%20on%20karpenter-v1.15.0-blue)](https://github.com/kubernetes-sigs/karpenter/releases/tag/v1.15.0)
 
 Production patchsets for running elastic, multi-tenant Ray clusters on Kubernetes with [Kueue](https://github.com/kubernetes-sigs/kueue), [KubeRay](https://github.com/ray-project/kuberay), and [Karpenter](https://github.com/kubernetes-sigs/karpenter).
 
@@ -91,8 +91,8 @@ Images published by this repository use a compound tag format:
 $$\text{Image Tag} = \langle\text{upstream-version}\rangle\text{-p}\langle\text{patch-version}\rangle$$
 
 Examples:
-- `ghcr.io/simonepri/kueue:v0.10.1-p0.1.0`
-- `ghcr.io/simonepri/kuberay-operator:v1.2.2-p0.1.0`
+- `ghcr.io/simonepri/kueue:v0.20.2-p0.1.0`
+- `ghcr.io/simonepri/kuberay-operator:v1.7.1-p0.1.0`
 
 When [Renovate](renovate.json) detects an upstream release, it opens a PR updating the upstream baseline. Once merged, [Release Please](release-please-config.json) increments the patch version independently.
 
@@ -111,10 +111,10 @@ helm repo add kuberay https://ray-project.github.io/kuberay-helm/
 helm repo update
 
 helm install kuberay-operator kuberay/kuberay-operator \
-  --version v1.2.2 \
+  --version v1.7.1 \
   --namespace default \
   --set image.repository=ghcr.io/simonepri/kuberay-operator \
-  --set image.tag=v1.2.2-p0.1.0
+  --set image.tag=v1.7.1-p0.1.0
 ```
 
 #### Required RBAC Permissions
@@ -156,16 +156,16 @@ Deploy Kueue using either Helm or the official release manifests:
 **Using Helm:**
 ```bash
 helm install kueue oci://registry.k8s.io/charts/kueue \
-  --version v0.10.1 \
+  --version v0.20.2 \
   --namespace kueue-system --create-namespace \
   --set controllerManager.manager.image.repository=ghcr.io/simonepri/kueue \
-  --set controllerManager.manager.image.tag=v0.10.1-p0.1.0
+  --set controllerManager.manager.image.tag=v0.20.2-p0.1.0
 ```
 
 **Using Official Manifests:**
 ```bash
-curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/v0.10.1/manifests.yaml" | \
-  sed -e "s|registry.k8s.io/kueue/kueue:v0.10.1|ghcr.io/simonepri/kueue:v0.10.1-p0.1.0|g" | \
+curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/v0.20.2/manifests.yaml" | \
+  sed -e "s|registry.k8s.io/kueue/kueue:v0.20.2|ghcr.io/simonepri/kueue:v0.20.2-p0.1.0|g" | \
   kubectl apply --server-side -f -
 ```
 

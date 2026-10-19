@@ -5,6 +5,7 @@ metadata:
   labels:
     ray.io/cluster: stateful-ray-cluster
     ray.io/group: workers
+    ray.io/node-type: worker
     ray.io/actor-state: busy
 spec:
   terminationGracePeriodSeconds: 0
@@ -20,6 +21,7 @@ metadata:
   labels:
     ray.io/cluster: stateful-ray-cluster
     ray.io/group: workers
+    ray.io/node-type: worker
     ray.io/actor-state: idle
 spec:
   terminationGracePeriodSeconds: 0

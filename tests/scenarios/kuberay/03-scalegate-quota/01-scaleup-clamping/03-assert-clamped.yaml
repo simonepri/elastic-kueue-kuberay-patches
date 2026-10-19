@@ -7,6 +7,5 @@ spec:
     - groupName: workers
       replicas: 4
 status:
-  conditions:
-    - type: ScaleGateClamped
-      status: "True"
+  (conditions[?type == 'ScaleGateClamped']):
+    - status: "True"

@@ -1,9 +1,9 @@
 diff --git a/ray-operator/controllers/ray/scalegate_controller.go b/ray-operator/controllers/ray/scalegate_controller.go
 new file mode 100644
-index 0000000..1128025
+index 0000000..525971a
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller.go
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,332 @@
 +package ray
 +
 +import (
@@ -26,12 +26,12 @@ index 0000000..1128025
 +var (
 +	clusterQueueGVK = schema.GroupVersionKind{
 +		Group:   "kueue.x-k8s.io",
-+		Version: "v1beta1",
++		Version: "v1beta2",
 +		Kind:    "ClusterQueue",
 +	}
 +	localQueueGVK = schema.GroupVersionKind{
 +		Group:   "kueue.x-k8s.io",
-+		Version: "v1beta1",
++		Version: "v1beta2",
 +		Kind:    "LocalQueue",
 +	}
 +)
@@ -214,22 +214,62 @@ index 0000000..1128025
 +
 +func (r *ScaleGateReconciler) resolveAvailableQuota(ctx context.Context, namespace, queueName string, workerUnit map[string]int64) (int, error) {
 +	cq := &unstructured.Unstructured{}
-+	cq.SetGroupVersionKind(clusterQueueGVK)
-+	if err := r.Get(ctx, client.ObjectKey{Name: queueName}, cq); err != nil {
-+		lq := &unstructured.Unstructured{}
-+		lq.SetGroupVersionKind(localQueueGVK)
-+		if errLq := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: queueName}, lq); errLq == nil {
-+			targetCq, _, _ := unstructured.NestedString(lq.Object, "spec", "clusterQueue")
-+			if targetCq != "" {
-+				_ = r.Get(ctx, client.ObjectKey{Name: targetCq}, cq)
++	versions := []string{"v1beta2", "v1beta1"}
++	foundCQ := false
++
++	for _, v := range versions {
++		cq.SetGroupVersionKind(schema.GroupVersionKind{
++			Group:   "kueue.x-k8s.io",
++			Version: v,
++			Kind:    "ClusterQueue",
++		})
++		if err := r.Get(ctx, client.ObjectKey{Name: queueName}, cq); err == nil {
++			foundCQ = true
++			break
++		}
++	}
++
++	if !foundCQ {
++		for _, v := range versions {
++			lq := &unstructured.Unstructured{}
++			lq.SetGroupVersionKind(schema.GroupVersionKind{
++				Group:   "kueue.x-k8s.io",
++				Version: v,
++				Kind:    "LocalQueue",
++			})
++			if errLq := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: queueName}, lq); errLq == nil {
++				targetCq, _, _ := unstructured.NestedString(lq.Object, "spec", "clusterQueue")
++				if targetCq != "" {
++					for _, cv := range versions {
++						cq.SetGroupVersionKind(schema.GroupVersionKind{
++							Group:   "kueue.x-k8s.io",
++							Version: cv,
++							Kind:    "ClusterQueue",
++						})
++						if errCq := r.Get(ctx, client.ObjectKey{Name: targetCq}, cq); errCq == nil {
++							foundCQ = true
++							break
++						}
++					}
++				}
++				if foundCQ {
++					break
++				}
 +			}
 +		}
 +	}
 +
++	if !foundCQ {
++		return 0, fmt.Errorf("cluster queue not found for queue %s", queueName)
++	}
++
 +	cohort, _, _ := unstructured.NestedString(cq.Object, "spec", "cohort")
++	if cohort == "" {
++		cohort, _, _ = unstructured.NestedString(cq.Object, "spec", "cohortName")
++	}
 +	rGroups, found, _ := unstructured.NestedSlice(cq.Object, "spec", "resourceGroups")
-+	if !found {
-+		return 4, nil
++	if !found || len(rGroups) == 0 {
++		return 0, fmt.Errorf("no resource groups found in cluster queue %s", cq.GetName())
 +	}
 +
 +	minAllowedReplicas := int64(math.MaxInt64)
@@ -285,7 +325,7 @@ index 0000000..1128025
 +	if matchedAnyResource && minAllowedReplicas != math.MaxInt64 && minAllowedReplicas > 0 {
 +		return int(minAllowedReplicas), nil
 +	}
-+	return 4, nil
++	return 0, fmt.Errorf("no quota matched for worker resources in cluster queue %s", cq.GetName())
 +}
 +
 +func (r *ScaleGateReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -297,15 +337,13 @@ index 0000000..1128025
 +		Complete(r)
 +}
 diff --git a/ray-operator/main.go b/ray-operator/main.go
-index 58e6a3c..2ae7dbe 100644
+index f100ce0..3387417 100644
 --- a/ray-operator/main.go
 +++ b/ray-operator/main.go
-@@ -233,6 +233,8 @@ func main() {
- 		"unable to create controller", "controller", "ActorProtect")
- 	exitOnError((&ray.SpotInterruptionReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr),
- 		"unable to create controller", "controller", "SpotInterruption")
-+	exitOnError((&ray.ScaleGateReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr),
-+		"unable to create controller", "controller", "ScaleGate")
+@@ -370,5 +370,6 @@ func main() {
  
- 	if os.Getenv("ENABLE_WEBHOOKS") == "true" {
- 		exitOnError((&rayv1.RayCluster{}).SetupWebhookWithManager(mgr),
+ 	exitOnError((&ray.ActorProtectReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ActorProtect")
+ 	exitOnError((&ray.SpotInterruptionReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "SpotInterruption")
++	exitOnError((&ray.ScaleGateReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ScaleGate")
+ 
+ 	// +kubebuilder:scaffold:builder

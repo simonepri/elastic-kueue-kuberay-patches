@@ -149,15 +149,14 @@ index 0000000..797af98
 +		Complete(r)
 +}
 diff --git a/ray-operator/main.go b/ray-operator/main.go
-index d23e0b7..58e6a3c 100644
+index cb7da0e..f100ce0 100644
 --- a/ray-operator/main.go
 +++ b/ray-operator/main.go
-@@ -231,6 +231,8 @@ func main() {
- 		"unable to create controller", "controller", "RayJob")
- 	exitOnError((&ray.ActorProtectReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr),
- 		"unable to create controller", "controller", "ActorProtect")
-+	exitOnError((&ray.SpotInterruptionReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr),
-+		"unable to create controller", "controller", "SpotInterruption")
+@@ -369,6 +369,7 @@ func main() {
+ 	}
  
- 	if os.Getenv("ENABLE_WEBHOOKS") == "true" {
- 		exitOnError((&rayv1.RayCluster{}).SetupWebhookWithManager(mgr),
+ 	exitOnError((&ray.ActorProtectReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ActorProtect")
++	exitOnError((&ray.SpotInterruptionReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "SpotInterruption")
+ 
+ 	// +kubebuilder:scaffold:builder
+ 

@@ -13,11 +13,11 @@ CLUSTER_NAME = "elastic-scale-lab"
 
 # Upstream versions
 # renovate: datasource=github-releases depName=kubernetes-sigs/kueue
-KUEUE_UPSTREAM = "v0.10.1"
+KUEUE_UPSTREAM = "v0.20.2"
 # renovate: datasource=github-releases depName=ray-project/kuberay
-KUBERAY_UPSTREAM = "v1.2.2"
+KUBERAY_UPSTREAM = "v1.7.1"
 # renovate: datasource=github-releases depName=kubernetes-sigs/karpenter
-KARPENTER_UPSTREAM = "v1.2.1"
+KARPENTER_UPSTREAM = "v1.15.0"
 
 # Internal patchset versions (tracks release-please manifests)
 KUEUE_PATCH_VERSION = "0.1.0"
@@ -150,11 +150,11 @@ kind load docker-image "$KUBERAY_IMG" --name "$CLUSTER_NAME"
 
 # 4. Install CRDs
 echo "Installing base CRDs..."
-kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayclusters.yaml
-kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayjobs.yaml
-kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayservices.yaml
-kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodeclaims.yaml
-kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodepools.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayclusters.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayjobs.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayservices.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodeclaims.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodepools.yaml
 
 # 5. Install KubeRay operator directly with patched image, ko entrypoint, and RBAC
 echo "Installing KubeRay operator with patched image..."
@@ -167,9 +167,11 @@ helm template kuberay-operator kuberay/kuberay-operator \
   --set leaderElectionEnabled=false \
   -n default | \
   sed -e "s| - /manager| - /ko-app/ray-operator|g" | \
-  kubectl apply --server-side -f -
+  kubectl apply --server-side --force-conflicts -f -
 
-cat << EOF | kubectl apply --server-side -f -
+kubectl set resources deployment/kuberay-operator -n default --limits=cpu=2,memory=2Gi --requests=cpu=500m,memory=512Mi
+
+cat << EOF | kubectl apply --server-side --force-conflicts -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -202,9 +204,9 @@ curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPST
   sed -e "s|registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM|$KUEUE_IMG|g" \
       -e "s|imagePullPolicy: Always|imagePullPolicy: IfNotPresent|g" \
       -e "s| - /manager| - /ko-app/kueue|g" | \
-  kubectl apply --server-side -f -
+  kubectl apply --server-side --force-conflicts -f -
 
-cat << EOF | kubectl apply --server-side -f -
+cat << EOF | kubectl apply --server-side --force-conflicts -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -227,6 +229,8 @@ subjects:
   name: kueue-controller-manager
   namespace: kueue-system
 EOF
+
+kubectl set resources deployment/kueue-controller-manager -n kueue-system --limits=memory=2Gi --requests=memory=512Mi
 
 # 7. Wait for rollouts
 kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=180s
@@ -253,11 +257,11 @@ fi
 
 # 3. Install base CRDs
 echo "Installing CRDs..."
-kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayclusters.yaml
-kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayjobs.yaml
-kubectl apply --server-side -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayservices.yaml
-kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodeclaims.yaml
-kubectl apply --server-side -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodepools.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayclusters.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayjobs.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/ray-project/kuberay/$KUBERAY_UPSTREAM/ray-operator/config/crd/bases/ray.io_rayservices.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodeclaims.yaml
+kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.com/kubernetes-sigs/karpenter/$KARPENTER_UPSTREAM/pkg/apis/crds/karpenter.sh_nodepools.yaml
 
 if ! kubectl get deployment kuberay-operator -n default >/dev/null 2>&1; then
   helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
@@ -267,7 +271,7 @@ else
   kubectl set image deployment/kuberay-operator -n default kuberay-operator=quay.io/kuberay/operator:$KUBERAY_UPSTREAM
 fi
 
-kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml
+kubectl apply --server-side --force-conflicts -f https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml
 kubectl set image deployment/kueue-controller-manager -n kueue-system manager=registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM
 
 kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=120s

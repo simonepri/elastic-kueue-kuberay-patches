@@ -90,15 +90,15 @@ index 0000000..618fc57
 +		Complete(r)
 +}
 diff --git a/ray-operator/main.go b/ray-operator/main.go
-index 3c24f6d..d23e0b7 100644
+index d033987..cb7da0e 100644
 --- a/ray-operator/main.go
 +++ b/ray-operator/main.go
-@@ -229,6 +229,8 @@ func main() {
- 		"unable to create controller", "controller", "RayService")
- 	exitOnError(ray.NewRayJobReconciler(ctx, mgr, config).SetupWithManager(mgr, config.ReconcileConcurrency),
- 		"unable to create controller", "controller", "RayJob")
-+	exitOnError((&ray.ActorProtectReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr),
-+		"unable to create controller", "controller", "ActorProtect")
+@@ -368,6 +368,8 @@ func main() {
+ 		setupLog.Info("RayClusterNetworkPolicy feature gate is disabled, skipping NetworkPolicy controller setup")
+ 	}
  
- 	if os.Getenv("ENABLE_WEBHOOKS") == "true" {
- 		exitOnError((&rayv1.RayCluster{}).SetupWebhookWithManager(mgr),
++	exitOnError((&ray.ActorProtectReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ActorProtect")
++
+ 	// +kubebuilder:scaffold:builder
+ 
+ 	exitOnError(mgr.AddHealthzCheck("healthz", healthz.Ping), "unable to set up health check")

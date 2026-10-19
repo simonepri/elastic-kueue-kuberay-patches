@@ -1,4 +1,4 @@
-ARG BUILDER_IMAGE=public.ecr.aws/docker/library/golang:1.27
+ARG BUILDER_IMAGE=golang:1.27
 ARG BASE_IMAGE=gcr.io/distroless/base-debian12:nonroot
 
 FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} AS builder

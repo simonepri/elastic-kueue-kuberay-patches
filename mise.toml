@@ -20,8 +20,8 @@ KUBERAY_UPSTREAM = "v1.7.1"
 KARPENTER_UPSTREAM = "v1.15.0"
 
 # Internal patchset versions (tracks release-please manifests)
-KUEUE_PATCH_VERSION = "0.2.0"
-KUBERAY_PATCH_VERSION = "0.2.0"
+KUEUE_PATCH_VERSION = "0.2.1"
+KUBERAY_PATCH_VERSION = "0.2.1"
 
 # Derived full image tags: <upstream>-p<patch_version>
 KUEUE_IMAGE_TAG = "{{env.KUEUE_UPSTREAM}}-p{{env.KUEUE_PATCH_VERSION}}"
@@ -76,22 +76,22 @@ description = "Apply all patches to third_party dependencies"
 depends = ["patch:kueue", "patch:kuberay"]
 
 [tasks."build:kueue"]
-description = "Build patched Kueue image with ko"
+description = "Build patched Kueue image"
 depends = ["patch:kueue"]
 run = """
-cd third_party/kueue
-KO_DOCKER_REPO=kind.local ko build --local --image-refs=../../.kueue-image.txt ./cmd/kueue
-KUEUE_IMG=$(cat ../../.kueue-image.txt)
+docker build -f docker/kueue.Dockerfile -t kind.local/kueue:$KUEUE_IMAGE_TAG -t kind.local/kueue:latest third_party/kueue
+echo "kind.local/kueue:$KUEUE_IMAGE_TAG" > .kueue-image.txt
+KUEUE_IMG=$(cat .kueue-image.txt)
 echo "Built Kueue image: $KUEUE_IMG"
 """
 
 [tasks."build:kuberay"]
-description = "Build patched KubeRay image with ko"
+description = "Build patched KubeRay image"
 depends = ["patch:kuberay"]
 run = """
-cd third_party/kuberay/ray-operator
-KO_DOCKER_REPO=kind.local ko build --local --image-refs=../../../.kuberay-image.txt .
-KUBERAY_IMG=$(cat ../../../.kuberay-image.txt)
+docker build -f docker/kuberay.Dockerfile -t kind.local/kuberay-operator:$KUBERAY_IMAGE_TAG -t kind.local/kuberay-operator:latest third_party/kuberay/ray-operator
+echo "kind.local/kuberay-operator:$KUBERAY_IMAGE_TAG" > .kuberay-image.txt
+KUBERAY_IMG=$(cat .kuberay-image.txt)
 echo "Built KubeRay image: $KUBERAY_IMG"
 """
 
@@ -100,23 +100,33 @@ description = "Build all patched controller images"
 depends = ["build:kueue", "build:kuberay"]
 
 [tasks."publish:kueue"]
-description = "Build and publish patched Kueue image to GHCR"
+description = "Build and publish patched Kueue multi-arch image to GHCR"
 depends = ["patch:kueue"]
 run = """
-cd third_party/kueue
 TAG="${KUEUE_UPSTREAM}-p${KUEUE_PATCH_VERSION}"
 echo "Publishing Kueue image ghcr.io/simonepri/kueue:$TAG..."
-KO_DOCKER_REPO=ghcr.io/simonepri/kueue ko build --bare -t "$TAG" -t latest ./cmd/kueue
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/kueue.Dockerfile \
+  -t "ghcr.io/simonepri/kueue:$TAG" \
+  -t "ghcr.io/simonepri/kueue:v0.20.2-p0.2.0" \
+  -t "ghcr.io/simonepri/kueue:latest" \
+  --push \
+  third_party/kueue
 """
 
 [tasks."publish:kuberay"]
-description = "Build and publish patched KubeRay image to GHCR"
+description = "Build and publish patched KubeRay multi-arch image to GHCR"
 depends = ["patch:kuberay"]
 run = """
-cd third_party/kuberay/ray-operator
 TAG="${KUBERAY_UPSTREAM}-p${KUBERAY_PATCH_VERSION}"
 echo "Publishing KubeRay image ghcr.io/simonepri/kuberay-operator:$TAG..."
-KO_DOCKER_REPO=ghcr.io/simonepri/kuberay-operator ko build --bare -t "$TAG" -t latest .
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/kuberay.Dockerfile \
+  -t "ghcr.io/simonepri/kuberay-operator:$TAG" \
+  -t "ghcr.io/simonepri/kuberay-operator:v1.7.1-p0.2.0" \
+  -t "ghcr.io/simonepri/kuberay-operator:latest" \
+  --push \
+  third_party/kuberay/ray-operator
 """
 
 [tasks.publish]

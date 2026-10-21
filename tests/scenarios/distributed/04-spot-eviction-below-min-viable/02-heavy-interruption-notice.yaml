@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: heavy-spot-interruption-notice
+  labels:
+    test.k8s.io/event: spot-interrupted
+    target-cluster: spot-minviable-raycluster
+data:
+  workerGroup: spot-workers
+  interruptedReplicas: "3"

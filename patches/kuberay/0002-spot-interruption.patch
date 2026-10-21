@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..797af98
 --- /dev/null
 +++ b/ray-operator/controllers/ray/spot_interruption_controller.go
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,154 @@
 +package ray
 +
 +import (
@@ -90,26 +90,36 @@ index 0000000..797af98
 +			}
 +			if wgMap["groupName"] == groupName || groupName == "" {
 +				curReplicas, _ := wgMap["replicas"].(int64)
-+				if curReplicas > interrupted {
++				minReplicas, _ := wgMap["minReplicas"].(int64)
++				effectiveMin := minReplicas
++				if effectiveMin <= 0 {
++					effectiveMin = 1
++				}
++				if curReplicas > effectiveMin {
 +					newReplicas := curReplicas - interrupted
-+					logger.Info("contracting workerGroup replicas and maxReplicas to match surviving capacity",
-+						"cluster", targetCluster, "old", curReplicas, "new", newReplicas)
-+					wgMap["replicas"] = newReplicas
-+					wgMap["maxReplicas"] = newReplicas
-+
-+					if targetPod != "" {
-+						strategy, _, _ := unstructured.NestedMap(wgMap, "scaleStrategy")
-+						if strategy == nil {
-+							strategy = map[string]interface{}{}
-+						}
-+						toDelete, _, _ := unstructured.NestedStringSlice(strategy, "workersToDelete")
-+						toDelete = append(toDelete, targetPod)
-+						strategy["workersToDelete"] = toDelete
-+						wgMap["scaleStrategy"] = strategy
++					if newReplicas < effectiveMin {
++						newReplicas = effectiveMin
 +					}
++					if newReplicas < curReplicas {
++						logger.Info("contracting workerGroup replicas and maxReplicas to match surviving capacity",
++							"cluster", targetCluster, "old", curReplicas, "new", newReplicas)
++						wgMap["replicas"] = newReplicas
++						wgMap["maxReplicas"] = newReplicas
 +
-+					wgs[i] = wgMap
-+					modified = true
++						if targetPod != "" {
++							strategy, _, _ := unstructured.NestedMap(wgMap, "scaleStrategy")
++							if strategy == nil {
++								strategy = map[string]interface{}{}
++							}
++							toDelete, _, _ := unstructured.NestedStringSlice(strategy, "workersToDelete")
++							toDelete = append(toDelete, targetPod)
++							strategy["workersToDelete"] = toDelete
++							wgMap["scaleStrategy"] = strategy
++						}
++
++						wgs[i] = wgMap
++						modified = true
++					}
 +				}
 +			}
 +		}

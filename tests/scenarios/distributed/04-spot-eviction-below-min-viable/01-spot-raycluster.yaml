@@ -1,0 +1,39 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: spot-minviable-raycluster
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        nodeSelector:
+          topology.kubernetes.io/region: us-central1
+          node.kubernetes.io/instance-type: local-cpu
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: spot-workers
+      replicas: 4
+      minReplicas: 2
+      maxReplicas: 6
+      rayStartParams: {}
+      template:
+        spec:
+          nodeSelector:
+            topology.kubernetes.io/region: us-central1
+            node.kubernetes.io/instance-type: spot-worker
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"

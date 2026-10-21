@@ -1,0 +1,23 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 14-spot-eviction-below-min-viable
+spec:
+  description: >
+    Verifies that when massive spot interruption events hit a worker group and attempt
+    to contract replicas below minReplicas, KubeRay's spot interruption controller protects
+    the cluster's minimum viable threshold: it clamps contraction so worker count never drops
+    below minReplicas and the Ray head remains healthy.
+  steps:
+    - name: setup-spot-cluster
+      try:
+        - apply:
+            file: 01-spot-raycluster.yaml
+    - name: simulate-heavy-spot-interruption
+      try:
+        - apply:
+            file: 02-heavy-interruption-notice.yaml
+    - name: assert-min-viable-protected
+      try:
+        - assert:
+            file: 03-assert-min-viable-protected.yaml

@@ -6,7 +6,7 @@ kubectl = "1.37.1"
 helm = "4.3.1"
 ko = "0.19.1"
 colima = "0.10.3"
-docker-cli = "29.9.1"
+docker-cli = "29.9.2"
 
 [env]
 CLUSTER_NAME = "elastic-scale-lab"

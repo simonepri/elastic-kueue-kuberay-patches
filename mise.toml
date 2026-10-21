@@ -20,8 +20,8 @@ KUBERAY_UPSTREAM = "v1.7.1"
 KARPENTER_UPSTREAM = "v1.15.0"
 
 # Internal patchset versions (tracks release-please manifests)
-KUEUE_PATCH_VERSION = "0.2.2"
-KUBERAY_PATCH_VERSION = "0.2.1"
+KUEUE_PATCH_VERSION = "0.3.0"
+KUBERAY_PATCH_VERSION = "0.3.0"
 
 # Derived full image tags: <upstream>-p<patch_version>
 KUEUE_IMAGE_TAG = "{{env.KUEUE_UPSTREAM}}-p{{env.KUEUE_PATCH_VERSION}}"
@@ -245,6 +245,17 @@ kubectl set resources deployment/kueue-controller-manager -n kueue-system --limi
 # 7. Wait for rollouts
 kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=180s
 kubectl rollout status deployment/kuberay-operator -n default --timeout=180s
+
+# 8. Wait for Kueue mutating webhook to become responsive before tests run
+echo "Waiting for Kueue webhook service to accept connections..."
+for i in $(seq 1 30); do
+  if kubectl run --dry-run=server --image=busybox:latest webhook-probe -n default >/dev/null 2>&1; then
+    echo "Kueue webhook service is ready!"
+    break
+  fi
+  sleep 1
+done
+
 echo "Cluster $CLUSTER_NAME is ready with patched controllers!"
 """
 

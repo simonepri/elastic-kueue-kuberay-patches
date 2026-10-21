@@ -1,0 +1,42 @@
+diff --git a/pkg/controller/jobs/deployment/deployment_webhook.go b/pkg/controller/jobs/deployment/deployment_webhook.go
+index e920676..bd8f1ac 100644
+--- a/pkg/controller/jobs/deployment/deployment_webhook.go
++++ b/pkg/controller/jobs/deployment/deployment_webhook.go
+@@ -162,12 +162,13 @@ func (wh *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj *appsv1.De
+ 	allErrs := jobframework.ValidateQueueName(newDeployment.Object())
+ 	allErrs = append(allErrs, jobframework.ValidateElasticJobAnnotation(newDeployment.Object(), newDeployment.GVK())...)
+ 
+-	// Prevents updating the queue-name if at least one Pod is not suspended
+-	// or if the queue-name has been deleted.
+-	isSuspended := oldDeployment.Status.ReadyReplicas == 0
+-	if !isSuspended || newQueueName == "" {
++	// Prevents removing the queue-name once set.
++	// Changing the queue-name while Pods are ready is allowed because Kueue admits each
++	// Deployment Pod as its own workload, enabling zero-downtime rolling updates.
++	if newQueueName == "" {
+ 		allErrs = append(allErrs, apivalidation.ValidateImmutableField(newQueueName, oldQueueName, queueNameLabelPath)...)
+ 	}
++	isSuspended := oldDeployment.Status.ReadyReplicas == 0
+ 	allErrs = append(allErrs, jobframework.ValidateUpdateForWorkloadPriorityClassName(
+ 		isSuspended,
+ 		oldDeployment.Object(),
+diff --git a/pkg/controller/jobs/deployment/deployment_webhook_test.go b/pkg/controller/jobs/deployment/deployment_webhook_test.go
+index 7b0953e..acb575c 100644
+--- a/pkg/controller/jobs/deployment/deployment_webhook_test.go
++++ b/pkg/controller/jobs/deployment/deployment_webhook_test.go
+@@ -481,6 +481,15 @@ func TestValidateUpdate(t *testing.T) {
+ 				Queue("test-queue-new").
+ 				ReadyReplicas(1).
+ 				Obj(),
++		},
++		"delete queue (ready replicas)": {
++			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
++				Queue("test-queue").
++				ReadyReplicas(1).
++				Obj(),
++			newDeployment: testingdeployment.MakeDeployment("test-pod", "").
++				ReadyReplicas(1).
++				Obj(),
+ 			wantErr: field.ErrorList{
+ 				&field.Error{
+ 					Type:  field.ErrorTypeInvalid,

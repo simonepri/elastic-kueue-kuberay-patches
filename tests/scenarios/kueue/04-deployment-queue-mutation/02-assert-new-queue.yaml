@@ -1,0 +1,8 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-serving-deployment
+  labels:
+    kueue.x-k8s.io/queue-name: queue-beta
+status:
+  readyReplicas: 1

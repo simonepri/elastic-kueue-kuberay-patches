@@ -1,0 +1,32 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 10-deployment-queue-mutation
+spec:
+  description: >
+    Verifies that a Deployment's queue can be changed while it has ready Pods (zero downtime rollout),
+    while preventing the queue name label from being completely removed.
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: create-deployment
+      try:
+        - apply:
+            file: 01-deployment.yaml
+        - assert:
+            file: 01-assert-ready.yaml
+    - name: mutate-queue-name
+      try:
+        - apply:
+            file: 02-deployment-new-queue.yaml
+        - assert:
+            file: 02-assert-new-queue.yaml
+    - name: disallow-queue-removal
+      try:
+        - apply:
+            file: 03-deployment-remove-queue.yaml
+            expect:
+              - check:
+                  ($error != null): true

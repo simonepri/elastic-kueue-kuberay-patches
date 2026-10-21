@@ -1,0 +1,51 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: deploy-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: deploy-cluster-queue-a
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: deploy-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "10"
+            - name: "memory"
+              nominalQuota: "20Gi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: deploy-cluster-queue-b
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: deploy-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "10"
+            - name: "memory"
+              nominalQuota: "20Gi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: queue-alpha
+spec:
+  clusterQueue: deploy-cluster-queue-a
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: queue-beta
+spec:
+  clusterQueue: deploy-cluster-queue-b

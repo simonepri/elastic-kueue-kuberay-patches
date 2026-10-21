@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-serving-deployment
+  labels:
+    kueue.x-k8s.io/queue-name: queue-beta
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-serving
+  template:
+    metadata:
+      labels:
+        app: test-serving
+    spec:
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.9
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi

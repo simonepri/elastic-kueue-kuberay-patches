@@ -1,0 +1,61 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: multicloud-ray-cluster
+  labels:
+    kueue.x-k8s.io/queue-name: multicloud-spot-local-queue
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: aws-workers
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 4
+      rayStartParams: {}
+      template:
+        spec:
+          nodeSelector:
+            node.kubernetes.io/instance-type: g5.2xlarge
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"
+    - groupName: gcp-workers
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 4
+      rayStartParams: {}
+      template:
+        spec:
+          nodeSelector:
+            node.kubernetes.io/instance-type: a2-highgpu-1g
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"

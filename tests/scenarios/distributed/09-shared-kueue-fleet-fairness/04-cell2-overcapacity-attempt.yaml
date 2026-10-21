@@ -1,0 +1,28 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: cell2-raycluster-spot
+spec:
+  workerGroupSpecs:
+    - groupName: spot-workers
+      replicas: 16
+      minReplicas: 2
+      maxReplicas: 16
+      rayStartParams: {}
+      template:
+        spec:
+          nodeSelector:
+            cell.boltz.bio/name: cell-2
+            node-tier: spot
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "8Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  cpu: "2"
+                  memory: "8Gi"
+                  nvidia.com/gpu: "1"

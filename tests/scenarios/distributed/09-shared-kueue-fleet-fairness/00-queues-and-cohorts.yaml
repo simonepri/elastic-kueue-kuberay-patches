@@ -1,0 +1,301 @@
+# ==============================================================================
+# 1. Physical Local Nodes (Cell 1 & Cell 2) and Virtual InterLink Nodes
+# ==============================================================================
+apiVersion: v1
+kind: Node
+metadata:
+  name: node-cell1-local-worker
+  labels:
+    cell.boltz.bio/name: cell-1
+    node-tier: local
+status:
+  capacity:
+    cpu: "16"
+    memory: "64Gi"
+    nvidia.com/gpu: "2"
+  allocatable:
+    cpu: "16"
+    memory: "64Gi"
+    nvidia.com/gpu: "2"
+  conditions:
+    - type: Ready
+      status: "True"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: node-cell2-local-worker
+  labels:
+    cell.boltz.bio/name: cell-2
+    node-tier: local
+status:
+  capacity:
+    cpu: "16"
+    memory: "64Gi"
+    nvidia.com/gpu: "2"
+  allocatable:
+    cpu: "16"
+    memory: "64Gi"
+    nvidia.com/gpu: "2"
+  conditions:
+    - type: Ready
+      status: "True"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: spot-virtual-node-cell1
+  labels:
+    node.kubernetes.io/instance-type: spot-virtual
+    cell.boltz.bio/name: cell-1
+    node-tier: spot
+status:
+  capacity:
+    cpu: "64"
+    memory: "256Gi"
+    nvidia.com/gpu: "8"
+  allocatable:
+    cpu: "64"
+    memory: "256Gi"
+    nvidia.com/gpu: "8"
+  conditions:
+    - type: Ready
+      status: "True"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: spot-virtual-node-cell2
+  labels:
+    node.kubernetes.io/instance-type: spot-virtual
+    cell.boltz.bio/name: cell-2
+    node-tier: spot
+status:
+  capacity:
+    cpu: "64"
+    memory: "256Gi"
+    nvidia.com/gpu: "8"
+  allocatable:
+    cpu: "64"
+    memory: "256Gi"
+    nvidia.com/gpu: "8"
+  conditions:
+    - type: Ready
+      status: "True"
+---
+# ==============================================================================
+# 2. Priorities for Borrowing & Reclaim
+# ==============================================================================
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pc-spot-low
+value: 100
+globalDefault: false
+description: "Low priority for elastic background borrowing"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pc-spot-high
+value: 1000
+globalDefault: false
+description: "High priority for fair nominal share reclaim"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: pc-spot-low
+value: 100
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: pc-spot-high
+value: 1000
+---
+# ==============================================================================
+# 3. Resource Flavors
+# ==============================================================================
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: local-head-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: cell1-local-flavor
+spec:
+  nodeLabels:
+    cell.boltz.bio/name: cell-1
+    node-tier: local
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: cell2-local-flavor
+spec:
+  nodeLabels:
+    cell.boltz.bio/name: cell-2
+    node-tier: local
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: spot-fleet-flavor
+spec:
+  nodeLabels:
+    node-tier: spot
+---
+# ==============================================================================
+# 4. Tier 1: Local ClusterQueues (Autonomous Cell Private Quotas)
+# ==============================================================================
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: cell1-local-cq
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: local-head-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "0"
+        - name: cell1-local-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "16"
+            - name: "memory"
+              nominalQuota: "64Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "2"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: cell1-local-lq
+spec:
+  clusterQueue: cell1-local-cq
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: cell2-local-cq
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: local-head-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "0"
+        - name: cell2-local-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "16"
+            - name: "memory"
+              nominalQuota: "64Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "2"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: cell2-local-lq
+spec:
+  clusterQueue: cell2-local-cq
+---
+# ==============================================================================
+# 5. Tier 2: Shared Spot Kueue on ctrl (Cohort "depot-global-spot-fleet")
+# Total Fleet Capacity: 8 GPUs (Cell 1: 4, Cell 2: 4)
+# BorrowingLimit = 4 enables bursting up to 8 GPUs when other cell is idle.
+# ReclaimStrategy = LowerPriority reclaims borrowed quota on contention.
+# ==============================================================================
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: ctrl-cell1-spot-cq
+spec:
+  namespaceSelector: {}
+  cohortName: depot-global-spot-fleet
+  preemption:
+    withinClusterQueue: LowerPriority
+    reclaimWithinCohort: Any
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: local-head-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "0"
+        - name: spot-fleet-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "4"
+              borrowingLimit: "4"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: ctrl-cell1-spot-lq
+spec:
+  clusterQueue: ctrl-cell1-spot-cq
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: ctrl-cell2-spot-cq
+spec:
+  namespaceSelector: {}
+  cohortName: depot-global-spot-fleet
+  preemption:
+    withinClusterQueue: LowerPriority
+    reclaimWithinCohort: Any
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: local-head-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "0"
+        - name: spot-fleet-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "4"
+              borrowingLimit: "4"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: ctrl-cell2-spot-lq
+spec:
+  clusterQueue: ctrl-cell2-spot-cq

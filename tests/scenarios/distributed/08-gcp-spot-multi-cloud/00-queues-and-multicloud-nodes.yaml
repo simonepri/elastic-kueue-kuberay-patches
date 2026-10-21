@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: Node
+metadata:
+  name: node-aws-spot-us-east-1
+  labels:
+    node.kubernetes.io/instance-type: g5.2xlarge
+    topology.kubernetes.io/region: us-east-1
+    node.kubernetes.io/capacity-type: spot
+status:
+  capacity:
+    cpu: "32"
+    memory: "128Gi"
+    nvidia.com/gpu: "8"
+  allocatable:
+    cpu: "32"
+    memory: "128Gi"
+    nvidia.com/gpu: "8"
+  conditions:
+    - type: Ready
+      status: "True"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: node-gcp-spot-us-central1
+  labels:
+    node.kubernetes.io/instance-type: a2-highgpu-1g
+    topology.kubernetes.io/region: us-central1
+    node.kubernetes.io/capacity-type: spot
+status:
+  capacity:
+    cpu: "32"
+    memory: "128Gi"
+    nvidia.com/gpu: "8"
+  allocatable:
+    cpu: "32"
+    memory: "128Gi"
+    nvidia.com/gpu: "8"
+  conditions:
+    - type: Ready
+      status: "True"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: local-head-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: aws-spot-flavor
+spec:
+  nodeLabels:
+    node.kubernetes.io/instance-type: g5.2xlarge
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: gcp-spot-flavor
+spec:
+  nodeLabels:
+    node.kubernetes.io/instance-type: a2-highgpu-1g
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: multicloud-spot-cluster-queue
+spec:
+  namespaceSelector: {}
+  preemption:
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: local-head-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "0"
+        - name: aws-spot-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "8"
+        - name: gcp-spot-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "8"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: multicloud-spot-local-queue
+spec:
+  clusterQueue: multicloud-spot-cluster-queue

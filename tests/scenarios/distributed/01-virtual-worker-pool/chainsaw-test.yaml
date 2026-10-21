@@ -1,0 +1,30 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 11-distributed-virtual-worker-pool
+spec:
+  description: >
+    Verifies distributed multi-pool execution across local and remote virtual worker pools.
+    Kueue coordinates multi-flavor quota distribution between local CPU nodes and remote GPU
+    worker pools. When a spot interruption notice is delivered for a remote worker, KubeRay's
+    spot interruption controller trims the remote worker group while preserving local workers
+    and the Ray head intact.
+  steps:
+    - name: setup-queues-and-virtual-node
+      try:
+        - apply:
+            file: 00-queues-and-virtual-node.yaml
+    - name: submit-multi-pool-raycluster
+      try:
+        - apply:
+            file: 01-raycluster-multi-pool.yaml
+        - assert:
+            file: 02-assert-multi-pool-active.yaml
+    - name: simulate-remote-spot-interruption
+      try:
+        - apply:
+            file: 03-remote-spot-interruption.yaml
+    - name: assert-remote-worker-drained
+      try:
+        - assert:
+            file: 04-assert-remote-worker-drained.yaml

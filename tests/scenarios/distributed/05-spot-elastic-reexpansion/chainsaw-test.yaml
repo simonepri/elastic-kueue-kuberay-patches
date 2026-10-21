@@ -1,0 +1,40 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 15-spot-elastic-reexpansion
+spec:
+  description: >
+    Verifies self-healing multi-pool elasticity: when remote spot pool capacity is preempted
+    by a higher-priority workload, Kueue partially preempts remote-workers down to minReplicas
+    while preserving the Ray head and local-workers intact. When spot capacity is restored,
+    the RayCluster automatically re-expands remote-workers back to target replicas cleanly
+    without restarting the Ray head.
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-raycluster
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+        - assert:
+            resource:
+              apiVersion: ray.io/v1
+              kind: RayCluster
+              metadata:
+                name: spot-elastic-raycluster
+              status:
+                desiredWorkerReplicas: 6
+    - name: simulate-spot-interruption
+      try:
+        - apply:
+            file: 02-interruption.yaml
+        - assert:
+            file: 03-assert-contracted.yaml
+    - name: restore-spot-capacity
+      try:
+        - delete:
+            file: 04-restore-capacity.yaml
+        - assert:
+            file: 05-assert-reexpanded.yaml

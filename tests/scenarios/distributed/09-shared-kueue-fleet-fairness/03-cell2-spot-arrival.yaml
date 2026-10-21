@@ -1,0 +1,48 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: cell2-raycluster-spot
+  labels:
+    kueue.x-k8s.io/queue-name: ctrl-cell2-spot-lq
+    kueue.x-k8s.io/priority-class: pc-spot-high
+    ray.io/cluster: cell2-raycluster-spot
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "1"
+                memory: "2Gi"
+              limits:
+                cpu: "1"
+                memory: "2Gi"
+  workerGroupSpecs:
+    - groupName: spot-workers
+      replicas: 4
+      minReplicas: 2
+      maxReplicas: 8
+      rayStartParams: {}
+      template:
+        spec:
+          nodeSelector:
+            cell.boltz.bio/name: cell-2
+            node-tier: spot
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "8Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  cpu: "2"
+                  memory: "8Gi"
+                  nvidia.com/gpu: "1"

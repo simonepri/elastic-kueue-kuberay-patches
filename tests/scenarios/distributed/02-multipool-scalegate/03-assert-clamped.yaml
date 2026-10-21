@@ -1,0 +1,15 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: multipool-raycluster
+spec:
+  workerGroupSpecs:
+    - groupName: local-workers
+      replicas: 6
+      maxReplicas: 8
+    - groupName: remote-workers
+      replicas: 4
+      maxReplicas: 4
+status:
+  (conditions[?type == 'ScaleGateClamped']):
+    - status: "True"

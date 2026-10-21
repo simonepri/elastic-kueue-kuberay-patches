@@ -1,0 +1,22 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 16-quota-exhaustion-prevention
+spec:
+  description: >
+    Verify that hard cloud account quota ceilings (e.g. AWS VcpuLimitExceeded / GPU quota cap)
+    are strictly enforced at the queue and controller level by ScaleGate before pods or NodeClaims
+    can flood the cloud API, preventing API rate limiting and pending pod thrashing.
+  steps:
+    - name: setup-strict-quota-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-giant-scaleup-raycluster
+      try:
+        - apply:
+            file: 01-raycluster-giant-scaleup.yaml
+    - name: assert-quota-exhaustion-prevented-and-clamped
+      try:
+        - assert:
+            file: 02-assert-prevented-and-clamped.yaml

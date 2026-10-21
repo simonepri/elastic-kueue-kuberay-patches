@@ -1,0 +1,6 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: distributed-ray-cluster
+status:
+  desiredWorkerReplicas: 6

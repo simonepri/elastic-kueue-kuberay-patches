@@ -1,0 +1,60 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: multipool-raycluster
+  labels:
+    kueue.x-k8s.io/queue-name: multipool-local-queue
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        nodeSelector:
+          topology.kubernetes.io/region: us-central1
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: local-workers
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 8
+      rayStartParams: {}
+      template:
+        spec:
+          nodeSelector:
+            topology.kubernetes.io/region: us-central1
+            node.kubernetes.io/instance-type: c5.2xlarge
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+    - groupName: remote-workers
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 4
+      rayStartParams: {}
+      template:
+        spec:
+          nodeSelector:
+            topology.kubernetes.io/region: us-east1
+            node.kubernetes.io/instance-type: g4dn.xlarge
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"

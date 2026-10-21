@@ -1,0 +1,22 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 13-spot-market-dry-cascade
+spec:
+  description: >
+    Verifies that when a primary spot flavor/pool has zero available capacity (e.g. AWS Spot market dry / ICE),
+    Kueue's multi-flavor evaluation cascades the workload to an alternate available flavor (e.g. secondary spot region
+    or burst pool) without failing the job or deadlocking.
+  steps:
+    - name: setup-cascade-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-distributed-workload
+      try:
+        - apply:
+            file: 01-workload-or-raycluster.yaml
+    - name: assert-flavor-cascaded
+      try:
+        - assert:
+            file: 02-assert-cascaded.yaml

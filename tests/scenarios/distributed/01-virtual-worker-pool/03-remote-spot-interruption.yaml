@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: remote-spot-interruption-notice
+  labels:
+    test.k8s.io/event: spot-interrupted
+    target-cluster: distributed-ray-cluster
+data:
+  workerGroup: remote-workers
+  interruptedReplicas: "1"

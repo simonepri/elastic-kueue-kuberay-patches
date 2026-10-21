@@ -1,0 +1,29 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 12-multipool-scalegate-clamping
+spec:
+  description: >
+    Verifies that when a distributed RayCluster with heterogeneous worker groups (local CPU vs remote GPU)
+    attempts to scale both pools, ScaleGate selectively clamps maxReplicas and replicas only for the
+    constrained worker group whose resource quota is capped by Kueue, while allowing the unconstrained
+    worker group to expand freely.
+  steps:
+    - name: setup-multipool-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: start-baseline-ray-cluster
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+        - assert:
+            file: 01-assert-baseline.yaml
+    - name: trigger-multipool-scaleup
+      try:
+        - apply:
+            file: 02-scaleup-request.yaml
+    - name: assert-selective-clamping
+      try:
+        - assert:
+            file: 03-assert-clamped.yaml

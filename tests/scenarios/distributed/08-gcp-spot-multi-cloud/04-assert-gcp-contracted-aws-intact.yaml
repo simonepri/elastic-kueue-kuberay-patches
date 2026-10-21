@@ -1,0 +1,10 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: multicloud-ray-cluster
+spec:
+  workerGroupSpecs:
+    - groupName: aws-workers
+      maxReplicas: 4
+    - groupName: gcp-workers
+      maxReplicas: 1

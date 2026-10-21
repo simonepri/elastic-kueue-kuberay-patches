@@ -1,0 +1,13 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: giant-scaleup-raycluster
+spec:
+  workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 4
+      maxReplicas: 4
+status:
+  desiredWorkerReplicas: 4
+  (conditions[?type == 'ScaleGateClamped']):
+    - status: "True"

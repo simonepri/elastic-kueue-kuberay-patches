@@ -20,7 +20,7 @@ KUBERAY_UPSTREAM = "v1.7.1"
 KARPENTER_UPSTREAM = "v1.15.0"
 
 # Internal patchset versions (tracks release-please manifests)
-KUEUE_PATCH_VERSION = "0.2.1"
+KUEUE_PATCH_VERSION = "0.2.2"
 KUBERAY_PATCH_VERSION = "0.2.1"
 
 # Derived full image tags: <upstream>-p<patch_version>
@@ -108,7 +108,6 @@ echo "Publishing Kueue image ghcr.io/simonepri/kueue:$TAG..."
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f docker/kueue.Dockerfile \
   -t "ghcr.io/simonepri/kueue:$TAG" \
-  -t "ghcr.io/simonepri/kueue:v0.20.2-p0.2.0" \
   -t "ghcr.io/simonepri/kueue:latest" \
   --push \
   third_party/kueue
@@ -123,7 +122,6 @@ echo "Publishing KubeRay image ghcr.io/simonepri/kuberay-operator:$TAG..."
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f docker/kuberay.Dockerfile \
   -t "ghcr.io/simonepri/kuberay-operator:$TAG" \
-  -t "ghcr.io/simonepri/kuberay-operator:v1.7.1-p0.2.0" \
   -t "ghcr.io/simonepri/kuberay-operator:latest" \
   --push \
   third_party/kuberay/ray-operator

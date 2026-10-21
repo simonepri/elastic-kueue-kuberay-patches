@@ -1,0 +1,30 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: cell1-raycluster-spot
+status:
+  desiredWorkerReplicas: 6
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: ctrl-cell1-spot-cq
+status:
+  flavorsReservation:
+    - name: local-head-flavor
+      resources:
+        - name: cpu
+          total: "1"
+        - name: memory
+          total: "2Gi"
+        - name: nvidia.com/gpu
+          total: "0"
+    - name: spot-fleet-flavor
+      resources:
+        - name: cpu
+          total: "12"
+        - name: memory
+          total: "48Gi"
+        - name: nvidia.com/gpu
+          borrowed: "2"
+          total: "6"

@@ -1,0 +1,46 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: local-cpu-flavor
+spec:
+  nodeLabels:
+    topology.kubernetes.io/region: us-central1
+    node.kubernetes.io/instance-type: c5.2xlarge
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: remote-gpu-flavor
+spec:
+  nodeLabels:
+    topology.kubernetes.io/region: us-east1
+    node.kubernetes.io/instance-type: g4dn.xlarge
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: multipool-scalegate-queue
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: local-cpu-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: 100
+            - name: "memory"
+              nominalQuota: 500Gi
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: remote-gpu-flavor
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 4
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: multipool-local-queue
+spec:
+  clusterQueue: multipool-scalegate-queue

@@ -1,0 +1,10 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: spot-elastic-raycluster
+spec:
+  workerGroupSpecs:
+    - groupName: remote-workers
+      replicas: 2
+    - groupName: local-workers
+      replicas: 2

@@ -1,0 +1,13 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: distributed-ray-cluster
+spec:
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+  workerGroupSpecs:
+    - groupName: local-workers
+      maxReplicas: 4
+    - groupName: remote-workers
+      maxReplicas: 3

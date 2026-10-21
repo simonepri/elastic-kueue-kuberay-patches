@@ -1,0 +1,65 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: cell1-raycluster-spot
+spec:
+  workerGroupSpecs:
+    - groupName: spot-workers
+      replicas: 4
+status:
+  desiredWorkerReplicas: 4
+---
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: cell2-raycluster-spot
+status:
+  desiredWorkerReplicas: 4
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: ctrl-cell1-spot-cq
+status:
+  flavorsReservation:
+    - name: local-head-flavor
+      resources:
+        - name: cpu
+          total: "1"
+        - name: memory
+          total: "2Gi"
+        - name: nvidia.com/gpu
+          total: "0"
+    - name: spot-fleet-flavor
+      resources:
+        - name: cpu
+          total: "8"
+        - name: memory
+          total: "32Gi"
+        - name: nvidia.com/gpu
+          borrowed: "0"
+          total: "4"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: ctrl-cell2-spot-cq
+status:
+  flavorsReservation:
+    - name: local-head-flavor
+      resources:
+        - name: cpu
+          total: "1"
+        - name: memory
+          total: "2Gi"
+        - name: nvidia.com/gpu
+          total: "0"
+    - name: spot-fleet-flavor
+      resources:
+        - name: cpu
+          total: "8"
+        - name: memory
+          total: "32Gi"
+        - name: nvidia.com/gpu
+          borrowed: "0"
+          total: "4"

@@ -1,0 +1,44 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: giant-scaleup-raycluster
+  labels:
+    kueue.x-k8s.io/queue-name: quota-exhaustion-local-queue
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        nodeSelector:
+          topology.kubernetes.io/region: us-central-1
+          node.kubernetes.io/instance-type: c5.2xlarge
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 16
+      minReplicas: 1
+      maxReplicas: 32
+      rayStartParams: {}
+      template:
+        spec:
+          nodeSelector:
+            topology.kubernetes.io/region: us-east-1
+            node.kubernetes.io/instance-type: g4dn.xlarge
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"

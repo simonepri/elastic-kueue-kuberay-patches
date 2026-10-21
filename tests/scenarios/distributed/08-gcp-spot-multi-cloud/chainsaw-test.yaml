@@ -1,0 +1,30 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 18-gcp-spot-multi-cloud
+spec:
+  description: >
+    Verifies multi-cloud spot execution across AWS and GCP under a single unified RayCluster.
+    Kueue coordinates quota distribution across AWS spot (g5.2xlarge in us-east-1) and GCP
+    spot (a2-highgpu-1g in us-central1). When GCP delivers a 30-second spot preemption notice,
+    KubeRay contracts the GCP worker group down to minReplicas, while the AWS worker group and
+    Ray head continue running undisturbed.
+  steps:
+    - name: setup-queues-and-multicloud-nodes
+      try:
+        - apply:
+            file: 00-queues-and-multicloud-nodes.yaml
+    - name: submit-multicloud-raycluster
+      try:
+        - apply:
+            file: 01-multicloud-raycluster.yaml
+        - assert:
+            file: 02-assert-multicloud-active.yaml
+    - name: simulate-gcp-spot-preemption
+      try:
+        - apply:
+            file: 03-gcp-spot-preemption-notice.yaml
+    - name: assert-gcp-contracted-aws-intact
+      try:
+        - assert:
+            file: 04-assert-gcp-contracted-aws-intact.yaml

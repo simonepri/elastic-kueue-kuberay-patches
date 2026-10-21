@@ -1,0 +1,6 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: multicloud-ray-cluster
+status:
+  desiredWorkerReplicas: 4

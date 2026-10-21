@@ -1,0 +1,48 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: local-head-flavor
+spec:
+  nodeLabels:
+    topology.kubernetes.io/region: us-central-1
+    node.kubernetes.io/instance-type: c5.2xlarge
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: cloud-gpu-flavor
+spec:
+  nodeLabels:
+    topology.kubernetes.io/region: us-east-1
+    node.kubernetes.io/instance-type: g4dn.xlarge
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: quota-exhaustion-cluster-queue
+spec:
+  cohortName: hard-cloud-quota
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: local-head-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: 100
+            - name: "memory"
+              nominalQuota: 500Gi
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: cloud-gpu-flavor
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 4
+              borrowingLimit: 0
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: quota-exhaustion-local-queue
+spec:
+  clusterQueue: quota-exhaustion-cluster-queue

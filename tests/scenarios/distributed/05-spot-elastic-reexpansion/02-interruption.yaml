@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spot-interruption-preemptor
+  labels:
+    kueue.x-k8s.io/queue-name: spot-elastic-local-queue
+    kueue.x-k8s.io/priority-class: pc-spot-elastic-high
+spec:
+  parallelism: 2
+  completions: 2
+  template:
+    spec:
+      terminationGracePeriodSeconds: 0
+      priorityClassName: pc-spot-elastic-high
+      nodeSelector:
+        node.kubernetes.io/instance-type: spot-gpu
+      containers:
+        - name: preemptor
+          image: busybox:latest
+          command: ["sleep", "120"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+      restartPolicy: Never

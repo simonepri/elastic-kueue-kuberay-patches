@@ -1,0 +1,12 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: cell2-raycluster-spot
+spec:
+  workerGroupSpecs:
+    - groupName: spot-workers
+      replicas: 4
+      maxReplicas: 8
+status:
+  (conditions[?type == 'ScaleGateClamped']):
+    - status: "True"

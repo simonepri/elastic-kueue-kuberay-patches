@@ -1,0 +1,35 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: spot-cascade-cluster
+  labels:
+    kueue.x-k8s.io/queue-name: spot-cascade-local-queue
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 4
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"

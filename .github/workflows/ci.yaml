@@ -68,7 +68,7 @@ jobs:
         uses: kyverno/action-install-chainsaw@v0.2.15
 
       - name: Install Mise
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v5
 
       - name: Spin up Cluster and Deploy Patched Controllers
         run: mise run cluster:up

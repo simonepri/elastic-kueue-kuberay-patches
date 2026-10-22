@@ -1,0 +1,6 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: hybrid-interlink-raycluster
+status:
+  desiredWorkerReplicas: 5

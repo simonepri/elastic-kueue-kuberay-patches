@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudvm-spot-interruption
+  labels:
+    test.k8s.io/event: spot-interrupted
+    target-cluster: hybrid-interlink-raycluster
+data:
+  workerGroup: interlink-spot-workers
+  interruptedReplicas: "2"

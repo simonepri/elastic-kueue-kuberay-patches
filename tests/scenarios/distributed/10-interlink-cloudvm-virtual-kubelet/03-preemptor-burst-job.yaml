@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: high-priority-burst-job
+  labels:
+    kueue.x-k8s.io/queue-name: interlink-cloudvm-local-queue
+    kueue.x-k8s.io/priority-class: pc-cloudvm-high
+spec:
+  parallelism: 3
+  completions: 3
+  template:
+    spec:
+      terminationGracePeriodSeconds: 0
+      priorityClassName: pc-cloudvm-high
+      nodeSelector:
+        node.kubernetes.io/instance-type: interlink-cloudvm
+      containers:
+        - name: trainer
+          image: busybox:latest
+          command: ["sleep", "120"]
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "2"
+            limits:
+              nvidia.com/gpu: "2"
+      restartPolicy: Never

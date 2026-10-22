@@ -87,7 +87,7 @@ spec:
       serviceAccountName: interlink-cloudvm-plugin
       containers:
         - name: provider
-          image: ghcr.io/simonepri/interlink-cloudvm-plugin:0.1.0
+          image: ghcr.io/simonepri/interlink-cloudvm-plugin:0.2.0
           imagePullPolicy: IfNotPresent
           env:
             - name: PORT
@@ -98,6 +98,8 @@ spec:
               value: "interlink-cloudvm-test"
             - name: AWS_REGION
               value: "us-east-1"
+            - name: IDLE_GRACE_PERIOD
+              value: "60s"
             - name: TOKEN_STORE_PATH
               value: "/tmp/tokens.json"
             - name: COMPLETED_STORE_PATH
@@ -181,12 +183,11 @@ spec:
             - name: "memory"
               nominalQuota: "256Gi"
             - name: "nvidia.com/gpu"
-              nominalQuota: "8"
+              nominalQuota: "4"
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   name: interlink-cloudvm-local-queue
-  namespace: default
 spec:
   clusterQueue: interlink-cloudvm-cluster-queue

@@ -6,8 +6,8 @@ metadata:
     kueue.x-k8s.io/queue-name: interlink-cloudvm-local-queue
     kueue.x-k8s.io/priority-class: pc-cloudvm-high
 spec:
-  parallelism: 3
-  completions: 3
+  parallelism: 2
+  completions: 2
   template:
     spec:
       terminationGracePeriodSeconds: 0
@@ -22,7 +22,7 @@ spec:
             requests:
               cpu: "4"
               memory: "16Gi"
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
             limits:
-              nvidia.com/gpu: "2"
+              nvidia.com/gpu: "1"
       restartPolicy: Never

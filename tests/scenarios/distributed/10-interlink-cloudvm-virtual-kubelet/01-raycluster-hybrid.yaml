@@ -25,20 +25,6 @@ spec:
                 cpu: "2"
                 memory: "4Gi"
   workerGroupSpecs:
-    - groupName: local-workers
-      replicas: 1
-      maxReplicas: 2
-      rayStartParams: {}
-      template:
-        spec:
-          priorityClassName: pc-cloudvm-low
-          containers:
-            - name: ray-worker
-              image: rayproject/ray:2.38.0
-              resources:
-                requests:
-                  cpu: "2"
-                  memory: "4Gi"
     - groupName: interlink-spot-workers
       replicas: 4
       minReplicas: 2
@@ -70,3 +56,17 @@ spec:
                   nvidia.com/gpu: "1"
                 limits:
                   nvidia.com/gpu: "1"
+    - groupName: local-workers
+      replicas: 1
+      maxReplicas: 2
+      rayStartParams: {}
+      template:
+        spec:
+          priorityClassName: pc-cloudvm-low
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"

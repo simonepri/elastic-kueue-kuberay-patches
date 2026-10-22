@@ -4,7 +4,7 @@ metadata:
   name: hybrid-interlink-raycluster
 spec:
   workerGroupSpecs:
-    - groupName: local-workers
-      replicas: 1
     - groupName: interlink-spot-workers
       replicas: 4
+    - groupName: local-workers
+      replicas: 1

@@ -5,7 +5,7 @@ metadata:
 spec:
   description: >
     Verifies end-to-end hybrid Ray cluster bursting onto an InterLink Virtual Kubelet node
-    (interlink-provider-cloudvm) under realistic network and provisioning latencies.
+    (interlink-cloudvm-plugin) under realistic network and provisioning latencies.
     Simulates:
     1. Cold-start VM provisioning latency (10s initial readiness probe delay for VM boot/pull).
     2. Ray GCS RPC reconnection and heartbeat jitter tolerance across virtual boundaries.

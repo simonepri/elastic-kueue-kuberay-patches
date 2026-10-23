@@ -102,7 +102,7 @@ index 1ffa48e..10faab1 100644
  
  	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
  	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
-@@ -149,6 +150,28 @@ func (j *RayCluster) RestorePodSetsInfo(ctx context.Context, podSetsInfo []podse
+@@ -149,6 +150,37 @@ func (j *RayCluster) RestorePodSetsInfo(ctx context.Context, podSetsInfo []podse
  	return ClearRuntimeWorkerStateAnnotations(j.Object()) || changed
  }
  
@@ -118,9 +118,18 @@ index 1ffa48e..10faab1 100644
 +		for i := range j.Spec.WorkerGroupSpecs {
 +			wgs := &j.Spec.WorkerGroupSpecs[i]
 +			if strings.EqualFold(wgs.GroupName, string(psa.Name)) {
-+				if psa.Count != nil && (wgs.Replicas == nil || *wgs.Replicas != *psa.Count) {
-+					wgs.Replicas = ptr.To(*psa.Count)
-+					changed = true
++				if psa.Count != nil {
++					targetCount := *psa.Count
++					if wgs.NumOfHosts > 1 {
++						targetCount = targetCount / wgs.NumOfHosts
++					}
++					if wgs.MaxReplicas != nil && targetCount > *wgs.MaxReplicas {
++						targetCount = *wgs.MaxReplicas
++					}
++					if wgs.Replicas == nil || *wgs.Replicas != targetCount {
++						wgs.Replicas = ptr.To(targetCount)
++						changed = true
++					}
 +				}
 +			}
 +		}

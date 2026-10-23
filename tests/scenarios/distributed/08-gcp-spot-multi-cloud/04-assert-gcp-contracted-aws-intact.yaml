@@ -5,6 +5,8 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: aws-workers
+      replicas: 2
       maxReplicas: 4
     - groupName: gcp-workers
-      maxReplicas: 1
+      replicas: 1
+      maxReplicas: 4

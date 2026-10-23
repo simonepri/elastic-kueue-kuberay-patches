@@ -17,7 +17,7 @@ KUEUE_UPSTREAM = "v0.20.3"
 # renovate: datasource=github-releases depName=ray-project/kuberay
 KUBERAY_UPSTREAM = "v1.7.1"
 # renovate: datasource=github-releases depName=kubernetes-sigs/karpenter
-KARPENTER_UPSTREAM = "v1.15.0"
+KARPENTER_UPSTREAM = "v1.15.1"
 
 # Internal patchset versions (tracks release-please manifests)
 KUEUE_PATCH_VERSION = "0.3.0"

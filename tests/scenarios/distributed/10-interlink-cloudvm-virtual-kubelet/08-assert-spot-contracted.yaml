@@ -5,6 +5,7 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: interlink-spot-workers
+      replicas: 2
       maxReplicas: 2
     - groupName: local-workers
       replicas: 1

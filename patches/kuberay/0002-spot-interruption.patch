@@ -1,17 +1,20 @@
 diff --git a/ray-operator/controllers/ray/spot_interruption_controller.go b/ray-operator/controllers/ray/spot_interruption_controller.go
 new file mode 100644
-index 0000000..797af98
+index 0000000..b8c4510
 --- /dev/null
 +++ b/ray-operator/controllers/ray/spot_interruption_controller.go
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,361 @@
 +package ray
 +
 +import (
 +	"context"
 +	"fmt"
++	"strings"
++	"time"
 +
 +	corev1 "k8s.io/api/core/v1"
 +	"k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/api/resource"
 +	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 +	"k8s.io/apimachinery/pkg/runtime"
 +	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -31,11 +34,31 @@ index 0000000..797af98
 +		Version: "v1",
 +		Kind:    "RayCluster",
 +	}
++	workloadGVK = schema.GroupVersionKind{
++		Group:   "kueue.x-k8s.io",
++		Version: "v1beta2",
++		Kind:    "Workload",
++	}
 +)
 +
 +type SpotInterruptionReconciler struct {
 +	client.Client
 +	Scheme *runtime.Scheme
++}
++
++func getInt64(val interface{}) (int64, bool) {
++	switch v := val.(type) {
++	case int64:
++		return v, true
++	case int32:
++		return int64(v), true
++	case int:
++		return int64(v), true
++	case float64:
++		return int64(v), true
++	default:
++		return 0, false
++	}
 +}
 +
 +func (r *SpotInterruptionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -72,60 +95,244 @@ index 0000000..797af98
 +	logger.Info("handling spot interruption for cluster",
 +		"cluster", targetCluster, "group", groupName, "interrupted", interrupted, "targetPod", targetPod)
 +
++	latest := &unstructured.Unstructured{}
++	latest.SetGroupVersionKind(rayClusterGVK)
++	if err := r.Get(ctx, client.ObjectKey{Namespace: cm.Namespace, Name: targetCluster}, latest); err != nil {
++		return ctrl.Result{}, err
++	}
++	targetClusterUID := string(latest.GetUID())
++
++	type groupCounts struct {
++		oldCount int64
++		newCount int64
++	}
++	contractedGroups := make(map[string]groupCounts)
++
++	wgs, found, _ := unstructured.NestedSlice(latest.Object, "spec", "workerGroupSpecs")
++	if !found || len(wgs) == 0 {
++		return ctrl.Result{}, nil
++	}
++
++	for _, wg := range wgs {
++		wgMap, ok := wg.(map[string]interface{})
++		if !ok {
++			continue
++		}
++		curGroupName, _ := wgMap["groupName"].(string)
++		if curGroupName == groupName || groupName == "" {
++			curReplicas, ok := getInt64(wgMap["replicas"])
++			if !ok {
++				continue
++			}
++			minReplicas, _ := getInt64(wgMap["minReplicas"])
++			effectiveMin := minReplicas
++			if effectiveMin <= 0 {
++				effectiveMin = 1
++			}
++			if curReplicas > effectiveMin {
++				newReplicas := curReplicas - interrupted
++				if newReplicas < effectiveMin {
++					newReplicas = effectiveMin
++				}
++				if newReplicas < curReplicas {
++					contractedGroups[curGroupName] = groupCounts{
++						oldCount: curReplicas,
++						newCount: newReplicas,
++					}
++				}
++			}
++		}
++	}
++
++	if len(contractedGroups) == 0 {
++		// Nothing to contract
++		return ctrl.Result{}, nil
++	}
++
++	// Step 1: Update Kueue Workload FIRST so that when RayCluster is updated,
++	// Kueue workload slicing recognizes the partial preemption condition and does not replace the slice.
++	if targetClusterUID != "" {
++		wlList := &unstructured.UnstructuredList{}
++		wlList.SetGroupVersionKind(schema.GroupVersionKind{
++			Group:   "kueue.x-k8s.io",
++			Version: "v1beta2",
++			Kind:    "WorkloadList",
++		})
++
++		if err := r.List(ctx, wlList, client.InNamespace(cm.Namespace)); err != nil {
++			logger.Error(err, "failed to list workloads for spot admission sync", "namespace", cm.Namespace)
++		} else {
++			for _, item := range wlList.Items {
++				// Skip replaced / finished workload slices
++				conditions, _, _ := unstructured.NestedSlice(item.Object, "status", "conditions")
++				isFinished := false
++				for _, c := range conditions {
++					if cMap, ok := c.(map[string]interface{}); ok {
++						if cMap["type"] == "Finished" && cMap["status"] == "True" {
++							isFinished = true
++							break
++						}
++					}
++				}
++				if isFinished {
++					continue
++				}
++
++				matched := false
++				if item.GetLabels()["kueue.x-k8s.io/job-uid"] == targetClusterUID {
++					matched = true
++				} else {
++					for _, owner := range item.GetOwnerReferences() {
++						if string(owner.UID) == targetClusterUID {
++							matched = true
++							break
++						}
++					}
++				}
++				if !matched {
++					continue
++				}
++
++				workloadName := item.GetName()
++				_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
++					currentWl := &unstructured.Unstructured{}
++					currentWl.SetGroupVersionKind(workloadGVK)
++					if err := r.Get(ctx, client.ObjectKey{Namespace: cm.Namespace, Name: workloadName}, currentWl); err != nil {
++						return err
++					}
++
++					admission, found, _ := unstructured.NestedMap(currentWl.Object, "status", "admission")
++					if !found || admission == nil {
++						return nil
++					}
++
++					psas, found, _ := unstructured.NestedSlice(admission, "podSetAssignments")
++					if !found || len(psas) == 0 {
++						return nil
++					}
++
++					wlModified := false
++					for pi, psaRaw := range psas {
++						psa, ok := psaRaw.(map[string]interface{})
++						if !ok {
++							continue
++						}
++						psaName, _ := psa["name"].(string)
++
++						for cGroupName, counts := range contractedGroups {
++							if strings.EqualFold(psaName, cGroupName) {
++								curCount, ok := getInt64(psa["count"])
++								if !ok || curCount <= 0 {
++									curCount = counts.oldCount
++								}
++								newCount := counts.newCount
++
++								if curCount > newCount {
++									logger.Info("contracting workload admission podSetAssignment count and quota",
++										"workload", workloadName, "podSet", psaName, "old", curCount, "new", newCount)
++
++									// Scale resourceUsage proportionally
++									ru, ruFound, _ := unstructured.NestedMap(psa, "resourceUsage")
++									if ruFound && ru != nil {
++										for resKey, resVal := range ru {
++											resStr := fmt.Sprintf("%v", resVal)
++											if q, err := resource.ParseQuantity(resStr); err == nil {
++												milliVal := q.MilliValue()
++												newMilliVal := (milliVal * newCount) / curCount
++												q.SetMilli(newMilliVal)
++												ru[resKey] = q.String()
++											}
++										}
++										psa["resourceUsage"] = ru
++									}
++
++									psa["count"] = newCount
++									psas[pi] = psa
++									wlModified = true
++								}
++								break
++							}
++						}
++					}
++
++					if wlModified {
++						_ = unstructured.SetNestedSlice(currentWl.Object, psas, "status", "admission", "podSetAssignments")
++
++						// Set Preempted status condition
++						condList, _, _ := unstructured.NestedSlice(currentWl.Object, "status", "conditions")
++						nowStr := time.Now().UTC().Format(time.RFC3339)
++						condFound := false
++						newCond := map[string]interface{}{
++							"type":               "Preempted",
++							"status":             "True",
++							"lastTransitionTime": nowStr,
++							"reason":             "SpotInterrupted",
++							"message":            fmt.Sprintf("Preempted %d replicas due to cloud spot interruption", interrupted),
++						}
++						for ci, c := range condList {
++							if cMap, ok := c.(map[string]interface{}); ok {
++								if cMap["type"] == "Preempted" {
++									condList[ci] = newCond
++									condFound = true
++									break
++								}
++							}
++						}
++						if !condFound {
++							condList = append(condList, newCond)
++						}
++						_ = unstructured.SetNestedSlice(currentWl.Object, condList, "status", "conditions")
++
++						return r.Status().Update(ctx, currentWl)
++					}
++					return nil
++				})
++			}
++		}
++	}
++
++	// Step 2: Update RayCluster spec with contracted replicas and scaleStrategy.
++	// Preserves original maxReplicas so self-healing elastic re-expansion is possible.
 +	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-+		latest := &unstructured.Unstructured{}
-+		latest.SetGroupVersionKind(rayClusterGVK)
-+		if err := r.Get(ctx, client.ObjectKey{Namespace: cm.Namespace, Name: targetCluster}, latest); err != nil {
++		latestRc := &unstructured.Unstructured{}
++		latestRc.SetGroupVersionKind(rayClusterGVK)
++		if err := r.Get(ctx, client.ObjectKey{Namespace: cm.Namespace, Name: targetCluster}, latestRc); err != nil {
 +			return err
 +		}
-+		wgs, found, _ := unstructured.NestedSlice(latest.Object, "spec", "workerGroupSpecs")
-+		if !found || len(wgs) == 0 {
++		wgsNow, found, _ := unstructured.NestedSlice(latestRc.Object, "spec", "workerGroupSpecs")
++		if !found || len(wgsNow) == 0 {
 +			return nil
 +		}
-+		modified := false
-+		for i, wg := range wgs {
++		rcModified := false
++		for i, wg := range wgsNow {
 +			wgMap, ok := wg.(map[string]interface{})
 +			if !ok {
 +				continue
 +			}
-+			if wgMap["groupName"] == groupName || groupName == "" {
-+				curReplicas, _ := wgMap["replicas"].(int64)
-+				minReplicas, _ := wgMap["minReplicas"].(int64)
-+				effectiveMin := minReplicas
-+				if effectiveMin <= 0 {
-+					effectiveMin = 1
-+				}
-+				if curReplicas > effectiveMin {
-+					newReplicas := curReplicas - interrupted
-+					if newReplicas < effectiveMin {
-+						newReplicas = effectiveMin
-+					}
-+					if newReplicas < curReplicas {
-+						logger.Info("contracting workerGroup replicas and maxReplicas to match surviving capacity",
-+							"cluster", targetCluster, "old", curReplicas, "new", newReplicas)
-+						wgMap["replicas"] = newReplicas
-+						wgMap["maxReplicas"] = newReplicas
++			curGroupName, _ := wgMap["groupName"].(string)
++			if counts, ok := contractedGroups[curGroupName]; ok {
++				logger.Info("contracting workerGroup replicas to match surviving capacity",
++					"cluster", targetCluster, "group", curGroupName, "old", counts.oldCount, "new", counts.newCount)
++				wgMap["replicas"] = counts.newCount
 +
-+						if targetPod != "" {
-+							strategy, _, _ := unstructured.NestedMap(wgMap, "scaleStrategy")
-+							if strategy == nil {
-+								strategy = map[string]interface{}{}
-+							}
-+							toDelete, _, _ := unstructured.NestedStringSlice(strategy, "workersToDelete")
-+							toDelete = append(toDelete, targetPod)
-+							strategy["workersToDelete"] = toDelete
-+							wgMap["scaleStrategy"] = strategy
-+						}
-+
-+						wgs[i] = wgMap
-+						modified = true
++				if targetPod != "" {
++					strategy, _, _ := unstructured.NestedMap(wgMap, "scaleStrategy")
++					if strategy == nil {
++						strategy = map[string]interface{}{}
 +					}
++					toDelete, _, _ := unstructured.NestedStringSlice(strategy, "workersToDelete")
++					toDelete = append(toDelete, targetPod)
++					strategy["workersToDelete"] = toDelete
++					wgMap["scaleStrategy"] = strategy
 +				}
++
++				wgsNow[i] = wgMap
++				rcModified = true
 +			}
 +		}
-+		if modified {
-+			_ = unstructured.SetNestedSlice(latest.Object, wgs, "spec", "workerGroupSpecs")
-+			return r.Update(ctx, latest)
++		if rcModified {
++			_ = unstructured.SetNestedSlice(latestRc.Object, wgsNow, "spec", "workerGroupSpecs")
++			return r.Update(ctx, latestRc)
 +		}
 +		return nil
 +	})
@@ -134,7 +341,7 @@ index 0000000..797af98
 +		return ctrl.Result{}, err
 +	}
 +
-+	// Mark processed for idempotency
++	// Step 3: Mark processed for idempotency
 +	_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 +		latestCm := &corev1.ConfigMap{}
 +		if err := r.Get(ctx, req.NamespacedName, latestCm); err != nil {

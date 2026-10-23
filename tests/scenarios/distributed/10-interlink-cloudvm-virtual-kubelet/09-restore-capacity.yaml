@@ -1,0 +1,9 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opportunistic-burst-job
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudvm-spot-interruption

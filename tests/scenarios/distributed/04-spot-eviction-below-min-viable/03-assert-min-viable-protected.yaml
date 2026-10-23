@@ -10,4 +10,4 @@ spec:
     - groupName: spot-workers
       replicas: 2
       minReplicas: 2
-      maxReplicas: 2
+      maxReplicas: 6

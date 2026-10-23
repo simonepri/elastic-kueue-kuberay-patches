@@ -1,0 +1,43 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 20-interlink-cloudvm-virtual-kubelet
+spec:
+  description: >
+    Verifies end-to-end hybrid Ray cluster bursting onto an InterLink Virtual Kubelet node
+    (interlink-cloudvm-plugin) under realistic network and provisioning latencies.
+    Simulates:
+    1. Cold-start VM provisioning latency (10s initial readiness probe delay for VM boot/pull).
+    2. Ray GCS RPC reconnection and heartbeat jitter tolerance across virtual boundaries.
+    3. Realistic 15s termination grace period latency during partial preemption and spot
+       interruption without double-counting quota, tripping Kueue recovery timeouts, or evicting
+       the Ray head pod.
+  steps:
+    - name: setup-interlink-and-queues
+      try:
+        - apply:
+            file: 00-interlink-setup.yaml
+    - name: submit-hybrid-raycluster-with-provisioning-latency
+      try:
+        - apply:
+            file: 01-raycluster-hybrid.yaml
+        - assert:
+            file: 02-assert-hybrid-active.yaml
+    - name: trigger-partial-preemption-with-termination-grace-latency
+      try:
+        - apply:
+            file: 03-preemptor-burst-job.yaml
+        - assert:
+            file: 04-assert-partial-preemption.yaml
+    - name: restore-quota-and-verify-elastic-reexpansion
+      try:
+        - delete:
+            file: 05-restore-capacity.yaml
+        - assert:
+            file: 06-assert-elastic-reexpanded.yaml
+    - name: simulate-cloud-spot-interruption-notice
+      try:
+        - apply:
+            file: 07-cloud-spot-interruption-notice.yaml
+        - assert:
+            file: 08-assert-spot-contracted.yaml

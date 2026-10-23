@@ -1,0 +1,10 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: hybrid-interlink-raycluster
+spec:
+  workerGroupSpecs:
+    - groupName: interlink-spot-workers
+      replicas: 2
+    - groupName: local-workers
+      replicas: 1

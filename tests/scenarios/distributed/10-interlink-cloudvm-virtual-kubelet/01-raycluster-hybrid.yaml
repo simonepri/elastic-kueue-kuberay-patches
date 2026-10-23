@@ -1,0 +1,72 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: hybrid-interlink-raycluster
+  labels:
+    kueue.x-k8s.io/queue-name: interlink-cloudvm-local-queue
+    kueue.x-k8s.io/priority-class: pc-cloudvm-low
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      gcs-rpc-server-reconnect-timeout-s: "60"
+      raylet-heartbeat-timeout-milliseconds: "30000"
+    template:
+      spec:
+        priorityClassName: pc-cloudvm-low
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: interlink-spot-workers
+      replicas: 4
+      minReplicas: 2
+      maxReplicas: 8
+      rayStartParams:
+        raylet-heartbeat-timeout-milliseconds: "30000"
+      template:
+        spec:
+          priorityClassName: pc-cloudvm-low
+          terminationGracePeriodSeconds: 15
+          nodeSelector:
+            node.kubernetes.io/instance-type: interlink-cloudvm
+          tolerations:
+            - key: "virtual-kubelet.io/provider"
+              operator: "Exists"
+              effect: "NoSchedule"
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              readinessProbe:
+                exec:
+                  command: ["/bin/sh", "-c", "ray health-check --address 127.0.0.1:6379 || exit 0"]
+                initialDelaySeconds: 10
+                periodSeconds: 5
+              resources:
+                requests:
+                  cpu: "4"
+                  memory: "16Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"
+    - groupName: local-workers
+      replicas: 1
+      maxReplicas: 2
+      rayStartParams: {}
+      template:
+        spec:
+          priorityClassName: pc-cloudvm-low
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"

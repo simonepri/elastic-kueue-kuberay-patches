@@ -1,0 +1,193 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pc-cloudvm-low
+value: 100
+globalDefault: false
+description: "Low priority for background Ray workloads"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pc-cloudvm-high
+value: 1000
+globalDefault: false
+description: "High priority for preempting burst workloads"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: pc-cloudvm-low
+value: 100
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: pc-cloudvm-high
+value: 1000
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: interlink-cloudvm-plugin
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: interlink-cloudvm-plugin
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: interlink-cloudvm-plugin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: interlink-cloudvm-plugin
+subjects:
+  - kind: ServiceAccount
+    name: interlink-cloudvm-plugin
+    namespace: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: interlink-cloudvm-plugin
+  namespace: default
+spec:
+  type: ClusterIP
+  ports:
+    - port: 4040
+      targetPort: 4040
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: interlink-cloudvm-plugin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: interlink-cloudvm-plugin
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: interlink-cloudvm-plugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: interlink-cloudvm-plugin
+    spec:
+      serviceAccountName: interlink-cloudvm-plugin
+      containers:
+        - name: provider
+          image: ghcr.io/simonepri/interlink-cloudvm-plugin:0.2.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PORT
+              value: "4040"
+            - name: PROVIDER_TYPE
+              value: "mock"
+            - name: CLUSTER_TAG
+              value: "interlink-cloudvm-test"
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: IDLE_GRACE_PERIOD
+              value: "60s"
+            - name: TOKEN_STORE_PATH
+              value: "/tmp/tokens.json"
+            - name: COMPLETED_STORE_PATH
+              value: "/tmp/completed-pods.json"
+            - name: TOMBSTONE_STORE_PATH
+              value: "/tmp/tombstones.json"
+            - name: REGION_STORE_PATH
+              value: "/tmp/instance-regions.json"
+          ports:
+            - name: http
+              containerPort: 4040
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 4040
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 4040
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: node-cloudvm-virtual-01
+  labels:
+    node.kubernetes.io/instance-type: interlink-cloudvm
+    topology.kubernetes.io/region: us-east-1
+    node.kubernetes.io/capacity-type: spot
+    type: virtual-kubelet
+status:
+  capacity:
+    cpu: "64"
+    memory: "256Gi"
+    nvidia.com/gpu: "8"
+  allocatable:
+    cpu: "64"
+    memory: "256Gi"
+    nvidia.com/gpu: "8"
+  conditions:
+    - type: Ready
+      status: "True"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: local-head-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: interlink-cloudvm-flavor
+spec:
+  nodeLabels:
+    node.kubernetes.io/instance-type: interlink-cloudvm
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: interlink-cloudvm-cluster-queue
+spec:
+  namespaceSelector: {}
+  preemption:
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: local-head-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "0"
+        - name: interlink-cloudvm-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "64"
+            - name: "memory"
+              nominalQuota: "256Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "4"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: interlink-cloudvm-local-queue
+spec:
+  clusterQueue: interlink-cloudvm-cluster-queue

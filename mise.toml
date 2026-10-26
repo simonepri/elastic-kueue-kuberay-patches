@@ -18,14 +18,18 @@ KUEUE_UPSTREAM = "v0.20.3"
 KUBERAY_UPSTREAM = "v1.7.1"
 # renovate: datasource=github-releases depName=kubernetes-sigs/karpenter
 KARPENTER_UPSTREAM = "v1.15.1"
+# renovate: datasource=github-releases depName=interlink-hq/interLink
+INTERLINK_UPSTREAM = "0.6.2"
 
 # Internal patchset versions (tracks release-please manifests)
 KUEUE_PATCH_VERSION = "0.3.0"
 KUBERAY_PATCH_VERSION = "0.3.0"
+INTERLINK_PATCH_VERSION = "0.1.0" # x-release-please-version
 
 # Derived full image tags: <upstream>-p<patch_version>
 KUEUE_IMAGE_TAG = "{{env.KUEUE_UPSTREAM}}-p{{env.KUEUE_PATCH_VERSION}}"
 KUBERAY_IMAGE_TAG = "{{env.KUBERAY_UPSTREAM}}-p{{env.KUBERAY_PATCH_VERSION}}"
+INTERLINK_IMAGE_TAG = "{{env.INTERLINK_UPSTREAM}}-p{{env.INTERLINK_PATCH_VERSION}}"
 
 [tasks."clone:kueue"]
 description = "Clone upstream Kueue at target version"
@@ -44,6 +48,16 @@ if [ ! -d third_party/kuberay/.git ]; then
   mkdir -p third_party
   echo "Cloning KubeRay $KUBERAY_UPSTREAM..."
   git clone --depth 1 --branch "$KUBERAY_UPSTREAM" https://github.com/ray-project/kuberay.git third_party/kuberay
+fi
+"""
+
+[tasks."clone:interlink"]
+description = "Clone upstream interLink at target version"
+run = """
+if [ ! -d third_party/interlink/.git ]; then
+  mkdir -p third_party
+  echo "Cloning interLink $INTERLINK_UPSTREAM..."
+  git clone --depth 1 --branch "$INTERLINK_UPSTREAM" https://github.com/interlink-hq/interLink.git third_party/interlink
 fi
 """
 
@@ -71,9 +85,21 @@ for p in ../../patches/kuberay/*.patch; do
 done
 """
 
+[tasks."patch:interlink"]
+description = "Apply patches to third_party/interlink"
+depends = ["clone:interlink"]
+run = """
+cd third_party/interlink
+for p in ../../patches/interlink/*.patch; do
+  [ -f "$p" ] || continue
+  echo "Applying patch $p..."
+  git apply --whitespace=nowarn "$p" || true
+done
+"""
+
 [tasks.patch]
 description = "Apply all patches to third_party dependencies"
-depends = ["patch:kueue", "patch:kuberay"]
+depends = ["patch:kueue", "patch:kuberay", "patch:interlink"]
 
 [tasks."build:kueue"]
 description = "Build patched Kueue image"
@@ -95,9 +121,25 @@ KUBERAY_IMG=$(cat .kuberay-image.txt)
 echo "Built KubeRay image: $KUBERAY_IMG"
 """
 
+[tasks."build:interlink"]
+description = "Build patched interLink virtual kubelet image"
+depends = ["patch:interlink"]
+run = """
+docker build -f docker/interlink.Dockerfile --build-arg VERSION=$INTERLINK_IMAGE_TAG -t kind.local/interlink-virtual-kubelet:$INTERLINK_IMAGE_TAG -t kind.local/interlink-virtual-kubelet:latest third_party/interlink
+echo "kind.local/interlink-virtual-kubelet:$INTERLINK_IMAGE_TAG" > .interlink-image.txt
+INTERLINK_IMG=$(cat .interlink-image.txt)
+echo "Built interLink virtual kubelet image: $INTERLINK_IMG"
+"""
+
+[tasks."test:interlink"]
+description = "Run patched interLink virtual kubelet unit tests"
+depends = ["patch:interlink"]
+dir = "third_party/interlink"
+run = "go test ./pkg/virtualkubelet/..."
+
 [tasks.build]
 description = "Build all patched controller images"
-depends = ["build:kueue", "build:kuberay"]
+depends = ["build:kueue", "build:kuberay", "build:interlink"]
 
 [tasks."publish:kueue"]
 description = "Build and publish patched Kueue multi-arch image to GHCR"
@@ -127,9 +169,24 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   third_party/kuberay/ray-operator
 """
 
+[tasks."publish:interlink"]
+description = "Build and publish patched interLink virtual kubelet multi-arch image to GHCR"
+depends = ["patch:interlink"]
+run = """
+TAG="${INTERLINK_UPSTREAM}-p${INTERLINK_PATCH_VERSION}"
+echo "Publishing interLink virtual kubelet image ghcr.io/simonepri/interlink-virtual-kubelet:$TAG..."
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/interlink.Dockerfile \
+  --build-arg VERSION="$TAG" \
+  -t "ghcr.io/simonepri/interlink-virtual-kubelet:$TAG" \
+  -t "ghcr.io/simonepri/interlink-virtual-kubelet:latest" \
+  --push \
+  third_party/interlink
+"""
+
 [tasks.publish]
 description = "Build and publish all patched images to GHCR"
-depends = ["publish:kueue", "publish:kuberay"]
+depends = ["publish:kueue", "publish:kuberay", "publish:interlink"]
 
 [tasks."cluster:up"]
 description = "Spin up Kind cluster and deploy patched controllers directly"

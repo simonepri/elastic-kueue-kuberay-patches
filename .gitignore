@@ -6,5 +6,6 @@ bin/
 # Cloned upstream sources for ko build
 third_party/kueue/
 third_party/kuberay/
+third_party/interlink/
 
 .*-image.txt

@@ -47,6 +47,14 @@
       ],
       "semanticCommitType": "feat",
       "semanticCommitScope": "kuberay"
+    },
+    {
+      "description": "Use feat(interlink) commit type for interLink upstream updates to trigger Release Please",
+      "matchPackageNames": [
+        "interlink-hq/interLink"
+      ],
+      "semanticCommitType": "feat",
+      "semanticCommitScope": "interlink"
     }
   ],
   "customManagers": [

@@ -1,0 +1,270 @@
+Update the container status that a remote status names.
+
+handleContainersUpdate and handleInitContainersUpdate looked up each remote
+status by name, appended it when no in-cluster status matched, and kept the
+index at 0. The update then landed on the first container's status: it was
+marked Ready and Running for a container that never started, and a terminated
+remote status panicked on the first entry's nil Terminated state.
+
+trackedContainerStatus returns the in-cluster entry to update. A name that
+belongs to the pod spec but has no status yet is appended and updated at its
+own index (len-1). A name outside the pod spec gets a detached copy, so it
+still counts toward the pod phase as before but never adds a status the pod
+spec cannot account for.
+
+Depends on 0001 for the shared test fixtures.
+
+Upstream status: reported to interlink-hq/interLink in a drafted issue, not
+yet filed (see readme).
+
+diff --git a/pkg/virtualkubelet/execute.go b/pkg/virtualkubelet/execute.go
+index b3590df..2d1a53a 100644
+--- a/pkg/virtualkubelet/execute.go
++++ b/pkg/virtualkubelet/execute.go
+@@ -1349,6 +1349,27 @@ func RemoteExecution(ctx context.Context, config Config, p *Provider, pod *v1.Po
+ 	}
+ 	return nil
+ }
++
++// trackedContainerStatus returns the entry of statuses that records remote, so
++// callers update the status of the container the remote status names. A name
++// that belongs to specs but has no entry yet is appended; a name outside specs
++// gets a detached copy, so updates to it never reach the pod status.
++func trackedContainerStatus(statuses *[]v1.ContainerStatus, specs []v1.Container, remote v1.ContainerStatus) *v1.ContainerStatus {
++	for i := range *statuses {
++		if (*statuses)[i].Name == remote.Name {
++			(*statuses)[i] = remote
++			return &(*statuses)[i]
++		}
++	}
++	for _, spec := range specs {
++		if spec.Name == remote.Name {
++			*statuses = append(*statuses, remote)
++			return &(*statuses)[len(*statuses)-1]
++		}
++	}
++	return &remote
++}
++
+ func handleInitContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus, podRefInCluster *v1.Pod, nInitContainersInPod int) (bool, bool, bool, string, int) {
+ 	log.G(ctx).Debug("Init containers detected, going to check them first")
+ 
+@@ -1359,43 +1380,28 @@ func handleInitContainersUpdate(ctx context.Context, podRemoteStatus types.PodSt
+ 	podInit := false
+ 
+ 	for _, containerRemoteStatus := range podRemoteStatus.InitContainers {
+-		index := 0
+-		foundCt := false
+-
+-		for i, checkedContainer := range podRefInCluster.Status.InitContainerStatuses {
+-			if checkedContainer.Name == containerRemoteStatus.Name {
+-				foundCt = true
+-				index = i
+-				break
+-			}
+-		}
+-
+-		if !foundCt {
+-			podRefInCluster.Status.InitContainerStatuses = append(podRefInCluster.Status.InitContainerStatuses, containerRemoteStatus)
+-		} else {
+-			podRefInCluster.Status.InitContainerStatuses[index] = containerRemoteStatus
+-		}
++		status := trackedContainerStatus(&podRefInCluster.Status.InitContainerStatuses, podRefInCluster.Spec.InitContainers, containerRemoteStatus)
+ 
+ 		switch {
+ 		case containerRemoteStatus.State.Terminated != nil:
+ 			counterOfTerminatedInitContainers++
+-			podRefInCluster.Status.InitContainerStatuses[index].State.Terminated.ExitCode = containerRemoteStatus.State.Terminated.ExitCode
+-			podRefInCluster.Status.InitContainerStatuses[index].State.Terminated.Reason = PodPhaseCompleted
++			status.State.Terminated.ExitCode = containerRemoteStatus.State.Terminated.ExitCode
++			status.State.Terminated.Reason = PodPhaseCompleted
+ 			if containerRemoteStatus.State.Terminated.ExitCode != 0 {
+ 				podErrored = true
+ 				failedReason = "Error: " + strconv.Itoa(int(containerRemoteStatus.State.Terminated.ExitCode))
+-				podRefInCluster.Status.InitContainerStatuses[index].State.Terminated.Reason = failedReason
++				status.State.Terminated.Reason = failedReason
+ 				log.G(ctx).Error("Container " + containerRemoteStatus.Name + " exited with error: " + strconv.Itoa(int(containerRemoteStatus.State.Terminated.ExitCode)))
+ 			}
+ 		case containerRemoteStatus.State.Waiting != nil:
+ 			log.G(ctx).Info("Pod " + podRemoteStatus.PodName + ": Service " + containerRemoteStatus.Name + " is setting up on Sidecar")
+ 			podWaitingForInitContainers = true
+-			podRefInCluster.Status.InitContainerStatuses[index].State.Waiting = containerRemoteStatus.State.Waiting
++			status.State.Waiting = containerRemoteStatus.State.Waiting
+ 		case containerRemoteStatus.State.Running != nil:
+ 			podInit = true
+ 			log.G(ctx).Debug("Pod " + podRemoteStatus.PodName + ": Service " + containerRemoteStatus.Name + " is running on Sidecar")
+-			podRefInCluster.Status.InitContainerStatuses[index].State.Running = containerRemoteStatus.State.Running
+-			podRefInCluster.Status.InitContainerStatuses[index].State.Waiting = nil
++			status.State.Running = containerRemoteStatus.State.Running
++			status.State.Waiting = nil
+ 		}
+ 	}
+ 	if counterOfTerminatedInitContainers == nInitContainersInPod {
+@@ -1412,34 +1418,18 @@ func handleContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus
+ 	podRunning := false
+ 
+ 	for _, containerRemoteStatus := range podRemoteStatus.Containers {
+-		index := 0
+-		foundCt := false
+-
+-		for i, checkedContainer := range podRefInCluster.Status.ContainerStatuses {
+-			if checkedContainer.Name == containerRemoteStatus.Name {
+-				foundCt = true
+-				index = i
+-				break
+-			}
+-		}
+-
+-		// if it is the first time checking the container, append it to the pod containers, otherwise just update the correct item
+-		if !foundCt {
+-			podRefInCluster.Status.ContainerStatuses = append(podRefInCluster.Status.ContainerStatuses, containerRemoteStatus)
+-		} else {
+-			podRefInCluster.Status.ContainerStatuses[index] = containerRemoteStatus
+-		}
++		status := trackedContainerStatus(&podRefInCluster.Status.ContainerStatuses, podRefInCluster.Spec.Containers, containerRemoteStatus)
+ 
+ 		// if the pod is waiting for the starting of the init containers or some of them are still running
+ 		// all the other containers are in waiting state
+ 		if podWaitingForInitContainers || podInit {
+-			podRefInCluster.Status.ContainerStatuses[index].State.Waiting = &v1.ContainerStateWaiting{Reason: "Waiting for init containers"}
+-			podRefInCluster.Status.ContainerStatuses[index].State.Running = nil
+-			podRefInCluster.Status.ContainerStatuses[index].State.Terminated = nil
++			status.State.Waiting = &v1.ContainerStateWaiting{Reason: "Waiting for init containers"}
++			status.State.Running = nil
++			status.State.Terminated = nil
+ 			if podInit {
+-				podRefInCluster.Status.ContainerStatuses[index].State.Waiting.Reason = "Init:" + strconv.Itoa(counterOfTerminatedInitContainers) + "/" + strconv.Itoa(nInitContainersInPod)
++				status.State.Waiting.Reason = "Init:" + strconv.Itoa(counterOfTerminatedInitContainers) + "/" + strconv.Itoa(nInitContainersInPod)
+ 			} else {
+-				podRefInCluster.Status.ContainerStatuses[index].State.Waiting.Reason = "PodInitializing"
++				status.State.Waiting.Reason = "PodInitializing"
+ 			}
+ 		} else {
+ 			// if plugin cannot return any non-terminated container set the status to terminated
+@@ -1448,11 +1438,11 @@ func handleContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus
+ 			case containerRemoteStatus.State.Terminated != nil:
+ 				log.G(ctx).Debug("Pod " + podRemoteStatus.PodName + ": Service " + containerRemoteStatus.Name + " is not running on Plugin side")
+ 				counterOfTerminatedContainers++
+-				podRefInCluster.Status.ContainerStatuses[index].State.Terminated.Reason = PodPhaseCompleted
++				status.State.Terminated.Reason = PodPhaseCompleted
+ 				if containerRemoteStatus.State.Terminated.ExitCode != 0 {
+ 					podErrored = true
+ 					failedReason = "Error: " + strconv.Itoa(int(containerRemoteStatus.State.Terminated.ExitCode))
+-					podRefInCluster.Status.ContainerStatuses[index].State.Terminated.Reason = failedReason
++					status.State.Terminated.Reason = failedReason
+ 					log.G(ctx).Error("Container " + containerRemoteStatus.Name + " exited with error: " + strconv.Itoa(int(containerRemoteStatus.State.Terminated.ExitCode)))
+ 				}
+ 			case containerRemoteStatus.State.Waiting != nil:
+@@ -1461,8 +1451,8 @@ func handleContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus
+ 				podRunning = true
+ 				log.G(ctx).Debug("Pod " + podRemoteStatus.PodName + ": Service " + containerRemoteStatus.Name + " is running on Sidecar")
+ 				podRefInCluster.Status.Phase = v1.PodPhase(v1.PodReady)
+-				podRefInCluster.Status.ContainerStatuses[index].Ready = true
+-				podRefInCluster.Status.ContainerStatuses[index].State.Running = containerRemoteStatus.State.Running
++				status.Ready = true
++				status.State.Running = containerRemoteStatus.State.Running
+ 			}
+ 		}
+ 	}
+diff --git a/pkg/virtualkubelet/execute_container_status_test.go b/pkg/virtualkubelet/execute_container_status_test.go
+new file mode 100644
+index 0000000..9d569ec
+--- /dev/null
++++ b/pkg/virtualkubelet/execute_container_status_test.go
+@@ -0,0 +1,96 @@
++package virtualkubelet
++
++import (
++	"context"
++	"testing"
++
++	types "github.com/interlink-hq/interlink/pkg/interlink"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++func runningStatus(name string) v1.ContainerStatus {
++	return v1.ContainerStatus{
++		Name:  name,
++		State: v1.ContainerState{Running: &v1.ContainerStateRunning{StartedAt: metav1.Now()}},
++	}
++}
++
++// TestHandleContainersUpdateUnknownContainer covers remote statuses whose name
++// matches no in-cluster status: the update must never land on another
++// container's entry, and names outside the pod spec must not be added.
++func TestHandleContainersUpdateUnknownContainer(t *testing.T) {
++	ctx := context.Background()
++
++	t.Run("running status for a name outside the spec leaves other containers untouched", func(t *testing.T) {
++		pod := statusTestPod("main")
++		pod.Status.ContainerStatuses = []v1.ContainerStatus{waitingStatus("main")}
++		remote := types.PodStatus{PodName: pod.Name, Containers: []v1.ContainerStatus{runningStatus("plugin-helper")}}
++
++		_, _, _, podRunning := handleContainersUpdate(ctx, remote, pod, false, false, 0, 0)
++
++		assert.True(t, podRunning)
++		require.Len(t, pod.Status.ContainerStatuses, 1)
++		assert.Equal(t, "main", pod.Status.ContainerStatuses[0].Name)
++		assert.False(t, pod.Status.ContainerStatuses[0].Ready)
++		assert.Nil(t, pod.Status.ContainerStatuses[0].State.Running)
++		assert.NotNil(t, pod.Status.ContainerStatuses[0].State.Waiting)
++	})
++
++	t.Run("terminated status for a name outside the spec does not panic", func(t *testing.T) {
++		pod := statusTestPod("main")
++		pod.Status.ContainerStatuses = []v1.ContainerStatus{waitingStatus("main")}
++		remote := types.PodStatus{PodName: pod.Name, Containers: []v1.ContainerStatus{terminatedStatus("plugin-helper", 2)}}
++
++		var terminated int
++		var podErrored bool
++		require.NotPanics(t, func() {
++			terminated, podErrored, _, _ = handleContainersUpdate(ctx, remote, pod, false, false, 0, 0)
++		})
++
++		assert.Equal(t, 1, terminated)
++		assert.True(t, podErrored)
++		require.Len(t, pod.Status.ContainerStatuses, 1)
++		assert.NotNil(t, pod.Status.ContainerStatuses[0].State.Waiting)
++		assert.Nil(t, pod.Status.ContainerStatuses[0].State.Terminated)
++	})
++
++	t.Run("spec container without a status entry is appended and updated in place", func(t *testing.T) {
++		pod := statusTestPod("main", "worker")
++		pod.Status.ContainerStatuses = []v1.ContainerStatus{waitingStatus("main")}
++		remote := types.PodStatus{PodName: pod.Name, Containers: []v1.ContainerStatus{runningStatus("worker")}}
++
++		handleContainersUpdate(ctx, remote, pod, false, false, 0, 0)
++
++		require.Len(t, pod.Status.ContainerStatuses, 2)
++		assert.False(t, pod.Status.ContainerStatuses[0].Ready)
++		assert.NotNil(t, pod.Status.ContainerStatuses[0].State.Waiting)
++		assert.Equal(t, "worker", pod.Status.ContainerStatuses[1].Name)
++		assert.True(t, pod.Status.ContainerStatuses[1].Ready)
++		assert.NotNil(t, pod.Status.ContainerStatuses[1].State.Running)
++	})
++}
++
++// TestHandleInitContainersUpdateUnknownContainer applies the same invariant to
++// init container statuses.
++func TestHandleInitContainersUpdateUnknownContainer(t *testing.T) {
++	ctx := context.Background()
++
++	pod := statusTestPod("main")
++	pod.Spec.InitContainers = []v1.Container{{Name: "init", Image: "busybox"}}
++	pod.Status.InitContainerStatuses = []v1.ContainerStatus{waitingStatus("init")}
++	remote := types.PodStatus{PodName: pod.Name, InitContainers: []v1.ContainerStatus{terminatedStatus("plugin-init", 3)}}
++
++	var podErrored bool
++	require.NotPanics(t, func() {
++		_, _, podErrored, _, _ = handleInitContainersUpdate(ctx, remote, pod, 1)
++	})
++
++	assert.True(t, podErrored)
++	require.Len(t, pod.Status.InitContainerStatuses, 1)
++	assert.Equal(t, "init", pod.Status.InitContainerStatuses[0].Name)
++	assert.NotNil(t, pod.Status.InitContainerStatuses[0].State.Waiting)
++	assert.Nil(t, pod.Status.InitContainerStatuses[0].State.Terminated)
++}

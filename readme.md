@@ -6,8 +6,9 @@
 [![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.20.2-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.2)
 [![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.7.1-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.7.1)
 [![Tested on Karpenter](https://img.shields.io/badge/tested%20on%20karpenter-v1.15.0-blue)](https://github.com/kubernetes-sigs/karpenter/releases/tag/v1.15.0)
+[![Tested on interLink](https://img.shields.io/badge/tested%20on%20interlink-0.6.2-blue)](https://github.com/interlink-hq/interLink/releases/tag/0.6.2)
 
-Production patchsets for running elastic, multi-tenant Ray clusters on Kubernetes with [Kueue](https://github.com/kubernetes-sigs/kueue), [KubeRay](https://github.com/ray-project/kuberay), and [Karpenter](https://github.com/kubernetes-sigs/karpenter).
+Production patchsets for running elastic, multi-tenant Ray clusters on Kubernetes with [Kueue](https://github.com/kubernetes-sigs/kueue), [KubeRay](https://github.com/ray-project/kuberay), and [Karpenter](https://github.com/kubernetes-sigs/karpenter), plus a patched [interLink](https://github.com/interlink-hq/interLink) virtual kubelet for bursting Ray workers onto remote capacity.
 
 ---
 
@@ -81,6 +82,41 @@ The table below outlines the core architectural issues in upstream controllers a
 | **4** | `ray-project/kuberay` | [`0001-actor-protect.patch`](patches/kuberay/0001-actor-protect.patch) | The Ray autoscaler terminates worker pods without Kubernetes awareness, killing pods actively executing stateful actor workloads during scale-down. | Operator inspects worker `ray.io/actor-state` labels and manages `controller.kubernetes.io/pod-deletion-cost` (e.g. `+1000` for busy actors, `-1000` for idle workers). | [`tests/scenarios/kuberay/01-actor-protect/01-actor-aware-drain`](tests/scenarios/kuberay/01-actor-protect/01-actor-aware-drain) |
 | **5** | `ray-project/kuberay` | [`0002-spot-interruption.patch`](patches/kuberay/0002-spot-interruption.patch) | Cloud spot interruptions (AWS 2-minute notice / GCP 30-second notice) trigger abrupt node termination and worker pod eviction without coordinated state drain. | Operator intercepts spot interruption notices, flags affected Ray pods, and coordinates graceful actor migration before the physical node is terminated. | [`tests/scenarios/kuberay/02-spot-interruption/01-spot-termination-drain`](tests/scenarios/kuberay/02-spot-interruption/01-spot-termination-drain) |
 | **6** | `ray-project/kuberay` | [`0003-scalegate.patch`](patches/kuberay/0003-scalegate.patch) | Ray autoscaler requests scale-up beyond ClusterQueue quota and cohort limits, leading to stuck pending pods and quota starvation for other tenants. | ScaleGate reconciler clamps `workerGroupSpecs.maxReplicas` to the ClusterQueue nominal quota plus cohort borrowing ceiling, keeping autoscaling strictly within budget. | [`tests/scenarios/kuberay/03-scalegate-quota/01-scaleup-clamping`](tests/scenarios/kuberay/03-scalegate-quota/01-scaleup-clamping) |
+| **7** | `interlink-hq/interLink` | [`0001-terminated-reason-nil-guard.patch`](patches/interlink/0001-terminated-reason-nil-guard.patch) | When a pod fails, `checkPodsStatus` rewrites `State.Terminated.Reason` on every container status; a status the plugin did not report is not terminated, so the virtual kubelet panics on a nil dereference and crash-loops the node. Upstream: [issue drafted, not filed](#interlink-upstream-issue-draft). | Rewrites the failure reason only on container statuses that are terminated. | `TestCheckPodsStatusFailedPodWithNonTerminatedContainer` in `pkg/virtualkubelet/execute_terminated_reason_test.go` (added by the patch; `mise run test:interlink`) |
+| **8** | `interlink-hq/interLink` | [`0002-container-status-index.patch`](patches/interlink/0002-container-status-index.patch) | When a remote container name matches no in-cluster status, `handleContainersUpdate` and `handleInitContainersUpdate` append it but keep updating index 0, marking the wrong container Ready or panicking on its nil `Terminated` state. Upstream: [issue drafted, not filed](#interlink-upstream-issue-draft). | Updates the entry the remote status names: a pod spec container without a status is appended and updated at its own index; a name outside the pod spec still counts toward the pod phase but is never written to the pod status. | `TestHandleContainersUpdateUnknownContainer` and `TestHandleInitContainersUpdateUnknownContainer` in `pkg/virtualkubelet/execute_container_status_test.go` (added by the patch; `mise run test:interlink`) |
+
+### interLink Upstream Issue Draft
+
+The following issue for `interlink-hq/interLink` covers patches 7 and 8. It is drafted here and not yet filed.
+
+<details>
+<summary><b>Virtual kubelet panics or updates the wrong container status in checkPodsStatus</b></summary>
+
+**Version:** 0.6.2 (`pkg/virtualkubelet/execute.go`)
+
+**1. Nil dereference when a failed pod has a non-terminated container status**
+
+When every container the plugin reports has terminated and at least one exited non-zero, `checkPodsStatus` marks the pod `Failed` and then rewrites the reason on every in-cluster container status:
+
+```go
+for i := range podRefInCluster.Status.ContainerStatuses {
+    podRefInCluster.Status.ContainerStatuses[i].State.Terminated.Reason = failedReason
+}
+```
+
+`CreatePod` creates a status for every spec container, but the completion check compares the terminated count with the number of containers the plugin reported. If the plugin omits a container (for example one excluded from offloading), that status is still `Waiting` or `Running`, `State.Terminated` is nil, and the virtual kubelet panics while holding `podsMu`. The pod is re-polled after restart, so the node crash-loops.
+
+Expected: only statuses whose `State.Terminated` is set get the failure reason.
+
+**2. Status update lands on index 0 when the remote container name is unknown**
+
+`handleContainersUpdate` (and the same code in `handleInitContainersUpdate`) looks up the remote status by name, appends it when nothing matches, but keeps `index := 0`. Every following write (`Ready`, `State.Running`, `State.Terminated.Reason`) goes to the first container's status. A running unknown container marks the first container Ready and Running; a terminated one panics on the first container's nil `State.Terminated`.
+
+Expected: write to the entry that was found or appended. We use `len-1` after appending names that belong to the pod spec, and skip writing names outside the pod spec while still counting them toward the pod phase, since a status the spec cannot account for confuses clients that pair statuses with spec containers.
+
+**Reproduction:** unit tests in [`patches/interlink`](https://github.com/simonepri/elastic-kueue-kuberay-patches/tree/main/patches/interlink) panic or fail on 0.6.2 and pass with the fix.
+
+</details>
 
 ### Distributed Multi-Pool & Multi-Cloud Test Scenarios
 
@@ -109,6 +145,7 @@ $$\text{Image Tag} = \langle\text{upstream-version}\rangle\text{-p}\langle\text{
 Examples:
 - `ghcr.io/simonepri/kueue:v0.20.2-p0.2.0`
 - `ghcr.io/simonepri/kuberay-operator:v1.7.1-p0.2.0`
+- `ghcr.io/simonepri/interlink-virtual-kubelet:0.6.2-p0.1.0`
 
 When [Renovate](renovate.json) detects an upstream release, it opens a PR updating the upstream baseline. Once merged, [Release Please](release-please-config.json) increments the patch version independently.
 
@@ -226,6 +263,18 @@ spec:
 
 ---
 
+### 3. interLink Virtual Kubelet
+
+The patched image is a drop-in replacement for `ghcr.io/interlink-hq/interlink/virtual-kubelet-inttw:0.6.2`: it keeps the `/vk` entrypoint and runs as the distroless `nonroot` user (`65532`). Point the virtual kubelet container of your interLink deployment at it:
+
+```yaml
+containers:
+  - name: virtual-kubelet
+    image: ghcr.io/simonepri/interlink-virtual-kubelet:0.6.2-p0.1.0
+```
+
+---
+
 ## Quickstart & Local Testing
 
 This repository uses [`mise`](https://mise.jdx.dev) to manage dependencies (`go`, `kind`, `kubectl`, `chainsaw`, `helm`, `ko`, `colima`, `docker-cli`).
@@ -243,6 +292,9 @@ mise run cluster:up
 
 # Run all integration test scenarios across Kueue and KubeRay
 mise run test
+
+# Run the patched interLink virtual kubelet unit tests
+mise run test:interlink
 
 # Tear down the local Kind cluster
 mise run cluster:down

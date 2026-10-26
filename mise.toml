@@ -22,8 +22,8 @@ KARPENTER_UPSTREAM = "v1.15.1"
 INTERLINK_UPSTREAM = "0.6.2"
 
 # Internal patchset versions (tracks release-please manifests)
-KUEUE_PATCH_VERSION = "0.3.0"
-KUBERAY_PATCH_VERSION = "0.3.0"
+KUEUE_PATCH_VERSION = "0.3.2"
+KUBERAY_PATCH_VERSION = "0.3.3"
 INTERLINK_PATCH_VERSION = "0.1.0" # x-release-please-version
 
 # Derived full image tags: <upstream>-p<patch_version>

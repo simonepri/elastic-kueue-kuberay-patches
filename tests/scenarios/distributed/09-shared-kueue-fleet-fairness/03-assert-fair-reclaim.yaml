@@ -19,7 +19,7 @@ status:
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
-  name: ctrl-cell1-spot-cq
+  name: fleet-cell1-spot-cq
 status:
   flavorsReservation:
     - name: local-head-flavor
@@ -43,7 +43,7 @@ status:
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
-  name: ctrl-cell2-spot-cq
+  name: fleet-cell2-spot-cq
 status:
   flavorsReservation:
     - name: local-head-flavor

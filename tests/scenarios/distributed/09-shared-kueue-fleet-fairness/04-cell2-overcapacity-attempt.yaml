@@ -12,7 +12,7 @@ spec:
       template:
         spec:
           nodeSelector:
-            cell.boltz.bio/name: cell-2
+            cell.example.com/name: cell-2
             node-tier: spot
           containers:
             - name: ray-worker

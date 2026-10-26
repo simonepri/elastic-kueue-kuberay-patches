@@ -6,7 +6,7 @@ spec:
   description: >
     Verifies the two-tier fleet queue architecture:
     1. Tier 1: Local physical cell nodes are managed 100% autonomously by the local cell's Kueue.
-    2. Tier 2: The InterLink spot fleet is managed by a Shared Kueue on ctrl with cohort fair-sharing.
+    2. Tier 2: The InterLink spot fleet is managed by a Shared Kueue on the control cluster with cohort fair-sharing.
     When Cell 1 scales up and Cell 2 is idle, Cell 1 borrows spot quota beyond its nominal share.
     When Cell 2 arrives requesting its nominal share, Kueue triggers cohort reclaim, contracting
     Cell 1 and granting Cell 2 its fair share without split-capacity deadlocks or over-subscription.

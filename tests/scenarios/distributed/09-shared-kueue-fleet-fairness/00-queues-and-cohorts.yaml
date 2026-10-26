@@ -6,7 +6,7 @@ kind: Node
 metadata:
   name: node-cell1-local-worker
   labels:
-    cell.boltz.bio/name: cell-1
+    cell.example.com/name: cell-1
     node-tier: local
 status:
   capacity:
@@ -26,7 +26,7 @@ kind: Node
 metadata:
   name: node-cell2-local-worker
   labels:
-    cell.boltz.bio/name: cell-2
+    cell.example.com/name: cell-2
     node-tier: local
 status:
   capacity:
@@ -47,7 +47,7 @@ metadata:
   name: spot-virtual-node-cell1
   labels:
     node.kubernetes.io/instance-type: spot-virtual
-    cell.boltz.bio/name: cell-1
+    cell.example.com/name: cell-1
     node-tier: spot
 status:
   capacity:
@@ -68,7 +68,7 @@ metadata:
   name: spot-virtual-node-cell2
   labels:
     node.kubernetes.io/instance-type: spot-virtual
-    cell.boltz.bio/name: cell-2
+    cell.example.com/name: cell-2
     node-tier: spot
 status:
   capacity:
@@ -129,7 +129,7 @@ metadata:
   name: cell1-local-flavor
 spec:
   nodeLabels:
-    cell.boltz.bio/name: cell-1
+    cell.example.com/name: cell-1
     node-tier: local
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
@@ -138,7 +138,7 @@ metadata:
   name: cell2-local-flavor
 spec:
   nodeLabels:
-    cell.boltz.bio/name: cell-2
+    cell.example.com/name: cell-2
     node-tier: local
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
@@ -219,7 +219,7 @@ spec:
   clusterQueue: cell2-local-cq
 ---
 # ==============================================================================
-# 5. Tier 2: Shared Spot Kueue on ctrl (Cohort "depot-global-spot-fleet")
+# 5. Tier 2: Shared Spot Kueue on the control cluster (Cohort "global-spot-fleet")
 # Total Fleet Capacity: 8 GPUs (Cell 1: 4, Cell 2: 4)
 # BorrowingLimit = 4 enables bursting up to 8 GPUs when other cell is idle.
 # ReclaimStrategy = LowerPriority reclaims borrowed quota on contention.
@@ -227,10 +227,10 @@ spec:
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
-  name: ctrl-cell1-spot-cq
+  name: fleet-cell1-spot-cq
 spec:
   namespaceSelector: {}
-  cohortName: depot-global-spot-fleet
+  cohortName: global-spot-fleet
   preemption:
     withinClusterQueue: LowerPriority
     reclaimWithinCohort: Any
@@ -258,17 +258,17 @@ spec:
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
-  name: ctrl-cell1-spot-lq
+  name: fleet-cell1-spot-lq
 spec:
-  clusterQueue: ctrl-cell1-spot-cq
+  clusterQueue: fleet-cell1-spot-cq
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
-  name: ctrl-cell2-spot-cq
+  name: fleet-cell2-spot-cq
 spec:
   namespaceSelector: {}
-  cohortName: depot-global-spot-fleet
+  cohortName: global-spot-fleet
   preemption:
     withinClusterQueue: LowerPriority
     reclaimWithinCohort: Any
@@ -296,6 +296,6 @@ spec:
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
-  name: ctrl-cell2-spot-lq
+  name: fleet-cell2-spot-lq
 spec:
-  clusterQueue: ctrl-cell2-spot-cq
+  clusterQueue: fleet-cell2-spot-cq

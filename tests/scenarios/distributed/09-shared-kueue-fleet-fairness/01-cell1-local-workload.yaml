@@ -31,7 +31,7 @@ spec:
       template:
         spec:
           nodeSelector:
-            cell.boltz.bio/name: cell-1
+            cell.example.com/name: cell-1
             node-tier: local
           containers:
             - name: ray-worker

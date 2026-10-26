@@ -3,7 +3,7 @@ kind: RayCluster
 metadata:
   name: cell2-raycluster-spot
   labels:
-    kueue.x-k8s.io/queue-name: ctrl-cell2-spot-lq
+    kueue.x-k8s.io/queue-name: fleet-cell2-spot-lq
     kueue.x-k8s.io/priority-class: pc-spot-high
     ray.io/cluster: cell2-raycluster-spot
 spec:
@@ -32,7 +32,7 @@ spec:
       template:
         spec:
           nodeSelector:
-            cell.boltz.bio/name: cell-2
+            cell.example.com/name: cell-2
             node-tier: spot
           containers:
             - name: ray-worker

@@ -7,14 +7,28 @@
       "release-type": "simple",
       "skip-changelog": true,
       "bump-minor-pre-major": true,
-      "initial-version": "0.1.0"
+      "initial-version": "0.1.0",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "/mise.toml",
+          "jsonpath": "$.env.KUEUE_PATCH_VERSION"
+        }
+      ]
     },
     "patches/kuberay": {
       "component": "kuberay",
       "release-type": "simple",
       "skip-changelog": true,
       "bump-minor-pre-major": true,
-      "initial-version": "0.1.0"
+      "initial-version": "0.1.0",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "/mise.toml",
+          "jsonpath": "$.env.KUBERAY_PATCH_VERSION"
+        }
+      ]
     },
     "patches/interlink": {
       "component": "interlink",

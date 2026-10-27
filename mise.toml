@@ -23,8 +23,8 @@ INTERLINK_UPSTREAM = "0.6.2"
 
 # Internal patchset versions (tracks release-please manifests)
 KUEUE_PATCH_VERSION = "0.3.2"
-KUBERAY_PATCH_VERSION = "0.3.3"
-INTERLINK_PATCH_VERSION = "0.2.0" # x-release-please-version
+KUBERAY_PATCH_VERSION = "0.3.4"
+INTERLINK_PATCH_VERSION = "0.3.0" # x-release-please-version
 
 # Derived full image tags: <upstream>-p<patch_version>
 KUEUE_IMAGE_TAG = "{{env.KUEUE_UPSTREAM}}-p{{env.KUEUE_PATCH_VERSION}}"

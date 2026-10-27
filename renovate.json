@@ -55,6 +55,14 @@
       ],
       "semanticCommitType": "feat",
       "semanticCommitScope": "interlink"
+    },
+    {
+      "description": "Use feat(ray) commit type for Ray upstream updates to trigger Release Please",
+      "matchPackageNames": [
+        "rayproject/ray"
+      ],
+      "semanticCommitType": "feat",
+      "semanticCommitScope": "ray"
     }
   ],
   "customManagers": [

@@ -43,6 +43,20 @@
           "path": "/mise.toml"
         }
       ]
+    },
+    "patches/ray": {
+      "component": "ray",
+      "release-type": "simple",
+      "skip-changelog": true,
+      "bump-minor-pre-major": true,
+      "initial-version": "0.1.0",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "/mise.toml",
+          "jsonpath": "$.env.RAY_PATCH_VERSION"
+        }
+      ]
     }
   }
 }

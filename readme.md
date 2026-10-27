@@ -172,7 +172,7 @@ helm install kuberay-operator kuberay/kuberay-operator \
 ```
 
 #### Required RBAC Permissions
-The patched operator requires permissions to watch `ConfigMap` resources (for spot interruption notices) and Kueue `ClusterQueue` / `LocalQueue` resources (for ScaleGate quota clamping):
+The patched operator requires permissions to read Kueue `ClusterQueue` / `LocalQueue` resources (for ScaleGate quota clamping). The spot interruption controller only runs when the operator's `KUBERAY_SPOT_INTERRUPTION_NOTICES` environment variable is `true`; only then does it need the `ConfigMap` permissions below, and it caches only ConfigMaps labelled `test.k8s.io/event=spot-interrupted`:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1

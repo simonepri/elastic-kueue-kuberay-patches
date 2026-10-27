@@ -1,0 +1,134 @@
+Report the pod IP the plugin returns in its status response.
+
+The plugin's /status response was decoded into types.PodStatus, which has no
+IP fields, so the virtual kubelet set status.podIP and status.hostIP of every
+pod from its own configured PodIP. Pods on remote VMs therefore reported the
+node's placeholder address instead of their VM's address. PodStatus now
+carries optional podIP and podIPs fields, and checkPodsStatus copies them to
+the pod's podIP, podIPs, and hostIP when present; when the plugin omits them
+(for example before the VM's address is known) the configured placeholder
+stays.
+
+Upstream status: not yet reported to interlink-hq/interLink.
+
+diff --git a/pkg/interlink/types.go b/pkg/interlink/types.go
+index 5356d7c..1748285 100644
+--- a/pkg/interlink/types.go
++++ b/pkg/interlink/types.go
+@@ -42,6 +42,10 @@ type PodStatus struct {
+ 	PodNamespace string `json:"namespace"`
+ 	// JobID is the remote system's job identifier (e.g., SLURM job ID, container ID)
+ 	JobID string `json:"JID"`
++	// PodIP is the IP address of the remote workload, when the plugin knows it
++	PodIP string `json:"podIP,omitempty"`
++	// PodIPs lists all IP addresses of the remote workload, when the plugin knows them
++	PodIPs []string `json:"podIPs,omitempty"`
+ 	// Containers holds the status of all regular containers in the pod
+ 	Containers []v1.ContainerStatus `json:"containers"`
+ 	// InitContainers holds the status of all init containers in the pod
+diff --git a/pkg/virtualkubelet/execute.go b/pkg/virtualkubelet/execute.go
+index 61d17b0..b24d49d 100644
+--- a/pkg/virtualkubelet/execute.go
++++ b/pkg/virtualkubelet/execute.go
+@@ -1573,6 +1573,25 @@ func checkPodsStatus(ctx context.Context, p *Provider, pod *v1.Pod, token string
+ 			// path) do not observe a partially-updated pod status.
+ 			p.podsMu.Lock()
+ 
++			// the plugin reports the address of the remote workload when it knows it;
++			// otherwise keep the node's configured placeholder address
++			if podRemoteStatus.PodIP != "" {
++				podRefInCluster.Status.PodIP = podRemoteStatus.PodIP
++				podRefInCluster.Status.HostIP = podRemoteStatus.PodIP
++				podRefInCluster.Status.PodIPs = []v1.PodIP{{IP: podRemoteStatus.PodIP}}
++			}
++			if len(podRemoteStatus.PodIPs) > 0 {
++				podIPs := make([]v1.PodIP, 0, len(podRemoteStatus.PodIPs))
++				for _, ip := range podRemoteStatus.PodIPs {
++					podIPs = append(podIPs, v1.PodIP{IP: ip})
++				}
++				podRefInCluster.Status.PodIPs = podIPs
++				if podRemoteStatus.PodIP == "" {
++					podRefInCluster.Status.PodIP = podRemoteStatus.PodIPs[0]
++					podRefInCluster.Status.HostIP = podRemoteStatus.PodIPs[0]
++				}
++			}
++
+ 			// if there are init containers, we need to check them first
+ 			if nInitContainersInPod > 0 {
+ 				podWaitingForInitContainers, podInit, podInitErrored, failedReasonInit, counterOfTerminatedInitContainers = handleInitContainersUpdate(ctx, podRemoteStatus, podRefInCluster, nInitContainersInPod)
+diff --git a/pkg/virtualkubelet/execute_pod_ip_test.go b/pkg/virtualkubelet/execute_pod_ip_test.go
+new file mode 100644
+index 0000000..cef3175
+--- /dev/null
++++ b/pkg/virtualkubelet/execute_pod_ip_test.go
+@@ -0,0 +1,70 @@
++package virtualkubelet
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"testing"
++
++	types "github.com/interlink-hq/interlink/pkg/interlink"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	v1 "k8s.io/api/core/v1"
++)
++
++// TestCheckPodsStatusPodIP covers the pod IP the plugin reports: it replaces
++// the node's placeholder address when present and leaves it alone when absent.
++func TestCheckPodsStatusPodIP(t *testing.T) {
++	cases := []struct {
++		name       string
++		podIP      string
++		podIPs     []string
++		wantPodIP  string
++		wantHostIP string
++		wantPodIPs []string
++	}{
++		{"plugin reports an address", "203.0.113.7", []string{"203.0.113.7"}, "203.0.113.7", "203.0.113.7", []string{"203.0.113.7"}},
++		{"plugin reports only the list", "", []string{"203.0.113.8"}, "203.0.113.8", "203.0.113.8", []string{"203.0.113.8"}},
++		{"plugin reports no address", "", nil, "10.0.0.1", "10.0.0.1", []string{"10.0.0.1"}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			pod := statusTestPod("main")
++			pod.Status.ContainerStatuses = []v1.ContainerStatus{waitingStatus("main")}
++			pod.Status.PodIP = "10.0.0.1"
++			pod.Status.HostIP = "10.0.0.1"
++			pod.Status.PodIPs = []v1.PodIP{{IP: "10.0.0.1"}}
++
++			remote := []types.PodStatus{{
++				PodName:      pod.Name,
++				PodNamespace: pod.Namespace,
++				PodUID:       string(pod.UID),
++				PodIP:        tc.podIP,
++				PodIPs:       tc.podIPs,
++				Containers:   []v1.ContainerStatus{runningStatus("main")},
++			}}
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++				require.NoError(t, json.NewEncoder(w).Encode(remote))
++			}))
++			defer server.Close()
++			serverURL, err := url.Parse(server.URL)
++			require.NoError(t, err)
++
++			p := &Provider{pods: map[string]*v1.Pod{string(pod.UID): pod}}
++			config := Config{InterlinkURL: "http://" + serverURL.Hostname(), InterlinkPort: serverURL.Port()}
++
++			_, err = checkPodsStatus(context.Background(), p, pod, "", config)
++			require.NoError(t, err)
++
++			assert.Equal(t, tc.wantPodIP, pod.Status.PodIP)
++			assert.Equal(t, tc.wantHostIP, pod.Status.HostIP)
++			var got []string
++			for _, ip := range pod.Status.PodIPs {
++				got = append(got, ip.IP)
++			}
++			assert.Equal(t, tc.wantPodIPs, got)
++		})
++	}
++}

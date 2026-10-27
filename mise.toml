@@ -369,8 +369,9 @@ kubectl rollout status deployment/kuberay-operator -n default --timeout=180s
 
 # 8. Wait until every webhook the scenarios call accepts a server-side dry run
 probe() {
+  manifest=$(cat)
   for i in $(seq 1 120); do
-    if kubectl create --dry-run=server -f - >/dev/null 2>&1; then
+    if echo "$manifest" | kubectl create --dry-run=server -f - >/dev/null 2>&1; then
       return 0
     fi
     sleep 1

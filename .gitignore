@@ -7,5 +7,6 @@ bin/
 third_party/kueue/
 third_party/kuberay/
 third_party/interlink/
+third_party/ray/
 
 .*-image.txt

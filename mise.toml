@@ -20,16 +20,21 @@ KUBERAY_UPSTREAM = "v1.7.1"
 KARPENTER_UPSTREAM = "v1.15.1"
 # renovate: datasource=github-releases depName=interlink-hq/interLink
 INTERLINK_UPSTREAM = "0.6.2"
+# renovate: datasource=docker depName=rayproject/ray
+RAY_UPSTREAM = "2.59.0"
+RAY_PYTHON = "py313"
 
 # Internal patchset versions (tracks release-please manifests)
 KUEUE_PATCH_VERSION = "0.3.2"
 KUBERAY_PATCH_VERSION = "0.3.5"
 INTERLINK_PATCH_VERSION = "0.5.0" # x-release-please-version
+RAY_PATCH_VERSION = "0.1.0"
 
 # Derived full image tags: <upstream>-p<patch_version>
 KUEUE_IMAGE_TAG = "{{env.KUEUE_UPSTREAM}}-p{{env.KUEUE_PATCH_VERSION}}"
 KUBERAY_IMAGE_TAG = "{{env.KUBERAY_UPSTREAM}}-p{{env.KUBERAY_PATCH_VERSION}}"
 INTERLINK_IMAGE_TAG = "{{env.INTERLINK_UPSTREAM}}-p{{env.INTERLINK_PATCH_VERSION}}"
+RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}-p{{env.RAY_PATCH_VERSION}}"
 
 [tasks."clone:kueue"]
 description = "Clone upstream Kueue at target version"
@@ -58,6 +63,20 @@ if [ ! -d third_party/interlink/.git ]; then
   mkdir -p third_party
   echo "Cloning interLink $INTERLINK_UPSTREAM..."
   git clone --depth 1 --branch "$INTERLINK_UPSTREAM" https://github.com/interlink-hq/interLink.git third_party/interlink
+fi
+"""
+
+[tasks."clone:ray"]
+description = "Sparse-clone the upstream Ray files that patches/ray touches"
+run = """
+if [ ! -d third_party/ray/.git ]; then
+  mkdir -p third_party/ray
+  echo "Cloning Ray $RAY_UPSTREAM files touched by patches/ray..."
+  git -C third_party/ray init -q
+  git -C third_party/ray remote add origin https://github.com/ray-project/ray.git
+  git -C third_party/ray sparse-checkout set --no-cone $(sed -n 's|^+++ b/||p' patches/ray/*.patch | sort -u)
+  git -C third_party/ray fetch -q --depth 1 --filter=blob:none origin tag "ray-$RAY_UPSTREAM"
+  git -C third_party/ray checkout -q FETCH_HEAD
 fi
 """
 
@@ -97,9 +116,21 @@ for p in ../../patches/interlink/*.patch; do
 done
 """
 
+[tasks."patch:ray"]
+description = "Apply patches to third_party/ray"
+depends = ["clone:ray"]
+run = """
+cd third_party/ray
+for p in ../../patches/ray/*.patch; do
+  [ -f "$p" ] || continue
+  echo "Applying patch $p..."
+  git apply --whitespace=nowarn "$p" || true
+done
+"""
+
 [tasks.patch]
 description = "Apply all patches to third_party dependencies"
-depends = ["patch:kueue", "patch:kuberay", "patch:interlink"]
+depends = ["patch:kueue", "patch:kuberay", "patch:interlink", "patch:ray"]
 
 [tasks."build:kueue"]
 description = "Build patched Kueue image"
@@ -131,6 +162,23 @@ INTERLINK_IMG=$(cat .interlink-image.txt)
 echo "Built interLink virtual kubelet image: $INTERLINK_IMG"
 """
 
+[tasks."build:ray"]
+description = "Build patched Ray image"
+depends = ["patch:ray"]
+run = """
+docker build -f docker/ray.Dockerfile --build-arg BASE_IMAGE=rayproject/ray:$RAY_UPSTREAM-$RAY_PYTHON -t kind.local/ray:$RAY_IMAGE_TAG -t kind.local/ray:latest third_party/ray
+echo "kind.local/ray:$RAY_IMAGE_TAG" > .ray-image.txt
+RAY_IMG=$(cat .ray-image.txt)
+echo "Built Ray image: $RAY_IMG"
+"""
+
+[tasks."test:ray"]
+description = "Run patched Ray unit tests inside the patched Ray image"
+depends = ["build:ray"]
+run = """
+docker run --rm -v "$PWD/tests/ray:/tests:ro" "$(cat .ray-image.txt)" python -m unittest discover -v -s /tests -p 'test_*.py'
+"""
+
 [tasks."test:interlink"]
 description = "Run patched interLink virtual kubelet unit tests"
 depends = ["patch:interlink"]
@@ -138,8 +186,8 @@ dir = "third_party/interlink"
 run = "go test ./pkg/virtualkubelet/..."
 
 [tasks.build]
-description = "Build all patched controller images"
-depends = ["build:kueue", "build:kuberay", "build:interlink"]
+description = "Build all patched images"
+depends = ["build:kueue", "build:kuberay", "build:interlink", "build:ray"]
 
 [tasks."publish:kueue"]
 description = "Build and publish patched Kueue multi-arch image to GHCR"
@@ -184,9 +232,23 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   third_party/interlink
 """
 
+[tasks."publish:ray"]
+description = "Build and publish patched Ray multi-arch image to GHCR"
+depends = ["patch:ray"]
+run = """
+TAG="${RAY_UPSTREAM}-${RAY_PYTHON}-p${RAY_PATCH_VERSION}"
+echo "Publishing Ray image ghcr.io/simonepri/ray:$TAG..."
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/ray.Dockerfile \
+  --build-arg BASE_IMAGE="rayproject/ray:${RAY_UPSTREAM}-${RAY_PYTHON}" \
+  -t "ghcr.io/simonepri/ray:$TAG" \
+  --push \
+  third_party/ray
+"""
+
 [tasks.publish]
 description = "Build and publish all patched images to GHCR"
-depends = ["publish:kueue", "publish:kuberay", "publish:interlink"]
+depends = ["publish:kueue", "publish:kuberay", "publish:interlink", "publish:ray"]
 
 [tasks."cluster:up"]
 description = "Spin up Kind cluster and deploy patched controllers directly"

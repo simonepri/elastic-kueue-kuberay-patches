@@ -1,0 +1,182 @@
+Reach other nodes' agents over HTTP through the gRPC CONNECT proxy.
+
+With RAY_grpc_enable_http_proxy set, the head reaches other nodes' raylets and
+agents over gRPC through the HTTP CONNECT proxy named by grpc_proxy,
+https_proxy, or http_proxy. The dashboard's HTTP calls to the same agents do
+not: the State API's runtime env query and the job head's calls to the job
+agent open plain aiohttp sessions, so a worker that only the proxy can reach,
+such as one on remote capacity behind a tunnel, cannot answer `ray list
+runtime-envs` or the job submissions and log reads routed to its agent. The new
+NodeAgentConnector makes both sessions follow the same proxy choice as gRPC,
+including no_grpc_proxy (or no_proxy when it is unset), and tunnels each
+proxied connection with CONNECT. Without the gRPC proxy flag, nothing changes.
+
+Upstream status: not yet reported to ray-project/ray.
+
+diff --git a/python/ray/dashboard/modules/job/job_head.py b/python/ray/dashboard/modules/job/job_head.py
+index e216349..e3f7114 100644
+--- a/python/ray/dashboard/modules/job/job_head.py
++++ b/python/ray/dashboard/modules/job/job_head.py
+@@ -50,6 +50,7 @@ from ray.dashboard.modules.job.utils import (
+     parse_and_validate_request,
+ )
+ from ray.dashboard.modules.version import CURRENT_VERSION, VersionResponse
++from ray.dashboard.node_agent_proxy import NodeAgentConnector
+ from ray.dashboard.runtime_env_redaction import (
+     redact_runtime_env,
+     should_redact_runtime_env,
+@@ -122,7 +123,7 @@ class JobAgentSubmissionClient:
+         dashboard_agent_address: str,
+     ):
+         self._agent_address = dashboard_agent_address
+-        self._session = aiohttp.ClientSession()
++        self._session = aiohttp.ClientSession(connector=NodeAgentConnector())
+ 
+     def _get_headers(self):
+         """Get auth headers if token authentication is enabled."""
+diff --git a/python/ray/dashboard/node_agent_proxy.py b/python/ray/dashboard/node_agent_proxy.py
+new file mode 100644
+index 0000000..68c619d
+--- /dev/null
++++ b/python/ray/dashboard/node_agent_proxy.py
+@@ -0,0 +1,119 @@
++"""Send HTTP requests to other nodes' agents through the proxy Ray's gRPC clients use.
++
++With RAY_grpc_enable_http_proxy set, gRPC reaches other nodes through the HTTP
++CONNECT proxy named by grpc_proxy, https_proxy, or http_proxy, unless the host
++matches no_grpc_proxy (or no_proxy when it is unset). NodeAgentConnector makes
++an aiohttp session follow the same choice and tunnels each proxied connection
++with CONNECT, as gRPC does, instead of sending absolute-form requests.
++"""
++
++import asyncio
++import ipaddress
++import os
++import socket
++from typing import Optional
++
++import aiohttp
++from yarl import URL
++
++from ray._common.network_utils import build_address
++from ray._private import ray_constants
++
++
++def _first_env(*names: str) -> Optional[str]:
++    for name in names:
++        value = os.environ.get(name)
++        if value:
++            return value
++    return None
++
++
++def _bypasses_proxy(host: str, no_proxy: str) -> bool:
++    try:
++        ip = ipaddress.ip_address(host)
++    except ValueError:
++        ip = None
++    for entry in no_proxy.split(","):
++        entry = entry.strip()
++        if not entry:
++            continue
++        if entry == "*":
++            return True
++        if ip is not None:
++            try:
++                if ip in ipaddress.ip_network(entry, strict=False):
++                    return True
++                continue
++            except ValueError:
++                pass
++        suffix = entry.lstrip(".").lower()
++        if host.lower() == suffix or host.lower().endswith("." + suffix):
++            return True
++    return False
++
++
++def node_agent_proxy(host: str) -> Optional[URL]:
++    """Return the proxy Ray's gRPC clients would use to reach host, if any."""
++    if not ray_constants.GRPC_ENABLE_HTTP_PROXY:
++        return None
++    proxy = _first_env("grpc_proxy", "https_proxy", "http_proxy")
++    if proxy is None:
++        return None
++    no_proxy = _first_env("no_grpc_proxy", "no_proxy")
++    if no_proxy is not None and _bypasses_proxy(host, no_proxy):
++        return None
++    if "://" not in proxy:
++        proxy = f"http://{proxy}"
++    return URL(proxy)
++
++
++class NodeAgentConnector(aiohttp.TCPConnector):
++    """A TCPConnector that opens a CONNECT tunnel when node_agent_proxy names a proxy."""
++
++    async def _create_connection(self, req, traces, timeout):
++        proxy = None if req.is_ssl() else node_agent_proxy(req.url.host)
++        if proxy is None:
++            return await super()._create_connection(req, traces, timeout)
++        sock = await asyncio.wait_for(
++            self._open_tunnel(proxy, req.url.host, req.url.port), timeout.sock_connect
++        )
++        _, protocol = await self._loop.create_connection(self._factory, sock=sock)
++        return protocol
++
++    async def _open_tunnel(self, proxy: URL, host: str, port: int) -> socket.socket:
++        target = build_address(host, port)
++        request = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
++        if proxy.user is not None:
++            auth = aiohttp.BasicAuth(proxy.user, proxy.password or "").encode()
++            request += f"Proxy-Authorization: {auth}\r\n"
++        request += "\r\n"
++
++        loop = asyncio.get_running_loop()
++        family, type_, proto, _, address = (
++            await loop.getaddrinfo(proxy.host, proxy.port, type=socket.SOCK_STREAM)
++        )[0]
++        sock = socket.socket(family, type_, proto)
++        sock.setblocking(False)
++        try:
++            await loop.sock_connect(sock, address)
++            await loop.sock_sendall(sock, request.encode("latin-1"))
++            response = b""
++            while b"\r\n\r\n" not in response:
++                chunk = await loop.sock_recv(sock, 4096)
++                if not chunk:
++                    raise aiohttp.ClientConnectionError(
++                        f"Proxy {proxy.host}:{proxy.port} closed the CONNECT "
++                        f"tunnel to {target}"
++                    )
++                response += chunk
++            status_line = response.split(b"\r\n", 1)[0].decode("latin-1")
++            if status_line.split(" ")[1:2] != ["200"]:
++                raise aiohttp.ClientConnectionError(
++                    f"Proxy {proxy.host}:{proxy.port} refused the CONNECT tunnel "
++                    f"to {target}: {status_line}"
++                )
++        except BaseException:
++            sock.close()
++            raise
++        return sock
++
+diff --git a/python/ray/util/state/state_manager.py b/python/ray/util/state/state_manager.py
+index 3b8eef2..a9e7c09 100644
+--- a/python/ray/util/state/state_manager.py
++++ b/python/ray/util/state/state_manager.py
+@@ -52,6 +52,7 @@ from ray.core.generated.runtime_env_agent_pb2 import (
+ from ray.dashboard.modules.job.common import JobInfoStorageClient
+ from ray.dashboard.modules.job.pydantic_models import JobDetails, JobType
+ from ray.dashboard.modules.job.utils import get_driver_jobs
++from ray.dashboard.node_agent_proxy import NodeAgentConnector
+ from ray.util.state.common import (
+     RAY_MAX_LIMIT_FROM_DATA_SOURCE,
+     PredicateType,
+@@ -143,7 +144,7 @@ class StateDataSourceClient:
+         self.register_gcs_client(gcs_channel)
+         self._job_client = JobInfoStorageClient(gcs_client)
+         self._gcs_client = gcs_client
+-        self._client_session = aiohttp.ClientSession()
++        self._client_session = aiohttp.ClientSession(connector=NodeAgentConnector())
+         self._dashboard_socket_dir = dashboard_socket_dir
+         self._dashboard_session_name = dashboard_session_name
+         if _READ_TASK_EVENTS_FROM_DASHBOARD_HEAD and (

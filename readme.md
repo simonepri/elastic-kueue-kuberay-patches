@@ -7,8 +7,9 @@
 [![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.7.1-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.7.1)
 [![Tested on Karpenter](https://img.shields.io/badge/tested%20on%20karpenter-v1.15.0-blue)](https://github.com/kubernetes-sigs/karpenter/releases/tag/v1.15.0)
 [![Tested on interLink](https://img.shields.io/badge/tested%20on%20interlink-0.6.2-blue)](https://github.com/interlink-hq/interLink/releases/tag/0.6.2)
+[![Tested on Ray](https://img.shields.io/badge/tested%20on%20ray-2.59.0-blue)](https://github.com/ray-project/ray/releases/tag/ray-2.59.0)
 
-Production patchsets for running elastic Ray clusters shared across teams on Kubernetes with [Kueue](https://github.com/kubernetes-sigs/kueue), [KubeRay](https://github.com/ray-project/kuberay), and [Karpenter](https://github.com/kubernetes-sigs/karpenter), plus a patched [interLink](https://github.com/interlink-hq/interLink) virtual kubelet for bursting Ray workers onto remote capacity.
+Production patchsets for running elastic Ray clusters shared across teams on Kubernetes with [Kueue](https://github.com/kubernetes-sigs/kueue), [KubeRay](https://github.com/ray-project/kuberay), and [Karpenter](https://github.com/kubernetes-sigs/karpenter), plus a patched [interLink](https://github.com/interlink-hq/interLink) virtual kubelet for bursting Ray workers onto remote capacity and a patched [Ray](https://github.com/ray-project/ray) image whose head reaches those workers' agents through the gRPC proxy.
 
 ---
 
@@ -87,6 +88,7 @@ The table below outlines the core architectural issues in upstream controllers a
 | **9** | `interlink-hq/interLink` | [`0003-image-pull-secrets.patch`](patches/interlink/0003-image-pull-secrets.patch) | The create request carries only the Secrets that volumes mount, not those named in `spec.imagePullSecrets`, so a plugin pulling images on remote capacity must read Secrets from the Kubernetes API itself, with its own RBAC. Upstream: not yet reported. | Adds each referenced `dockerconfigjson` or `dockercfg` Secret to the request's `secrets`, once per name; like the kubelet, warns and continues when a pull secret is missing, unreadable, or of another type. | `TestRemoteExecutionHandleImagePullSecrets` in `pkg/virtualkubelet/execute_image_pull_secrets_test.go` (added by the patch; `mise run test:interlink`) |
 | **10** | `interlink-hq/interLink` | [`0004-env-fieldref-paths.patch`](patches/interlink/0004-env-fieldref-paths.patch) | Env `fieldRef`s resolve only `status.podIP`, `metadata.name`, `metadata.namespace`, `metadata.uid`, and single annotations; every other path, such as `metadata.labels['topology.kubernetes.io/region']` or `spec.nodeName`, silently becomes an empty string. Upstream: not yet reported. | Resolves env `fieldRef`s with the downward API volume resolver, extended to single label and annotation references; a missing key resolves to the empty string as in the kubelet, and an unsupported path is logged and left unresolved. | `TestResolveEnvRefs_FieldRefs` in `pkg/virtualkubelet/execute_env_fieldref_test.go` (added by the patch; `mise run test:interlink`) |
 | **11** | `interlink-hq/interLink` | [`0005-pod-ip-from-plugin-status.patch`](patches/interlink/0005-pod-ip-from-plugin-status.patch) | The plugin's status response is decoded into `types.PodStatus`, which has no IP fields, so the virtual kubelet sets every pod's `status.podIP` and `hostIP` from its own configured `PodIP`; pods on remote VMs report the node's placeholder address. Upstream: not yet reported. | `PodStatus` gains optional `podIP` and `podIPs` fields, and `checkPodsStatus` copies them to the pod's `podIP`, `podIPs`, and `hostIP` when present; the configured placeholder stays when the plugin omits them. | `TestCheckPodsStatusPodIP` in `pkg/virtualkubelet/execute_pod_ip_test.go` (added by the patch; `mise run test:interlink`) |
+| **12** | `ray-project/ray` | [`0001-node-agent-proxy.patch`](patches/ray/0001-node-agent-proxy.patch) | With `RAY_grpc_enable_http_proxy` set, gRPC reaches other nodes through the HTTP CONNECT proxy in `grpc_proxy`, `https_proxy`, or `http_proxy`, but the dashboard's HTTP calls to other nodes' agents (the State API's runtime env query and the job head's job agent client) connect directly, so they fail for workers only the proxy can reach. Upstream: not yet reported. | Adds `NodeAgentConnector`, an aiohttp connector that applies the same proxy and `no_grpc_proxy`/`no_proxy` choice as gRPC and tunnels each proxied connection with `CONNECT`; both sessions use it. Without the gRPC proxy flag, connections are unchanged. | [`tests/ray/test_node_agent_proxy.py`](tests/ray/test_node_agent_proxy.py) (`mise run test:ray`, inside the patched image) |
 
 ### interLink Upstream Issue Draft
 
@@ -149,6 +151,7 @@ Examples:
 - `ghcr.io/simonepri/kueue:v0.20.2-p0.2.0`
 - `ghcr.io/simonepri/kuberay-operator:v1.7.1-p0.2.0`
 - `ghcr.io/simonepri/interlink-virtual-kubelet:0.6.2-p0.1.0`
+- `ghcr.io/simonepri/ray:2.59.0-py313-p0.1.0` (the upstream image tag, including its Python suffix, then the patch version)
 
 When [Renovate](renovate.json) detects an upstream release, it opens a PR updating the upstream baseline. Once merged, [Release Please](release-please-config.json) increments the patch version independently.
 

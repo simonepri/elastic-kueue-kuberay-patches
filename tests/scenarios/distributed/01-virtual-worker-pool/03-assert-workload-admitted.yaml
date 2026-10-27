@@ -1,0 +1,5 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+status:
+  admission:
+    clusterQueue: distributed-cluster-queue

@@ -12,6 +12,7 @@ spec:
       try:
         - apply:
             file: 00-spot-raycluster.yaml
+            timeout: 60s
         - assert:
             file: 00-assert-running.yaml
     - name: simulate-spot-interruption

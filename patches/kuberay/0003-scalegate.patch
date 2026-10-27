@@ -337,13 +337,14 @@ index 0000000..525971a
 +		Complete(r)
 +}
 diff --git a/ray-operator/main.go b/ray-operator/main.go
-index f100ce0..3387417 100644
+index b670b53..4e36021 100644
 --- a/ray-operator/main.go
 +++ b/ray-operator/main.go
-@@ -370,5 +370,6 @@ func main() {
- 
- 	exitOnError((&ray.ActorProtectReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ActorProtect")
- 	exitOnError((&ray.SpotInterruptionReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "SpotInterruption")
+@@ -384,6 +384,7 @@ func main() {
+ 	} else {
+ 		setupLog.Info("Spot interruption notices are disabled, skipping SpotInterruption controller setup", "env", ray.SpotInterruptionNoticesEnv)
+ 	}
 +	exitOnError((&ray.ScaleGateReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ScaleGate")
  
  	// +kubebuilder:scaffold:builder
+ 

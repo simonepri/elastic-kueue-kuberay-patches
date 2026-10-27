@@ -1,9 +1,9 @@
 diff --git a/ray-operator/controllers/ray/spot_interruption_controller.go b/ray-operator/controllers/ray/spot_interruption_controller.go
 new file mode 100644
-index 0000000..b8c4510
+index 0000000..acd3d77
 --- /dev/null
 +++ b/ray-operator/controllers/ray/spot_interruption_controller.go
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,366 @@
 +package ray
 +
 +import (
@@ -26,6 +26,11 @@ index 0000000..b8c4510
 +
 +const (
 +	AnnotationProcessed = "kuberay.io/spot-interruption-processed"
++	// SpotInterruptionEventLabel marks a ConfigMap as a spot interruption notice when set to SpotInterruptionEventValue.
++	SpotInterruptionEventLabel = "test.k8s.io/event"
++	SpotInterruptionEventValue = "spot-interrupted"
++	// SpotInterruptionNoticesEnv opts the operator into watching interruption notices when set to "true".
++	SpotInterruptionNoticesEnv = "KUBERAY_SPOT_INTERRUPTION_NOTICES"
 +)
 +
 +var (
@@ -72,7 +77,7 @@ index 0000000..b8c4510
 +		return ctrl.Result{}, err
 +	}
 +
-+	if cm.Labels["test.k8s.io/event"] != "spot-interrupted" {
++	if cm.Labels[SpotInterruptionEventLabel] != SpotInterruptionEventValue {
 +		return ctrl.Result{}, nil
 +	}
 +
@@ -366,14 +371,42 @@ index 0000000..b8c4510
 +		Complete(r)
 +}
 diff --git a/ray-operator/main.go b/ray-operator/main.go
-index cb7da0e..f100ce0 100644
+index cb7da0e..b670b53 100644
 --- a/ray-operator/main.go
 +++ b/ray-operator/main.go
-@@ -369,6 +369,7 @@ func main() {
+@@ -13,6 +13,8 @@ import (
+ 	"go.uber.org/zap/zapcore"
+ 	"gopkg.in/natefinch/lumberjack.v2"
+ 	batchv1 "k8s.io/api/batch/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/runtime/serializer"
+ 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+@@ -248,6 +250,14 @@ func main() {
+ 	selectorsByObject, err := managercache.K8sControllerRuntimeCacheSelectors()
+ 	exitOnError(err, "unable to build manager cache ByObject")
+ 	options.Cache.ByObject = selectorsByObject
++	// The spot interruption controller only runs when opted in, so the operator needs no ConfigMap access by default,
++	// and its cache then holds only interruption notices.
++	spotInterruptionNotices := os.Getenv(ray.SpotInterruptionNoticesEnv) == "true"
++	if spotInterruptionNotices {
++		options.Cache.ByObject[&corev1.ConfigMap{}] = cache.ByObject{
++			Label: labels.SelectorFromSet(labels.Set{ray.SpotInterruptionEventLabel: ray.SpotInterruptionEventValue}),
++		}
++	}
+ 
+ 	if watchNamespaces := strings.Split(config.WatchNamespace, ","); len(watchNamespaces) == 1 { // It is not possible for len(watchNamespaces) == 0 to be true. The length of `strings.Split("", ",")` is still 1.
+ 		if watchNamespaces[0] == "" {
+@@ -369,6 +379,11 @@ func main() {
  	}
  
  	exitOnError((&ray.ActorProtectReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ActorProtect")
-+	exitOnError((&ray.SpotInterruptionReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "SpotInterruption")
++	if spotInterruptionNotices {
++		exitOnError((&ray.SpotInterruptionReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "SpotInterruption")
++	} else {
++		setupLog.Info("Spot interruption notices are disabled, skipping SpotInterruption controller setup", "env", ray.SpotInterruptionNoticesEnv)
++	}
  
  	// +kubebuilder:scaffold:builder
  

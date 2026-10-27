@@ -230,6 +230,8 @@ helm template kuberay-operator kuberay/kuberay-operator \
   --set image.repository="${KUBERAY_IMG%:*}" \
   --set image.tag="${KUBERAY_IMG##*:}" \
   --set leaderElectionEnabled=false \
+  --set env[0].name=KUBERAY_SPOT_INTERRUPTION_NOTICES \
+  --set-string env[0].value=true \
   --set resources.limits.cpu=2 \
   --set resources.limits.memory=2Gi \
   --set resources.requests.cpu=500m \

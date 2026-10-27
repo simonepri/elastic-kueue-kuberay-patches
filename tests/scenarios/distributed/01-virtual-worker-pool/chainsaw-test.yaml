@@ -18,13 +18,16 @@ spec:
       try:
         - apply:
             file: 01-raycluster-multi-pool.yaml
+            timeout: 60s
         - assert:
             file: 02-assert-multi-pool-active.yaml
+        - assert:
+            file: 03-assert-workload-admitted.yaml
     - name: simulate-remote-spot-interruption
       try:
         - apply:
-            file: 03-remote-spot-interruption.yaml
+            file: 04-remote-spot-interruption.yaml
     - name: assert-remote-worker-drained
       try:
         - assert:
-            file: 04-assert-remote-worker-drained.yaml
+            file: 05-assert-remote-worker-drained.yaml

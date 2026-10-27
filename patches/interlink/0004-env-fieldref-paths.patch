@@ -1,0 +1,152 @@
+Resolve every downward API env fieldRef the kubelet supports.
+
+The virtual kubelet resolved env fieldRefs itself and knew only status.podIP,
+metadata.name, metadata.namespace, metadata.uid, and single annotations. Any
+other path, such as metadata.labels['topology.kubernetes.io/region'] or
+spec.nodeName, became an empty string, so a remote container could not read
+the node topology labels Kubernetes copies onto the pod. resolveEnvRefs now
+uses the same resolver as downward API volumes, which also accepts single
+label and annotation references; like the kubelet, a missing key resolves to
+the empty string. A path that resolver does not support is logged and left
+unresolved instead of being blanked.
+
+Upstream status: not yet reported to interlink-hq/interLink.
+
+diff --git a/pkg/virtualkubelet/execute_env_fieldref_test.go b/pkg/virtualkubelet/execute_env_fieldref_test.go
+new file mode 100644
+index 0000000..cebfe1c
+--- /dev/null
++++ b/pkg/virtualkubelet/execute_env_fieldref_test.go
+@@ -0,0 +1,63 @@
++package virtualkubelet
++
++import (
++	"context"
++	"testing"
++
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++func fieldRefEnv(name, path string) v1.EnvVar {
++	return v1.EnvVar{Name: name, ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: path}}}
++}
++
++func TestResolveEnvRefs_FieldRefs(t *testing.T) {
++	pod := &v1.Pod{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:        "worker",
++			Namespace:   "team",
++			UID:         "uid-1",
++			Labels:      map[string]string{"topology.kubernetes.io/region": "eu-west-1"},
++			Annotations: map[string]string{"example.com/owner": "data"},
++		},
++		Spec:   v1.PodSpec{NodeName: "virtual-node-a", ServiceAccountName: "runner"},
++		Status: v1.PodStatus{PodIP: "10.0.0.5", HostIP: "10.0.0.1"},
++	}
++	container := &v1.Container{Env: []v1.EnvVar{
++		fieldRefEnv("REGION", "metadata.labels['topology.kubernetes.io/region']"),
++		fieldRefEnv("ZONE", "metadata.labels['topology.kubernetes.io/zone']"),
++		fieldRefEnv("OWNER", "metadata.annotations['example.com/owner']"),
++		fieldRefEnv("NODE", "spec.nodeName"),
++		fieldRefEnv("SA", "spec.serviceAccountName"),
++		fieldRefEnv("HOST_IP", "status.hostIP"),
++		fieldRefEnv("POD_IP", "status.podIP"),
++		fieldRefEnv("UNSUPPORTED", "status.podIPs"),
++	}}
++
++	resolveEnvRefs(context.Background(), nil, pod, container)
++
++	want := map[string]string{
++		"REGION":  "eu-west-1",
++		"ZONE":    "", // a missing label resolves to the empty string, as in the kubelet
++		"OWNER":   "data",
++		"NODE":    "virtual-node-a",
++		"SA":      "runner",
++		"HOST_IP": "10.0.0.1",
++		"POD_IP":  "10.0.0.5",
++	}
++	for _, env := range container.Env {
++		if env.Name == "UNSUPPORTED" {
++			if env.ValueFrom == nil || env.Value != "" {
++				t.Errorf("unsupported fieldRef must stay unresolved, got value %q", env.Value)
++			}
++			continue
++		}
++		if env.ValueFrom != nil {
++			t.Errorf("%s: fieldRef left unresolved", env.Name)
++		}
++		if env.Value != want[env.Name] {
++			t.Errorf("%s = %q, want %q", env.Name, env.Value, want[env.Name])
++		}
++	}
++}
+diff --git a/pkg/virtualkubelet/execute.go b/pkg/virtualkubelet/execute.go
+index d7c69ae..61d17b0 100644
+--- a/pkg/virtualkubelet/execute.go
++++ b/pkg/virtualkubelet/execute.go
+@@ -860,7 +860,18 @@ func formatDownwardAPIMetadataMap(data map[string]string) string {
+ 	return b.String()
+ }
+ 
++// downwardAPISubscriptRE matches a single label or annotation reference such as metadata.labels['app'].
++var downwardAPISubscriptRE = regexp.MustCompile(`^metadata\.(labels|annotations)\[['"]?(.+?)['"]?\]$`)
++
++// resolveDownwardAPIFieldPath returns the value a fieldRef with fieldPath resolves to, and false for paths it does not support.
++// Like the kubelet, it resolves a reference to a missing label or annotation key to the empty string.
+ func resolveDownwardAPIFieldPath(pod *v1.Pod, fieldPath string) (string, bool) {
++	if m := downwardAPISubscriptRE.FindStringSubmatch(fieldPath); m != nil {
++		if m[1] == "labels" {
++			return pod.Labels[m[2]], true
++		}
++		return pod.Annotations[m[2]], true
++	}
+ 	switch fieldPath {
+ 	case "metadata.name":
+ 		return pod.Name, true
+@@ -1074,41 +1085,20 @@ func resolveEnvRefs(
+ 	pod *v1.Pod,
+ 	container *v1.Container,
+ ) {
+-	var annotationFieldRefRE = regexp.MustCompile(`^metadata\.annotations\[['"]?(.+?)['"]?\]$`)
+-
+ 	for i, env := range container.Env {
+ 		if env.ValueFrom == nil {
+ 			continue
+ 		}
+ 
+ 		if fr := env.ValueFrom.FieldRef; fr != nil {
+-
+-			var resolved string
+-			switch fr.FieldPath {
+-			case "status.podIP":
+-				resolved = pod.Status.PodIP
+-			case "metadata.name":
+-				resolved = pod.Name
+-			case "metadata.namespace":
+-				resolved = pod.Namespace
+-			case "metadata.uid":
+-				resolved = string(pod.UID)
+-
+-			default:
+-				if matches := annotationFieldRefRE.FindStringSubmatch(fr.FieldPath); len(matches) == 2 {
+-					annKey := matches[1]
+-					val, ok := pod.Annotations[annKey]
+-					if !ok {
+-						continue
+-					}
+-					resolved = val
+-				}
++			resolved, ok := resolveDownwardAPIFieldPath(pod, fr.FieldPath)
++			if !ok {
++				log.G(ctx).Warningf("in pod %s unsupported env fieldRef %s in InterLink, leaving %s unresolved", pod.Name, fr.FieldPath, env.Name)
++				continue
+ 			}
+-
+ 			container.Env[i].Value = resolved
+ 			container.Env[i].ValueFrom = nil
+ 			continue
+-
+ 		}
+ 
+ 		if sk := env.ValueFrom.SecretKeyRef; sk != nil {

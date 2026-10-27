@@ -367,15 +367,68 @@ kubectl set resources deployment/kueue-controller-manager -n kueue-system --limi
 kubectl rollout status deployment/kueue-controller-manager -n kueue-system --timeout=180s
 kubectl rollout status deployment/kuberay-operator -n default --timeout=180s
 
-# 8. Wait for Kueue mutating webhook to become responsive before tests run
-echo "Waiting for Kueue webhook service to accept connections..."
-for i in $(seq 1 30); do
-  if kubectl run --dry-run=server --image=busybox:latest webhook-probe -n default >/dev/null 2>&1; then
-    echo "Kueue webhook service is ready!"
-    break
-  fi
-  sleep 1
-done
+# 8. Wait until every webhook the scenarios call accepts a server-side dry run
+probe() {
+  for i in $(seq 1 120); do
+    if kubectl create --dry-run=server -f - >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Webhook probe $1 did not succeed within 120s" >&2
+  exit 1
+}
+echo "Waiting for Kueue and KubeRay webhooks to accept requests..."
+probe resourceflavor <<EOF
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: webhook-probe
+EOF
+probe clusterqueue <<EOF
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: webhook-probe
+spec:
+  resourceGroups: []
+EOF
+probe localqueue <<EOF
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: webhook-probe
+  namespace: default
+spec:
+  clusterQueue: webhook-probe
+EOF
+probe pod <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: webhook-probe
+  namespace: default
+spec:
+  containers:
+    - name: probe
+      image: busybox:latest
+EOF
+probe raycluster <<EOF
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: webhook-probe
+  namespace: default
+spec:
+  headGroupSpec:
+    rayStartParams: {}
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+EOF
+echo "Kueue and KubeRay webhooks are ready!"
 
 echo "Cluster $CLUSTER_NAME is ready with patched controllers!"
 """

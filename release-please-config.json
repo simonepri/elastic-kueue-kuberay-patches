@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "bootstrap-sha": "05f2c6c641be147d1c07c8b293d28c9c649da5de",
-  "last-release-sha": "1496e75a91f044d1da723ff0ba4f99c698f53cb0",
+  "last-release-sha": "e2809f1056dab2a99ea78247575abe3c4a958856",
   "packages": {
     "patches/kueue": {
       "component": "kueue",

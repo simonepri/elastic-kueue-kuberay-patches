@@ -1,7 +1,7 @@
 [tools]
 go = "1.27.3"
 kind = "0.33.0"
-kubectl = "1.37.1"
+kubectl = "1.37.2"
 "aqua:kyverno/chainsaw" = "0.2.15"
 helm = "4.3.1"
 ko = "0.19.1"

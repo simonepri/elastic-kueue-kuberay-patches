@@ -1,0 +1,5 @@
+# Matches any NodeClaim the check created for this namespace; none may remain once the gang's Job is deleted.
+apiVersion: karpenter.sh/v1
+kind: NodeClaim
+metadata:
+  (labels."kueue.x-k8s.io/workload-namespace"): ($namespace)

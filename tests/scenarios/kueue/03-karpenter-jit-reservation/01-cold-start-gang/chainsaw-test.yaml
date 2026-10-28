@@ -34,3 +34,13 @@ spec:
       try:
         - assert:
             file: 03-assert-admission.yaml
+    - name: deleting-the-job-releases-nodeclaims
+      try:
+        - delete:
+            ref:
+              apiVersion: batch/v1
+              kind: Job
+              name: distributed-training-job
+        - error:
+            timeout: 60s
+            file: 04-nodeclaims-released.yaml

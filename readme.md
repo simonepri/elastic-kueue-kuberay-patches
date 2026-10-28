@@ -292,6 +292,10 @@ The check creates NodeClaims that reference the `EC2NodeClass` named `default` (
 
 The check is Ready once every NodeClaim reports the `karpenter-wait-for` condition. It fails the attempt when a NodeClaim is deleted before that, which is how Karpenter reports insufficient capacity or a NodeClass that is not ready, or when the launch timeout passes since quota was reserved. It then deletes the NodeClaims, records the failed flavors in the Workload's `kueue.x-k8s.io/karpenter-excluded-flavors` annotation, sets `kueue.x-k8s.io/workload-allowed-resource-flavors` to the ClusterQueue's other flavors, and sets the check to Retry. Kueue evicts the Workload and assigns it the first allowed flavor that fits. The exclusions are removed when the Workload is admitted, so a later eviction tries the Karpenter flavor again, and each expires after the cooldown, so a Workload that fits nowhere else returns to the Karpenter flavor. The check leaves a Workload whose allowed flavors another controller set unchanged, and only retries it.
 
+The check deletes a Workload's NodeClaims when the Workload finishes, is evicted, deactivated, or deleted, or loses its quota reservation, and when a new reservation replaces the one they were created for. Every 5 minutes the leader also deletes NodeClaims older than 2 minutes whose Workload is gone or no longer holds that reservation, which covers deletions missed while Kueue was down. NodeClaims created by earlier versions of this patch lack the `kueue.x-k8s.io/workload-namespace` and `kueue.x-k8s.io/karpenter-attempt` labels, so the sweep leaves them alone; delete them by hand once their Workloads are gone.
+
+The NodeClaims carry no `karpenter.sh/nodepool` label. Karpenter v1.15 still launches, registers, and terminates them: deleting a NodeClaim drains and deletes its Node and terminates the instance, and `expireAfter` (720h by default) deletes it. Disruption skips nodes without a NodePool, so Karpenter never consolidates, drifts, or repairs them, and they count toward no NodePool limit. Releasing them is therefore up to the check.
+
 ---
 
 ### 3. interLink Virtual Kubelet

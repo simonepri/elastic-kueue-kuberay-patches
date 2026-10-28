@@ -80,10 +80,10 @@ index ff3e6fb..4a6fc27 100644
  	cq := newClusterQueueImpl(ctx, nil, defaultOrdering, testingclock.NewFakeClock(time.Now()))
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
 new file mode 100644
-index 0000000..e9f43c7
+index 0000000..13f76c7
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,645 @@
 +// Package karpenter implements an AdmissionCheck that provisions one Karpenter NodeClaim per
 +// admitted pod, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
 +package karpenter
@@ -104,10 +104,13 @@ index 0000000..e9f43c7
 +	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 +	"k8s.io/apimachinery/pkg/runtime/schema"
 +	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/klog/v2"
 +	"k8s.io/utils/clock"
 +	ctrl "sigs.k8s.io/controller-runtime"
 +	"sigs.k8s.io/controller-runtime/pkg/client"
 +	"sigs.k8s.io/controller-runtime/pkg/log"
++	"sigs.k8s.io/controller-runtime/pkg/manager"
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
@@ -148,6 +151,8 @@ index 0000000..e9f43c7
 +	DefaultLaunchTimeout  = 5 * time.Minute
 +	DefaultFlavorCooldown = 10 * time.Minute
 +	pollInterval          = 10 * time.Second
++	sweepInterval         = 5 * time.Minute
++	sweepGracePeriod      = 2 * time.Minute
 +
 +	conditionLaunched   = "Launched"
 +	conditionRegistered = "Registered"
@@ -226,7 +231,10 @@ index 0000000..e9f43c7
 +func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 +	wl := &kueue.Workload{}
 +	if err := c.Get(ctx, req.NamespacedName, wl); err != nil {
-+		return ctrl.Result{}, client.IgnoreNotFound(err)
++		if apierrors.IsNotFound(err) {
++			return ctrl.Result{}, c.deleteNodeClaims(ctx, req.Namespace, req.Name, "")
++		}
++		return ctrl.Result{}, err
 +	}
 +
 +	var expiry time.Duration
@@ -237,8 +245,12 @@ index 0000000..e9f43c7
 +		}
 +	}
 +
-+	if !workload.IsActive(wl) || !workload.HasQuotaReservation(wl) || wl.Status.Admission == nil ||
-+		apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadEvicted) {
++	if !holdsReservation(wl) {
++		if _, provisioned := wl.Annotations[ProvisionedAttemptAnnotation]; provisioned {
++			if err := c.releaseNodeClaims(ctx, wl); err != nil {
++				return ctrl.Result{}, err
++			}
++		}
 +		return ctrl.Result{RequeueAfter: expiry}, nil
 +	}
 +
@@ -271,6 +283,83 @@ index 0000000..e9f43c7
 +		return result, err
 +	}
 +	return ctrl.Result{RequeueAfter: expiry}, nil
++}
++
++// holdsReservation reports whether the Workload still uses the quota its current NodeClaims were created for.
++// A finished, deleted, deactivated, or evicted Workload, or one without quota, needs no NodeClaims.
++func holdsReservation(wl *kueue.Workload) bool {
++	return wl.DeletionTimestamp == nil && workload.IsActive(wl) && workload.HasQuotaReservation(wl) && wl.Status.Admission != nil &&
++		!apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadEvicted) &&
++		!apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadFinished)
++}
++
++// releaseNodeClaims deletes every NodeClaim of a Workload that no longer holds a reservation, then forgets the attempt.
++func (c *Controller) releaseNodeClaims(ctx context.Context, wl *kueue.Workload) error {
++	if err := c.deleteNodeClaims(ctx, wl.Namespace, wl.Name, ""); err != nil {
++		return err
++	}
++	patch := client.MergeFrom(wl.DeepCopy())
++	delete(wl.Annotations, ProvisionedAttemptAnnotation)
++	log.FromContext(ctx).Info("Released NodeClaims of a Workload without a reservation")
++	return client.IgnoreNotFound(c.Patch(ctx, wl, patch))
++}
++
++// deleteNodeClaims deletes the Workload's NodeClaims except those of the given attempt.
++func (c *Controller) deleteNodeClaims(ctx context.Context, namespace, name, keepAttempt string) error {
++	claims, err := c.listNodeClaims(ctx, namespace, name)
++	if err != nil {
++		if apimeta.IsNoMatchError(err) {
++			return nil
++		}
++		return err
++	}
++	for i := range claims {
++		if keepAttempt != "" && claims[i].GetLabels()[AttemptLabelKey] == keepAttempt {
++			continue
++		}
++		if err := c.Delete(ctx, &claims[i]); client.IgnoreNotFound(err) != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// Sweep deletes NodeClaims whose Workload no longer exists or no longer holds the reservation they were created for.
++// It catches what the Workload reconciler missed, such as a deletion while Kueue was down. NodeClaims younger than
++// sweepGracePeriod are skipped, so a Workload the informer cache has not caught up with keeps its new NodeClaims.
++func (c *Controller) Sweep(ctx context.Context) error {
++	list := &unstructured.UnstructuredList{}
++	list.SetGroupVersionKind(nodeClaimGVK.GroupVersion().WithKind("NodeClaimList"))
++	if err := c.List(ctx, list, client.MatchingLabels{ManagedLabelKey: "kueue"}); err != nil {
++		if apimeta.IsNoMatchError(err) {
++			return nil
++		}
++		return err
++	}
++	for i := range list.Items {
++		claim := &list.Items[i]
++		labels := claim.GetLabels()
++		namespace, name, attempt := labels[WorkloadNamespaceLabelKey], labels[WorkloadLabelKey], labels[AttemptLabelKey]
++		// NodeClaims created before the namespace and attempt labels cannot be matched to a Workload.
++		if namespace == "" || name == "" || attempt == "" || claim.GetDeletionTimestamp() != nil ||
++			c.Clock.Since(claim.GetCreationTimestamp().Time) < sweepGracePeriod {
++			continue
++		}
++		wl := &kueue.Workload{}
++		err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, wl)
++		if client.IgnoreNotFound(err) != nil {
++			return err
++		}
++		if err == nil && holdsReservation(wl) &&
++			attemptID(wl, apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadQuotaReserved).LastTransitionTime.Time) == attempt {
++			continue
++		}
++		log.FromContext(ctx).Info("Deleting orphaned NodeClaim", "nodeClaim", claim.GetName(), "workload", klog.KRef(namespace, name))
++		if err := c.Delete(ctx, claim); client.IgnoreNotFound(err) != nil {
++			return err
++		}
++	}
++	return nil
 +}
 +
 +// syncExclusions drops the flavor exclusions once the Workload is admitted, since they have done their job, and
@@ -311,7 +400,7 @@ index 0000000..e9f43c7
 +		return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady, "No pods require NodeClaims")
 +	}
 +
-+	claims, err := c.listNodeClaims(ctx, wl)
++	claims, err := c.listNodeClaims(ctx, wl.Namespace, wl.Name)
 +	if err != nil {
 +		return ctrl.Result{}, err
 +	}
@@ -551,10 +640,10 @@ index 0000000..e9f43c7
 +	return nc
 +}
 +
-+func (c *Controller) listNodeClaims(ctx context.Context, wl *kueue.Workload) ([]unstructured.Unstructured, error) {
++func (c *Controller) listNodeClaims(ctx context.Context, namespace, name string) ([]unstructured.Unstructured, error) {
 +	list := &unstructured.UnstructuredList{}
 +	list.SetGroupVersionKind(nodeClaimGVK.GroupVersion().WithKind("NodeClaimList"))
-+	if err := c.List(ctx, list, client.MatchingLabels{WorkloadLabelKey: wl.Name, WorkloadNamespaceLabelKey: wl.Namespace}); err != nil {
++	if err := c.List(ctx, list, client.MatchingLabels{WorkloadLabelKey: name, WorkloadNamespaceLabelKey: namespace}); err != nil {
 +		return nil, err
 +	}
 +	return list.Items, nil
@@ -621,20 +710,33 @@ index 0000000..e9f43c7
 +		Complete(&ACReconciler{Client: mgr.GetClient()}); err != nil {
 +		return err
 +	}
++	c := &Controller{Client: mgr.GetClient(), Clock: clock.RealClock{}}
 +	// NodeClaims are polled rather than watched, so Kueue starts on clusters without the Karpenter CRDs.
-+	return ctrl.NewControllerManagedBy(mgr).
++	// Deleting a Workload also reconciles it, and the NotFound path deletes its NodeClaims.
++	if err := ctrl.NewControllerManagedBy(mgr).
 +		Named("karpenter_admission_check").
 +		For(&kueue.Workload{}).
-+		Complete(&Controller{Client: mgr.GetClient(), Clock: clock.RealClock{}})
++		Complete(c); err != nil {
++		return err
++	}
++	// The sweep runs only on the leader, like every Runnable that does not opt out of leader election.
++	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
++		wait.UntilWithContext(ctx, func(ctx context.Context) {
++			if err := c.Sweep(ctx); err != nil {
++				log.FromContext(ctx).Error(err, "Sweeping orphaned NodeClaims")
++			}
++		}, sweepInterval)
++		return nil
++	}))
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/controller_test.go b/pkg/controller/admissionchecks/karpenter/controller_test.go
 new file mode 100644
-index 0000000..89aa0a7
+index 0000000..05934a0
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller_test.go
-@@ -0,0 +1,431 @@
-+// Tests for the Karpenter AdmissionCheck: NodeClaim creation, readiness, timeout and deletion failures,
-+// flavor exclusion through the allowed-flavors annotation, and clearing exclusions after admission or cooldown.
+@@ -0,0 +1,538 @@
++// Tests for the Karpenter AdmissionCheck: NodeClaim creation, readiness, failures, flavor exclusion and its expiry,
++// and NodeClaim cleanup when a Workload finishes, is evicted or deleted, or is found orphaned by the sweep.
 +package karpenter
 +
 +import (
@@ -646,6 +748,7 @@ index 0000000..89aa0a7
 +
 +	"github.com/google/go-cmp/cmp"
 +	corev1 "k8s.io/api/core/v1"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
 +	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 +	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 +	"k8s.io/apimachinery/pkg/types"
@@ -1062,6 +1165,112 @@ index 0000000..89aa0a7
 +				t.Errorf("config = %+v, want %+v", got, tc.want)
 +			}
 +		})
++	}
++}
++
++// provisionedFixture returns a fixture whose Workload has its NodeClaims created and then gets mutate applied.
++func provisionedFixture(t *testing.T, mutate func(*kueue.Workload)) *fixture {
++	t.Helper()
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	if n := len(f.claims()); n != 2 {
++		t.Fatalf("got %d NodeClaims, want 2", n)
++	}
++	wl := f.workload()
++	mutate(wl)
++	if err := f.c.Status().Update(f.ctx, wl); err != nil {
++		t.Fatalf("Update workload status: %v", err)
++	}
++	return f
++}
++
++func TestReleasesNodeClaimsWhenWorkloadStopsHoldingReservation(t *testing.T) {
++	cases := map[string]func(*kueue.Workload){
++		"finished": func(wl *kueue.Workload) {
++			apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadFinished, Status: metav1.ConditionTrue, Reason: "Succeeded"})
++		},
++		"evicted": func(wl *kueue.Workload) {
++			apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadEvicted, Status: metav1.ConditionTrue, Reason: kueue.WorkloadEvictedByPreemption})
++		},
++		"quota released": func(wl *kueue.Workload) {
++			apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse, Reason: "Pending"})
++		},
++	}
++	for name, mutate := range cases {
++		t.Run(name, func(t *testing.T) {
++			f := provisionedFixture(t, mutate)
++			f.reconcile()
++			if n := len(f.claims()); n != 0 {
++				t.Errorf("got %d NodeClaims, want 0", n)
++			}
++			if _, ok := f.workload().Annotations[ProvisionedAttemptAnnotation]; ok {
++				t.Error("provisioned attempt annotation kept after releasing the NodeClaims")
++			}
++		})
++	}
++}
++
++func TestDeletedWorkloadReleasesNodeClaims(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	if err := f.c.Delete(f.ctx, f.workload()); err != nil {
++		t.Fatal(err)
++	}
++	f.reconcile()
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims after the Workload was deleted, want 0", n)
++	}
++}
++
++func TestDeletingWorkloadReleasesNodeClaims(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	wl := f.workload()
++	wl.Finalizers = []string{"example.com/hold"}
++	if err := f.c.Update(f.ctx, wl); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.c.Delete(f.ctx, wl); err != nil {
++		t.Fatal(err)
++	}
++	f.reconcile()
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims while the Workload is being deleted, want 0", n)
++	}
++}
++
++func TestSweepDeletesOrphanedNodeClaims(t *testing.T) {
++	live := reservedWorkload("karpenter-a").Obj()
++	attempt := attemptID(live, reservedAt)
++	old := metav1.NewTime(reservedAt.Add(-time.Hour))
++	claim := func(name, namespace, wlName, attempt string, created metav1.Time) *unstructured.Unstructured {
++		nc := newNodeClaim(utiltestingapi.MakeWorkload(wlName, namespace).Obj(), attempt, "main-0", nil)
++		nc.SetName(name)
++		nc.SetCreationTimestamp(created)
++		if namespace == "" {
++			labels := nc.GetLabels()
++			delete(labels, WorkloadNamespaceLabelKey)
++			delete(labels, AttemptLabelKey)
++			nc.SetLabels(labels)
++		}
++		return nc
++	}
++	f := newFixture(t, live, nil,
++		claim("current", ns, wlName, attempt, old),
++		claim("stale-attempt", ns, wlName, "stale", old),
++		claim("gone-workload", ns, "gone", "x", old),
++		claim("young", ns, "gone", "x", metav1.NewTime(reservedAt)),
++		claim("legacy", "", "gone", "", old),
++	)
++	if err := f.ctrl.Sweep(f.ctx); err != nil {
++		t.Fatalf("Sweep: %v", err)
++	}
++	var got []string
++	for _, c := range f.claims() {
++		got = append(got, c.GetName())
++	}
++	if diff := cmp.Diff([]string{"current", "legacy", "young"}, got); diff != "" {
++		t.Errorf("NodeClaims after sweep (-want +got):\n%s", diff)
 +	}
 +}
 diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go

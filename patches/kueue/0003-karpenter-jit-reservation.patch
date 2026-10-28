@@ -80,10 +80,10 @@ index ff3e6fb..4a6fc27 100644
  	cq := newClusterQueueImpl(ctx, nil, defaultOrdering, testingclock.NewFakeClock(time.Now()))
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
 new file mode 100644
-index 0000000..5fcd525
+index 0000000..e9f43c7
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,543 @@
 +// Package karpenter implements an AdmissionCheck that provisions one Karpenter NodeClaim per
 +// admitted pod, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
 +package karpenter
@@ -296,6 +296,12 @@ index 0000000..5fcd525
 +	logger := log.FromContext(ctx).WithValues("check", checkName)
 +	reservedAt := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadQuotaReserved).LastTransitionTime.Time
 +	attempt := attemptID(wl, reservedAt)
++
++	// Right after a reservation on a flavor the check does not guard, the check is still Pending
++	// until Kueue drops it from the Workload; it needs no NodeClaims.
++	if guarded, err := c.guardedFlavors(ctx, wl, checkName); err != nil || len(guarded) == 0 {
++		return ctrl.Result{}, err
++	}
 +
 +	expected, err := c.desiredNodeClaims(ctx, wl, attempt)
 +	if err != nil {
@@ -623,10 +629,10 @@ index 0000000..5fcd525
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/controller_test.go b/pkg/controller/admissionchecks/karpenter/controller_test.go
 new file mode 100644
-index 0000000..81f0efa
+index 0000000..89aa0a7
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller_test.go
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,431 @@
 +// Tests for the Karpenter AdmissionCheck: NodeClaim creation, readiness, timeout and deletion failures,
 +// flavor exclusion through the allowed-flavors annotation, and clearing exclusions after admission or cooldown.
 +package karpenter
@@ -1005,6 +1011,15 @@ index 0000000..81f0efa
 +		if claim.GetLabels()[AttemptLabelKey] == "stale" {
 +			t.Errorf("NodeClaim %s of an earlier reservation was kept", claim.GetName())
 +		}
++	}
++}
++
++func TestIgnoresCheckOnUnguardedFlavor(t *testing.T) {
++	// Kueue reserved quota on a flavor without the check before it removed the reset Pending check.
++	f := newFixture(t, reservedWorkload("remote").Obj(), nil)
++	f.reconcile()
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims for a flavor the check does not guard, want 0", n)
 +	}
 +}
 +

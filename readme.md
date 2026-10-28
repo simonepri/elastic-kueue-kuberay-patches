@@ -79,7 +79,7 @@ The table below outlines the core architectural issues in upstream controllers a
 | :-: | :--- | :--- | :--- | :--- | :--- |
 | **1** | `kubernetes-sigs/kueue` | [`0001-partial-preemption.patch`](patches/kueue/0001-partial-preemption.patch) | Binary all-or-nothing preemption terminates the entire Ray cluster when higher-priority jobs arrive. Also prevents borrowing workloads from being reclaimed proportionally. | Schedules partial preemption down to `minReplicas` (`minCount`), evicting only surplus elastic worker pods while keeping the Ray head and state intact. Reclaims cohort borrowed quota proportionally. | [`tests/scenarios/kueue/01-partial-preemption/01-collaborative-drain`](tests/scenarios/kueue/01-partial-preemption/01-collaborative-drain)<br>[`tests/scenarios/kueue/01-partial-preemption/02-min-viable-guard`](tests/scenarios/kueue/01-partial-preemption/02-min-viable-guard)<br>[`tests/scenarios/kueue/01-partial-preemption/03-cohort-reclaim`](tests/scenarios/kueue/01-partial-preemption/03-cohort-reclaim) |
 | **2** | `kubernetes-sigs/kueue` | [`0002-elastic-reexpansion.patch`](patches/kueue/0002-elastic-reexpansion.patch) | Admitted Workload status and pod set counts are immutable; when competing workloads terminate, previously trimmed elastic clusters remain permanently shrunken. | Allows in-place pod set assignment mutations via admission webhooks and watches cluster queue releases to automatically re-expand workloads to their original spec count. | [`tests/scenarios/kueue/02-elastic-reexpansion/01-reexpansion`](tests/scenarios/kueue/02-elastic-reexpansion/01-reexpansion) |
-| **3** | `kubernetes-sigs/kueue` | [`0003-karpenter-jit-reservation.patch`](patches/kueue/0003-karpenter-jit-reservation.patch) | Kueue relies on standard cluster autoscalers reactively; cold-start gang workloads stall without JIT capacity, and newly provisioned nodes get stolen by rogue unmanaged pods. | Implements an in-tree Karpenter AdmissionCheck controller that pre-provisions `NodeClaim` resources for gang workloads and isolates nodes with `kyield.io/claimed-by=<gang-id>` reservation taints. | [`tests/scenarios/kueue/03-karpenter-jit-reservation/01-cold-start-gang`](tests/scenarios/kueue/03-karpenter-jit-reservation/01-cold-start-gang)<br>[`tests/scenarios/kueue/03-karpenter-jit-reservation/02-anti-theft-taint`](tests/scenarios/kueue/03-karpenter-jit-reservation/02-anti-theft-taint) |
+| **3** | `kubernetes-sigs/kueue` | [`0003-karpenter-jit-reservation.patch`](patches/kueue/0003-karpenter-jit-reservation.patch) | Kueue relies on standard cluster autoscalers reactively; cold-start gang workloads stall without JIT capacity, newly provisioned nodes get stolen by rogue unmanaged pods, and a workload whose flavor has no capacity waits on it forever instead of moving to the next flavor. | Implements an in-tree Karpenter AdmissionCheck controller that creates one `NodeClaim` per admitted pod, restricted to the flavor's node labels and tainted `karpenter.sh/claimed-by=<workload>`, and keeps the check Pending until every NodeClaim is `Launched` (or `Registered`). When a NodeClaim is deleted first, as Karpenter does on insufficient capacity, or the launch timeout passes, it deletes the NodeClaims, excludes the flavor through the `kueue.x-k8s.io/workload-allowed-resource-flavors` annotation, and sets the check to Retry, so Kueue assigns the next flavor. The scheduler honors that annotation without the `ConcurrentAdmission` feature gate. | [`tests/scenarios/kueue/03-karpenter-jit-reservation/01-cold-start-gang`](tests/scenarios/kueue/03-karpenter-jit-reservation/01-cold-start-gang)<br>[`tests/scenarios/kueue/03-karpenter-jit-reservation/02-anti-theft-taint`](tests/scenarios/kueue/03-karpenter-jit-reservation/02-anti-theft-taint)<br>[`tests/scenarios/kueue/03-karpenter-jit-reservation/03-launch-timeout-fallback`](tests/scenarios/kueue/03-karpenter-jit-reservation/03-launch-timeout-fallback)<br>`pkg/controller/admissionchecks/karpenter/controller_test.go` (added by the patch; `mise run test:kueue`) |
 | **4** | `ray-project/kuberay` | [`0001-actor-protect.patch`](patches/kuberay/0001-actor-protect.patch) | The Ray autoscaler terminates worker pods without Kubernetes awareness, killing pods actively executing stateful actor workloads during scale-down. | Operator inspects worker `ray.io/actor-state` labels and manages `controller.kubernetes.io/pod-deletion-cost` (e.g. `+1000` for busy actors, `-1000` for idle workers). | [`tests/scenarios/kuberay/01-actor-protect/01-actor-aware-drain`](tests/scenarios/kuberay/01-actor-protect/01-actor-aware-drain) |
 | **5** | `ray-project/kuberay` | [`0002-spot-interruption.patch`](patches/kuberay/0002-spot-interruption.patch) | Cloud spot interruptions (AWS 2-minute notice / GCP 30-second notice) trigger abrupt node termination and worker pod eviction without coordinated state drain. | Operator intercepts spot interruption notices, flags affected Ray pods, and coordinates graceful actor migration before the physical node is terminated. | [`tests/scenarios/kuberay/02-spot-interruption/01-spot-termination-drain`](tests/scenarios/kuberay/02-spot-interruption/01-spot-termination-drain) |
 | **6** | `ray-project/kuberay` | [`0003-scalegate.patch`](patches/kuberay/0003-scalegate.patch) | Ray autoscaler requests scale-up beyond ClusterQueue quota and cohort limits, leading to stuck pending pods and quota starvation for other tenants. | ScaleGate reconciler clamps `workerGroupSpecs.maxReplicas` to the ClusterQueue nominal quota plus cohort borrowing ceiling, keeping autoscaling strictly within budget. | [`tests/scenarios/kuberay/03-scalegate-quota/01-scaleup-clamping`](tests/scenarios/kuberay/03-scalegate-quota/01-scaleup-clamping) |
@@ -229,7 +229,7 @@ curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/v0.20.2/man
 ```
 
 #### Required RBAC for Karpenter JIT AdmissionCheck
-When using the in-tree Karpenter AdmissionCheck controller for JIT gang pre-provisioning, grant Kueue permission to manage `karpenter.sh/v1` `NodeClaim` resources:
+When using the in-tree Karpenter AdmissionCheck controller for JIT gang pre-provisioning, grant Kueue permission to create, list, and delete `karpenter.sh/v1` `NodeClaim` resources. The controller reads NodeClaim status but never writes it:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -238,8 +238,8 @@ metadata:
   name: kueue-karpenter-nodeclaims
 rules:
   - apiGroups: ["karpenter.sh"]
-    resources: ["nodeclaims", "nodeclaims/status"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources: ["nodeclaims"]
+    verbs: ["get", "list", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -256,16 +256,41 @@ subjects:
 ```
 
 #### Configure Karpenter AdmissionCheck
-To enable JIT gang pre-provisioning, define the AdmissionCheck and associate it with your `ClusterQueue`:
+Define the AdmissionCheck and run it only on the flavors Karpenter provisions, so that a flavor without it, such as a virtual-kubelet flavor for remote capacity, is where workloads go when Karpenter cannot launch nodes. List the Karpenter flavors first in the resource group:
 
 ```yaml
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: AdmissionCheck
 metadata:
   name: karpenter-provision
+  annotations:
+    kueue.x-k8s.io/karpenter-launch-timeout: 5m    # default 5m
+    kueue.x-k8s.io/karpenter-wait-for: Launched    # Launched (default) or Registered
+    kueue.x-k8s.io/karpenter-flavor-cooldown: 10m  # default 10m
 spec:
-  controllerName: kyield.io/admission-check
+  controllerName: kueue.x-k8s.io/karpenter
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: training
+spec:
+  admissionChecksStrategy:
+    admissionChecks:
+      - name: karpenter-provision
+        onFlavors: [karpenter-gpu]
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: karpenter-gpu   # nodeLabels become NodeClaim requirements
+          resources: [...]
+        - name: remote-gpu      # no Karpenter check
+          resources: [...]
 ```
+
+The check creates NodeClaims that reference the `EC2NodeClass` named `default` (`karpenter.k8s.aws`), so that class must exist and be ready. Each NodeClaim requires `kubernetes.io/os=linux` plus the node labels of the pod's flavors.
+
+The check is Ready once every NodeClaim reports the `karpenter-wait-for` condition. It fails the attempt when a NodeClaim is deleted before that, which is how Karpenter reports insufficient capacity or a NodeClass that is not ready, or when the launch timeout passes since quota was reserved. It then deletes the NodeClaims, records the failed flavors in the Workload's `kueue.x-k8s.io/karpenter-excluded-flavors` annotation, sets `kueue.x-k8s.io/workload-allowed-resource-flavors` to the ClusterQueue's other flavors, and sets the check to Retry. Kueue evicts the Workload and assigns it the first allowed flavor that fits. The exclusions are removed when the Workload is admitted, so a later eviction tries the Karpenter flavor again, and each expires after the cooldown, so a Workload that fits nowhere else returns to the Karpenter flavor. The check leaves a Workload whose allowed flavors another controller set unchanged, and only retries it.
 
 ---
 
@@ -298,6 +323,9 @@ mise run cluster:up
 
 # Run all integration test scenarios across Kueue and KubeRay
 mise run test
+
+# Run the patched Kueue unit tests
+mise run test:kueue
 
 # Run the patched interLink virtual kubelet unit tests
 mise run test:interlink

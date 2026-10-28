@@ -22,6 +22,14 @@ spec:
       try:
         - assert:
             file: 02-assert-nodeclaims.yaml
+    - name: karpenter-launches-nodeclaims
+      try:
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../launch-nodeclaims.sh 4
     - name: assert-nodes-ready-and-workload-admitted
       try:
         - assert:

@@ -1,0 +1,10 @@
+# After the launch timeout the workload is admitted on the remote flavor and its flavor exclusion is cleared.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  (annotations."kueue.x-k8s.io/karpenter-excluded-flavors" == `null`): true
+  (annotations."kueue.x-k8s.io/workload-allowed-resource-flavors" == `null`): true
+status:
+  (admission.podSetAssignments[0].flavors.cpu): remote-capacity
+  (conditions[?type == 'Admitted']):
+    - status: "True"

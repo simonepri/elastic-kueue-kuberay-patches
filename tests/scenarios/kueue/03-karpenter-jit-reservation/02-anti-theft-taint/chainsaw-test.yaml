@@ -20,6 +20,14 @@ spec:
       try:
         - assert:
             file: 02-assert-tainted-nodeclaim.yaml
+    - name: karpenter-launches-nodeclaims
+      try:
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../launch-nodeclaims.sh 1
     - name: assert-admission-granted
       try:
         - assert:

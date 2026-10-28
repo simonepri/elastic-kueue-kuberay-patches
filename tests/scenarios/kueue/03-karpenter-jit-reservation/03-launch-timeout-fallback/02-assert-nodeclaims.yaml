@@ -1,0 +1,9 @@
+# The check requests a NodeClaim restricted to the first flavor's node labels.
+apiVersion: karpenter.sh/v1
+kind: NodeClaim
+metadata:
+  (labels."kueue.x-k8s.io/workload-namespace"): ($namespace)
+spec:
+  (requirements[?key == 'example.com/pool']):
+    - operator: In
+      values: [karpenter]

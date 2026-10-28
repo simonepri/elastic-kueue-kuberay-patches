@@ -179,6 +179,12 @@ run = """
 docker run --rm -v "$PWD/tests/ray:/tests:ro" "$(cat .ray-image.txt)" python -m unittest discover -v -s /tests -p 'test_*.py'
 """
 
+[tasks."test:kueue"]
+description = "Run unit tests of the packages the Karpenter AdmissionCheck and deployment queue patches change"
+depends = ["patch:kueue"]
+dir = "third_party/kueue"
+run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/scheduler/flavorassigner/ ./pkg/workload/ ./pkg/controller/jobs/deployment/"
+
 [tasks."test:interlink"]
 description = "Run patched interLink virtual kubelet unit tests"
 depends = ["patch:interlink"]
@@ -344,8 +350,8 @@ metadata:
   name: kueue-karpenter-nodeclaims
 rules:
 - apiGroups: ["karpenter.sh"]
-  resources: ["nodeclaims", "nodeclaims/status"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  resources: ["nodeclaims"]
+  verbs: ["get", "list", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

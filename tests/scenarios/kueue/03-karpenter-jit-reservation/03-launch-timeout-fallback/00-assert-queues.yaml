@@ -1,0 +1,8 @@
+# The Karpenter AdmissionCheck reports Active, so the ClusterQueue can admit workloads.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: AdmissionCheck
+metadata:
+  name: karpenter-fallback
+status:
+  (conditions[?type == 'Active']):
+    - status: "True"

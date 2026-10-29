@@ -1,5 +1,5 @@
 {
-  "patches/kueue": "0.4.0",
+  "patches/kueue": "0.5.0",
   "patches/kuberay": "0.3.5",
   "patches/interlink": "0.5.0",
   "patches/ray": "0.1.0"

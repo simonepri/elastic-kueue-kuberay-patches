@@ -23,6 +23,10 @@ INTERLINK_UPSTREAM = "0.6.2"
 # renovate: datasource=docker depName=rayproject/ray
 RAY_UPSTREAM = "2.59.0"
 RAY_PYTHON = "py313"
+# Upstream Ray image variant (the tag suffix after the Python version, such as "-gpu") and its platforms;
+# CI builds every variant in patches/ray/variants.json by setting both.
+RAY_VARIANT = "{{ get_env(name='RAY_VARIANT', default='') }}"
+RAY_PLATFORMS = "{{ get_env(name='RAY_PLATFORMS', default='linux/amd64,linux/arm64') }}"
 
 # Internal patchset versions (tracks release-please manifests)
 KUEUE_PATCH_VERSION = "0.5.0"
@@ -34,7 +38,8 @@ RAY_PATCH_VERSION = "0.1.0"
 KUEUE_IMAGE_TAG = "{{env.KUEUE_UPSTREAM}}-p{{env.KUEUE_PATCH_VERSION}}"
 KUBERAY_IMAGE_TAG = "{{env.KUBERAY_UPSTREAM}}-p{{env.KUBERAY_PATCH_VERSION}}"
 INTERLINK_IMAGE_TAG = "{{env.INTERLINK_UPSTREAM}}-p{{env.INTERLINK_PATCH_VERSION}}"
-RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}-p{{env.RAY_PATCH_VERSION}}"
+RAY_BASE_IMAGE = "rayproject/ray:{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}"
+RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}-p{{env.RAY_PATCH_VERSION}}"
 
 [tasks."clone:kueue"]
 description = "Clone upstream Kueue at target version"
@@ -163,20 +168,21 @@ echo "Built interLink virtual kubelet image: $INTERLINK_IMG"
 """
 
 [tasks."build:ray"]
-description = "Build patched Ray image"
+description = "Build the patched Ray image for RAY_VARIANT"
 depends = ["patch:ray"]
 run = """
-docker build -f docker/ray.Dockerfile --build-arg BASE_IMAGE=rayproject/ray:$RAY_UPSTREAM-$RAY_PYTHON -t kind.local/ray:$RAY_IMAGE_TAG -t kind.local/ray:latest third_party/ray
+docker build -f docker/ray.Dockerfile --build-arg BASE_IMAGE=$RAY_BASE_IMAGE -t kind.local/ray:$RAY_IMAGE_TAG -t kind.local/ray:latest third_party/ray
 echo "kind.local/ray:$RAY_IMAGE_TAG" > .ray-image.txt
 RAY_IMG=$(cat .ray-image.txt)
 echo "Built Ray image: $RAY_IMG"
 """
 
 [tasks."test:ray"]
-description = "Run patched Ray unit tests inside the patched Ray image"
+description = "Run patched Ray unit tests inside the patched Ray image for RAY_VARIANT"
 depends = ["build:ray"]
 run = """
-docker run --rm -v "$PWD/tests/ray:/tests:ro" "$(cat .ray-image.txt)" python -m unittest discover -v -s /tests -p 'test_*.py'
+docker run --rm -v "$PWD/tests/ray:/tests:ro" -v "$PWD/third_party/ray/python/ray:/patched:ro" -e RAY_PATCHED_SOURCES=/patched \
+  "$(cat .ray-image.txt)" python -m unittest discover -v -s /tests -p 'test_*.py'
 """
 
 [tasks."test:kueue"]
@@ -239,15 +245,14 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 """
 
 [tasks."publish:ray"]
-description = "Build and publish patched Ray multi-arch image to GHCR"
+description = "Build and publish the patched Ray image for RAY_VARIANT on RAY_PLATFORMS to GHCR"
 depends = ["patch:ray"]
 run = """
-TAG="${RAY_UPSTREAM}-${RAY_PYTHON}-p${RAY_PATCH_VERSION}"
-echo "Publishing Ray image ghcr.io/simonepri/ray:$TAG..."
-docker buildx build --platform linux/amd64,linux/arm64 \
+echo "Publishing Ray image ghcr.io/simonepri/ray:$RAY_IMAGE_TAG from $RAY_BASE_IMAGE for $RAY_PLATFORMS..."
+docker buildx build --platform "$RAY_PLATFORMS" \
   -f docker/ray.Dockerfile \
-  --build-arg BASE_IMAGE="rayproject/ray:${RAY_UPSTREAM}-${RAY_PYTHON}" \
-  -t "ghcr.io/simonepri/ray:$TAG" \
+  --build-arg BASE_IMAGE="$RAY_BASE_IMAGE" \
+  -t "ghcr.io/simonepri/ray:$RAY_IMAGE_TAG" \
   --push \
   third_party/ray
 """

@@ -21,6 +21,8 @@ metadata:
   name: karpenter-fallback
   annotations:
     kueue.x-k8s.io/karpenter-launch-timeout: 10s
+    # The first flavor names no NodePool, so its NodeClaims use this node class.
+    kueue.x-k8s.io/karpenter-node-class: karpenter.k8s.aws/EC2NodeClass/default
 spec:
   controllerName: kueue.x-k8s.io/karpenter
 ---

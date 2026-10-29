@@ -1,7 +1,26 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: anti-theft-pool
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+      requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: anti-theft-flavor
+spec:
+  nodeLabels:
+    karpenter.sh/nodepool: anti-theft-pool
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: AdmissionCheck

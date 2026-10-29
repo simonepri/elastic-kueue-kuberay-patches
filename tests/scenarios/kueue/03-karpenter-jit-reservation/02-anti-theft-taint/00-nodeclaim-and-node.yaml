@@ -7,6 +7,8 @@ metadata:
     topology.kubernetes.io/zone: us-east-1a
   annotations:
     karpenter.sh/nodepool: default
+    # Karpenter copies the NodeClaim's annotations, including the check's disruption hold, to the Node it registers.
+    karpenter.sh/do-not-disrupt: "true"
 spec:
   taints:
     - key: karpenter.sh/claimed-by

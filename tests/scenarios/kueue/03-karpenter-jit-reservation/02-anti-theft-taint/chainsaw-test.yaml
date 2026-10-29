@@ -6,7 +6,8 @@ spec:
   description: >
     Verifies that Karpenter NodeClaims dynamically pre-provisioned by Kueue's Karpenter
     controller are assigned anti-theft taints (karpenter.sh/claimed-by) preventing rogue workloads
-    from stealing capacity, and that the workload is admitted once nodes are ready.
+    from stealing capacity, that the workload is admitted once nodes are ready, and that the
+    NodeClaim's do-not-disrupt hold is removed from it and its Node once a pod is bound to the Node.
   steps:
     - name: setup-queues
       try:
@@ -46,3 +47,14 @@ spec:
             file: 02-intended-pod.yaml
         - assert:
             file: 02-assert-intended-pod-scheduled.yaml
+    - name: hold-released-once-pod-bound
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+              - name: NODE
+                value: simulated-gpu-node-01
+            content: ../bind-nodeclaims.sh
+        - assert:
+            file: 04-assert-hold-released.yaml

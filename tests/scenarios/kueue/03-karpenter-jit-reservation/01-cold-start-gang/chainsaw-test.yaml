@@ -6,7 +6,8 @@ spec:
   description: >
     Verifies that a gang-scheduled batch workload submitted to Kueue triggers JIT
     pre-provisioning of Karpenter NodeClaims with anti-theft taints before Kueue admits the workload,
-    preventing the 15-minute waitForPodsReady timeout failure.
+    preventing the 15-minute waitForPodsReady timeout failure. The NodeClaims belong to the flavor's
+    NodePool, take its node class and taints, and request the resources of the pods packed onto each.
   steps:
     - name: setup-queues
       try:
@@ -22,6 +23,8 @@ spec:
       try:
         - assert:
             file: 02-assert-nodeclaims.yaml
+        - error:
+            file: 02-unpacked-nodeclaims.yaml
     - name: karpenter-launches-nodeclaims
       try:
         - script:
@@ -29,7 +32,7 @@ spec:
             env:
               - name: NS
                 value: ($namespace)
-            content: ../launch-nodeclaims.sh 4
+            content: ../launch-nodeclaims.sh 2
     - name: assert-nodes-ready-and-workload-admitted
       try:
         - assert:

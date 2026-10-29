@@ -1,7 +1,39 @@
+# A Karpenter NodePool whose requirements bound the instance size, and a flavor that names it.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-pool
+spec:
+  template:
+    metadata:
+      labels:
+        example.com/team: ml
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu
+      requirements:
+        - key: karpenter.k8s.aws/instance-cpu
+          operator: In
+          values: ["16", "32"]
+        - key: karpenter.k8s.aws/instance-memory
+          operator: In
+          values: ["65536", "131072"]
+        - key: karpenter.k8s.aws/instance-gpu-count
+          operator: In
+          values: ["1", "4"]
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: gpu-flavor
+spec:
+  nodeLabels:
+    karpenter.sh/nodepool: gpu-pool
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: AdmissionCheck

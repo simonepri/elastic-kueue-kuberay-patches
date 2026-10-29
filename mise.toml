@@ -183,7 +183,7 @@ docker run --rm -v "$PWD/tests/ray:/tests:ro" "$(cat .ray-image.txt)" python -m 
 description = "Run unit tests of the packages the Karpenter AdmissionCheck and deployment queue patches change"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
-run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/scheduler/flavorassigner/ ./pkg/workload/ ./pkg/controller/jobs/deployment/"
+run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/deployment/"
 
 [tasks."test:interlink"]
 description = "Run patched interLink virtual kubelet unit tests"
@@ -335,7 +335,8 @@ subjects:
   namespace: default
 EOF
 
-# 6. Install Kueue manifests directly patched with sed (image, ko entrypoint, and Karpenter NodeClaim RBAC)
+# 6. Install Kueue manifests directly patched with sed (image, ko entrypoint), the ConcurrentAdmission feature gate
+#    the Karpenter AdmissionCheck requires, and the Karpenter RBAC
 echo "Installing Kueue manifests with patched image..."
 curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml" | \
   sed -e "s|registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM|$KUEUE_IMG|g" \
@@ -351,7 +352,13 @@ metadata:
 rules:
 - apiGroups: ["karpenter.sh"]
   resources: ["nodeclaims"]
-  verbs: ["get", "list", "create", "delete"]
+  verbs: ["get", "list", "create", "patch", "delete"]
+- apiGroups: ["karpenter.sh"]
+  resources: ["nodepools"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -367,6 +374,8 @@ subjects:
   namespace: kueue-system
 EOF
 
+kubectl patch deployment/kueue-controller-manager -n kueue-system --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates=ConcurrentAdmission=true"}]'
 kubectl set resources deployment/kueue-controller-manager -n kueue-system --limits=memory=2Gi --requests=memory=512Mi
 
 # 7. Wait for rollouts

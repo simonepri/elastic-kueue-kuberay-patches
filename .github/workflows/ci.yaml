@@ -75,13 +75,38 @@ jobs:
             git apply --whitespace=nowarn "$patch" || (echo "Failed to apply $patch" && exit 1)
           done
 
-  ray-unit-tests:
-    name: Ray Unit Tests
-    needs: [validate-patches]
+  ray-variants:
+    name: List Ray Image Variants
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.variants.outputs.matrix }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Read Variants
+        id: variants
+        run: echo "matrix=$(jq -c . patches/ray/variants.json)" >> "$GITHUB_OUTPUT"
+
+  ray-unit-tests:
+    name: Ray Unit Tests (py313${{ matrix.variant }})
+    needs: [validate-patches, ray-variants]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.ray-variants.outputs.matrix) }}
+    env:
+      RAY_VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Free Disk Space for the CUDA Base Image
+        if: ${{ matrix.variant != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install Mise
         uses: jdx/mise-action@v5

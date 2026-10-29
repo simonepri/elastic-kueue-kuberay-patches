@@ -1,0 +1,30 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 03-launch-timeout-fallback
+spec:
+  description: >
+    Verifies that when Karpenter does not launch a gang's NodeClaims within the AdmissionCheck's launch timeout,
+    the check deletes the NodeClaims, excludes the flavor, and sets Retry, so Kueue admits the workload on the
+    next flavor and the exclusion is cleared once it is admitted.
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+        - assert:
+            file: 00-assert-queues.yaml
+    - name: submit-gang-job
+      try:
+        - apply:
+            file: 01-job.yaml
+    - name: assert-nodeclaims-requested-on-first-flavor
+      try:
+        - assert:
+            file: 02-assert-nodeclaims.yaml
+    - name: assert-fallback-to-remote-flavor
+      try:
+        - assert:
+            file: 03-assert-admitted-on-fallback.yaml
+        - error:
+            file: 03-nodeclaims-released.yaml

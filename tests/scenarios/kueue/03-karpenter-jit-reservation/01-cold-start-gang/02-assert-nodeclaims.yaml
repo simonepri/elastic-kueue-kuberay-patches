@@ -1,9 +1,27 @@
+# Half of the largest allowed instance (4 GPUs) holds 2 of the 4 pods, so the check requests 2 NodeClaims in the
+# NodePool, each sized for 2 pods and protected from disruption until those pods are bound.
 apiVersion: karpenter.sh/v1
 kind: NodeClaim
 metadata:
+  (labels."kueue.x-k8s.io/workload-namespace"): ($namespace)
   labels:
     karpenter.sh/managed-by: kueue
+    karpenter.sh/nodepool: gpu-pool
+    example.com/team: ml
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"
+    kueue.x-k8s.io/karpenter-pods: "2"
 spec:
-  taints:
+  nodeClassRef:
+    group: karpenter.k8s.aws
+    kind: EC2NodeClass
+    name: gpu
+  resources:
+    requests:
+      cpu: "4"
+      memory: 8Gi
+      nvidia.com/gpu: "2"
+  (taints[?key == 'karpenter.sh/claimed-by']):
     - effect: NoSchedule
-      key: karpenter.sh/claimed-by
+  (taints[?key == 'nvidia.com/gpu']):
+    - effect: NoSchedule

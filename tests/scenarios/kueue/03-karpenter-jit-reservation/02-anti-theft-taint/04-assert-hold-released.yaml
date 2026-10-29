@@ -1,0 +1,13 @@
+# Once the Node runs the pod its NodeClaim was sized for, the check removes the disruption hold from both.
+apiVersion: karpenter.sh/v1
+kind: NodeClaim
+metadata:
+  (labels."kueue.x-k8s.io/workload-namespace"): ($namespace)
+  (annotations."karpenter.sh/do-not-disrupt" == `null`): true
+  (annotations."kueue.x-k8s.io/karpenter-disruption-hold" == `null`): true
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: simulated-gpu-node-01
+  (annotations."karpenter.sh/do-not-disrupt" == `null`): true

@@ -22,19 +22,21 @@ index 8c981cc..ae6b909 100644
  	if err := provisioning.ServerSupportsProvisioningRequest(mgr); err != nil {
  		setupLog.Error(
 diff --git a/pkg/cache/queue/cluster_queue.go b/pkg/cache/queue/cluster_queue.go
-index 3db5d8f..0e5891c 100644
+index 3db5d8f..e9ddb5f 100644
 --- a/pkg/cache/queue/cluster_queue.go
 +++ b/pkg/cache/queue/cluster_queue.go
-@@ -397,6 +397,7 @@ func (c *ClusterQueue) PushOrUpdate(wInfo *workload.Info) {
+@@ -397,6 +397,9 @@ func (c *ClusterQueue) PushOrUpdate(wInfo *workload.Info) {
  		if !specChangedSinceEval &&
  			equality.Semantic.DeepEqual(oldInfo.Obj.Spec, wInfo.Obj.Spec) &&
  			!priorityBoostAnnotationChanged(oldInfo, wInfo) &&
++			// The Karpenter admission check widens the allowed flavors of a waiting Workload when a flavor exclusion
++			// expires; the change bumps no generation, so without this check the Workload would wait for an unrelated event.
 +			oldInfo.Obj.Annotations[controllerconstants.WorkloadAllowedResourceFlavorAnnotation] == wInfo.Obj.Annotations[controllerconstants.WorkloadAllowedResourceFlavorAnnotation] &&
  			equality.Semantic.DeepEqual(oldInfo.Obj.Status.ReclaimablePods, wInfo.Obj.Status.ReclaimablePods) &&
  			equality.Semantic.DeepEqual(oldInfo.Obj.Status.RequeueState, wInfo.Obj.Status.RequeueState) &&
  			equality.Semantic.DeepEqual(apimeta.FindStatusCondition(oldInfo.Obj.Status.Conditions, kueue.WorkloadEvicted),
 diff --git a/pkg/cache/queue/cluster_queue_test.go b/pkg/cache/queue/cluster_queue_test.go
-index ff3e6fb..4a6fc27 100644
+index ff3e6fb..8070848 100644
 --- a/pkg/cache/queue/cluster_queue_test.go
 +++ b/pkg/cache/queue/cluster_queue_test.go
 @@ -37,6 +37,7 @@ import (
@@ -45,11 +47,12 @@ index ff3e6fb..4a6fc27 100644
  	"sigs.k8s.io/kueue/pkg/features"
  	"sigs.k8s.io/kueue/pkg/metrics"
  	"sigs.k8s.io/kueue/pkg/resources"
-@@ -337,6 +338,32 @@ func TestPushOrUpdateGenerationChanged(t *testing.T) {
+@@ -337,6 +338,33 @@ func TestPushOrUpdateGenerationChanged(t *testing.T) {
  	}
  }
  
 +func TestPushOrUpdateAllowedFlavorsChanged(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, true)
 +	now := time.Now()
 +	ctx, log := utiltesting.ContextWithLog(t)
 +	cq := newClusterQueueImpl(ctx, nil, defaultOrdering, testingclock.NewFakeClock(now))
@@ -80,28 +83,33 @@ index ff3e6fb..4a6fc27 100644
  	cq := newClusterQueueImpl(ctx, nil, defaultOrdering, testingclock.NewFakeClock(time.Now()))
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
 new file mode 100644
-index 0000000..13f76c7
+index 0000000..e613e58
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
-@@ -0,0 +1,645 @@
-+// Package karpenter implements an AdmissionCheck that provisions one Karpenter NodeClaim per
-+// admitted pod, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
+@@ -0,0 +1,1064 @@
++// Package karpenter implements an AdmissionCheck that provisions Karpenter NodeClaims sized for the admitted pods
++// in the flavor's NodePool, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
 +package karpenter
 +
 +import (
 +	"context"
 +	"crypto/sha256"
 +	"fmt"
++	"maps"
++	"math"
 +	"slices"
 +	"sort"
++	"strconv"
 +	"strings"
 +	"time"
 +
 +	corev1 "k8s.io/api/core/v1"
 +	apierrors "k8s.io/apimachinery/pkg/api/errors"
 +	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	"k8s.io/apimachinery/pkg/api/resource"
 +	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 +	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
 +	"k8s.io/apimachinery/pkg/runtime/schema"
 +	"k8s.io/apimachinery/pkg/types"
 +	"k8s.io/apimachinery/pkg/util/wait"
@@ -114,6 +122,8 @@ index 0000000..13f76c7
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
 +	"sigs.k8s.io/kueue/pkg/util/admissioncheck"
 +	"sigs.k8s.io/kueue/pkg/util/csv"
 +	utilqueue "sigs.k8s.io/kueue/pkg/util/queue"
@@ -140,6 +150,15 @@ index 0000000..13f76c7
 +	WaitForAnnotation = "kueue.x-k8s.io/karpenter-wait-for"
 +	// FlavorCooldownAnnotation on the AdmissionCheck sets how long a failed flavor stays excluded.
 +	FlavorCooldownAnnotation = "kueue.x-k8s.io/karpenter-flavor-cooldown"
++	// NodeClassAnnotation on the AdmissionCheck names the node class, as "group/Kind/name", of NodeClaims for
++	// flavors whose node labels name no NodePool. Flavors that name a NodePool use the NodePool's nodeClassRef.
++	NodeClassAnnotation = "kueue.x-k8s.io/karpenter-node-class"
++	// NodeFillFractionAnnotation on the AdmissionCheck sets the share of the largest instance the NodePool allows
++	// that the pods packed onto one NodeClaim may request, between 0 (exclusive) and 1.
++	NodeFillFractionAnnotation = "kueue.x-k8s.io/karpenter-node-fill-fraction"
++	// MaxNodeClaimsAnnotation on the AdmissionCheck caps the NodeClaims of one quota reservation; a reservation
++	// that needs more fails like one Karpenter cannot launch.
++	MaxNodeClaimsAnnotation = "kueue.x-k8s.io/karpenter-max-nodeclaims"
 +
 +	// ExcludedFlavorsAnnotation on the Workload records each excluded flavor with the time its exclusion expires,
 +	// as "flavor=RFC3339,...". The controller owns the allowed-flavors annotation only while this one is present.
@@ -147,18 +166,48 @@ index 0000000..13f76c7
 +	// ProvisionedAttemptAnnotation on the Workload records the attempt whose NodeClaims were all created,
 +	// so a NodeClaim that is missing afterwards was deleted rather than not yet created.
 +	ProvisionedAttemptAnnotation = "kueue.x-k8s.io/karpenter-provisioned-attempt"
++	// HoldsReleasedAnnotation on the Workload records the attempt whose NodeClaims no longer block disruption.
++	HoldsReleasedAnnotation = "kueue.x-k8s.io/karpenter-holds-released"
 +
-+	DefaultLaunchTimeout  = 5 * time.Minute
-+	DefaultFlavorCooldown = 10 * time.Minute
-+	pollInterval          = 10 * time.Second
-+	sweepInterval         = 5 * time.Minute
-+	sweepGracePeriod      = 2 * time.Minute
++	// DisruptionHoldAnnotation on a NodeClaim marks a do-not-disrupt annotation that the check set and removes
++	// once the NodeClaim's Node runs the pods the NodeClaim was sized for.
++	DisruptionHoldAnnotation = "kueue.x-k8s.io/karpenter-disruption-hold"
++	// PodsAnnotation on a NodeClaim records how many pods of its pod set the NodeClaim was sized for.
++	PodsAnnotation = "kueue.x-k8s.io/karpenter-pods"
++
++	// Karpenter's well-known label and annotations.
++	NodePoolLabelKey                 = "karpenter.sh/nodepool"
++	DoNotDisruptAnnotationKey        = "karpenter.sh/do-not-disrupt"
++	nodePoolHashAnnotationKey        = "karpenter.sh/nodepool-hash"
++	nodePoolHashVersionAnnotationKey = "karpenter.sh/nodepool-hash-version"
++
++	DefaultLaunchTimeout    = 5 * time.Minute
++	DefaultFlavorCooldown   = 10 * time.Minute
++	DefaultNodeFillFraction = 0.5
++	DefaultMaxNodeClaims    = 100
++	pollInterval            = 10 * time.Second
++	sweepInterval           = 5 * time.Minute
++	sweepGracePeriod        = 2 * time.Minute
 +
 +	conditionLaunched   = "Launched"
 +	conditionRegistered = "Registered"
 +)
 +
-+var nodeClaimGVK = schema.GroupVersionKind{Group: "karpenter.sh", Version: "v1", Kind: "NodeClaim"}
++var (
++	nodeClaimGVK = schema.GroupVersionKind{Group: "karpenter.sh", Version: "v1", Kind: "NodeClaim"}
++	nodePoolGVK  = schema.GroupVersionKind{Group: "karpenter.sh", Version: "v1", Kind: "NodePool"}
++)
++
++// instanceCapacityLabels maps a resource to the instance label that states how much of it an instance has, and
++// the quantity of one label unit. They are the labels the Karpenter AWS provider puts on its instance types.
++var instanceCapacityLabels = map[corev1.ResourceName]struct {
++	key  string
++	unit resource.Quantity
++}{
++	corev1.ResourceCPU:    {"karpenter.k8s.aws/instance-cpu", resource.MustParse("1")},
++	corev1.ResourceMemory: {"karpenter.k8s.aws/instance-memory", resource.MustParse("1Mi")},
++	"nvidia.com/gpu":      {"karpenter.k8s.aws/instance-gpu-count", resource.MustParse("1")},
++}
 +
 +func isOwnController(name string) bool {
 +	return name == ControllerName || name == AdmissionCheckName
@@ -175,6 +224,12 @@ index 0000000..13f76c7
 +	}
 +	if !isOwnController(ac.Spec.ControllerName) {
 +		return ctrl.Result{}, nil
++	}
++	if !features.Enabled(features.ConcurrentAdmission) {
++		return ctrl.Result{}, a.setActive(ctx, ac, metav1.ConditionFalse, "FeatureGateDisabled",
++			"The karpenter admission check requires the ConcurrentAdmission feature gate, because Kueue honors the "+
++				controllerconstants.WorkloadAllowedResourceFlavorAnnotation+" annotation that moves Workloads to another flavor only with it; "+
++				"start Kueue with --feature-gates=ConcurrentAdmission=true")
 +	}
 +	if _, err := parseConfig(ac); err != nil {
 +		return ctrl.Result{}, a.setActive(ctx, ac, metav1.ConditionFalse, "BadParameters", err.Error())
@@ -198,13 +253,31 @@ index 0000000..13f76c7
 +
 +// config holds the per-AdmissionCheck settings read from its annotations.
 +type config struct {
-+	launchTimeout  time.Duration
-+	waitFor        string
-+	flavorCooldown time.Duration
++	launchTimeout    time.Duration
++	waitFor          string
++	flavorCooldown   time.Duration
++	nodeClass        nodeClassRef
++	nodeFillFraction float64
++	maxNodeClaims    int
++}
++
++// nodeClassRef is a NodeClaim's spec.nodeClassRef; the zero value means none is configured.
++type nodeClassRef struct {
++	group, kind, name string
++}
++
++func (r nodeClassRef) object() map[string]any {
++	return map[string]any{"group": r.group, "kind": r.kind, "name": r.name}
 +}
 +
 +func parseConfig(ac *kueue.AdmissionCheck) (config, error) {
-+	cfg := config{launchTimeout: DefaultLaunchTimeout, waitFor: conditionLaunched, flavorCooldown: DefaultFlavorCooldown}
++	cfg := config{
++		launchTimeout:    DefaultLaunchTimeout,
++		waitFor:          conditionLaunched,
++		flavorCooldown:   DefaultFlavorCooldown,
++		nodeFillFraction: DefaultNodeFillFraction,
++		maxNodeClaims:    DefaultMaxNodeClaims,
++	}
 +	for key, target := range map[string]*time.Duration{LaunchTimeoutAnnotation: &cfg.launchTimeout, FlavorCooldownAnnotation: &cfg.flavorCooldown} {
 +		if v, ok := ac.Annotations[key]; ok {
 +			d, err := time.ParseDuration(v)
@@ -220,12 +293,35 @@ index 0000000..13f76c7
 +		}
 +		cfg.waitFor = v
 +	}
++	if v, ok := ac.Annotations[NodeClassAnnotation]; ok {
++		parts := strings.Split(v, "/")
++		if len(parts) != 3 || slices.Contains(parts, "") {
++			return cfg, fmt.Errorf("annotation %s must be group/Kind/name, got %q", NodeClassAnnotation, v)
++		}
++		cfg.nodeClass = nodeClassRef{group: parts[0], kind: parts[1], name: parts[2]}
++	}
++	if v, ok := ac.Annotations[NodeFillFractionAnnotation]; ok {
++		f, err := strconv.ParseFloat(v, 64)
++		if err != nil || f <= 0 || f > 1 {
++			return cfg, fmt.Errorf("annotation %s must be a number greater than 0 and at most 1, got %q", NodeFillFractionAnnotation, v)
++		}
++		cfg.nodeFillFraction = f
++	}
++	if v, ok := ac.Annotations[MaxNodeClaimsAnnotation]; ok {
++		n, err := strconv.Atoi(v)
++		if err != nil || n <= 0 {
++			return cfg, fmt.Errorf("annotation %s must be a positive integer, got %q", MaxNodeClaimsAnnotation, v)
++		}
++		cfg.maxNodeClaims = n
++	}
 +	return cfg, nil
 +}
 +
 +type Controller struct {
 +	client.Client
-+	Clock clock.Clock
++	// APIReader lists the Pods on a Node from the API server, which needs no Pod index in the cache.
++	APIReader client.Reader
++	Clock     clock.Clock
 +}
 +
 +func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -254,13 +350,13 @@ index 0000000..13f76c7
 +		return ctrl.Result{RequeueAfter: expiry}, nil
 +	}
 +
-+	var pending []kueue.AdmissionCheckState
++	var checks []kueue.AdmissionCheckState
 +	for _, check := range wl.Status.AdmissionChecks {
-+		if check.State == kueue.CheckStatePending {
-+			pending = append(pending, check)
++		if check.State == kueue.CheckStatePending || check.State == kueue.CheckStateReady {
++			checks = append(checks, check)
 +		}
 +	}
-+	for _, check := range pending {
++	for _, check := range checks {
 +		ac := &kueue.AdmissionCheck{}
 +		if err := c.Get(ctx, types.NamespacedName{Name: string(check.Name)}, ac); err != nil {
 +			if apierrors.IsNotFound(err) {
@@ -272,11 +368,16 @@ index 0000000..13f76c7
 +			continue
 +		}
 +		cfg, err := parseConfig(ac)
-+		if err != nil {
-+			// The AdmissionCheck reconciler reports the bad parameters as Active=False.
-+			return ctrl.Result{}, nil
++		if err != nil || !features.Enabled(features.ConcurrentAdmission) {
++			// The AdmissionCheck reconciler reports bad parameters and a disabled feature gate as Active=False.
++			return ctrl.Result{RequeueAfter: expiry}, nil
 +		}
-+		result, err := c.reconcileCheck(ctx, wl, check.Name, cfg)
++		var result ctrl.Result
++		if check.State == kueue.CheckStatePending {
++			result, err = c.reconcileCheck(ctx, wl, check.Name, cfg)
++		} else {
++			result, err = c.releaseDisruptionHolds(ctx, wl)
++		}
 +		if expiry > 0 && (result.RequeueAfter == 0 || expiry < result.RequeueAfter) {
 +			result.RequeueAfter = expiry
 +		}
@@ -300,6 +401,7 @@ index 0000000..13f76c7
 +	}
 +	patch := client.MergeFrom(wl.DeepCopy())
 +	delete(wl.Annotations, ProvisionedAttemptAnnotation)
++	delete(wl.Annotations, HoldsReleasedAnnotation)
 +	log.FromContext(ctx).Info("Released NodeClaims of a Workload without a reservation")
 +	return client.IgnoreNotFound(c.Patch(ctx, wl, patch))
 +}
@@ -392,9 +494,21 @@ index 0000000..13f76c7
 +		return ctrl.Result{}, err
 +	}
 +
-+	expected, err := c.desiredNodeClaims(ctx, wl, attempt)
++	expected, problem, err := c.desiredNodeClaims(ctx, wl, attempt, cfg)
 +	if err != nil {
 +		return ctrl.Result{}, err
++	}
++	if problem != "" {
++		claims, err := c.listNodeClaims(ctx, wl.Namespace, wl.Name)
++		if err != nil {
++			return ctrl.Result{}, err
++		}
++		current := make(map[string]*unstructured.Unstructured, len(claims))
++		for i := range claims {
++			current[claims[i].GetName()] = &claims[i]
++		}
++		logger.Info("Cannot provision NodeClaims on this flavor, retrying on another flavor", "reason", problem)
++		return ctrl.Result{}, c.fail(ctx, wl, checkName, cfg, current, problem)
 +	}
 +	if len(expected) == 0 {
 +		return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady, "No pods require NodeClaims")
@@ -418,9 +532,24 @@ index 0000000..13f76c7
 +	}
 +
 +	if wl.Annotations[ProvisionedAttemptAnnotation] != attempt {
++		var missing []*unstructured.Unstructured
 +		for _, nc := range expected {
-+			if _, ok := current[nc.GetName()]; ok {
-+				continue
++			if _, ok := current[nc.GetName()]; !ok {
++				missing = append(missing, nc)
++			}
++		}
++		problem, err := c.exceedsNodePoolLimits(ctx, missing)
++		if err != nil {
++			return ctrl.Result{}, err
++		}
++		if problem != "" {
++			logger.Info("Cannot provision NodeClaims on this flavor, retrying on another flavor", "reason", problem)
++			return ctrl.Result{}, c.fail(ctx, wl, checkName, cfg, current, problem)
++		}
++		for _, nc := range missing {
++			if _, ok := nc.GetLabels()[NodePoolLabelKey]; !ok {
++				logger.Info("Warning: the flavor names no NodePool in node label "+NodePoolLabelKey+
++					", so Karpenter does not apply NodePool limits, drift, or repair to the NodeClaim", "nodeClaim", nc.GetName())
 +			}
 +			if err := c.Create(ctx, nc); client.IgnoreAlreadyExists(err) != nil {
 +				return ctrl.Result{}, err
@@ -562,8 +691,10 @@ index 0000000..13f76c7
 +	}, workloadpatching.WithLooseOnApply(), workloadpatching.WithRetryOnConflict())
 +}
 +
-+// desiredNodeClaims returns one NodeClaim per admitted pod, restricted to the node labels of the pod's flavors.
-+func (c *Controller) desiredNodeClaims(ctx context.Context, wl *kueue.Workload, attempt string) ([]*unstructured.Unstructured, error) {
++// desiredNodeClaims returns the NodeClaims for the admitted pods. A pod set's NodeClaims are restricted to the
++// node labels of its flavors, use the NodePool those labels name, and each requests the resources of the pods
++// packed onto it. A non-empty problem means the check cannot provision this reservation on its flavors.
++func (c *Controller) desiredNodeClaims(ctx context.Context, wl *kueue.Workload, attempt string, cfg config) ([]*unstructured.Unstructured, string, error) {
 +	podSets := make(map[kueue.PodSetReference]kueue.PodSet, len(wl.Spec.PodSets))
 +	for _, ps := range wl.Spec.PodSets {
 +		podSets[ps.Name] = ps
@@ -571,13 +702,12 @@ index 0000000..13f76c7
 +	nodeLabels := map[kueue.ResourceFlavorReference]map[string]string{}
 +	var claims []*unstructured.Unstructured
 +	for _, psa := range wl.Status.Admission.PodSetAssignments {
-+		requirements := []any{requirement(corev1.LabelOSStable, string(corev1.Linux))}
 +		labels := map[string]string{}
 +		for _, f := range psa.Flavors {
 +			if _, ok := nodeLabels[f]; !ok {
 +				rf := &kueue.ResourceFlavor{}
 +				if err := c.Get(ctx, types.NamespacedName{Name: string(f)}, rf); err != nil {
-+					return nil, err
++					return nil, "", err
 +				}
 +				nodeLabels[f] = rf.Spec.NodeLabels
 +			}
@@ -585,59 +715,351 @@ index 0000000..13f76c7
 +				labels[k] = v
 +			}
 +		}
-+		keys := make([]string, 0, len(labels))
-+		for k := range labels {
-+			keys = append(keys, k)
-+		}
-+		sort.Strings(keys)
-+		for _, k := range keys {
-+			requirements = append(requirements, requirement(k, labels[k]))
-+		}
-+		count := podSets[psa.Name].Count
++		ps := podSets[psa.Name]
++		count := ps.Count
 +		if psa.Count != nil {
 +			count = *psa.Count
 +		}
-+		for i := range int(count) {
-+			claims = append(claims, newNodeClaim(wl, attempt, fmt.Sprintf("%s-%d", psa.Name, i), requirements))
++		if count == 0 {
++			continue
++		}
++		tmpl, problem, err := c.nodeClaimTemplate(ctx, labels, cfg)
++		if err != nil || problem != "" {
++			return nil, problem, err
++		}
++		perPod := resources.PodRequests(&ps.Template.Spec)
++		perClaim := min(podsPerNodeClaim(perPod, tmpl.requirements, cfg.nodeFillFraction), count)
++		for i := int32(0); i*perClaim < count; i++ {
++			pods := min(perClaim, count-i*perClaim)
++			claims = append(claims, tmpl.nodeClaim(wl, attempt, fmt.Sprintf("%s-%d", psa.Name, i), pods, perPod))
 +		}
 +	}
-+	return claims, nil
++	if len(claims) > cfg.maxNodeClaims {
++		return nil, fmt.Sprintf("the reservation needs %d NodeClaims, more than the %d that annotation %s allows",
++			len(claims), cfg.maxNodeClaims, MaxNodeClaimsAnnotation), nil
++	}
++	return claims, "", nil
 +}
 +
-+func requirement(key, value string) map[string]any {
-+	return map[string]any{"key": key, "operator": "In", "values": []any{value}}
++// nodeClaimTemplate holds what the NodeClaims of one pod set share.
++type nodeClaimTemplate struct {
++	// nodePool is the NodePool the flavor names, or nil when it names none.
++	nodePool     *unstructured.Unstructured
++	nodeClassRef map[string]any
++	requirements []any
++	// spec holds the NodePool template's taints, startup taints, expiry, and termination grace period.
++	spec        map[string]any
++	labels      map[string]string
++	annotations map[string]string
 +}
 +
-+func newNodeClaim(wl *kueue.Workload, attempt, suffix string, requirements []any) *unstructured.Unstructured {
++// nodeClaimTemplate builds the template from the NodePool that the flavor node labels name in karpenter.sh/nodepool,
++// as Karpenter builds its own NodeClaims, or from the node class annotation of the AdmissionCheck when they name none.
++func (c *Controller) nodeClaimTemplate(ctx context.Context, flavorLabels map[string]string, cfg config) (*nodeClaimTemplate, string, error) {
++	tmpl := &nodeClaimTemplate{spec: map[string]any{}, labels: map[string]string{}, annotations: map[string]string{}}
++	if name, ok := flavorLabels[NodePoolLabelKey]; ok {
++		pool := &unstructured.Unstructured{}
++		pool.SetGroupVersionKind(nodePoolGVK)
++		if err := c.Get(ctx, types.NamespacedName{Name: name}, pool); err != nil {
++			if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
++				return nil, fmt.Sprintf("NodePool %s that the flavor names in node label %s does not exist", name, NodePoolLabelKey), nil
++			}
++			return nil, "", err
++		}
++		if _, static, _ := unstructured.NestedFieldNoCopy(pool.Object, "spec", "replicas"); static {
++			return nil, fmt.Sprintf("NodePool %s sets spec.replicas, and Karpenter removes NodeClaims beyond the replicas of a static NodePool", name), nil
++		}
++		ref, _, _ := unstructured.NestedMap(pool.Object, "spec", "template", "spec", "nodeClassRef")
++		if len(ref) == 0 {
++			return nil, fmt.Sprintf("NodePool %s has no spec.template.spec.nodeClassRef", name), nil
++		}
++		tmpl.nodePool = pool
++		tmpl.nodeClassRef = ref
++		tmpl.requirements, _, _ = unstructured.NestedSlice(pool.Object, "spec", "template", "spec", "requirements")
++		for _, field := range []string{"taints", "startupTaints", "expireAfter", "terminationGracePeriod"} {
++			if v, ok, _ := unstructured.NestedFieldCopy(pool.Object, "spec", "template", "spec", field); ok {
++				tmpl.spec[field] = v
++			}
++		}
++		if labels, _, _ := unstructured.NestedStringMap(pool.Object, "spec", "template", "metadata", "labels"); labels != nil {
++			tmpl.labels = labels
++		}
++		if annotations, _, _ := unstructured.NestedStringMap(pool.Object, "spec", "template", "metadata", "annotations"); annotations != nil {
++			tmpl.annotations = annotations
++		}
++	} else {
++		if cfg.nodeClass == (nodeClassRef{}) {
++			return nil, fmt.Sprintf("the flavor names no NodePool in node label %s and the AdmissionCheck has no %s annotation",
++				NodePoolLabelKey, NodeClassAnnotation), nil
++		}
++		tmpl.nodeClassRef = cfg.nodeClass.object()
++		tmpl.requirements = []any{requirement(corev1.LabelOSStable, string(corev1.Linux))}
++	}
++	keys := make([]string, 0, len(flavorLabels))
++	for k := range flavorLabels {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	for _, k := range keys {
++		tmpl.requirements = append(tmpl.requirements, requirement(k, flavorLabels[k]))
++	}
++	return tmpl, "", nil
++}
++
++// nodeClaim returns a NodeClaim for the given number of pods of a pod set.
++func (t *nodeClaimTemplate) nodeClaim(wl *kueue.Workload, attempt, suffix string, pods int32, perPod corev1.ResourceList) *unstructured.Unstructured {
++	requests := map[string]any{}
++	for name, q := range perPod {
++		if q.IsZero() {
++			continue
++		}
++		total := q.DeepCopy()
++		total.Mul(int64(pods))
++		requests[string(name)] = total.String()
++	}
++	spec := map[string]any{}
++	maps.Copy(spec, runtime.DeepCopyJSON(t.spec))
++	spec["nodeClassRef"] = runtime.DeepCopyJSON(t.nodeClassRef)
++	spec["requirements"] = runtime.DeepCopyJSONValue(t.requirements)
++	spec["resources"] = map[string]any{"requests": requests}
++	poolTaints, _ := spec["taints"].([]any)
++	spec["taints"] = append([]any{map[string]any{
++		"key":    AntiTheftTaintKey,
++		"value":  wl.Name,
++		"effect": string(corev1.TaintEffectNoSchedule),
++	}}, poolTaints...)
++
++	nc := &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
++	nc.SetGroupVersionKind(nodeClaimGVK)
 +	name := wl.Name
 +	if len(name) > 200 {
 +		name = name[:200]
 +	}
-+	nc := &unstructured.Unstructured{Object: map[string]any{
-+		"spec": map[string]any{
-+			"nodeClassRef": map[string]any{
-+				"group": "karpenter.k8s.aws",
-+				"kind":  "EC2NodeClass",
-+				"name":  "default",
-+			},
-+			"taints": []any{map[string]any{
-+				"key":    AntiTheftTaintKey,
-+				"value":  wl.Name,
-+				"effect": string(corev1.TaintEffectNoSchedule),
-+			}},
-+			"requirements": requirements,
-+		},
-+	}}
-+	nc.SetGroupVersionKind(nodeClaimGVK)
 +	nc.SetName(strings.ToLower(fmt.Sprintf("%s-%s-%s", name, attempt, suffix)))
-+	nc.SetLabels(map[string]string{
++	labels := map[string]string{}
++	maps.Copy(labels, t.labels)
++	maps.Copy(labels, map[string]string{
 +		ManagedLabelKey:           "kueue",
 +		GangIDLabelKey:            "gang-" + wl.Name,
 +		WorkloadLabelKey:          wl.Name,
 +		WorkloadNamespaceLabelKey: wl.Namespace,
 +		AttemptLabelKey:           attempt,
 +	})
++	annotations := map[string]string{}
++	maps.Copy(annotations, t.annotations)
++	annotations[PodsAnnotation] = strconv.Itoa(int(pods))
++	if t.nodePool != nil {
++		// Karpenter applies a NodePool's limits accounting, drift, repair, and expiry to the NodeClaims labeled with it.
++		labels[NodePoolLabelKey] = t.nodePool.GetName()
++		if group, kind := t.nodeClassRef["group"], t.nodeClassRef["kind"]; group != nil && kind != nil {
++			labels[fmt.Sprintf("%v/%s", group, strings.ToLower(fmt.Sprint(kind)))] = fmt.Sprint(t.nodeClassRef["name"])
++		}
++		for _, key := range []string{nodePoolHashAnnotationKey, nodePoolHashVersionAnnotationKey} {
++			if v, ok := t.nodePool.GetAnnotations()[key]; ok {
++				annotations[key] = v
++			}
++		}
++		nc.SetOwnerReferences([]metav1.OwnerReference{{
++			APIVersion: nodePoolGVK.GroupVersion().String(),
++			Kind:       nodePoolGVK.Kind,
++			Name:       t.nodePool.GetName(),
++			UID:        t.nodePool.GetUID(),
++		}})
++		// Consolidation would remove a launched node before the pods it was made for are bound to it.
++		if annotations[DoNotDisruptAnnotationKey] != "true" {
++			annotations[DoNotDisruptAnnotationKey] = "true"
++			annotations[DisruptionHoldAnnotation] = "true"
++		}
++	}
++	nc.SetLabels(labels)
++	nc.SetAnnotations(annotations)
 +	return nc
++}
++
++func requirement(key, value string) map[string]any {
++	return map[string]any{"key": key, "operator": "In", "values": []any{value}}
++}
++
++// podsPerNodeClaim returns how many pods with the given requests one NodeClaim holds: as many as fit in the
++// fill fraction of the largest instance the requirements allow. It is 1 when the requirements do not bound
++// the instance size of a requested resource through the instance capacity labels.
++func podsPerNodeClaim(perPod corev1.ResourceList, requirements []any, fillFraction float64) int32 {
++	pods := int64(math.MaxInt32)
++	for name, q := range perPod {
++		if q.IsZero() {
++			continue
++		}
++		capacityLabel, ok := instanceCapacityLabels[name]
++		if !ok {
++			return 1
++		}
++		units, ok := upperBound(requirements, capacityLabel.key)
++		if !ok {
++			return 1
++		}
++		capacity := float64(units) * float64(capacityLabel.unit.MilliValue())
++		pods = min(pods, int64(math.Floor(fillFraction*capacity/float64(q.MilliValue()))))
++	}
++	if pods == math.MaxInt32 {
++		return 1
++	}
++	return int32(max(pods, 1))
++}
++
++// upperBound returns the largest integer value that the requirements allow for the label, if they bound it.
++func upperBound(requirements []any, key string) (int64, bool) {
++	bound, found := int64(math.MaxInt64), false
++	for _, raw := range requirements {
++		req, ok := raw.(map[string]any)
++		if !ok || req["key"] != key {
++			continue
++		}
++		values, _ := req["values"].([]any)
++		switch req["operator"] {
++		case string(corev1.NodeSelectorOpIn):
++			largest := int64(math.MinInt64)
++			for _, v := range values {
++				n, err := strconv.ParseInt(fmt.Sprint(v), 10, 64)
++				if err != nil {
++					return 0, false
++				}
++				largest = max(largest, n)
++			}
++			if len(values) > 0 {
++				bound, found = min(bound, largest), true
++			}
++		case string(corev1.NodeSelectorOpLt):
++			if len(values) != 1 {
++				return 0, false
++			}
++			n, err := strconv.ParseInt(fmt.Sprint(values[0]), 10, 64)
++			if err != nil {
++				return 0, false
++			}
++			bound, found = min(bound, n-1), true
++		}
++	}
++	return bound, found && bound > 0
++}
++
++// exceedsNodePoolLimits reports a NodePool whose spec.limits the NodeClaims would exceed on top of its
++// status.resources. Karpenter enforces limits only on the NodeClaims it creates itself, so the check enforces
++// them on its own; instances usually have more than the requested resources, so this bounds usage from below.
++func (c *Controller) exceedsNodePoolLimits(ctx context.Context, claims []*unstructured.Unstructured) (string, error) {
++	added := map[string]corev1.ResourceList{}
++	for _, nc := range claims {
++		pool, ok := nc.GetLabels()[NodePoolLabelKey]
++		if !ok {
++			continue
++		}
++		if added[pool] == nil {
++			added[pool] = corev1.ResourceList{}
++		}
++		requests, _, _ := unstructured.NestedStringMap(nc.Object, "spec", "resources", "requests")
++		if requests == nil {
++			requests = map[string]string{}
++		}
++		requests["nodes"] = "1"
++		for name, v := range requests {
++			total := added[pool][corev1.ResourceName(name)]
++			total.Add(resource.MustParse(v))
++			added[pool][corev1.ResourceName(name)] = total
++		}
++	}
++	pools := slices.Sorted(maps.Keys(added))
++	for _, name := range pools {
++		pool := &unstructured.Unstructured{}
++		pool.SetGroupVersionKind(nodePoolGVK)
++		if err := c.Get(ctx, types.NamespacedName{Name: name}, pool); err != nil {
++			return "", err
++		}
++		limits, _, _ := unstructured.NestedStringMap(pool.Object, "spec", "limits")
++		used, _, _ := unstructured.NestedStringMap(pool.Object, "status", "resources")
++		for _, r := range slices.Sorted(maps.Keys(limits)) {
++			limit, err := resource.ParseQuantity(limits[r])
++			if err != nil {
++				continue
++			}
++			total := added[name][corev1.ResourceName(r)]
++			if v, err := resource.ParseQuantity(used[r]); err == nil {
++				total.Add(v)
++			}
++			if total.Cmp(limit) > 0 {
++				return fmt.Sprintf("the NodeClaims would take NodePool %s to %s %s, over its limit of %s", name, total.String(), r, limit.String()), nil
++			}
++		}
++	}
++	return "", nil
++}
++
++// releaseDisruptionHolds removes the do-not-disrupt annotation that the check set on a NodeClaim and its Node
++// once the Node runs as many pods, other than DaemonSet pods, as the NodeClaim was sized for. It polls while
++// a hold remains and records on the Workload when none does.
++func (c *Controller) releaseDisruptionHolds(ctx context.Context, wl *kueue.Workload) (ctrl.Result, error) {
++	attempt := wl.Annotations[ProvisionedAttemptAnnotation]
++	if attempt == "" || wl.Annotations[HoldsReleasedAnnotation] == attempt {
++		return ctrl.Result{}, nil
++	}
++	claims, err := c.listNodeClaims(ctx, wl.Namespace, wl.Name)
++	if err != nil {
++		return ctrl.Result{}, err
++	}
++	held := 0
++	for i := range claims {
++		claim := &claims[i]
++		if claim.GetLabels()[AttemptLabelKey] != attempt || claim.GetAnnotations()[DisruptionHoldAnnotation] != "true" {
++			continue
++		}
++		nodeName, _, _ := unstructured.NestedString(claim.Object, "status", "nodeName")
++		bound, err := c.boundPods(ctx, nodeName)
++		if err != nil {
++			return ctrl.Result{}, err
++		}
++		want, err := strconv.Atoi(claim.GetAnnotations()[PodsAnnotation])
++		if err != nil {
++			want = 1
++		}
++		if bound < want {
++			held++
++			continue
++		}
++		release := client.RawPatch(types.MergePatchType, fmt.Appendf(nil, `{"metadata":{"annotations":{%q:null,%q:null}}}`,
++			DoNotDisruptAnnotationKey, DisruptionHoldAnnotation))
++		// Karpenter copies NodeClaim annotations to the Node when it registers, and reads them from the Node afterwards.
++		if err := c.Patch(ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}, release); client.IgnoreNotFound(err) != nil {
++			return ctrl.Result{}, err
++		}
++		if err := c.Patch(ctx, claim, release); client.IgnoreNotFound(err) != nil {
++			return ctrl.Result{}, err
++		}
++		log.FromContext(ctx).V(2).Info("Released the disruption hold of a NodeClaim", "nodeClaim", claim.GetName(), "node", nodeName)
++	}
++	if held > 0 {
++		return ctrl.Result{RequeueAfter: pollInterval}, nil
++	}
++	patch := client.MergeFrom(wl.DeepCopy())
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, HoldsReleasedAnnotation, attempt)
++	return ctrl.Result{}, client.IgnoreNotFound(c.Patch(ctx, wl, patch))
++}
++
++// boundPods counts the running or pending Pods bound to the Node that no DaemonSet owns.
++func (c *Controller) boundPods(ctx context.Context, nodeName string) (int, error) {
++	if nodeName == "" {
++		return 0, nil
++	}
++	pods := &corev1.PodList{}
++	if err := c.APIReader.List(ctx, pods, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
++		return 0, err
++	}
++	bound := 0
++	for _, pod := range pods.Items {
++		owner := metav1.GetControllerOf(&pod)
++		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed || (owner != nil && owner.Kind == "DaemonSet") {
++			continue
++		}
++		bound++
++	}
++	return bound, nil
 +}
 +
 +func (c *Controller) listNodeClaims(ctx context.Context, namespace, name string) ([]unstructured.Unstructured, error) {
@@ -710,7 +1132,7 @@ index 0000000..13f76c7
 +		Complete(&ACReconciler{Client: mgr.GetClient()}); err != nil {
 +		return err
 +	}
-+	c := &Controller{Client: mgr.GetClient(), Clock: clock.RealClock{}}
++	c := &Controller{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Clock: clock.RealClock{}}
 +	// NodeClaims are polled rather than watched, so Kueue starts on clusters without the Karpenter CRDs.
 +	// Deleting a Workload also reconciles it, and the NotFound path deletes its NodeClaims.
 +	if err := ctrl.NewControllerManagedBy(mgr).
@@ -731,16 +1153,17 @@ index 0000000..13f76c7
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/controller_test.go b/pkg/controller/admissionchecks/karpenter/controller_test.go
 new file mode 100644
-index 0000000..05934a0
+index 0000000..1f1ab4f
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller_test.go
-@@ -0,0 +1,538 @@
-+// Tests for the Karpenter AdmissionCheck: NodeClaim creation, readiness, failures, flavor exclusion and its expiry,
-+// and NodeClaim cleanup when a Workload finishes, is evicted or deleted, or is found orphaned by the sweep.
+@@ -0,0 +1,953 @@
++// Tests for the Karpenter AdmissionCheck: the feature gate, NodeClaims built from the NodePool and sized for packed pods,
++// readiness, failures, flavor exclusion and its expiry, disruption holds, and NodeClaim cleanup.
 +package karpenter
 +
 +import (
 +	"context"
++	"fmt"
 +	"sort"
 +	"strings"
 +	"testing"
@@ -749,6 +1172,7 @@ index 0000000..05934a0
 +	"github.com/google/go-cmp/cmp"
 +	corev1 "k8s.io/api/core/v1"
 +	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	"k8s.io/apimachinery/pkg/api/resource"
 +	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 +	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 +	"k8s.io/apimachinery/pkg/types"
@@ -758,6 +1182,7 @@ index 0000000..05934a0
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
++	"sigs.k8s.io/kueue/pkg/features"
 +	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 +	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 +)
@@ -779,14 +1204,55 @@ index 0000000..05934a0
 +	wlKey types.NamespacedName
 +}
 +
++// nodePool returns a NodePool whose template sets a label, a requirement, a taint, and an expiry.
++func nodePool(name string) *unstructured.Unstructured {
++	pool := &unstructured.Unstructured{Object: map[string]any{
++		"spec": map[string]any{
++			"template": map[string]any{
++				"metadata": map[string]any{"labels": map[string]any{"team": "ml"}},
++				"spec": map[string]any{
++					"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "gpu"},
++					"requirements": []any{
++						map[string]any{"key": "karpenter.sh/capacity-type", "operator": "In", "values": []any{"on-demand"}},
++					},
++					"taints":      []any{map[string]any{"key": "nvidia.com/gpu", "effect": "NoSchedule"}},
++					"expireAfter": "168h",
++				},
++			},
++		},
++	}}
++	pool.SetGroupVersionKind(nodePoolGVK)
++	pool.SetName(name)
++	pool.SetUID("pool-uid")
++	pool.SetAnnotations(map[string]string{nodePoolHashAnnotationKey: "123", nodePoolHashVersionAnnotationKey: "v3"})
++	return pool
++}
++
++// setPoolField sets a field of the karpenter-a flavor's NodePool.
++func (f *fixture) setPoolField(value any, fields ...string) {
++	f.t.Helper()
++	pool := &unstructured.Unstructured{}
++	pool.SetGroupVersionKind(nodePoolGVK)
++	if err := f.c.Get(f.ctx, types.NamespacedName{Name: "pool-a"}, pool); err != nil {
++		f.t.Fatal(err)
++	}
++	if err := unstructured.SetNestedField(pool.Object, value, fields...); err != nil {
++		f.t.Fatal(err)
++	}
++	if err := f.c.Update(f.ctx, pool); err != nil {
++		f.t.Fatal(err)
++	}
++}
++
 +func baseObjects(acAnnotations map[string]string) []client.Object {
 +	ac := utiltestingapi.MakeAdmissionCheck(string(checkRef)).ControllerName(ControllerName).Obj()
 +	ac.Annotations = acAnnotations
 +	return []client.Object{
 +		ac,
 +		utiltestingapi.MakeAdmissionCheck("other").ControllerName("example.com/other").Obj(),
-+		utiltestingapi.MakeResourceFlavor("karpenter-a").NodeLabel("pool", "a").Obj(),
++		utiltestingapi.MakeResourceFlavor("karpenter-a").NodeLabel(NodePoolLabelKey, "pool-a").Obj(),
 +		utiltestingapi.MakeResourceFlavor("karpenter-b").NodeLabel("pool", "b").Obj(),
++		nodePool("pool-a"),
 +		utiltestingapi.MakeResourceFlavor("remote").Obj(),
 +		utiltestingapi.MakeClusterQueue("cq").
 +			ResourceGroup(
@@ -814,13 +1280,16 @@ index 0000000..05934a0
 +
 +func newFixture(t *testing.T, wl *kueue.Workload, acAnnotations map[string]string, extra ...client.Object) *fixture {
 +	t.Helper()
++	features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, true)
 +	objs := append(baseObjects(acAnnotations), extra...)
 +	objs = append(objs, wl)
-+	c := utiltesting.NewClientBuilder().WithObjects(objs...).WithStatusSubresource(wl).Build()
++	c := utiltesting.NewClientBuilder().WithObjects(objs...).WithStatusSubresource(wl).
++		WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string { return []string{o.(*corev1.Pod).Spec.NodeName} }).
++		Build()
 +	clk := testingclock.NewFakeClock(reservedAt.Add(time.Second))
 +	return &fixture{
 +		t: t, ctx: t.Context(), clk: clk, c: c,
-+		ctrl:  &Controller{Client: c, Clock: clk},
++		ctrl:  &Controller{Client: c, APIReader: c, Clock: clk},
 +		wlKey: types.NamespacedName{Namespace: ns, Name: wlName},
 +	}
 +}
@@ -890,23 +1359,46 @@ index 0000000..05934a0
 +	attempt := attemptID(f.workload(), reservedAt)
 +	for _, claim := range claims {
 +		wantLabels := map[string]string{
-+			ManagedLabelKey:           "kueue",
-+			GangIDLabelKey:            "gang-" + wlName,
-+			WorkloadLabelKey:          wlName,
-+			WorkloadNamespaceLabelKey: ns,
-+			AttemptLabelKey:           attempt,
++			ManagedLabelKey:                  "kueue",
++			GangIDLabelKey:                   "gang-" + wlName,
++			WorkloadLabelKey:                 wlName,
++			WorkloadNamespaceLabelKey:        ns,
++			AttemptLabelKey:                  attempt,
++			NodePoolLabelKey:                 "pool-a",
++			"karpenter.k8s.aws/ec2nodeclass": "gpu",
++			"team":                           "ml",
 +		}
 +		if diff := cmp.Diff(wantLabels, claim.GetLabels()); diff != "" {
 +			t.Errorf("labels (-want +got):\n%s", diff)
 +		}
-+		requirements, _, _ := unstructured.NestedSlice(claim.Object, "spec", "requirements")
-+		wantRequirements := []any{requirement(corev1.LabelOSStable, "linux"), requirement("pool", "a")}
-+		if diff := cmp.Diff(wantRequirements, requirements); diff != "" {
-+			t.Errorf("requirements (-want +got):\n%s", diff)
++		wantAnnotations := map[string]string{
++			PodsAnnotation:                   "1",
++			DoNotDisruptAnnotationKey:        "true",
++			DisruptionHoldAnnotation:         "true",
++			nodePoolHashAnnotationKey:        "123",
++			nodePoolHashVersionAnnotationKey: "v3",
 +		}
-+		taints, _, _ := unstructured.NestedSlice(claim.Object, "spec", "taints")
-+		if len(taints) != 1 || taints[0].(map[string]any)["key"] != AntiTheftTaintKey {
-+			t.Errorf("taints = %v, want the %s reservation taint", taints, AntiTheftTaintKey)
++		if diff := cmp.Diff(wantAnnotations, claim.GetAnnotations()); diff != "" {
++			t.Errorf("annotations (-want +got):\n%s", diff)
++		}
++		if refs := claim.GetOwnerReferences(); len(refs) != 1 || refs[0].Kind != "NodePool" || refs[0].Name != "pool-a" {
++			t.Errorf("owner references = %v, want the NodePool", refs)
++		}
++		wantSpec := map[string]any{
++			"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "gpu"},
++			"requirements": []any{
++				map[string]any{"key": "karpenter.sh/capacity-type", "operator": "In", "values": []any{"on-demand"}},
++				requirement(NodePoolLabelKey, "pool-a"),
++			},
++			"taints": []any{
++				map[string]any{"key": AntiTheftTaintKey, "value": wlName, "effect": "NoSchedule"},
++				map[string]any{"key": "nvidia.com/gpu", "effect": "NoSchedule"},
++			},
++			"resources":   map[string]any{"requests": map[string]any{"cpu": "1"}},
++			"expireAfter": "168h",
++		}
++		if diff := cmp.Diff(wantSpec, claim.Object["spec"]); diff != "" {
++			t.Errorf("spec (-want +got):\n%s", diff)
 +		}
 +	}
 +	if got := f.workload().Annotations[ProvisionedAttemptAnnotation]; got != attempt {
@@ -1026,7 +1518,7 @@ index 0000000..05934a0
 +		Annotation(ExcludedFlavorsAnnotation, "karpenter-a="+earlier.Format(time.RFC3339)).
 +		Annotation(controllerconstants.WorkloadAllowedResourceFlavorAnnotation, "karpenter-b,remote").
 +		Obj()
-+	f := newFixture(t, wl, map[string]string{LaunchTimeoutAnnotation: "1m"})
++	f := newFixture(t, wl, map[string]string{LaunchTimeoutAnnotation: "1m", NodeClassAnnotation: "karpenter.k8s.aws/EC2NodeClass/default"})
 +	f.reconcile()
 +	f.clk.SetTime(reservedAt.Add(time.Minute))
 +	f.reconcile()
@@ -1107,7 +1599,7 @@ index 0000000..05934a0
 +}
 +
 +func TestDeletesNodeClaimsOfEarlierReservation(t *testing.T) {
-+	stale := newNodeClaim(utiltestingapi.MakeWorkload(wlName, ns).Obj(), "stale", "main-0", nil)
++	stale := (&nodeClaimTemplate{}).nodeClaim(utiltestingapi.MakeWorkload(wlName, ns).Obj(), "stale", "main-0", 1, nil)
 +	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil, stale)
 +	f.reconcile()
 +	for _, claim := range f.claims() {
@@ -1143,15 +1635,24 @@ index 0000000..05934a0
 +		wantErr     bool
 +	}{
 +		"defaults": {
-+			want: config{launchTimeout: DefaultLaunchTimeout, waitFor: conditionLaunched, flavorCooldown: DefaultFlavorCooldown},
++			want: config{launchTimeout: DefaultLaunchTimeout, waitFor: conditionLaunched, flavorCooldown: DefaultFlavorCooldown,
++				nodeFillFraction: DefaultNodeFillFraction, maxNodeClaims: DefaultMaxNodeClaims},
 +		},
 +		"overrides": {
-+			annotations: map[string]string{LaunchTimeoutAnnotation: "90s", WaitForAnnotation: conditionRegistered, FlavorCooldownAnnotation: "1h"},
-+			want:        config{launchTimeout: 90 * time.Second, waitFor: conditionRegistered, flavorCooldown: time.Hour},
++			annotations: map[string]string{
++				LaunchTimeoutAnnotation: "90s", WaitForAnnotation: conditionRegistered, FlavorCooldownAnnotation: "1h",
++				NodeClassAnnotation: "karpenter.k8s.aws/EC2NodeClass/default", NodeFillFractionAnnotation: "0.8", MaxNodeClaimsAnnotation: "8",
++			},
++			want: config{launchTimeout: 90 * time.Second, waitFor: conditionRegistered, flavorCooldown: time.Hour,
++				nodeClass:        nodeClassRef{group: "karpenter.k8s.aws", kind: "EC2NodeClass", name: "default"},
++				nodeFillFraction: 0.8, maxNodeClaims: 8},
 +		},
-+		"bad duration":  {annotations: map[string]string{LaunchTimeoutAnnotation: "soon"}, wantErr: true},
-+		"zero cooldown": {annotations: map[string]string{FlavorCooldownAnnotation: "0s"}, wantErr: true},
-+		"bad wait-for":  {annotations: map[string]string{WaitForAnnotation: "Ready"}, wantErr: true},
++		"bad duration":        {annotations: map[string]string{LaunchTimeoutAnnotation: "soon"}, wantErr: true},
++		"zero cooldown":       {annotations: map[string]string{FlavorCooldownAnnotation: "0s"}, wantErr: true},
++		"bad wait-for":        {annotations: map[string]string{WaitForAnnotation: "Ready"}, wantErr: true},
++		"bad node class":      {annotations: map[string]string{NodeClassAnnotation: "default"}, wantErr: true},
++		"fill fraction above": {annotations: map[string]string{NodeFillFractionAnnotation: "1.5"}, wantErr: true},
++		"zero max claims":     {annotations: map[string]string{MaxNodeClaimsAnnotation: "0"}, wantErr: true},
 +	}
 +	for name, tc := range cases {
 +		t.Run(name, func(t *testing.T) {
@@ -1244,7 +1745,7 @@ index 0000000..05934a0
 +	attempt := attemptID(live, reservedAt)
 +	old := metav1.NewTime(reservedAt.Add(-time.Hour))
 +	claim := func(name, namespace, wlName, attempt string, created metav1.Time) *unstructured.Unstructured {
-+		nc := newNodeClaim(utiltestingapi.MakeWorkload(wlName, namespace).Obj(), attempt, "main-0", nil)
++		nc := (&nodeClaimTemplate{}).nodeClaim(utiltestingapi.MakeWorkload(wlName, namespace).Obj(), attempt, "main-0", 1, nil)
 +		nc.SetName(name)
 +		nc.SetCreationTimestamp(created)
 +		if namespace == "" {
@@ -1273,161 +1774,339 @@ index 0000000..05934a0
 +		t.Errorf("NodeClaims after sweep (-want +got):\n%s", diff)
 +	}
 +}
-diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
-index bd505ee..729d431 100644
---- a/pkg/scheduler/flavorassigner/flavorassigner.go
-+++ b/pkg/scheduler/flavorassigner/flavorassigner.go
-@@ -741,7 +741,7 @@ func (a *FlavorAssigner) findFlavorForPodSets(
- 
- 		triedFlavors.Insert(fName)
- 
--		if features.Enabled(features.ConcurrentAdmission) && !concurrentadmission.IsFlavorAllowedForVariant(a.wl.Obj, fName) {
-+		if !concurrentadmission.IsFlavorAllowed(a.wl.Obj, fName) {
- 			status.appendf("skipping flavor %s due to WorkloadAllowedResourceFlavorAnnotation annotation", fName)
- 			continue
- 		}
-diff --git a/pkg/scheduler/flavorassigner/flavorassigner_test.go b/pkg/scheduler/flavorassigner/flavorassigner_test.go
-index 1eb0867..8e24897 100644
---- a/pkg/scheduler/flavorassigner/flavorassigner_test.go
-+++ b/pkg/scheduler/flavorassigner/flavorassigner_test.go
-@@ -7093,46 +7093,48 @@ func TestAssignFlavors_AllowedFlavors(t *testing.T) {
- 	}
- 
- 	for name, tc := range tests {
--		t.Run(name, func(t *testing.T) {
--			ctx, log := utiltesting.ContextWithLog(t)
--			features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, true)
--			wlBuilder := utiltestingapi.MakeWorkload("wl", "ns").
--				PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "2").Obj())
--			if tc.allowedFlavors != nil {
--				wlBuilder = wlBuilder.AllowedFlavors(tc.allowedFlavors...)
--			}
--			wl := wlBuilder.Obj()
-+		for _, concurrentAdmission := range []bool{true, false} {
-+			t.Run(fmt.Sprintf("%s, ConcurrentAdmission=%t", name, concurrentAdmission), func(t *testing.T) {
-+				ctx, log := utiltesting.ContextWithLog(t)
-+				features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, concurrentAdmission)
-+				wlBuilder := utiltestingapi.MakeWorkload("wl", "ns").
-+					PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "2").Obj())
-+				if tc.allowedFlavors != nil {
-+					wlBuilder = wlBuilder.AllowedFlavors(tc.allowedFlavors...)
-+				}
-+				wl := wlBuilder.Obj()
- 
--			wlInfo := workload.NewInfo(log, wl)
-+				wlInfo := workload.NewInfo(log, wl)
- 
--			cache := schdcache.New(utiltesting.NewFakeClient())
--			if err := cache.AddClusterQueue(ctx, &cq); err != nil {
--				t.Fatalf("Failed to add CQ to cache: %v", err)
--			}
--			for _, rf := range resourceFlavors {
--				cache.AddOrUpdateResourceFlavor(log, rf)
--			}
--			snapshot, err := cache.Snapshot(ctx)
--			if err != nil {
--				t.Fatalf("unexpected error while building snapshot: %v", err)
--			}
--			cqSnapshot := snapshot.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
-+				cache := schdcache.New(utiltesting.NewFakeClient())
-+				if err := cache.AddClusterQueue(ctx, &cq); err != nil {
-+					t.Fatalf("Failed to add CQ to cache: %v", err)
-+				}
-+				for _, rf := range resourceFlavors {
-+					cache.AddOrUpdateResourceFlavor(log, rf)
-+				}
-+				snapshot, err := cache.Snapshot(ctx)
-+				if err != nil {
-+					t.Fatalf("unexpected error while building snapshot: %v", err)
-+				}
-+				cqSnapshot := snapshot.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
- 
--			assigner := New(wlInfo, cqSnapshot, resourceFlavors, false, &testOracle{}, nil, configapi.QuotaCheckBlockUndeclared, resources.NewResourceFormatter(), 0)
--			gotAssignment := assigner.AssignFlavors(ctx, log, nil)
-+				assigner := New(wlInfo, cqSnapshot, resourceFlavors, false, &testOracle{}, nil, configapi.QuotaCheckBlockUndeclared, resources.NewResourceFormatter(), 0)
-+				gotAssignment := assigner.AssignFlavors(ctx, log, nil)
- 
--			if gotAssignment.RepresentativeMode() != tc.wantRepMode {
--				t.Errorf("RepresentativeMode() = %v, want %v", gotAssignment.RepresentativeMode(), tc.wantRepMode)
--			}
-+				if gotAssignment.RepresentativeMode() != tc.wantRepMode {
-+					t.Errorf("RepresentativeMode() = %v, want %v", gotAssignment.RepresentativeMode(), tc.wantRepMode)
-+				}
- 
--			if tc.wantRepMode == Fit {
--				psAssignment := gotAssignment.PodSets[0]
--				gotFlavor := psAssignment.Flavors[corev1.ResourceCPU].Name
--				if gotFlavor != tc.wantFlavor {
--					t.Errorf("Assigned flavor = %v, want %v", gotFlavor, tc.wantFlavor)
-+				if tc.wantRepMode == Fit {
-+					psAssignment := gotAssignment.PodSets[0]
-+					gotFlavor := psAssignment.Flavors[corev1.ResourceCPU].Name
-+					if gotFlavor != tc.wantFlavor {
-+						t.Errorf("Assigned flavor = %v, want %v", gotFlavor, tc.wantFlavor)
-+					}
- 				}
--			}
--		})
-+			})
-+		}
- 	}
- }
- 
-diff --git a/pkg/workload/concurrentadmission/concurrentadmission.go b/pkg/workload/concurrentadmission/concurrentadmission.go
-index 76501e4..8175ae1 100644
---- a/pkg/workload/concurrentadmission/concurrentadmission.go
-+++ b/pkg/workload/concurrentadmission/concurrentadmission.go
-@@ -87,6 +87,13 @@ func IsFlavorAllowedForVariant(wl *kueue.Workload, flavor kueue.ResourceFlavorRe
- 	if !features.Enabled(features.ConcurrentAdmission) {
- 		return true
- 	}
-+	return IsFlavorAllowed(wl, flavor)
++
++func TestACInactiveWithoutConcurrentAdmission(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("ConcurrentAdmission=%t", enabled), func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, enabled)
++			ac := utiltestingapi.MakeAdmissionCheck(string(checkRef)).ControllerName(ControllerName).Obj()
++			c := utiltesting.NewClientBuilder().WithObjects(ac).WithStatusSubresource(ac).Build()
++			r := &ACReconciler{Client: c}
++			if _, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: string(checkRef)}}); err != nil {
++				t.Fatal(err)
++			}
++			if err := c.Get(t.Context(), types.NamespacedName{Name: string(checkRef)}, ac); err != nil {
++				t.Fatal(err)
++			}
++			active := apimeta.FindStatusCondition(ac.Status.Conditions, kueue.AdmissionCheckActive)
++			wantStatus, wantReason := metav1.ConditionTrue, "Active"
++			if !enabled {
++				wantStatus, wantReason = metav1.ConditionFalse, "FeatureGateDisabled"
++			}
++			if active == nil || active.Status != wantStatus || active.Reason != wantReason {
++				t.Fatalf("Active condition = %v, want %s %s", active, wantStatus, wantReason)
++			}
++			if !enabled && !strings.Contains(active.Message, "--feature-gates=ConcurrentAdmission=true") {
++				t.Errorf("message %q does not say how to enable the feature gate", active.Message)
++			}
++		})
++	}
 +}
 +
-+// IsFlavorAllowed reports whether the Workload's allowed-flavors annotation, when present,
-+// lists the flavor. The scheduler honors the annotation with or without ConcurrentAdmission,
-+// because other controllers also use it to steer a Workload away from a flavor.
-+func IsFlavorAllowed(wl *kueue.Workload, flavor kueue.ResourceFlavorReference) bool {
- 	val, ok := wl.GetAnnotations()[controllerconstants.WorkloadAllowedResourceFlavorAnnotation]
- 	if !ok {
- 		return true
-diff --git a/pkg/workload/workload.go b/pkg/workload/workload.go
-index e8b765c..b7af73d 100644
---- a/pkg/workload/workload.go
-+++ b/pkg/workload/workload.go
-@@ -459,10 +459,8 @@ func computeSchedulingHash(log logr.Logger, wl *kueue.Workload, totalRequests []
- 		"podSets":  podSetShapes,
- 		"priority": effectivePriority,
- 	}
--	if features.Enabled(features.ConcurrentAdmission) {
--		if val, ok := wl.GetAnnotations()[controllerconstants.WorkloadAllowedResourceFlavorAnnotation]; ok {
--			shape["allowedFlavors"] = val
--		}
-+	if val, ok := wl.GetAnnotations()[controllerconstants.WorkloadAllowedResourceFlavorAnnotation]; ok {
-+		shape["allowedFlavors"] = val
- 	}
- 	shapeJSON, err := json.Marshal(shape)
- 	if err != nil {
-diff --git a/pkg/workload/workload_test.go b/pkg/workload/workload_test.go
-index cc03c50..0315075 100644
---- a/pkg/workload/workload_test.go
-+++ b/pkg/workload/workload_test.go
-@@ -4047,6 +4047,18 @@ func TestSchedulingHash(t *testing.T) {
- 				features.ConcurrentAdmission:          true,
- 			},
- 		},
-+		"same spec, different allowed flavors annotation, concurrent admission disabled produces different hash": {
-+			wl1: func() *kueue.Workload {
-+				wl := utiltestingapi.MakeWorkload("wl1", "ns").
-+					Request(corev1.ResourceCPU, "1").Obj()
-+				wl.Annotations = map[string]string{controllerconstants.WorkloadAllowedResourceFlavorAnnotation: "flavor1"}
-+				return wl
-+			}(),
-+			wl2: utiltestingapi.MakeWorkload("wl2", "ns").
-+				Request(corev1.ResourceCPU, "1").Obj(),
-+			wantSame:     false,
-+			featureGates: map[featuregate.Feature]bool{features.SchedulingEquivalenceHashing: true},
++func TestNoNodeClaimsWithoutConcurrentAdmission(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, false)
++	f.reconcile()
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims with the feature gate disabled, want 0", n)
++	}
++}
++
++// podSetWorkload returns a Workload holding quota on karpenter-a for one pod set of count pods.
++func podSetWorkload(ps *kueue.PodSet) *kueue.Workload {
++	return utiltestingapi.MakeWorkload(wlName, ns).
++		UID("uid").
++		Queue("lq").
++		PodSets(*ps).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(ps.Name).Flavor(corev1.ResourceCPU, "karpenter-a").Count(ps.Count).Obj(),
++		).Obj(), reservedAt).
++		AdmissionCheck(kueue.AdmissionCheckState{Name: checkRef, State: kueue.CheckStatePending, LastTransitionTime: metav1.NewTime(reservedAt)}).
++		Obj()
++}
++
++func requests(t *testing.T, claim unstructured.Unstructured) map[string]string {
++	t.Helper()
++	got, _, err := unstructured.NestedStringMap(claim.Object, "spec", "resources", "requests")
++	if err != nil {
++		t.Fatal(err)
++	}
++	return got
++}
++
++func TestNodeClaimRequestsEffectivePodRequests(t *testing.T) {
++	always := corev1.ContainerRestartPolicyAlways
++	ps := utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
++		InitContainers(
++			corev1.Container{Name: "sidecar", RestartPolicy: &always, Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++				corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi"),
++			}}},
++			corev1.Container{Name: "init", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++				corev1.ResourceCPU: resource.MustParse("3"),
++			}}},
++		).
++		Containers(corev1.Container{Name: "main", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++			corev1.ResourceCPU:              resource.MustParse("1"),
++			corev1.ResourceMemory:           resource.MustParse("2Gi"),
++			corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
++			"nvidia.com/gpu":                resource.MustParse("1"),
++		}}}).
++		Obj()
++	f := newFixture(t, podSetWorkload(ps), nil)
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 1 {
++		t.Fatalf("got %d NodeClaims, want 1", len(claims))
++	}
++	// The init container runs beside the sidecar (3+1 CPUs), and so does the main container (1+1 CPUs, 2+1Gi).
++	want := map[string]string{"cpu": "4", "memory": "3Gi", "ephemeral-storage": "10Gi", "nvidia.com/gpu": "1"}
++	if diff := cmp.Diff(want, requests(t, claims[0])); diff != "" {
++		t.Errorf("requests (-want +got):\n%s", diff)
++	}
++}
++
++func TestPacksPodsWhenNodePoolBoundsInstanceSize(t *testing.T) {
++	ps := utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 5).
++		Request(corev1.ResourceCPU, "2").Request(corev1.ResourceMemory, "4Gi").Obj()
++	f := newFixture(t, podSetWorkload(ps), nil)
++	// The largest allowed instance has 16 CPUs and 64Gi, so half of it holds 4 pods by CPU and 8 by memory.
++	f.setPoolField([]any{
++		map[string]any{"key": "karpenter.k8s.aws/instance-cpu", "operator": "Lt", "values": []any{"17"}},
++		map[string]any{"key": "karpenter.k8s.aws/instance-memory", "operator": "In", "values": []any{"32768", "65536"}},
++	}, "spec", "template", "spec", "requirements")
++	f.reconcile()
++
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d NodeClaims, want 2", len(claims))
++	}
++	for i, want := range []struct {
++		pods     string
++		requests map[string]string
++	}{
++		{"4", map[string]string{"cpu": "8", "memory": "16Gi"}},
++		{"1", map[string]string{"cpu": "2", "memory": "4Gi"}},
++	} {
++		if got := claims[i].GetAnnotations()[PodsAnnotation]; got != want.pods {
++			t.Errorf("NodeClaim %s sized for %s pods, want %s", claims[i].GetName(), got, want.pods)
++		}
++		if diff := cmp.Diff(want.requests, requests(t, claims[i])); diff != "" {
++			t.Errorf("NodeClaim %s requests (-want +got):\n%s", claims[i].GetName(), diff)
++		}
++	}
++}
++
++func TestPodsPerNodeClaim(t *testing.T) {
++	cpu := func(v string) map[string]any {
++		return map[string]any{"key": "karpenter.k8s.aws/instance-cpu", "operator": "In", "values": []any{v}}
++	}
++	gpus := map[string]any{"key": "karpenter.k8s.aws/instance-gpu-count", "operator": "Lt", "values": []any{"9"}}
++	cases := map[string]struct {
++		requests     corev1.ResourceList
++		requirements []any
++		fraction     float64
++		want         int32
++	}{
++		"unbounded": {
++			requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
++			fraction: 0.5, want: 1,
 +		},
- 		"same spec, different topology spreading annotation produces different hash": {
- 			wl1: utiltestingapi.MakeWorkload("wl1", "ns").
- 				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
++		"bounded cpu": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
++			requirements: []any{cpu("8")}, fraction: 0.5, want: 8,
++		},
++		"tightest of two bounds": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
++			requirements: []any{cpu("32"), cpu("8")}, fraction: 1, want: 8,
++		},
++		"gpus bound": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), "nvidia.com/gpu": resource.MustParse("1")},
++			requirements: []any{cpu("96"), gpus}, fraction: 0.5, want: 4,
++		},
++		"resource without capacity label": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceEphemeralStorage: resource.MustParse("1Gi")},
++			requirements: []any{cpu("96")}, fraction: 0.5, want: 1,
++		},
++		"pod larger than the fraction": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6")},
++			requirements: []any{cpu("8")}, fraction: 0.5, want: 1,
++		},
++		"non-numeric value": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
++			requirements: []any{cpu("large")}, fraction: 0.5, want: 1,
++		},
++		"no requests": {requirements: []any{cpu("8")}, fraction: 0.5, want: 1},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			if got := podsPerNodeClaim(tc.requests, tc.requirements, tc.fraction); got != tc.want {
++				t.Errorf("podsPerNodeClaim = %d, want %d", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestFlavorWithoutNodePoolUsesNodeClassAnnotation(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-b").Obj(), map[string]string{NodeClassAnnotation: "karpenter.k8s.aws/EC2NodeClass/default"})
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d NodeClaims, want 2", len(claims))
++	}
++	ref, _, _ := unstructured.NestedMap(claims[0].Object, "spec", "nodeClassRef")
++	if diff := cmp.Diff(map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "default"}, ref); diff != "" {
++		t.Errorf("nodeClassRef (-want +got):\n%s", diff)
++	}
++	requirements, _, _ := unstructured.NestedSlice(claims[0].Object, "spec", "requirements")
++	if diff := cmp.Diff([]any{requirement(corev1.LabelOSStable, "linux"), requirement("pool", "b")}, requirements); diff != "" {
++		t.Errorf("requirements (-want +got):\n%s", diff)
++	}
++	if _, ok := claims[0].GetLabels()[NodePoolLabelKey]; ok {
++		t.Error("NodeClaim labeled with a NodePool although the flavor names none")
++	}
++	if _, ok := claims[0].GetAnnotations()[DoNotDisruptAnnotationKey]; ok {
++		t.Error("NodeClaim without a NodePool got a disruption hold")
++	}
++}
++
++func TestProvisioningProblemsFailTheAttempt(t *testing.T) {
++	cases := map[string]struct {
++		flavor      kueue.ResourceFlavorReference
++		annotations map[string]string
++		mutatePool  func(f *fixture)
++		wantMessage string
++	}{
++		"no NodePool and no node class": {
++			flavor:      "karpenter-b",
++			wantMessage: "the flavor names no NodePool",
++		},
++		"missing NodePool": {
++			flavor: "karpenter-a",
++			mutatePool: func(f *fixture) {
++				pool := nodePool("pool-a")
++				if err := f.c.Delete(f.ctx, pool); err != nil {
++					f.t.Fatal(err)
++				}
++			},
++			wantMessage: "NodePool pool-a that the flavor names",
++		},
++		"static NodePool": {
++			flavor:      "karpenter-a",
++			mutatePool:  func(f *fixture) { f.setPoolField(int64(3), "spec", "replicas") },
++			wantMessage: "sets spec.replicas",
++		},
++		"too many NodeClaims": {
++			flavor:      "karpenter-a",
++			annotations: map[string]string{MaxNodeClaimsAnnotation: "1"},
++			wantMessage: "needs 2 NodeClaims, more than the 1",
++		},
++		"NodePool limit": {
++			flavor: "karpenter-a",
++			mutatePool: func(f *fixture) {
++				f.setPoolField(map[string]any{"cpu": "10"}, "spec", "limits")
++				f.setPoolField(map[string]any{"cpu": "9"}, "status", "resources")
++			},
++			wantMessage: "would take NodePool pool-a to 11 cpu, over its limit of 10",
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			f := newFixture(t, reservedWorkload(tc.flavor).Obj(), tc.annotations)
++			if tc.mutatePool != nil {
++				tc.mutatePool(f)
++			}
++			f.reconcile()
++			check := f.check()
++			if check.State != kueue.CheckStateRetry || !strings.Contains(check.Message, tc.wantMessage) {
++				t.Errorf("check = %s %q, want Retry containing %q", check.State, check.Message, tc.wantMessage)
++			}
++			if n := len(f.claims()); n != 0 {
++				t.Errorf("got %d NodeClaims, want 0", n)
++			}
++			if _, ok := f.workload().Annotations[ExcludedFlavorsAnnotation]; !ok {
++				t.Error("flavor not excluded")
++			}
++		})
++	}
++}
++
++func TestNodePoolDoNotDisruptIsNotAHold(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.setPoolField(map[string]any{DoNotDisruptAnnotationKey: "true"}, "spec", "template", "metadata", "annotations")
++	f.reconcile()
++	for _, claim := range f.claims() {
++		if claim.GetAnnotations()[DoNotDisruptAnnotationKey] != "true" {
++			t.Errorf("NodeClaim %s lost the NodePool's do-not-disrupt annotation", claim.GetName())
++		}
++		if _, ok := claim.GetAnnotations()[DisruptionHoldAnnotation]; ok {
++			t.Errorf("NodeClaim %s marks the NodePool's do-not-disrupt annotation as a hold the check removes", claim.GetName())
++		}
++	}
++}
++
++func TestReleasesDisruptionHoldOncePodsAreBound(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	claims := f.claims()
++	for i := range claims {
++		nodeName := fmt.Sprintf("node-%d", i)
++		if err := unstructured.SetNestedField(claims[i].Object, nodeName, "status", "nodeName"); err != nil {
++			t.Fatal(err)
++		}
++		f.setCondition(&claims[i], conditionLaunched)
++		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName, Annotations: map[string]string{DoNotDisruptAnnotationKey: "true"}}}
++		if err := f.c.Create(f.ctx, node); err != nil {
++			t.Fatal(err)
++		}
++	}
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStateReady {
++		t.Fatalf("check state = %s, want Ready", got)
++	}
++	daemon := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "daemon", Namespace: ns, OwnerReferences: []metav1.OwnerReference{{
++		APIVersion: "apps/v1", Kind: "DaemonSet", Name: "agent", UID: "ds", Controller: new(true),
++	}}}, Spec: corev1.PodSpec{NodeName: "node-0"}}
++	worker := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker-0", Namespace: ns}, Spec: corev1.PodSpec{NodeName: "node-0"}}
++	for _, pod := range []*corev1.Pod{daemon, worker} {
++		if err := f.c.Create(f.ctx, pod); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if res := f.reconcile(); res.RequeueAfter == 0 {
++		t.Error("expected a requeue while node-1 has no pods")
++	}
++	held := func() []string {
++		var names []string
++		for _, claim := range f.claims() {
++			node := &corev1.Node{}
++			if err := f.c.Get(f.ctx, types.NamespacedName{Name: claim.Object["status"].(map[string]any)["nodeName"].(string)}, node); err != nil {
++				t.Fatal(err)
++			}
++			_, claimHeld := claim.GetAnnotations()[DoNotDisruptAnnotationKey]
++			_, nodeHeld := node.Annotations[DoNotDisruptAnnotationKey]
++			if claimHeld != nodeHeld {
++				t.Errorf("NodeClaim %s held=%t but its Node held=%t", claim.GetName(), claimHeld, nodeHeld)
++			}
++			if claimHeld {
++				names = append(names, node.Name)
++			}
++		}
++		return names
++	}
++	if diff := cmp.Diff([]string{"node-1"}, held()); diff != "" {
++		t.Errorf("held nodes (-want +got):\n%s", diff)
++	}
++
++	if err := f.c.Create(f.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker-1", Namespace: ns}, Spec: corev1.PodSpec{NodeName: "node-1"}}); err != nil {
++		t.Fatal(err)
++	}
++	if res := f.reconcile(); res.RequeueAfter != 0 {
++		t.Errorf("RequeueAfter = %s, want no requeue once every hold is released", res.RequeueAfter)
++	}
++	if got := held(); len(got) != 0 {
++		t.Errorf("held nodes = %v, want none", got)
++	}
++	if got := f.workload().Annotations[HoldsReleasedAnnotation]; got != attemptID(f.workload(), reservedAt) {
++		t.Errorf("holds released annotation = %q, want the attempt", got)
++	}
++}

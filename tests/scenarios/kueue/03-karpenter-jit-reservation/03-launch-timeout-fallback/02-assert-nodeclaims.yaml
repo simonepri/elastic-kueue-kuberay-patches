@@ -1,9 +1,11 @@
-# The check requests a NodeClaim restricted to the first flavor's node labels.
+# The check requests a NodeClaim restricted to the first flavor's node labels, with the AdmissionCheck's node class.
 apiVersion: karpenter.sh/v1
 kind: NodeClaim
 metadata:
   (labels."kueue.x-k8s.io/workload-namespace"): ($namespace)
 spec:
+  nodeClassRef:
+    name: default
   (requirements[?key == 'example.com/pool']):
     - operator: In
       values: [karpenter]

@@ -3,6 +3,9 @@ kind: NodeClaim
 metadata:
   labels:
     karpenter.sh/managed-by: kueue
+    karpenter.sh/nodepool: anti-theft-pool
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"
 spec:
   taints:
     - effect: NoSchedule

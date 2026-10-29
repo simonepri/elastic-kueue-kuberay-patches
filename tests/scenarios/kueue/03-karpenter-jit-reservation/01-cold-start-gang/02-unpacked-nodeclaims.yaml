@@ -1,0 +1,6 @@
+# Matches a NodeClaim of this namespace sized for other than 2 pods; none may exist.
+apiVersion: karpenter.sh/v1
+kind: NodeClaim
+metadata:
+  (labels."kueue.x-k8s.io/workload-namespace"): ($namespace)
+  (annotations."kueue.x-k8s.io/karpenter-pods" != '2'): true

@@ -6,6 +6,8 @@ metadata:
     kueue.x-k8s.io/queue-name: fleet-cell2-spot-lq
     kueue.x-k8s.io/priority-class: pc-spot-high
     ray.io/cluster: cell2-raycluster-spot
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
 spec:
   rayVersion: "2.38.0"
   headGroupSpec:

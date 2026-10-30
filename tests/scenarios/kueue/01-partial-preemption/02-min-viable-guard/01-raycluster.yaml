@@ -5,6 +5,8 @@ metadata:
   labels:
     kueue.x-k8s.io/queue-name: minviable-local-queue
     kueue.x-k8s.io/priority-class: pc-minviable-low
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
 spec:
   rayVersion: "2.38.0"
   headGroupSpec:

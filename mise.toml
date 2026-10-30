@@ -191,6 +191,18 @@ depends = ["patch:kueue"]
 dir = "third_party/kueue"
 run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/deployment/"
 
+[tasks."test:kueue"]
+description = "Run patched Kueue preemption unit tests and the topology-aware reclaim integration suite"
+depends = ["patch:kueue"]
+dir = "third_party/kueue"
+run = """
+go test ./pkg/scheduler/preemption/...
+make test-integration \
+  INTEGRATION_TARGET=./test/integration/singlecluster/tas/... \
+  INTEGRATION_NPROCS=1 \
+  'INTEGRATION_FILTERS=--focus="Topology-aware cohort reclaim"'
+"""
+
 [tasks."test:interlink"]
 description = "Run patched interLink virtual kubelet unit tests"
 depends = ["patch:interlink"]

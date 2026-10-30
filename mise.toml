@@ -186,10 +186,21 @@ docker run --rm -v "$PWD/tests/ray:/tests:ro" -v "$PWD/third_party/ray/python/ra
 """
 
 [tasks."test:kueue"]
-description = "Run unit tests of the packages the Karpenter AdmissionCheck and deployment queue patches change"
+description = "Run unit tests of the packages the Karpenter AdmissionCheck, deployment queue, and topology-aware reclaim patches change"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
-run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/deployment/"
+run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/deployment/ ./pkg/scheduler/preemption/..."
+
+[tasks."test:kueue-integration"]
+description = "Run the patched Kueue topology-aware reclaim integration suite against envtest"
+depends = ["patch:kueue"]
+dir = "third_party/kueue"
+run = """
+make test-integration \
+  INTEGRATION_TARGET=./test/integration/singlecluster/tas/... \
+  INTEGRATION_NPROCS=1 \
+  'INTEGRATION_FILTERS=--focus="Topology-aware cohort reclaim"'
+"""
 
 [tasks."test:interlink"]
 description = "Run patched interLink virtual kubelet unit tests"

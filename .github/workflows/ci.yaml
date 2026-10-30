@@ -128,8 +128,8 @@ jobs:
       - name: Run Patched Kueue Unit Tests
         run: mise run test:kueue
 
-  kueue-tests:
-    name: Kueue Preemption Tests
+  kueue-integration-tests:
+    name: Kueue Integration Tests
     needs: [validate-patches]
     runs-on: ubuntu-latest
     steps:
@@ -139,8 +139,8 @@ jobs:
       - name: Install Mise
         uses: jdx/mise-action@v5
 
-      - name: Run Patched Kueue Preemption Tests
-        run: mise run test:kueue
+      - name: Run Patched Kueue Integration Tests
+        run: mise run test:kueue-integration
 
   interlink-unit-tests:
     name: interLink Virtual Kubelet Unit Tests

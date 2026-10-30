@@ -1,15 +1,15 @@
 diff --git a/cmd/kueue/main.go b/cmd/kueue/main.go
-index 8c981cc..ae6b909 100644
+index 8c981cc..bc14431 100644
 --- a/cmd/kueue/main.go
 +++ b/cmd/kueue/main.go
-@@ -57,6 +57,7 @@ import (
+@@ -56,6 +56,7 @@ import (
+ 	"sigs.k8s.io/kueue/pkg/cache/scheduler/was"
  	"sigs.k8s.io/kueue/pkg/config"
  	"sigs.k8s.io/kueue/pkg/constants"
- 	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/multikueue"
 +	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/karpenter"
+ 	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/multikueue"
  	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/multikueue/externalframeworks"
  	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/provisioning"
- 	"sigs.k8s.io/kueue/pkg/controller/concurrentadmission"
 @@ -499,6 +500,10 @@ func setupIndexes(
  		return err
  	}

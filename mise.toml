@@ -89,48 +89,96 @@ fi
 description = "Apply patches to third_party/kueue"
 depends = ["clone:kueue"]
 run = """
+set -e
 cd third_party/kueue
+# The stamp records the patch set applied to the clone, so a rerun skips it and a stale clone fails.
+stamp=.git/applied-patches
+want=$(cat ../../patches/kueue/*.patch | git hash-object --stdin)
+if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
+  echo "Patches already applied to third_party/kueue"
+  exit 0
+fi
+if [ -n "$(git status --porcelain)" ]; then
+  echo "third_party/kueue has changes other than the current patches; delete it to apply them again" >&2
+  exit 1
+fi
 for p in ../../patches/kueue/*.patch; do
-  [ -f "$p" ] || continue
   echo "Applying patch $p..."
-  git apply --whitespace=nowarn "$p" || true
+  git apply --whitespace=nowarn "$p"
 done
+echo "$want" > "$stamp"
 """
 
 [tasks."patch:kuberay"]
 description = "Apply patches to third_party/kuberay"
 depends = ["clone:kuberay"]
 run = """
+set -e
 cd third_party/kuberay
+# The stamp records the patch set applied to the clone, so a rerun skips it and a stale clone fails.
+stamp=.git/applied-patches
+want=$(cat ../../patches/kuberay/*.patch | git hash-object --stdin)
+if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
+  echo "Patches already applied to third_party/kuberay"
+  exit 0
+fi
+if [ -n "$(git status --porcelain)" ]; then
+  echo "third_party/kuberay has changes other than the current patches; delete it to apply them again" >&2
+  exit 1
+fi
 for p in ../../patches/kuberay/*.patch; do
-  [ -f "$p" ] || continue
   echo "Applying patch $p..."
-  git apply --whitespace=nowarn "$p" || true
+  git apply --whitespace=nowarn "$p"
 done
+echo "$want" > "$stamp"
 """
 
 [tasks."patch:interlink"]
 description = "Apply patches to third_party/interlink"
 depends = ["clone:interlink"]
 run = """
+set -e
 cd third_party/interlink
+# The stamp records the patch set applied to the clone, so a rerun skips it and a stale clone fails.
+stamp=.git/applied-patches
+want=$(cat ../../patches/interlink/*.patch | git hash-object --stdin)
+if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
+  echo "Patches already applied to third_party/interlink"
+  exit 0
+fi
+if [ -n "$(git status --porcelain)" ]; then
+  echo "third_party/interlink has changes other than the current patches; delete it to apply them again" >&2
+  exit 1
+fi
 for p in ../../patches/interlink/*.patch; do
-  [ -f "$p" ] || continue
   echo "Applying patch $p..."
-  git apply --whitespace=nowarn "$p" || true
+  git apply --whitespace=nowarn "$p"
 done
+echo "$want" > "$stamp"
 """
 
 [tasks."patch:ray"]
 description = "Apply patches to third_party/ray"
 depends = ["clone:ray"]
 run = """
+set -e
 cd third_party/ray
+# The stamp records the patch set applied to the clone, so a rerun skips it and a stale clone fails.
+stamp=.git/applied-patches
+want=$(cat ../../patches/ray/*.patch | git hash-object --stdin)
+if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
+  echo "Patches already applied to third_party/ray"
+  exit 0
+fi
+if [ -n "$(git status --porcelain)" ]; then
+  echo "third_party/ray has changes other than the current patches; delete it to apply them again" >&2
+  exit 1
+fi
 for p in ../../patches/ray/*.patch; do
-  [ -f "$p" ] || continue
   echo "Applying patch $p..."
-  git apply --whitespace=nowarn "$p" || true
+  git apply --whitespace=nowarn "$p"
 done
+echo "$want" > "$stamp"
 """
 
 [tasks.patch]
@@ -189,7 +237,7 @@ docker run --rm -v "$PWD/tests/ray:/tests:ro" -v "$PWD/third_party/ray/python/ra
 description = "Run unit tests of the packages the Karpenter AdmissionCheck, deployment queue, and topology-aware reclaim patches change"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
-run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/deployment/ ./pkg/scheduler/preemption/..."
+run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/deployment/ ./pkg/scheduler/..."
 
 [tasks."test:kueue-integration"]
 description = "Run the patched Kueue topology-aware reclaim integration suite against envtest"

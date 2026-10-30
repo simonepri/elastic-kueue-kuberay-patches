@@ -2,104 +2,412 @@ Topology-aware victim selection for cohort reclaim and preemption.
 
 Fixes https://github.com/kubernetes-sigs/kueue/issues/10815: when the victims
 Kueue picks by priority are spread across topology domains, the plan fails the
-TAS check and nothing is preempted. After the ordinary plan fails, retry by
-freeing whole placements and pick the one whose victims cost the least.
+TAS check and nothing is preempted. When ordinary preemption frees enough quota
+but no topology placement, and fails at every pod count partial admission
+tries, the scheduler retries once at the full count by freeing whole placements
+and picks the one whose victims cost the least.
 
 Builds on the upstream draft https://github.com/kubernetes-sigs/kueue/pull/17834.
 
-diff --git a/pkg/scheduler/preemption/classical/candidate_generator.go b/pkg/scheduler/preemption/classical/candidate_generator.go
-index 58a5d6036..040d83a4b 100644
---- a/pkg/scheduler/preemption/classical/candidate_generator.go
-+++ b/pkg/scheduler/preemption/classical/candidate_generator.go
-@@ -94,6 +94,7 @@ func splitEvicted(workloads []*candidateElem) ([]*candidateElem, []*candidateEle
- // with and without borrowing. The runs are independent which means that the same candidates
- // might be returned for both, but note that the candidates with borrowing are a subset of
- // candidates without borrowing.
-+// Ordering must be stable within each queue for the lifetime of the snapshot.
- func NewCandidateIterator(
- 	hierarchicalReclaimCtx *HierarchicalPreemptionCtx,
- 	enabledAfs bool,
-@@ -105,17 +106,19 @@ func NewCandidateIterator(
- 	if features.Enabled(features.ClassicalPreemptionCandidateOrderCache) {
- 		return newCacheCandidateIterator(hierarchicalReclaimCtx, enabledAfs, frsNeedPreemption, snapshot, clock, ordering)
- 	}
--	return newCandidateIterator(hierarchicalReclaimCtx, enabledAfs, frsNeedPreemption, snapshot, clock, ordering)
-+	return NewUncachedCandidateIterator(hierarchicalReclaimCtx, enabledAfs, frsNeedPreemption, snapshot, clock, ordering)
- }
- 
--func newCandidateIterator(
-+// NewUncachedCandidateIterator sorts candidates for an attempt-specific order
-+// without reading or replacing the snapshot's shared candidate-order cache.
-+func NewUncachedCandidateIterator(
- 	hierarchicalReclaimCtx *HierarchicalPreemptionCtx,
- 	enabledAfs bool,
- 	frsNeedPreemption sets.Set[resources.FlavorResource],
- 	snapshot *schdcache.Snapshot,
- 	clock clock.Clock,
- 	ordering func(logr.Logger, bool, *workload.Info, *workload.Info, kueue.ClusterQueueReference, time.Time) int,
--) *candidateIterator {
-+) CandidateIterator {
- 	sameQueueCandidates := collectSameQueueCandidates(hierarchicalReclaimCtx)
- 	hierarchyCandidates, priorityCandidates := collectCandidatesForHierarchicalReclaim(hierarchicalReclaimCtx)
- 	slices.SortFunc(sameQueueCandidates, func(a, b *candidateElem) int {
-diff --git a/pkg/scheduler/preemption/classical_strategy.go b/pkg/scheduler/preemption/classical_strategy.go
-index 05871068a..37e7e1b4f 100644
---- a/pkg/scheduler/preemption/classical_strategy.go
-+++ b/pkg/scheduler/preemption/classical_strategy.go
-@@ -19,9 +19,13 @@ package preemption
- import (
- 	"context"
- 	"iter"
-+	"time"
- 
-+	"github.com/go-logr/logr"
-+	"k8s.io/apimachinery/pkg/util/sets"
+diff --git a/pkg/cache/scheduler/snapshot_workload_usage.go b/pkg/cache/scheduler/snapshot_workload_usage.go
+new file mode 100644
+index 0000000..063231e
+--- /dev/null
++++ b/pkg/cache/scheduler/snapshot_workload_usage.go
+@@ -0,0 +1,42 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package scheduler
++
++import (
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// RemoveWorkloadUsage removes usage, a part of wl's usage such as only its
++// quota or only its TAS usage, from wl's ClusterQueue and the overlapping TAS
++// flavors, and keeps wl in the ClusterQueue. It lets a search see the
++// snapshot as if one kind of wl's usage were gone, at a fraction of the cost
++// of RemoveWorkload. AddWorkloadUsage reverts it. Neither changes a workload
++// whose usage was released.
++func (s *Snapshot) RemoveWorkloadUsage(wl *workload.Info, usage workload.Usage) {
++	cq := s.ClusterQueue(wl.ClusterQueue)
++	if !cq.released.Has(workload.Key(wl.Obj)) {
++		s.removeUsage(cq, usage)
++	}
++}
++
++// AddWorkloadUsage adds back usage removed by RemoveWorkloadUsage.
++func (s *Snapshot) AddWorkloadUsage(wl *workload.Info, usage workload.Usage) {
++	cq := s.ClusterQueue(wl.ClusterQueue)
++	if !cq.released.Has(workload.Key(wl.Obj)) {
++		s.AddUsage(cq, usage)
++	}
++}
+diff --git a/pkg/cache/scheduler/tas_flavor_snapshot_fingerprint.go b/pkg/cache/scheduler/tas_flavor_snapshot_fingerprint.go
+new file mode 100644
+index 0000000..3657518
+--- /dev/null
++++ b/pkg/cache/scheduler/tas_flavor_snapshot_fingerprint.go
+@@ -0,0 +1,85 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package scheduler
++
++import (
++	"hash/maphash"
++	"strings"
++
++	corev1 "k8s.io/api/core/v1"
++
++	"sigs.k8s.io/kueue/pkg/resources"
++	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
++)
++
++// StateFingerprint returns a hash of the state a topology assignment on the
++// snapshot reads: the nodes the topology was built from, each leaf's capacity,
++// free capacity and TAS usage, the TAS usage of virtual domains, and the
++// flavor's tolerations. Snapshots that place workloads differently have
++// different fingerprints, except for hash collisions.
++func (s *TASFlavorSnapshot) StateFingerprint(seed maphash.Seed) uint64 {
++	type amountItem struct {
++		kind     uint8
++		domain   utiltas.TopologyDomainID
++		resource corev1.ResourceName
++		small    int64
++		large    string
++	}
++	var sum uint64
++	addRequests := func(kind uint8, domain utiltas.TopologyDomainID, requests resources.Requests) {
++		if requests == nil {
++			return
++		}
++		for name, amount := range requests.Iter() {
++			item := amountItem{kind: kind, domain: domain, resource: name}
++			if small, ok := amount.Int64(); ok {
++				item.small = small
++			} else {
++				item.large = amount.String()
++			}
++			sum += maphash.Comparable(seed, item)
++		}
++	}
++	sum += maphash.Comparable(seed, struct {
++		generation int64
++		levels     string
++		leaves     int
++		virtual    bool
++	}{s.generation, strings.Join(s.levelKeys, "\x00"), len(s.leaves), s.virtualHostname})
++	for id, leaf := range s.leaves {
++		leafCapacity := s.leafCapacityOf(leaf)
++		addRequests(0, id, leaf.capacity)
++		addRequests(1, id, leafCapacity.freeCapacity)
++		addRequests(2, id, leafCapacity.tasUsage)
++	}
++	for id, usage := range s.domainTASUsage {
++		addRequests(3, id, usage)
++	}
++	for i, toleration := range s.tolerations {
++		var seconds int64 = -1
++		if toleration.TolerationSeconds != nil {
++			seconds = *toleration.TolerationSeconds
++		}
++		sum += maphash.Comparable(seed, struct {
++			index                int
++			key, operator, value string
++			effect               corev1.TaintEffect
++			tolerationSeconds    int64
++		}{i, toleration.Key, string(toleration.Operator), toleration.Value, toleration.Effect, seconds})
++	}
++	return sum
++}
+diff --git a/pkg/scheduler/assignment/native/native.go b/pkg/scheduler/assignment/native/native.go
+index 94b2dcc..2130c58 100644
+--- a/pkg/scheduler/assignment/native/native.go
++++ b/pkg/scheduler/assignment/native/native.go
+@@ -22,11 +22,13 @@ import (
+ 	"k8s.io/klog/v2"
  	"sigs.k8s.io/controller-runtime/pkg/log"
  
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+ 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
  	"sigs.k8s.io/kueue/pkg/features"
- 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/classical"
- 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
-@@ -100,6 +104,38 @@ func classicalPreemptionStrategy(ctx context.Context, preemptor *Preemptor, pree
- 				return
- 			}
+ 	"sigs.k8s.io/kueue/pkg/scheduler/assignment"
+ 	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
+ 	"sigs.k8s.io/kueue/pkg/scheduler/preemption"
++	"sigs.k8s.io/kueue/pkg/util/tas"
+ 	"sigs.k8s.io/kueue/pkg/workload"
+ )
+ 
+@@ -62,18 +64,55 @@ func (p *nativePlanner) Plan(ctx context.Context, asgn *flavorassigner.Assignmen
+ 	arm := asgn.RepresentativeMode()
+ 
+ 	if arm == flavorassigner.Preempt {
+-		strategies := p.preemptor.GetPreemptionStrategyIterator(ctx, *p.wl, p.snapshot, *asgn)
+-		faPreemptionTargets := p.preemptor.GetTargetsWithStrategy(ctx, strategies)
++		faPreemptionTargets, topologyRetry := p.preemptor.GetTargets(ctx, *p.wl, p.snapshot, *asgn)
+ 		if len(faPreemptionTargets) > 0 {
+ 			p.updateAssignmentForTAS(ctx, cq, asgn, faPreemptionTargets)
+ 			return assignment.Plan{Assignment: asgn, PreemptionTargets: faPreemptionTargets}
  		}
-+		if len(preemptionCtx.tasRequests) == 0 {
-+			return
++		if topologyRetry != nil {
++			return p.planWithTopologyRetry(ctx, cq, asgn, topologyRetry)
 +		}
-+		// The ordinary attempts take victims by priority and stop once each
-+		// borrowing queue is back at its nominal quota, which can leave the
-+		// freed capacity spread across topology domains. Retry by freeing whole
-+		// placements, choosing the one whose victims cost the least.
-+		for _, opts := range attemptPossibleOpts {
-+			allowBorrowing := opts.borrowing
-+			makeStrategy := func(preferred sets.Set[workload.Reference]) PreemptionStrategy {
-+				iterator := classical.NewUncachedCandidateIterator(
-+					hierarchicalReclaimCtx, preemptor.enabledAfs, preemptionCtx.frsNeedPreemption,
-+					preemptionCtx.snapshot, preemptor.clock,
-+					func(log logr.Logger, afsEnabled bool, a, b *workload.Info, cq kueue.ClusterQueueReference, now time.Time) int {
-+						return policy.CandidatesOrderingWithPreference(log, afsEnabled, a, b, cq, now, func(w *workload.Info) bool {
-+							return preferred.Has(workload.Key(w.Obj))
-+						})
-+					},
-+				)
-+				return newPreemptionStrategy(func(yieldCandidate func(*Target) bool) {
-+					iterateOverCandidates(ctx, preemptionCtx, iterator, allowBorrowing, yieldCandidate)
-+				}, allowBorrowing, preemptionCtx)
-+			}
-+			placements := topologyPlacements(ctx, preemptionCtx, eligibleCandidates(candidatesGenerator, allowBorrowing))
-+			preferred, found := preemptor.cheapestTopologyPlacement(ctx, placements, makeStrategy)
-+			if !found {
-+				continue
-+			}
-+			if !yieldStrategy(makeStrategy(preferred)) {
-+				return
-+			}
+ 	}
+ 
+ 	p.updateAssignmentForTAS(ctx, cq, asgn, nil)
+ 	return assignment.Plan{Assignment: asgn, PreemptionTargets: nil}
+ }
+ 
++// planWithTopologyRetry returns the plan without preemption targets, and lets
++// the caller run the topology retry once nothing else fits.
++func (p *nativePlanner) planWithTopologyRetry(
++	ctx context.Context,
++	cq *schdcache.ClusterQueueSnapshot,
++	asgn *flavorassigner.Assignment,
++	topologyRetry preemption.TopologyRetry,
++) assignment.Plan {
++	type podSetTopology struct {
++		assignment *tas.TopologyAssignment
++		delayed    *kueue.DelayedTopologyRequestState
++	}
++	unplaced := make([]podSetTopology, len(asgn.PodSets))
++	for i, ps := range asgn.PodSets {
++		unplaced[i] = podSetTopology{ps.TopologyAssignment, ps.DelayedTopologyRequest}
++	}
++	p.updateAssignmentForTAS(ctx, cq, asgn, nil)
++	plan := assignment.Plan{Assignment: asgn}
++	plan.TopologyRetry = func(ctx context.Context) assignment.Plan {
++		targets := topologyRetry(ctx)
++		if len(targets) == 0 {
++			return plan
 +		}
++		// Drop the placement on an empty cluster recorded above, so the
++		// topology requests are placed again around the targets.
++		for i, ps := range unplaced {
++			asgn.PodSets[i].TopologyAssignment = ps.assignment
++			asgn.PodSets[i].DelayedTopologyRequest = ps.delayed
++		}
++		p.updateAssignmentForTAS(ctx, cq, asgn, targets)
++		return assignment.Plan{Assignment: asgn, PreemptionTargets: targets}
++	}
++	return plan
++}
++
+ func (p *nativePlanner) updateAssignmentForTAS(
+ 	ctx context.Context,
+ 	cq *schdcache.ClusterQueueSnapshot,
+diff --git a/pkg/scheduler/assignment/planner.go b/pkg/scheduler/assignment/planner.go
+index 8fd630e..b48d1f1 100644
+--- a/pkg/scheduler/assignment/planner.go
++++ b/pkg/scheduler/assignment/planner.go
+@@ -38,6 +38,12 @@ type Plan struct {
+ 	// Empty unless Assignment.RepresentativeMode() is Preempt
+ 	// and preemptions make the fit feasible.
+ 	PreemptionTargets []*preemption.Target
++	// TopologyRetry, when set, searches for preemption targets that free whole
++	// topology domains, because ordinary preemption freed enough quota but no
++	// topology placement. It returns the plan with those targets, or this plan
++	// when there are none. Callers run it only after every other way to admit
++	// the workload failed, so ordinary preemption wins whenever it succeeds.
++	TopologyRetry func(ctx context.Context) Plan
+ }
+ 
+ func (p *Plan) CanFit() bool {
+diff --git a/pkg/scheduler/preemption/classical/candidate_generator.go b/pkg/scheduler/preemption/classical/candidate_generator.go
+index 58a5d60..4358917 100644
+--- a/pkg/scheduler/preemption/classical/candidate_generator.go
++++ b/pkg/scheduler/preemption/classical/candidate_generator.go
+@@ -51,6 +51,8 @@ type candidateIterator struct {
+ 	noCandidateFromOtherQueues        bool
+ 	noCandidateForHierarchicalReclaim bool
+ 	hierarchicalReclaimCtx            *HierarchicalPreemptionCtx
++	// The sorted groups the candidates were assembled from.
++	sameQueueCandidates, hierarchyCandidates, priorityCandidates []*candidateElem
+ }
+ 
+ func (c *candidateIterator) NoCandidateFromOtherQueues() bool {
+@@ -127,7 +129,42 @@ func newCandidateIterator(
+ 	slices.SortFunc(hierarchyCandidates, func(a, b *candidateElem) int {
+ 		return ordering(hierarchicalReclaimCtx.Log, enabledAfs, a.wl, b.wl, hierarchicalReclaimCtx.Cq.Name, clock.Now())
+ 	})
++	return assembleCandidateIterator(hierarchicalReclaimCtx, frsNeedPreemption, snapshot, sameQueueCandidates, hierarchyCandidates, priorityCandidates)
++}
+ 
++// NewReorderedCandidateIterators sorts the candidates once by ordering, and
++// returns a function that builds iterators offering the candidates that keep
++// accepts, with each group stably re-sorted by reorder. It neither reads nor
++// replaces the snapshot's candidate-order cache, so the reordering never leaks
++// into other preemption attempts.
++func NewReorderedCandidateIterators(
++	hierarchicalReclaimCtx *HierarchicalPreemptionCtx,
++	enabledAfs bool,
++	frsNeedPreemption sets.Set[resources.FlavorResource],
++	snapshot *schdcache.Snapshot,
++	clock clock.Clock,
++	ordering func(logr.Logger, bool, *workload.Info, *workload.Info, kueue.ClusterQueueReference, time.Time) int,
++) func(reorder func(a, b *workload.Info) int, keep func(*workload.Info) bool) CandidateIterator {
++	sorted := newCandidateIterator(hierarchicalReclaimCtx, enabledAfs, frsNeedPreemption, snapshot, clock, ordering)
++	return func(reorder func(a, b *workload.Info) int, keep func(*workload.Info) bool) CandidateIterator {
++		resort := func(candidates []*candidateElem) []*candidateElem {
++			candidates = slices.DeleteFunc(slices.Clone(candidates), func(c *candidateElem) bool { return !keep(c.wl) })
++			slices.SortStableFunc(candidates, func(a, b *candidateElem) int { return reorder(a.wl, b.wl) })
++			return candidates
++		}
++		return assembleCandidateIterator(hierarchicalReclaimCtx, frsNeedPreemption, snapshot,
++			resort(sorted.sameQueueCandidates), resort(sorted.hierarchyCandidates), resort(sorted.priorityCandidates))
++	}
++}
++
++// assembleCandidateIterator builds the iterator over the sorted candidate
++// groups, offering evicted candidates first.
++func assembleCandidateIterator(
++	hierarchicalReclaimCtx *HierarchicalPreemptionCtx,
++	frsNeedPreemption sets.Set[resources.FlavorResource],
++	snapshot *schdcache.Snapshot,
++	sameQueueCandidates, hierarchyCandidates, priorityCandidates []*candidateElem,
++) *candidateIterator {
+ 	evictedHierarchicalReclaimCandidates, nonEvictedHierarchicalReclaimCandidates := splitEvicted(hierarchyCandidates)
+ 	evictedSTCandidates, nonEvictedSTCandidates := splitEvicted(priorityCandidates)
+ 	evictedSameQueueCandidates, nonEvictedSameQueueCandidates := splitEvicted(sameQueueCandidates)
+@@ -146,6 +183,9 @@ func newCandidateIterator(
+ 		noCandidateFromOtherQueues:        len(hierarchyCandidates) == 0 && len(priorityCandidates) == 0,
+ 		noCandidateForHierarchicalReclaim: len(hierarchyCandidates) == 0,
+ 		hierarchicalReclaimCtx:            hierarchicalReclaimCtx,
++		sameQueueCandidates:               sameQueueCandidates,
++		hierarchyCandidates:               hierarchyCandidates,
++		priorityCandidates:                priorityCandidates,
  	}
  }
  
-@@ -124,3 +160,14 @@ func iterateOverCandidates(
+diff --git a/pkg/scheduler/preemption/classical_strategy.go b/pkg/scheduler/preemption/classical_strategy.go
+index 0587106..6da3b27 100644
+--- a/pkg/scheduler/preemption/classical_strategy.go
++++ b/pkg/scheduler/preemption/classical_strategy.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 	"iter"
+ 
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	"sigs.k8s.io/controller-runtime/pkg/log"
+ 
+ 	"sigs.k8s.io/kueue/pkg/features"
+@@ -39,6 +40,31 @@ type candidateIterator interface {
+ // ClusterQueues are still borrowing resources and while the incoming Workload
+ // doesn't fit in the quota.
+ func classicalPreemptionStrategy(ctx context.Context, preemptor *Preemptor, preemptionCtx *preemptionCtx) iter.Seq[PreemptionStrategy] {
++	_, candidatesGenerator, attemptPossibleOpts := classicalPreemptionAttempts(ctx, preemptor, preemptionCtx)
++	return func(yieldStrategy func(PreemptionStrategy) bool) {
++		for _, opts := range attemptPossibleOpts {
++			allowBorrowing := opts.borrowing
++			candidateIter := func(yieldCandidate func(*Target) bool) {
++				cont := iterateOverCandidates(ctx, preemptionCtx, candidatesGenerator, allowBorrowing, yieldCandidate)
++				if cont && features.Enabled(features.ConfigurablePreemptions) {
++					preemptionCtx.configurableEvaluator.FindCandidates(
++						preemptionCtx.snapshot,
++						preemptionCtx.frsNeedPreemption,
++						func() bool { return workloadQuotaFits(preemptionCtx, allowBorrowing) },
++						yieldCandidate,
++					)
++				}
++			}
++			if !yieldStrategy(newPreemptionStrategy(candidateIter, allowBorrowing, preemptionCtx)) {
++				return
++			}
++		}
++	}
++}
++
++// classicalPreemptionAttempts builds the candidate iterator of the classical
++// heuristic and the borrowing options it tries, in order.
++func classicalPreemptionAttempts(ctx context.Context, preemptor *Preemptor, preemptionCtx *preemptionCtx) (*classical.HierarchicalPreemptionCtx, candidateIterator, []preemptionAttemptOpts) {
+ 	log := log.FromContext(ctx)
+ 	hierarchicalReclaimCtx := &classical.HierarchicalPreemptionCtx{
+ 		Log:               log,
+@@ -81,26 +107,37 @@ func classicalPreemptionStrategy(ctx context.Context, preemptor *Preemptor, pree
+ 	default:
+ 		attemptPossibleOpts = []preemptionAttemptOpts{{true}, {false}}
+ 	}
++	return hierarchicalReclaimCtx, candidatesGenerator, attemptPossibleOpts
++}
+ 
+-	return func(yieldStrategy func(PreemptionStrategy) bool) {
+-		for _, opts := range attemptPossibleOpts {
+-			allowBorrowing := opts.borrowing
+-			candidateIter := func(yieldCandidate func(*Target) bool) {
+-				cont := iterateOverCandidates(ctx, preemptionCtx, candidatesGenerator, allowBorrowing, yieldCandidate)
+-				if cont && features.Enabled(features.ConfigurablePreemptions) {
+-					preemptionCtx.configurableEvaluator.FindCandidates(
+-						preemptionCtx.snapshot,
+-						preemptionCtx.frsNeedPreemption,
+-						func() bool { return workloadQuotaFits(preemptionCtx, allowBorrowing) },
+-						yieldCandidate,
+-					)
+-				}
+-			}
+-			if !yieldStrategy(newPreemptionStrategy(candidateIter, allowBorrowing, preemptionCtx)) {
+-				return
+-			}
+-		}
++// classicalTopologyRetryAttempts returns, for each borrowing option of the
++// classical heuristic, the candidates it may preempt and a strategy that
++// offers the kept candidates, the preferred ones first, within the same policy
++// checks.
++func classicalTopologyRetryAttempts(ctx context.Context, preemptor *Preemptor, preemptionCtx *preemptionCtx) []topologyRetryAttempt {
++	log := log.FromContext(ctx)
++	hierarchicalReclaimCtx, candidatesGenerator, attemptPossibleOpts := classicalPreemptionAttempts(ctx, preemptor, preemptionCtx)
++	reorderedIterator := classical.NewReorderedCandidateIterators(
++		hierarchicalReclaimCtx, preemptor.enabledAfs, preemptionCtx.frsNeedPreemption,
++		preemptionCtx.snapshot, preemptor.clock, policy.CandidatesOrdering,
++	)
++	attempts := make([]topologyRetryAttempt, 0, len(attemptPossibleOpts))
++	for _, opts := range attemptPossibleOpts {
++		allowBorrowing := opts.borrowing
++		attempts = append(attempts, topologyRetryAttempt{
++			allowBorrowing: allowBorrowing,
++			candidates:     eligibleCandidates(candidatesGenerator, allowBorrowing),
++			strategy: func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy {
++				iterator := reorderedIterator(func(a, b *workload.Info) int {
++					return policy.CandidatesPreferenceOrdering(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, preferred.Has)
++				}, keep)
++				return newPreemptionStrategy(func(yieldCandidate func(*Target) bool) {
++					iterateOverCandidates(ctx, preemptionCtx, iterator, allowBorrowing, yieldCandidate)
++				}, allowBorrowing, preemptionCtx)
++			},
++		})
+ 	}
++	return attempts
+ }
+ 
+ func iterateOverCandidates(
+@@ -124,3 +161,14 @@ func iterateOverCandidates(
  	}
  	return true
  }
@@ -115,51 +423,67 @@ index 05871068a..37e7e1b4f 100644
 +	return candidates
 +}
 diff --git a/pkg/scheduler/preemption/fair_strategy.go b/pkg/scheduler/preemption/fair_strategy.go
-index eb81adbf9..9e9735506 100644
+index eb81adb..ab8c21e 100644
 --- a/pkg/scheduler/preemption/fair_strategy.go
 +++ b/pkg/scheduler/preemption/fair_strategy.go
-@@ -62,7 +62,6 @@ func fairPreemptionStrategy(
+@@ -61,12 +61,45 @@ func fairPreemptionStrategy(
+ 	preemptionCtx *preemptionCtx,
  	fsStrategies []fairsharing.Strategy,
  ) iter.Seq[PreemptionStrategy] {
- 	log := log.FromContext(ctx)
--	allowBorrowing := true
- 
- 	candidateWls := preemptor.findCandidates(log, preemptionCtx.preemptor.Obj, preemptionCtx.preemptorCQ, preemptionCtx.frsNeedPreemption)
- 	if noCandidates(preemptionCtx, candidateWls) {
-@@ -81,6 +80,44 @@ func fairPreemptionStrategy(
- 		)
- 	}
- 
++	candidateWls, found := fairPreemptionCandidates(ctx, preemptor, preemptionCtx)
++	if !found {
++		return func(yieldStrategy func(PreemptionStrategy) bool) {}
++	}
 +	return func(yieldStrategy func(PreemptionStrategy) bool) {
-+		if !yieldStrategy(fairStrategy(ctx, preemptionCtx, fsStrategies, slices.Clone(candidateWls))) {
-+			return
-+		}
-+		if len(preemptionCtx.tasRequests) == 0 {
-+			return
-+		}
-+		// The ordinary attempt stops taking victims from a queue once it is no
-+		// longer borrowing, which can leave the freed capacity spread across
-+		// topology domains. Retry with each queue's workloads in a cheapest
-+		// freeable placement first; the fair sharing rules still apply.
-+		makeStrategy := func(preferred sets.Set[workload.Reference]) PreemptionStrategy {
-+			ordered := slices.Clone(candidateWls)
-+			now := preemptor.clock.Now()
-+			slices.SortStableFunc(ordered, func(a, b *workload.Info) int {
-+				return policy.CandidatesOrderingWithPreference(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, now, func(w *workload.Info) bool {
-+					return preferred.Has(workload.Key(w.Obj))
-+				})
-+			})
-+			return fairStrategy(ctx, preemptionCtx, fsStrategies, ordered)
-+		}
-+		placements := topologyPlacements(ctx, preemptionCtx, candidateWls)
-+		if preferred, found := preemptor.cheapestTopologyPlacement(ctx, placements, makeStrategy); found {
-+			yieldStrategy(makeStrategy(preferred))
-+		}
++		yieldStrategy(fairStrategy(ctx, preemptionCtx, fsStrategies, candidateWls))
 +	}
 +}
 +
++// fairTopologyRetryAttempts returns the fair sharing candidates and a strategy
++// that offers the kept candidates, the preferred ones first, within the order
++// of ClusterQueues by share; the fair sharing rules still apply.
++func fairTopologyRetryAttempts(ctx context.Context, preemptor *Preemptor, preemptionCtx *preemptionCtx, fsStrategies []fairsharing.Strategy) []topologyRetryAttempt {
+ 	log := log.FromContext(ctx)
+-	allowBorrowing := true
++	candidateWls, found := fairPreemptionCandidates(ctx, preemptor, preemptionCtx)
++	if !found {
++		return nil
++	}
++	return []topologyRetryAttempt{{
++		allowBorrowing: true,
++		candidates:     candidateWls,
++		strategy: func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy {
++			ordered := slices.DeleteFunc(slices.Clone(candidateWls), func(wl *workload.Info) bool { return !keep(wl) })
++			slices.SortStableFunc(ordered, func(a, b *workload.Info) int {
++				return policy.CandidatesPreferenceOrdering(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, preferred.Has)
++			})
++			return fairStrategy(ctx, preemptionCtx, fsStrategies, ordered)
++		},
++	}}
++}
+ 
++// fairPreemptionCandidates returns the candidates fair sharing may preempt, in
++// the default order. It returns false when neither a candidate nor a
++// configurable preemption rule can free capacity.
++func fairPreemptionCandidates(ctx context.Context, preemptor *Preemptor, preemptionCtx *preemptionCtx) ([]*workload.Info, bool) {
++	log := log.FromContext(ctx)
+ 	candidateWls := preemptor.findCandidates(log, preemptionCtx.preemptor.Obj, preemptionCtx.preemptorCQ, preemptionCtx.frsNeedPreemption)
+ 	if noCandidates(preemptionCtx, candidateWls) {
+-		return func(yieldStrategy func(PreemptionStrategy) bool) {}
++		return nil, false
+ 	}
+ 	slices.SortFunc(candidateWls, preemptor.candidatesOrdering(log, preemptionCtx.preemptorCQ.Name))
+ 	if logV := log.V(5); logV.Enabled() {
+@@ -80,7 +113,20 @@ func fairPreemptionStrategy(
+ 			klog.KObj(preemptionCtx.preemptor.Obj),
+ 		)
+ 	}
++	return candidateWls, true
++}
+ 
 +// fairStrategy builds the fair sharing strategy that offers candidateWls in
-+// the given order, within the order of ClusterQueues by share.
++// the given order, within the order of ClusterQueues by share. The strategy
++// consumes candidateWls, so each strategy needs its own slice.
 +func fairStrategy(
 +	ctx context.Context,
 +	preemptionCtx *preemptionCtx,
@@ -171,7 +495,7 @@ index eb81adbf9..9e9735506 100644
  	candidatesIter := func(yieldCandidate func(*Target) bool) {
  		var cont bool
  		targetsInPreemptorCQ := false
-@@ -148,16 +185,14 @@ func fairPreemptionStrategy(
+@@ -148,16 +194,14 @@ func fairPreemptionStrategy(
  		}
  	}
  
@@ -197,43 +521,148 @@ index eb81adbf9..9e9735506 100644
  
  // verifyFairSharingTargets checks that every cross-ClusterQueue target in targets
 diff --git a/pkg/scheduler/preemption/policy/ordering.go b/pkg/scheduler/preemption/policy/ordering.go
-index 558ed9446..c012a5e0a 100644
+index 558ed94..3d4afd7 100644
 --- a/pkg/scheduler/preemption/policy/ordering.go
 +++ b/pkg/scheduler/preemption/policy/ordering.go
-@@ -41,6 +41,14 @@ import (
+@@ -41,6 +41,49 @@ import (
  // 3. Workloads with lower priority first.
  // 4. Workloads admitted more recently first.
  func CandidatesOrdering(log logr.Logger, afsEnabled bool, a, b *workload.Info, cq kueue.ClusterQueueReference, now time.Time) int {
-+	return CandidatesOrderingWithPreference(log, afsEnabled, a, b, cq, now, nil)
++	return cmputil.LazyOr(
++		func() int {
++			return candidatesOrderingBeforePriority(log, afsEnabled, a, b, cq)
++		},
++		func() int {
++			return cmp.Compare(
++				priority.EffectivePriority(log, a.Obj),
++				priority.EffectivePriority(log, b.Obj),
++			)
++		},
++		func() int {
++			return quotaReservationTime(b.Obj, now).Compare(quotaReservationTime(a.Obj, now))
++		},
++		func() int {
++			// Arbitrary comparison for deterministic sorting.
++			return cmp.Compare(
++				a.Obj.UID,
++				b.Obj.UID,
++			)
++		},
++	)
 +}
 +
-+// CandidatesOrderingWithPreference orders preferred workloads before the
-+// others, after criteria 0-2 and before priority. A topology retry uses it to
-+// free one topology domain even when the domain's workloads do not have the
-+// lowest priorities; every candidate still has to pass the preemption policy.
-+func CandidatesOrderingWithPreference(log logr.Logger, afsEnabled bool, a, b *workload.Info, cq kueue.ClusterQueueReference, now time.Time, preferred func(*workload.Info) bool) int {
++// CandidatesPreferenceOrdering compares criteria 0-2 of CandidatesOrdering,
++// then orders preferred workloads first. Stable-sorting candidates already in
++// CandidatesOrdering by it puts the preferred workloads before the others
++// that tie on criteria 0-2 and keeps the remaining order. A topology retry
++// uses it to free one topology domain even when the domain's workloads do not
++// have the lowest priorities; every candidate still has to pass the
++// preemption policy.
++func CandidatesPreferenceOrdering(log logr.Logger, afsEnabled bool, a, b *workload.Info, cq kueue.ClusterQueueReference, preferred func(*workload.Info) bool) int {
++	return cmputil.LazyOr(
++		func() int {
++			return candidatesOrderingBeforePriority(log, afsEnabled, a, b, cq)
++		},
++		func() int {
++			return cmputil.CompareBool(preferred(b), preferred(a))
++		},
++	)
++}
++
++// candidatesOrderingBeforePriority compares criteria 0-2 of CandidatesOrdering.
++func candidatesOrderingBeforePriority(log logr.Logger, afsEnabled bool, a, b *workload.Info, cq kueue.ClusterQueueReference) int {
  	return cmputil.LazyOr(
  		func() int {
  			return cmputil.CompareBool(
-@@ -65,6 +73,12 @@ func CandidatesOrdering(log logr.Logger, afsEnabled bool, a, b *workload.Info, c
+@@ -65,22 +108,6 @@ func CandidatesOrdering(log logr.Logger, afsEnabled bool, a, b *workload.Info, c
  			}
  			return 0
  		},
-+		func() int {
-+			if preferred == nil {
-+				return 0
-+			}
-+			return cmputil.CompareBool(preferred(b), preferred(a))
-+		},
- 		func() int {
- 			return cmp.Compare(
- 				priority.EffectivePriority(log, a.Obj),
+-		func() int {
+-			return cmp.Compare(
+-				priority.EffectivePriority(log, a.Obj),
+-				priority.EffectivePriority(log, b.Obj),
+-			)
+-		},
+-		func() int {
+-			return quotaReservationTime(b.Obj, now).Compare(quotaReservationTime(a.Obj, now))
+-		},
+-		func() int {
+-			// Arbitrary comparison for deterministic sorting.
+-			return cmp.Compare(
+-				a.Obj.UID,
+-				b.Obj.UID,
+-			)
+-		},
+ 	)
+ }
+ 
+diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
+index e4f1814..56b0fe9 100644
+--- a/pkg/scheduler/preemption/preemption.go
++++ b/pkg/scheduler/preemption/preemption.go
+@@ -76,6 +76,7 @@ type Preemptor struct {
+ 	roleTracker            *roletracker.RoleTracker
+ 	customLabels           *metrics.CustomLabels
+ 	preemptionExpectations *expectations.Store
++	topologyRetryFailures  *topologyRetryFailures
+ }
+ 
+ // PreemptionStrategy represents a singular set of ordered potential preemption candidates.
+@@ -132,6 +133,10 @@ type preemptionCtx struct {
+ 	assignment            flavorassigner.Assignment
+ 	frsNeedPreemption     sets.Set[resources.FlavorResource]
+ 	configurableEvaluator *configurable.PreemptionEvaluator
++	// topologyBlocked records that a strategy freed enough quota for the
++	// workload but no topology placement fit, the only failure a topology
++	// retry can fix.
++	topologyBlocked bool
+ }
+ 
+ func New(
+@@ -156,6 +161,7 @@ func New(
+ 		roleTracker:            tracker,
+ 		customLabels:           customLabels,
+ 		preemptionExpectations: preemptionExpectations,
++		topologyRetryFailures:  newTopologyRetryFailures(),
+ 	}
+ 	return p
+ }
+@@ -406,7 +412,7 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
+ 		var targets []*Target
+ 		for candidate := range strategy.candidates {
+ 			targets = append(targets, candidate)
+-			if workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
++			if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
+ 				if psName, currentCount, minCount, isElastic := getElasticInfo(candidate.WorkloadInfo); isElastic {
+ 					totalUsage := candidate.WorkloadInfo.Usage()
+ 					perPodQuota := make(resources.FlavorResourceQuantities)
+@@ -690,6 +696,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
+ 	return workloadQuotaFits(preemptionCtx, allowBorrowing) && workloadTopologyFits(ctx, preemptionCtx)
+ }
+ 
++// workloadFitsNotingTopology is workloadFits that also records in the
++// preemption context when the quota fits but no topology assignment does.
++func workloadFitsNotingTopology(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrowing bool) bool {
++	if !workloadQuotaFits(preemptionCtx, allowBorrowing) {
++		return false
++	}
++	if workloadTopologyFits(ctx, preemptionCtx) {
++		return true
++	}
++	preemptionCtx.topologyBlocked = true
++	return false
++}
++
+ // workloadQuotaFits determines if the quota requested by the workload is available in
+ // the ClusterQueue and its cohort, if it belongs to one.
+ func workloadQuotaFits(preemptionCtx *preemptionCtx, allowBorrowing bool) bool {
 diff --git a/pkg/scheduler/preemption/preemption_tas_bench_test.go b/pkg/scheduler/preemption/preemption_tas_bench_test.go
 new file mode 100644
-index 000000000..0c57b1a23
+index 0000000..ef152ee
 --- /dev/null
 +++ b/pkg/scheduler/preemption/preemption_tas_bench_test.go
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,161 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -360,20 +789,36 @@ index 000000000..0c57b1a23
 +					if err != nil {
 +						b.Fatal(err)
 +					}
-+					preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, nil, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
-+					// Warm the candidate order cache for repeated attempts on this snapshot.
-+					preemptor.GetTargetsWithStrategy(ctx, preemptor.GetPreemptionStrategyIterator(ctx, *info, snapshot, assignment))
-+					b.ReportAllocs()
-+					b.ResetTimer()
-+					targetCount := 0
-+					for range b.N {
-+						targets := preemptor.GetTargetsWithStrategy(ctx, preemptor.GetPreemptionStrategyIterator(ctx, *info, snapshot, assignment))
-+						targetCount += len(targets)
++					newPreemptor := func() *Preemptor {
++						return New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, nil, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
 +					}
-+					b.StopTimer()
-+					b.ReportMetric(float64(targetCount)/float64(b.N), "targets/op")
-+					b.ReportMetric(nodes, "nodes")
-+					b.ReportMetric(nodes*slots, "workloads")
++					// Warm the candidate order cache for repeated attempts on this snapshot.
++					getTargetsWithTopologyRetry(ctx, newPreemptor(), *info, snapshot, assignment)
++					// A first attempt runs on a fresh preemptor, which remembers no
++					// failed retry; repeated attempts reuse one preemptor in an
++					// unchanged state, as a workload that stays pending does.
++					for _, attempt := range []string{"first", "repeated"} {
++						b.Run("attempt="+attempt, func(b *testing.B) {
++							preemptor := newPreemptor()
++							getTargetsWithTopologyRetry(ctx, preemptor, *info, snapshot, assignment)
++							b.ReportAllocs()
++							b.ResetTimer()
++							targetCount := 0
++							for range b.N {
++								if attempt == "first" {
++									b.StopTimer()
++									preemptor = newPreemptor()
++									b.StartTimer()
++								}
++								targets := getTargetsWithTopologyRetry(ctx, preemptor, *info, snapshot, assignment)
++								targetCount += len(targets)
++							}
++							b.StopTimer()
++							b.ReportMetric(float64(targetCount)/float64(b.N), "targets/op")
++							b.ReportMetric(nodes, "nodes")
++							b.ReportMetric(nodes*slots, "workloads")
++						})
++					}
 +				})
 +			}
 +		})
@@ -381,10 +826,10 @@ index 000000000..0c57b1a23
 +}
 diff --git a/pkg/scheduler/preemption/preemption_tas_test.go b/pkg/scheduler/preemption/preemption_tas_test.go
 new file mode 100644
-index 000000000..9e9a21883
+index 0000000..fcae8a2
 --- /dev/null
 +++ b/pkg/scheduler/preemption/preemption_tas_test.go
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,255 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -405,6 +850,7 @@ index 000000000..9e9a21883
 +
 +import (
 +	"cmp"
++	"context"
 +	"maps"
 +	"slices"
 +	"testing"
@@ -587,7 +1033,7 @@ index 000000000..9e9a21883
 +					}
 +
 +					preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
-+					targets := preemptor.GetTargetsWithStrategy(ctx, preemptor.GetPreemptionStrategyIterator(ctx, *info, snapshot, assignment))
++					targets := getTargetsWithTopologyRetry(ctx, preemptor, *info, snapshot, assignment)
 +					var gotTargets []string
 +					for _, target := range targets {
 +						gotTargets = append(gotTargets, target.WorkloadInfo.Obj.Name)
@@ -604,7 +1050,7 @@ index 000000000..9e9a21883
 +							Name: "main", Count: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
 +							Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "tas", Mode: flavorassigner.Preempt}},
 +						}}}
-+						targets = preemptor.GetTargetsWithStrategy(ctx, preemptor.GetPreemptionStrategyIterator(ctx, *next, snapshot, nextAssignment))
++						targets = getTargetsWithTopologyRetry(ctx, preemptor, *next, snapshot, nextAssignment)
 +						gotTargets = nil
 +						for _, target := range targets {
 +							gotTargets = append(gotTargets, target.WorkloadInfo.Obj.Name)
@@ -629,12 +1075,22 @@ index 000000000..9e9a21883
 +		})
 +	}
 +}
++
++// getTargetsWithTopologyRetry runs the topology retry when ordinary preemption
++// finds no targets, as the scheduler does once no pod count fits.
++func getTargetsWithTopologyRetry(ctx context.Context, preemptor *Preemptor, wl workload.Info, snapshot *schdcache.Snapshot, assignment flavorassigner.Assignment) []*Target {
++	targets, retry := preemptor.GetTargets(ctx, wl, snapshot, assignment)
++	if len(targets) == 0 && retry != nil {
++		targets = retry(ctx)
++	}
++	return targets
++}
 diff --git a/pkg/scheduler/preemption/topology_retry.go b/pkg/scheduler/preemption/topology_retry.go
 new file mode 100644
-index 000000000..8ba26c6ef
+index 0000000..30ffa6b
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry.go
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,543 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -656,6 +1112,7 @@ index 000000000..8ba26c6ef
 +import (
 +	"cmp"
 +	"context"
++	"math/bits"
 +	"slices"
 +
 +	"k8s.io/apimachinery/pkg/util/sets"
@@ -663,90 +1120,488 @@ index 000000000..8ba26c6ef
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
 +	"sigs.k8s.io/kueue/pkg/util/priority"
 +	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 +	"sigs.k8s.io/kueue/pkg/workload"
 +)
 +
-+// maxTopologyPlacements bounds how many alternative placements a topology
-+// retry evaluates, so a workload that keeps failing costs a bounded amount of
-+// work per scheduling attempt.
-+const maxTopologyPlacements = 8
++// maxTopologyEvaluations bounds how many placements a topology retry runs the
++// preemption strategy for in each attempt. maxTopologySearches and
++// maxMinimizingSearches bound how many topology searches it runs to find the
++// priority ceiling and the placements and to trim each placement's victims,
++// so a workload that keeps failing costs a bounded amount of work per
++// scheduling attempt, however many candidates and priorities there are; see
++// topologyRetryAttemptTargets for the bound.
++const (
++	maxTopologyEvaluations = 8
++	maxTopologySearches    = 64
++	maxMinimizingSearches  = 8
++)
 +
-+// topologyPlacements finds placements of the preemptor that become possible
-+// once candidates are removed, and returns, for each placement, the candidates
-+// occupying its topology domains. Each search keeps the candidates of the
-+// previous placements in place, so the next placement lands in other domains.
-+// The placements only guide victim ordering: the strategies built from them
-+// recheck every policy as victims are removed.
-+func topologyPlacements(ctx context.Context, pCtx *preemptionCtx, candidates []*workload.Info) []sets.Set[workload.Reference] {
-+	var placements []sets.Set[workload.Reference]
-+	kept := sets.New[workload.Reference]()
-+	for range maxTopologyPlacements {
-+		removed := make([]*workload.Info, 0, len(candidates))
-+		for _, candidate := range candidates {
-+			if !kept.Has(workload.Key(candidate.Obj)) {
-+				removed = append(removed, candidate)
-+			}
-+		}
-+		if len(removed) == 0 {
-+			break
-+		}
-+		restore := pCtx.snapshot.SimulateWorkloadRemoval(removed)
-+		assignments := pCtx.preemptorCQ.FindTopologyAssignmentsForWorkload(ctx, pCtx.tasRequests, schdcache.WithWorkloadInfo(&pCtx.preemptor))
-+		restore()
-+		if assignments.Failure() != nil {
-+			break
-+		}
-+		occupants := candidatesInDomains(removed, assignments)
-+		if len(occupants) == 0 {
-+			break
-+		}
-+		placements = append(placements, occupants)
-+		kept = kept.Union(occupants)
++// TopologyRetry searches for preemption targets that free whole topology
++// domains for the preemptor. It returns no targets when no placement can be
++// freed within the preemption policies.
++type TopologyRetry func(ctx context.Context) []*Target
++
++// GetTargets returns the targets of ordinary preemption for wl. When ordinary
++// preemption finds no targets because the quota fits but no topology placement
++// does, it also returns a TopologyRetry. The caller runs it only once every
++// other way to admit wl failed, so ordinary preemption wins whenever it
++// succeeds. A retry that already failed for wl in the same state is not run
++// again.
++func (p *Preemptor) GetTargets(
++	ctx context.Context,
++	wl workload.Info,
++	snapshot *schdcache.Snapshot,
++	assignment flavorassigner.Assignment,
++) ([]*Target, TopologyRetry) {
++	pCtx := p.buildContext(ctx, wl, assignment, snapshot)
++	targets := p.getTargets(ctx, p.getPreemptionStrategyIterator(ctx, pCtx))
++	if len(targets) > 0 || !pCtx.topologyBlocked {
++		return targets, nil
 +	}
-+	return placements
++	return nil, func(ctx context.Context) []*Target {
++		return p.topologyRetryFailures.run(ctx, p, pCtx, func() []*Target {
++			return p.topologyRetryTargets(ctx, pCtx)
++		})
++	}
 +}
 +
-+// candidatesInDomains returns the candidates that use any topology domain of
-+// the given assignments.
-+func candidatesInDomains(candidates []*workload.Info, assignments schdcache.TASAssignmentsResult) sets.Set[workload.Reference] {
-+	domains := make(map[kueue.ResourceFlavorReference]sets.Set[utiltas.TopologyDomainID])
-+	for _, assignment := range assignments {
-+		if domains[assignment.Flavor] == nil {
-+			domains[assignment.Flavor] = sets.New[utiltas.TopologyDomainID]()
-+		}
-+		for _, domain := range assignment.TopologyAssignment.Domains {
-+			domains[assignment.Flavor].Insert(utiltas.DomainID(domain.Values))
++// topologyRetryAttempt is one way the preemption algorithm may take victims:
++// the candidates it can preempt, and a strategy offering the kept candidates,
++// the preferred ones first, while it rechecks every policy as victims are
++// removed.
++type topologyRetryAttempt struct {
++	allowBorrowing bool
++	candidates     []*workload.Info
++	strategy       func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy
++}
++
++// topologyRetryTargets takes victims by topology placement instead of by
++// priority alone. The ordinary attempts stop taking victims once each
++// borrowing queue is back at its nominal quota, which can leave the freed
++// capacity spread across topology domains. For the first attempt that frees a
++// placement, it returns the targets that cost the least among the
++// placements it evaluates: the lowest highest-priority target first, then the
++// lowest next-highest, and so on, then the fewest targets. See
++// topologyRetryAttemptTargets for which of these are exact.
++func (p *Preemptor) topologyRetryTargets(ctx context.Context, pCtx *preemptionCtx) []*Target {
++	var attempts []topologyRetryAttempt
++	if p.enableFairSharing {
++		attempts = fairTopologyRetryAttempts(ctx, p, pCtx, p.fsStrategies)
++	} else {
++		attempts = classicalTopologyRetryAttempts(ctx, p, pCtx)
++	}
++	for _, attempt := range attempts {
++		if targets := p.topologyRetryAttemptTargets(ctx, pCtx, attempt); len(targets) > 0 {
++			return targets
 +		}
 +	}
-+	occupants := sets.New[workload.Reference]()
++	return nil
++}
++
++// retryCandidate is a candidate of a topology retry, with the parts of its
++// usage the search removes from the snapshot computed once.
++type retryCandidate struct {
++	wl       *workload.Info
++	priority int64
++	quota    workload.Usage
++	tas      workload.Usage
++	domains  []flavorDomain
++	// order is the candidate's position in ascending priority, ties in the
++	// order the strategy offers them.
++	order int
++	// removedLeaves counts the freed leaves the candidate occupies.
++	removedLeaves int
++	// excluded marks the occupants of a placement already found, which stay
++	// in the snapshot.
++	excluded bool
++}
++
++// topologyRetryAttemptTargets raises a priority ceiling through the
++// candidates' priorities, lowest first, and starts at the first ceiling where
++// removing every candidate at or below it frees both the quota and a
++// topology placement for the preemptor. Removing more candidates never frees
++// less, so no set of victims below that ceiling admits the preemptor,
++// however many topology domains there are. At each ceiling from there, it
++// finds the placements whose occupants cost the least, keeps of each only
++// the occupants the preemptor needs gone, skips those the ClusterQueues may
++// not give up together, runs the strategy for the rest, limited to the
++// candidates at or below the ceiling, and returns the targets that cost the
++// least. When the policies reject every such placement, it moves on to the
++// next ceiling. The search removes only the quota or only the TAS usage of
++// the candidates, and restores the snapshot before it runs a strategy.
++//
++// It runs the strategy at most maxTopologyEvaluations times and at most
++// maxTopologySearches + maxTopologyEvaluations*(2*bits.Len(L) +
++// maxMinimizingSearches) topology searches, where L is the number of
++// topology leaves the candidates occupy: finding the starting ceiling takes
++// about log2 of the number of distinct priorities, and each placement about
++// 2*log2(L) to find and up to maxMinimizingSearches to trim. With 8
++// evaluations and 1024 leaves that is 304 searches.
++//
++// The highest priority among the targets is the lowest any set of victims
++// that admits the preemptor can have when the strategy succeeds at the
++// starting ceiling, given that freeing more capacity never makes a topology
++// placement stop fitting. The lowest next-highest priorities and the fewest
++// targets are best effort: they compare only the placements found, at most
++// maxTopologyEvaluations, chosen by a greedy order of topology leaves.
++func (p *Preemptor) topologyRetryAttemptTargets(ctx context.Context, pCtx *preemptionCtx, attempt topologyRetryAttempt) []*Target {
++	log := log.FromContext(ctx)
++	limits := newReclaimLimits(pCtx)
++	candidates := make([]*retryCandidate, 0, len(attempt.candidates))
++	leaves := sets.New[flavorDomain]()
++	for _, wl := range attempt.candidates {
++		usage := wl.Usage()
++		candidate := &retryCandidate{
++			wl:       wl,
++			priority: priority.EffectivePriority(log, wl.Obj),
++			quota:    workload.Usage{Quota: usage.Quota},
++			tas:      workload.Usage{TAS: usage.TAS},
++			domains:  candidateDomains(usage.TAS),
++		}
++		leaves.Insert(candidate.domains...)
++		candidates = append(candidates, candidate)
++	}
++	slices.SortStableFunc(candidates, func(a, b *retryCandidate) int { return cmp.Compare(a.priority, b.priority) })
++	var ceilings []int
++	for i, candidate := range candidates {
++		candidate.order = i
++		if i+1 == len(candidates) || candidates[i+1].priority != candidate.priority {
++			ceilings = append(ceilings, i+1)
++		}
++	}
++
++	searches := maxTopologySearches + maxTopologyEvaluations*(2*bits.Len(uint(leaves.Len()))+maxMinimizingSearches)
++	start := lowestQuotaCeiling(pCtx, candidates, ceilings, attempt.allowBorrowing)
++	start = lowestTopologyCeiling(ctx, pCtx, candidates, ceilings, start, &searches)
++	evaluations := maxTopologyEvaluations
++	for _, end := range ceilings[start:] {
++		if evaluations == 0 || searches == 0 {
++			break
++		}
++		placements := cheapestPlacements(ctx, pCtx, limits, candidates[:end], attempt.allowBorrowing, evaluations, &searches)
++		if len(placements) == 0 {
++			continue
++		}
++		evaluations -= len(placements)
++		ceiling := candidates[end-1].priority
++		keep := func(wl *workload.Info) bool { return priority.EffectivePriority(log, wl.Obj) <= ceiling }
++		if targets := p.cheapestTargets(ctx, placements, attempt, keep); len(targets) > 0 {
++			return targets
++		}
++	}
++	return nil
++}
++
++// lowestQuotaCeiling returns the index of the first ceiling at which removing
++// the quota usage of every candidate at or below it lets the preemptor's
++// quota fit, or len(ceilings) when none does. It ignores which candidates the
++// ClusterQueues may give up, so the ceiling it returns is never above the
++// lowest one the strategies can reach.
++func lowestQuotaCeiling(pCtx *preemptionCtx, candidates []*retryCandidate, ceilings []int, allowBorrowing bool) int {
++	removed := 0
++	defer func() {
++		for _, candidate := range candidates[:removed] {
++			pCtx.snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
++		}
++	}()
++	for i, end := range ceilings {
++		for ; removed < end; removed++ {
++			pCtx.snapshot.RemoveWorkloadUsage(candidates[removed].wl, candidates[removed].quota)
++		}
++		if workloadQuotaFits(pCtx, allowBorrowing) {
++			return i
++		}
++	}
++	return len(ceilings)
++}
++
++// lowestTopologyCeiling returns the index of the first ceiling, from start
++// on, at which removing the TAS usage of every candidate at or below it lets
++// a topology placement fit, or len(ceilings) when none does. It bisects the
++// ceilings, which assumes that freeing more capacity never makes a placement
++// stop fitting, so its searches grow with the logarithm of the number of
++// distinct priorities, and it charges each one to searches.
++func lowestTopologyCeiling(ctx context.Context, pCtx *preemptionCtx, candidates []*retryCandidate, ceilings []int, start int, searches *int) int {
++	// cheapestPlacements searches with every candidate removed at the last
++	// ceiling anyway.
++	if start >= len(ceilings)-1 {
++		return start
++	}
++	removed := 0
++	setRemoved := func(n int) {
++		for ; removed < n; removed++ {
++			pCtx.snapshot.RemoveWorkloadUsage(candidates[removed].wl, candidates[removed].tas)
++		}
++		for ; removed > n; removed-- {
++			pCtx.snapshot.AddWorkloadUsage(candidates[removed-1].wl, candidates[removed-1].tas)
++		}
++	}
++	defer setRemoved(0)
++	fits := func(i int) (fit, ok bool) {
++		if *searches == 0 {
++			return false, false
++		}
++		*searches--
++		setRemoved(ceilings[i])
++		return topologyFits(ctx, pCtx), true
++	}
++	// low never fits; high fits.
++	low, high := start-1, len(ceilings)-1
++	if fit, ok := fits(high); !fit || !ok {
++		return len(ceilings)
++	}
++	for high-low > 1 {
++		mid := (low + high) / 2
++		fit, ok := fits(mid)
++		if !ok {
++			return len(ceilings)
++		}
++		if fit {
++			high = mid
++		} else {
++			low = mid
++		}
++	}
++	return high
++}
++
++// topologyFits reports whether a topology placement of the preemptor fits in
++// the current state of the snapshot.
++func topologyFits(ctx context.Context, pCtx *preemptionCtx) bool {
++	return pCtx.assignment.FindTopologyAssignments(ctx, pCtx.preemptorCQ, pCtx.tasRequests, schdcache.WithWorkloadInfo(&pCtx.preemptor)).Failure() == nil
++}
++
++// cheapestPlacements finds up to limit placements of the preemptor, cheapest
++// first, that removing candidates makes possible within what their
++// ClusterQueues may give up, and returns, for each, the candidates the
++// preemptor needs gone from its topology domains.
++//
++// Each topology leaf offers a set of its candidates that their ClusterQueues
++// and Cohorts may give up together, built from the most expensive candidate
++// down, so a cheap candidate a placement may not need cannot use up what a
++// lender may give before one it does. It orders the leaves by the priorities
++// of those candidates, highest first, compared like victim costs, and frees
++// the shortest run of the cheapest leaves after which a placement fits, found
++// by bisection, which assumes that freeing more leaves never makes a
++// placement stop fitting, so a placement inside one leaf is the cheapest one. It then puts back the
++// occupants of the placement's leaves, most expensive first, that the
++// preemptor's topology placement and quota still fit without, keeps the rest
++// as the placement's victims, and keeps every occupant in place while it
++// looks for the next placement. A placement whose victims the ClusterQueues
++// may not give up together is skipped and does not count toward limit. It
++// charges each topology search to searches and returns what it found when
++// they run out.
++//
++// The leaf order and the occupants it puts back are greedy: they find the
++// lowest highest-priority victim the ceiling allows, but not always the
++// lowest next-highest victims or the fewest victims.
++func cheapestPlacements(ctx context.Context, pCtx *preemptionCtx, limits *reclaimLimits, candidates []*retryCandidate, allowBorrowing bool, limit int, searches *int) []sets.Set[*workload.Info] {
++	allOccupants := make(map[flavorDomain][]*retryCandidate)
 +	for _, candidate := range candidates {
-+		for flavor, usage := range candidate.TASUsage() {
-+			for _, domain := range usage {
-+				if domains[flavor].Has(utiltas.DomainID(domain.Values)) {
-+					occupants.Insert(workload.Key(candidate.Obj))
++		candidate.removedLeaves, candidate.excluded = 0, false
++		for _, leaf := range candidate.domains {
++			allOccupants[leaf] = append(allOccupants[leaf], candidate)
++		}
++	}
++	type leafCost struct {
++		leaf flavorDomain
++		cost []int64
++	}
++	byLeaf := make(map[flavorDomain][]*retryCandidate, len(allOccupants))
++	leaves := make([]leafCost, 0, len(allOccupants))
++	for leaf, occupants := range allOccupants {
++		// The occupants are in ascending priority.
++		group := limits.newGroup()
++		for _, occupant := range slices.Backward(occupants) {
++			group.tryAdd(occupant)
++		}
++		freeable := group.release()
++		if len(freeable) == 0 {
++			continue
++		}
++		byLeaf[leaf] = freeable
++		cost := make([]int64, 0, len(freeable))
++		for _, occupant := range freeable {
++			cost = append(cost, occupant.priority)
++		}
++		leaves = append(leaves, leafCost{leaf: leaf, cost: cost})
++	}
++	slices.SortFunc(leaves, func(a, b leafCost) int {
++		return cmp.Or(slices.Compare(a.cost, b.cost), cmp.Compare(a.leaf.flavor, b.leaf.flavor), cmp.Compare(a.leaf.domain, b.leaf.domain))
++	})
++
++	// freed is the number of leading leaves whose candidates are removed.
++	freed := 0
++	freeLeaves := func(n int) {
++		for ; freed < n; freed++ {
++			for _, candidate := range byLeaf[leaves[freed].leaf] {
++				if candidate.removedLeaves++; candidate.removedLeaves == 1 && !candidate.excluded {
++					pCtx.snapshot.RemoveWorkloadUsage(candidate.wl, candidate.tas)
++				}
++			}
++		}
++		for ; freed > n; freed-- {
++			for _, candidate := range byLeaf[leaves[freed-1].leaf] {
++				if candidate.removedLeaves--; candidate.removedLeaves == 0 && !candidate.excluded {
++					pCtx.snapshot.AddWorkloadUsage(candidate.wl, candidate.tas)
 +				}
 +			}
 +		}
 +	}
-+	return occupants
++	defer freeLeaves(0)
++	// search reports whether a placement fits with the first n leaves freed,
++	// and false for ok once the searches run out.
++	var fitting schdcache.TASAssignmentsResult
++	search := func(n int) (fit, ok bool) {
++		if *searches == 0 {
++			return false, false
++		}
++		*searches--
++		freeLeaves(n)
++		assignments := pCtx.assignment.FindTopologyAssignments(ctx, pCtx.preemptorCQ, pCtx.tasRequests, schdcache.WithWorkloadInfo(&pCtx.preemptor))
++		if assignments.Failure() != nil {
++			return false, true
++		}
++		fitting = assignments
++		return true, true
++	}
++
++	var placements []sets.Set[*workload.Info]
++	if fit, _ := search(len(leaves)); !fit {
++		return nil
++	}
++	// low leaves never fit; the search fits with high leaves.
++	low := 0
++	for len(placements) < limit {
++		high := -1
++		var assignments schdcache.TASAssignmentsResult
++		for step := 1; ; step *= 2 {
++			n := min(low+step, len(leaves))
++			fit, ok := search(n)
++			if !ok {
++				return placements
++			}
++			if fit {
++				high, assignments = n, fitting
++				break
++			}
++			if n == len(leaves) {
++				break
++			}
++			low = n
++		}
++		if high < 0 {
++			break
++		}
++		for high-low > 1 {
++			mid := (low + high) / 2
++			fit, ok := search(mid)
++			if !ok {
++				return placements
++			}
++			if fit {
++				high, assignments = mid, fitting
++			} else {
++				low = mid
++			}
++		}
++		freeLeaves(high)
++		// The occupants are every removed candidate in the placement's leaves,
++		// including one removed for another leaf it also occupies.
++		var occupants []*retryCandidate
++		for _, assignment := range assignments {
++			for _, domain := range assignment.TopologyAssignment.Domains {
++				for _, candidate := range allOccupants[flavorDomain{flavor: assignment.Flavor, domain: utiltas.DomainID(domain.Values)}] {
++					if candidate.removedLeaves > 0 && !candidate.excluded {
++						candidate.excluded = true
++						occupants = append(occupants, candidate)
++					}
++				}
++			}
++		}
++		if len(occupants) == 0 {
++			break
++		}
++		// Excluded candidates stay in the snapshot, so restore the occupants
++		// before freeing the leaves again.
++		for _, occupant := range occupants {
++			pCtx.snapshot.AddWorkloadUsage(occupant.wl, occupant.tas)
++		}
++		freeLeaves(0)
++		// The strategy takes the occupants cheapest first; when that would
++		// leave a lender that stops borrowing before an occupant it needs,
++		// it keeps only the occupants the preemptor needs gone.
++		slices.SortFunc(occupants, func(a, b *retryCandidate) int { return cmp.Compare(a.order, b.order) })
++		victims := occupants
++		if !limits.allowsInOrder(occupants) {
++			victims = neededOccupants(ctx, pCtx, occupants, allowBorrowing, searches)
++		}
++		if limits.allows(victims) {
++			placement := sets.New[*workload.Info]()
++			for _, victim := range victims {
++				placement.Insert(victim.wl)
++			}
++			placements = append(placements, placement)
++		}
++		// With the occupants back, the first high-1 leaves still do not fit.
++		low = high - 1
++	}
++	return placements
 +}
 +
-+// cheapestTopologyPlacement evaluates the strategy built for each placement
-+// and returns the placement whose targets cost the least: the lowest
-+// highest-priority target first, then the lowest next-highest, and so on, then
-+// the fewest targets. It returns false when no placement yields targets.
-+func (p *Preemptor) cheapestTopologyPlacement(
++// neededOccupants removes the quota and TAS usage of the occupants of a
++// placement, puts them back one at a time, most expensive first, keeping
++// back each one the preemptor's topology placement still fits without and,
++// when the quota fit with every occupant removed, its quota too, and returns
++// the occupants it could not put back. It runs a topology search for each of
++// the first maxMinimizingSearches occupants, charges it to searches, and
++// keeps the others as victims. It leaves the snapshot as it found it.
++func neededOccupants(ctx context.Context, pCtx *preemptionCtx, occupants []*retryCandidate, allowBorrowing bool, searches *int) []*retryCandidate {
++	if len(occupants) < 2 {
++		return occupants
++	}
++	slices.SortFunc(occupants, func(a, b *retryCandidate) int { return cmp.Compare(b.order, a.order) })
++	usage := func(candidate *retryCandidate) workload.Usage {
++		return workload.Usage{Quota: candidate.quota.Quota, TAS: candidate.tas.TAS}
++	}
++	for _, occupant := range occupants {
++		pCtx.snapshot.RemoveWorkloadUsage(occupant.wl, usage(occupant))
++	}
++	quotaFits := workloadQuotaFits(pCtx, allowBorrowing)
++	needed := make([]*retryCandidate, 0, len(occupants))
++	for i, occupant := range occupants {
++		if i < maxMinimizingSearches && *searches > 0 {
++			*searches--
++			pCtx.snapshot.AddWorkloadUsage(occupant.wl, usage(occupant))
++			if topologyFits(ctx, pCtx) && (!quotaFits || workloadQuotaFits(pCtx, allowBorrowing)) {
++				continue
++			}
++			pCtx.snapshot.RemoveWorkloadUsage(occupant.wl, usage(occupant))
++		}
++		needed = append(needed, occupant)
++	}
++	for _, occupant := range needed {
++		pCtx.snapshot.AddWorkloadUsage(occupant.wl, usage(occupant))
++	}
++	return needed
++}
++
++// cheapestTargets runs the strategy for each placement, ordered by the cost
++// of its occupants, and returns the targets that cost the least.
++func (p *Preemptor) cheapestTargets(
 +	ctx context.Context,
-+	placements []sets.Set[workload.Reference],
-+	makeStrategy func(preferred sets.Set[workload.Reference]) PreemptionStrategy,
-+) (sets.Set[workload.Reference], bool) {
++	placements []sets.Set[*workload.Info],
++	attempt topologyRetryAttempt,
++	keep func(*workload.Info) bool,
++) []*Target {
 +	log := log.FromContext(ctx)
-+	var best sets.Set[workload.Reference]
++	var best []*Target
 +	var bestCost []int64
 +	for _, placement := range placements {
-+		strategy := makeStrategy(placement)
++		strategy := attempt.strategy(placement, keep)
 +		targets := p.getTargets(ctx, func(yield func(PreemptionStrategy) bool) { yield(strategy) })
 +		if len(targets) == 0 {
 +			continue
@@ -757,14 +1612,1413 @@ index 000000000..8ba26c6ef
 +		}
 +		slices.SortFunc(cost, func(a, b int64) int { return cmp.Compare(b, a) })
 +		if best == nil || slices.Compare(cost, bestCost) < 0 {
-+			best, bestCost = placement, cost
++			best, bestCost = targets, cost
 +		}
 +	}
-+	return best, best != nil
++	return best
++}
++
++// flavorDomain identifies a topology domain of a resource flavor.
++type flavorDomain struct {
++	flavor kueue.ResourceFlavorReference
++	domain utiltas.TopologyDomainID
++}
++
++// candidateDomains returns the topology domains of a candidate's TAS usage.
++func candidateDomains(usage workload.TASUsage) []flavorDomain {
++	var domains []flavorDomain
++	for flavor, flavorUsage := range usage {
++		for _, domain := range flavorUsage {
++			domains = append(domains, flavorDomain{flavor: flavor, domain: utiltas.DomainID(domain.Values)})
++		}
++	}
++	return domains
++}
+diff --git a/pkg/scheduler/preemption/topology_retry_failures.go b/pkg/scheduler/preemption/topology_retry_failures.go
+new file mode 100644
+index 0000000..7b5e8b5
+--- /dev/null
++++ b/pkg/scheduler/preemption/topology_retry_failures.go
+@@ -0,0 +1,254 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package preemption
++
++import (
++	"context"
++	"hash/maphash"
++	"sync"
++
++	"github.com/go-logr/logr"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/klog/v2"
++	"sigs.k8s.io/controller-runtime/pkg/log"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
++	"sigs.k8s.io/kueue/pkg/util/priority"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// maxTopologyRetryFailures bounds how many failed topology retries are
++// remembered; the memory is dropped whole once it is full.
++const maxTopologyRetryFailures = 4096
++
++// topologyRetryFailures remembers, for each workload whose topology retry
++// found no targets, a fingerprint of the state the retry read. A retry for
++// the same workload in the same state fails again, so it is skipped until any
++// admission, eviction, quota, policy, or topology change in the workload's
++// cohort tree or its topology flavors changes the fingerprint.
++type topologyRetryFailures struct {
++	seed maphash.Seed
++
++	mu     sync.Mutex
++	failed map[topologyRetryKey]uint64
++}
++
++type topologyRetryKey struct {
++	workload workload.Reference
++	uid      types.UID
++}
++
++func newTopologyRetryFailures() *topologyRetryFailures {
++	return &topologyRetryFailures{seed: maphash.MakeSeed(), failed: make(map[topologyRetryKey]uint64)}
++}
++
++// run returns the targets of retry, or none without running it when it
++// already failed for the workload in the same state.
++func (f *topologyRetryFailures) run(ctx context.Context, p *Preemptor, pCtx *preemptionCtx, retry func() []*Target) []*Target {
++	// Admission fair sharing orders candidates by usage that decays over
++	// time, configurable preemptions read rules outside the snapshot, and the
++	// scheduler library integration places pods through a simulator whose
++	// inputs the snapshot does not hold, so the fingerprint cannot cover
++	// everything such a retry reads.
++	if p.enabledAfs || features.Enabled(features.ConfigurablePreemptions) || features.Enabled(features.SchedulerLibraryIntegration) {
++		return retry()
++	}
++	key := topologyRetryKey{workload: workload.Key(pCtx.preemptor.Obj), uid: pCtx.preemptor.Obj.UID}
++	fingerprint := f.fingerprint(ctx, p, pCtx)
++	f.mu.Lock()
++	previous, found := f.failed[key]
++	f.mu.Unlock()
++	if found && previous == fingerprint {
++		log.FromContext(ctx).V(5).Info("Skipping the topology retry, which already failed in the same state", "workload", klog.KObj(pCtx.preemptor.Obj))
++		return nil
++	}
++	targets := retry()
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if len(targets) > 0 {
++		delete(f.failed, key)
++		return targets
++	}
++	if len(f.failed) >= maxTopologyRetryFailures {
++		clear(f.failed)
++	}
++	f.failed[key] = fingerprint
++	return nil
++}
++
++// fingerprint hashes the state a topology retry for pCtx reads: the
++// preemptor's spec, effective priority, queue order timestamp, and
++// assignment, the quotas, usage, policies, and workloads of every ClusterQueue
++// and Cohort in its cohort tree, and the state of its ClusterQueue's topology
++// flavors, which also holds the TAS usage of workloads outside the tree. The
++// effective priority and the timestamp change without the generation, through
++// the priority boost annotation and the status. Collections are combined by
++// summing item hashes, so their iteration order does not matter.
++func (f *topologyRetryFailures) fingerprint(ctx context.Context, p *Preemptor, pCtx *preemptionCtx) uint64 {
++	log := log.FromContext(ctx)
++	h := fingerprintHasher{seed: f.seed}
++	obj := pCtx.preemptor.Obj
++	h.add(struct {
++		uid            types.UID
++		generation     int64
++		priority       int64
++		queueOrderTime int64
++	}{obj.UID, obj.Generation, priority.EffectivePriority(log, obj), p.workloadOrdering.GetQueueOrderTimestamp(obj).UnixNano()})
++	for i, ps := range pCtx.assignment.PodSets {
++		h.add(struct {
++			index int
++			name  kueue.PodSetReference
++			count int32
++		}{i, ps.Name, ps.Count})
++		for resource, flavor := range ps.Flavors {
++			if flavor == nil {
++				continue
++			}
++			h.add(struct {
++				index    int
++				resource string
++				flavor   kueue.ResourceFlavorReference
++				mode     int
++			}{i, string(resource), flavor.Name, int(flavor.Mode)})
++		}
++	}
++	h.addQuantities("preemptor", pCtx.workloadUsage.Quota.Assigned)
++
++	cq := pCtx.preemptorCQ
++	cqs := []*schdcache.ClusterQueueSnapshot{cq}
++	if cq.HasParent() {
++		root := cq.Parent().Root()
++		cqs = root.SubtreeClusterQueues()
++		h.addCohorts(root)
++	}
++	for _, member := range cqs {
++		h.addClusterQueue(log, member)
++	}
++	for name, tasFlavor := range cq.TASFlavors {
++		h.add(struct {
++			flavor kueue.ResourceFlavorReference
++			state  uint64
++		}{name, tasFlavor.StateFingerprint(f.seed)})
++	}
++	return h.sum
++}
++
++type fingerprintHasher struct {
++	seed maphash.Seed
++	sum  uint64
++}
++
++func (h *fingerprintHasher) add(item any) {
++	h.sum += maphash.Comparable(h.seed, item)
++}
++
++func (h *fingerprintHasher) addAmount(owner, kind string, fr resources.FlavorResource, amount resources.Amount) {
++	item := struct {
++		owner, kind string
++		fr          resources.FlavorResource
++		small       int64
++		large       string
++	}{owner: owner, kind: kind, fr: fr}
++	if small, ok := amount.Int64(); ok {
++		item.small = small
++	} else {
++		item.large = amount.String()
++	}
++	h.add(item)
++}
++
++func (h *fingerprintHasher) addQuantities(owner string, quantities resources.FlavorResourceQuantities) {
++	for fr, amount := range quantities {
++		h.addAmount(owner, "quantity", fr, amount)
++	}
++}
++
++func (h *fingerprintHasher) addQuotas(owner string, quotas map[resources.FlavorResource]schdcache.ResourceQuota) {
++	for fr, quota := range quotas {
++		h.addAmount(owner, "nominal", fr, quota.Nominal)
++		if quota.BorrowingLimit != nil {
++			h.addAmount(owner, "borrowingLimit", fr, *quota.BorrowingLimit)
++		}
++		if quota.LendingLimit != nil {
++			h.addAmount(owner, "lendingLimit", fr, *quota.LendingLimit)
++		}
++	}
++}
++
++func (h *fingerprintHasher) addCohorts(cohort *schdcache.CohortSnapshot) {
++	owner := "cohort/" + string(cohort.Name)
++	h.add(struct {
++		owner      string
++		fairWeight float64
++	}{owner, cohort.FairWeight})
++	h.addQuotas(owner, cohort.ResourceNode.Quotas)
++	h.addQuantities(owner+"/subtreeQuota", cohort.ResourceNode.SubtreeQuota)
++	h.addQuantities(owner+"/usage", cohort.ResourceNode.Usage)
++	for _, child := range cohort.ChildCohorts() {
++		h.addCohorts(child)
++	}
++}
++
++func (h *fingerprintHasher) addClusterQueue(log logr.Logger, cq *schdcache.ClusterQueueSnapshot) {
++	owner := "clusterQueue/" + string(cq.Name)
++	borrowWithinCohort := struct {
++		set       bool
++		policy    kueue.BorrowWithinCohortPolicy
++		threshold int32
++		hasLimit  bool
++	}{}
++	if bwc := cq.Preemption.BorrowWithinCohort; bwc != nil {
++		borrowWithinCohort.set = true
++		borrowWithinCohort.policy = bwc.Policy
++		if bwc.MaxPriorityThreshold != nil {
++			borrowWithinCohort.hasLimit = true
++			borrowWithinCohort.threshold = *bwc.MaxPriorityThreshold
++		}
++	}
++	h.add(struct {
++		owner                 string
++		generation            int64
++		reclaim, withinCQ     kueue.PreemptionPolicy
++		borrowWithinCohortSet bool
++		borrowWithinCohort    kueue.BorrowWithinCohortPolicy
++		borrowThreshold       int32
++		borrowThresholdSet    bool
++		fairWeight            float64
++		workloads, notReady   int
++	}{
++		owner, cq.AllocatableResourceGeneration,
++		cq.Preemption.ReclaimWithinCohort, cq.Preemption.WithinClusterQueue,
++		borrowWithinCohort.set, borrowWithinCohort.policy, borrowWithinCohort.threshold, borrowWithinCohort.hasLimit,
++		cq.FairWeight, len(cq.Workloads), len(cq.WorkloadsNotReady),
++	})
++	h.addQuotas(owner, cq.ResourceNode.Quotas)
++	h.addQuantities(owner+"/subtreeQuota", cq.ResourceNode.SubtreeQuota)
++	h.addQuantities(owner+"/usage", cq.ResourceNode.Usage)
++	for key, wl := range cq.Workloads {
++		h.add(struct {
++			owner           string
++			key             workload.Reference
++			uid             types.UID
++			resourceVersion string
++			generation      int64
++			priority        int64
++		}{owner, key, wl.Obj.UID, wl.Obj.ResourceVersion, wl.Obj.Generation, priority.EffectivePriority(log, wl.Obj)})
++	}
++}
+diff --git a/pkg/scheduler/preemption/topology_retry_limits.go b/pkg/scheduler/preemption/topology_retry_limits.go
+new file mode 100644
+index 0000000..089b0a0
+--- /dev/null
++++ b/pkg/scheduler/preemption/topology_retry_limits.go
+@@ -0,0 +1,200 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package preemption
++
++import (
++	"slices"
++
++	"k8s.io/apimachinery/pkg/util/sets"
++
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/resources"
++)
++
++// reclaimLimits checks sets of candidates against the rule Classical
++// preemption and fair sharing share: a candidate of another ClusterQueue is
++// taken only while that ClusterQueue, and every Cohort between it and the
++// first Cohort it shares with the preemptor, still borrows in one of the
++// resources that need preemption. It removes the candidates' quota usage from
++// the snapshot and asks the snapshot's own resource tree whether each of them
++// still borrows, so guaranteed quota, lending limits, and nested Cohorts give
++// up usage to their parents exactly as they do when the strategy removes the
++// victims. A topology retry checks its placements with it before it runs a
++// strategy, so it does not spend its evaluations on placements the strategy
++// rejects. Fair sharing also requires every node on the path to borrow in one
++// resource the candidate uses, and checks the shares, so it may reject a set
++// this accepts, never the other way around.
++type reclaimLimits struct {
++	pCtx               *preemptionCtx
++	frs                sets.Set[resources.FlavorResource]
++	preemptorAncestors sets.Set[*schdcache.CohortSnapshot]
++}
++
++func newReclaimLimits(pCtx *preemptionCtx) *reclaimLimits {
++	limits := &reclaimLimits{
++		pCtx:               pCtx,
++		frs:                pCtx.frsNeedPreemption,
++		preemptorAncestors: sets.New[*schdcache.CohortSnapshot](),
++	}
++	for cohort := range pCtx.preemptorCQ.PathParentToRoot() {
++		limits.preemptorAncestors.Insert(cohort)
++	}
++	return limits
++}
++
++// mayTake reports whether the strategies may take candidate in the current
++// state of the snapshot.
++func (l *reclaimLimits) mayTake(candidate *retryCandidate) bool {
++	if candidate.wl.ClusterQueue == l.pCtx.preemptorCQ.Name {
++		return true
++	}
++	cq := l.pCtx.snapshot.ClusterQueue(candidate.wl.ClusterQueue)
++	if schdcache.IsWithinNominalInResources(cq, l.frs) {
++		return false
++	}
++	for cohort := range cq.PathParentToRoot() {
++		if l.preemptorAncestors.Has(cohort) {
++			break
++		}
++		if schdcache.IsWithinNominalInResources(cohort, l.frs) {
++			return false
++		}
++	}
++	return true
++}
++
++// allows reports whether the strategies may take every candidate in
++// candidates in some order. It answers exactly: removing usage never makes a
++// node borrow, so a candidate the rule accepts with more usage left still
++// accepts it later. Building the order backwards, from the state with every
++// candidate removed, it can add back any candidate the rule accepts as the
++// last one taken without ruling out an order for the others. It leaves the
++// snapshot as it found it and costs up to len(candidates) squared checks of the rule.
++func (l *reclaimLimits) allows(candidates []*retryCandidate) bool {
++	snapshot := l.pCtx.snapshot
++	pending := make([]*retryCandidate, 0, len(candidates))
++	for _, candidate := range candidates {
++		if candidate.wl.ClusterQueue == l.pCtx.preemptorCQ.Name {
++			continue
++		}
++		snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++		pending = append(pending, candidate)
++	}
++	defer func() {
++		for _, candidate := range pending {
++			snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
++		}
++	}()
++	for len(pending) > 0 {
++		last := -1
++		for i, candidate := range pending {
++			snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
++			if l.mayTake(candidate) {
++				last = i
++				break
++			}
++			snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++		}
++		if last < 0 {
++			return false
++		}
++		pending = append(pending[:last], pending[last+1:]...)
++	}
++	return true
++}
++
++// allowsInOrder reports whether the strategies may take candidates in the
++// order given, as they take the candidates a placement prefers. It leaves
++// the snapshot as it found it.
++func (l *reclaimLimits) allowsInOrder(candidates []*retryCandidate) bool {
++	snapshot := l.pCtx.snapshot
++	removed := 0
++	defer func() {
++		for _, candidate := range candidates[:removed] {
++			snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
++		}
++	}()
++	for _, candidate := range candidates {
++		if !l.mayTake(candidate) {
++			return false
++		}
++		snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++		removed++
++	}
++	return true
++}
++
++// reclaimGroup is a set of candidates the strategies may take together in
++// some order. It keeps their quota usage removed from the snapshot until
++// release.
++type reclaimGroup struct {
++	limits  *reclaimLimits
++	members []*retryCandidate
++}
++
++func (l *reclaimLimits) newGroup() *reclaimGroup {
++	return &reclaimGroup{limits: l}
++}
++
++// tryAdd adds candidate to the group when the strategies may still take the
++// whole group, and reports whether it did. When the rule accepts candidate
++// with the group removed, candidate can be taken last, which costs one check;
++// otherwise it looks for another order the way allows does.
++func (g *reclaimGroup) tryAdd(candidate *retryCandidate) bool {
++	snapshot := g.limits.pCtx.snapshot
++	if g.limits.mayTake(candidate) {
++		snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++		g.members = append(g.members, candidate)
++		return true
++	}
++	snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++	pending := append(slices.Clone(g.members), candidate)
++	var added []*retryCandidate
++	for len(pending) > 0 {
++		last := -1
++		for i, member := range pending {
++			snapshot.AddWorkloadUsage(member.wl, member.quota)
++			if g.limits.mayTake(member) {
++				last = i
++				break
++			}
++			snapshot.RemoveWorkloadUsage(member.wl, member.quota)
++		}
++		if last < 0 {
++			break
++		}
++		added = append(added, pending[last])
++		pending = append(pending[:last], pending[last+1:]...)
++	}
++	for _, member := range added {
++		snapshot.RemoveWorkloadUsage(member.wl, member.quota)
++	}
++	if len(pending) > 0 {
++		snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
++		return false
++	}
++	g.members = append(g.members, candidate)
++	return true
++}
++
++// release puts back the quota usage of the group's members and returns them.
++func (g *reclaimGroup) release() []*retryCandidate {
++	for _, member := range g.members {
++		g.limits.pCtx.snapshot.AddWorkloadUsage(member.wl, member.quota)
++	}
++	return g.members
++}
+diff --git a/pkg/scheduler/preemption/topology_retry_limits_test.go b/pkg/scheduler/preemption/topology_retry_limits_test.go
+new file mode 100644
+index 0000000..940121a
+--- /dev/null
++++ b/pkg/scheduler/preemption/topology_retry_limits_test.go
+@@ -0,0 +1,356 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package preemption
++
++import (
++	"fmt"
++	"slices"
++	"strconv"
++	"testing"
++	"time"
++
++	gocmp "github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	"k8s.io/apimachinery/pkg/types"
++	clocktesting "k8s.io/utils/clock/testing"
++
++	config "sigs.k8s.io/kueue/apis/config/v1beta2"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// TestTopologyRetryRespectsReclaimLimits builds nodes of 4 CPUs. Every node
++// but the last holds one priority-2 workload of ClusterQueue "c" and three
++// priority-1 workloads of ClusterQueue "b"; the last node holds the four
++// oldest workloads of "c". "b" borrows 2 CPUs and "c" borrows 4, which
++// ClusterQueue "incoming" reclaims for a priority-3 workload that needs a
++// whole node. Each node but the last frees cheaper victims, but only after
++// taking 3 CPUs from "b", which stops being a candidate once it is back at
++// its nominal quota, so only the last node can be freed.
++func TestTopologyRetryRespectsReclaimLimits(t *testing.T) {
++	modes := []struct {
++		name         string
++		cacheEnabled bool
++		fairSharing  *config.FairSharing
++	}{
++		{name: "classical/cache=false"},
++		{name: "classical/cache=true", cacheEnabled: true},
++		{name: "fairsharing", fairSharing: &config.FairSharing{}},
++	}
++	for _, mode := range modes {
++		for _, nodes := range []int{5, 9, 64} {
++			t.Run(fmt.Sprintf("%s/nodes=%d", mode.name, nodes), func(t *testing.T) {
++				features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++				features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++				ctx, log := utiltesting.ContextWithLog(t)
++				now := time.Now().Truncate(time.Second)
++				const slots = 4
++				last := fmt.Sprintf("n%02d", nodes-1)
++				var admitted []kueue.Workload
++				add := func(name string, cq kueue.ClusterQueueReference, node string, priority int32, age int) {
++					admitted = append(admitted, *utiltestingapi.MakeWorkload(name, "default").UID(types.UID(name)).Priority(priority).
++						PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
++						ReserveQuotaAt(utiltestingapi.MakeAdmission(cq).PodSets(
++							utiltestingapi.MakePodSetAssignment("main").Count(1).
++								Assignment(corev1.ResourceCPU, "tas", "1").
++								TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++									Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{node}, 1).Obj()).Obj()).Obj()).Obj(),
++							now.Add(-time.Duration(age)*time.Second)).Obj())
++				}
++				// Newer workloads spread over the nodes, so ordinary preemption,
++				// which takes the newest first among equal priorities, takes
++				// victims on different nodes.
++				for s := range slots {
++					add(fmt.Sprintf("%s-c%d", last, s), "c", last, 2, 10*nodes+s)
++				}
++				for n := range nodes - 1 {
++					node := fmt.Sprintf("n%02d", n)
++					add(node+"-c", "c", node, 2, n)
++					for s := range slots - 1 {
++						add(fmt.Sprintf("%s-b%d", node, s), "b", node, 1, s*nodes+n)
++					}
++				}
++
++				cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: admitted}).
++					WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).Build()
++				cache := schdcache.New(cl)
++				cache.AddOrUpdateTopology(log, utiltestingapi.MakeTopology("hostname").Levels(corev1.LabelHostname).Obj())
++				cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("tas").NodeLabel("pool", "tas").TopologyName("hostname").Obj())
++				for n := range nodes {
++					node := fmt.Sprintf("n%02d", n)
++					cache.TASCache().SyncNode(testingnode.MakeNode(node).Label("pool", "tas").Label(corev1.LabelHostname, node).
++						StatusAllocatable(corev1.ResourceList{
++							corev1.ResourceCPU:  resource.MustParse(strconv.Itoa(slots)),
++							corev1.ResourcePods: resource.MustParse("100"),
++						}).Ready().Obj())
++				}
++				// "b" uses 3 CPUs per node but the last and borrows 2, "c" uses
++				// one per node but the last plus 4 and borrows 4, and "incoming"
++				// lends the 6 CPUs they borrow.
++				for _, cq := range []*kueue.ClusterQueue{
++					utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").
++						ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "6", "0").Obj()).
++						Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyLowerPriority}).Obj(),
++					utiltestingapi.MakeClusterQueue("b").Cohort("shared").
++						ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, strconv.Itoa(3*(nodes-1)-2)).Obj()).Obj(),
++					utiltestingapi.MakeClusterQueue("c").Cohort("shared").
++						ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, strconv.Itoa(nodes-1)).Obj()).Obj(),
++				} {
++					if err := cache.AddClusterQueue(ctx, cq); err != nil {
++						t.Fatal(err)
++					}
++				}
++				snapshot, err := cache.Snapshot(ctx)
++				if err != nil {
++					t.Fatal(err)
++				}
++				incoming := workload.NewInfo(log, utiltestingapi.MakeWorkload("incoming", "default").UID("incoming").Priority(3).
++					PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, strconv.Itoa(slots)).UnconstrainedTopologyRequest().Obj()).Obj())
++				incoming.ClusterQueue = "incoming"
++				assignment := flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++					Name: "main", Count: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(strconv.Itoa(slots))},
++					Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "tas", Mode: flavorassigner.Preempt}},
++				}}}
++
++				preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
++				targets, retry := preemptor.GetTargets(ctx, *incoming, snapshot, assignment)
++				if len(targets) > 0 || retry == nil {
++					t.Fatalf("ordinary preemption found %d targets and retry=%t, want no targets and a retry", len(targets), retry != nil)
++				}
++				var gotTargets []string
++				for _, target := range retry(ctx) {
++					gotTargets = append(gotTargets, target.WorkloadInfo.Obj.Name)
++				}
++				slices.Sort(gotTargets)
++				wantTargets := []string{last + "-c0", last + "-c1", last + "-c2", last + "-c3"}
++				if diff := gocmp.Diff(wantTargets, gotTargets); diff != "" {
++					t.Errorf("unexpected preemption targets (-want/+got):\n%s", diff)
++				}
++			})
++		}
++	}
++}
++
++// limitsWorkload is a one-pod workload of a ClusterQueue on one node.
++type limitsWorkload struct {
++	name     string
++	cq       kueue.ClusterQueueReference
++	node     string
++	cpu      int
++	gpu      int
++	priority int32
++}
++
++// limitsResources is the capacity of a node or the requests of a pod.
++type limitsResources struct {
++	cpu, gpu int
++}
++
++// TestTopologyRetryMatchesStrategyLimits checks that the retry offers every
++// victim set the strategies may take: a ClusterQueue or Cohort gives up
++// quota to its parent only past its guaranteed quota, and a cheap victim the
++// placement does not need must not use up what a lender may give.
++func TestTopologyRetryMatchesStrategyLimits(t *testing.T) {
++	gpu := corev1.ResourceName("example.com/gpu")
++	cpu := func(nominal string, limits ...string) kueue.FlavorQuotas {
++		return *utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, append([]string{nominal}, limits...)...).Obj()
++	}
++	cpuGPU := func(cpuNominal, gpuNominal string) kueue.FlavorQuotas {
++		return *utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, cpuNominal).Resource(gpu, gpuNominal).Obj()
++	}
++	requests := func(r limitsResources) corev1.ResourceList {
++		list := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(strconv.Itoa(r.cpu))}
++		if r.gpu > 0 {
++			list[gpu] = resource.MustParse(strconv.Itoa(r.gpu))
++		}
++		return list
++	}
++	reclaim := kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyLowerPriority}
++	cases := map[string]struct {
++		cohorts     []*kueue.Cohort
++		cqs         []*kueue.ClusterQueue
++		nodes       map[string]limitsResources
++		workloads   []limitsWorkload
++		incoming    limitsResources
++		wantTargets []string
++	}{
++		// "sub" borrows 2 CPUs, one for each ClusterQueue, which lend nothing,
++		// so removing a1 takes only the 1 CPU a1 borrows from "sub".
++		"ClusterQueues with a lending limit in a nested Cohort": {
++			cohorts: []*kueue.Cohort{utiltestingapi.MakeCohort("sub").Parent("root").Obj()},
++			cqs: []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("root").ResourceGroup(cpu("7")).Preemption(reclaim).Obj(),
++				utiltestingapi.MakeClusterQueue("a1").Cohort("sub").ResourceGroup(cpu("2", "", "0")).Obj(),
++				utiltestingapi.MakeClusterQueue("a2").Cohort("sub").ResourceGroup(cpu("1", "", "0")).Obj(),
++			},
++			nodes: map[string]limitsResources{"n0": {cpu: 2}, "n1": {cpu: 4}},
++			workloads: []limitsWorkload{
++				{name: "a1x", cq: "a1", node: "n0", cpu: 1, priority: 1},
++				{name: "a1", cq: "a1", node: "n1", cpu: 2, priority: 2},
++				{name: "a2", cq: "a2", node: "n1", cpu: 2, priority: 2},
++			},
++			incoming:    limitsResources{cpu: 4},
++			wantTargets: []string{"a1", "a2"},
++		},
++		// "sub" guarantees itself 1 CPU and borrows 2, so it still borrows
++		// after a1 gives up the CPU it borrows from "sub".
++		"Cohort with a lending limit": {
++			cohorts: []*kueue.Cohort{utiltestingapi.MakeCohort("sub").Parent("root").ResourceGroup(cpu("1", "", "0")).Obj()},
++			cqs: []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("root").ResourceGroup(cpu("7")).Preemption(reclaim).Obj(),
++				utiltestingapi.MakeClusterQueue("a1").Cohort("sub").ResourceGroup(cpu("2", "", "0")).Obj(),
++				utiltestingapi.MakeClusterQueue("a2").Cohort("sub").ResourceGroup(cpu("1", "", "0")).Obj(),
++				utiltestingapi.MakeClusterQueue("a3").Cohort("sub").ResourceGroup(cpu("0")).Obj(),
++			},
++			nodes: map[string]limitsResources{"n0": {cpu: 2}, "n1": {cpu: 4}, "n2": {cpu: 1}},
++			workloads: []limitsWorkload{
++				{name: "a1x", cq: "a1", node: "n0", cpu: 1, priority: 1},
++				{name: "a1", cq: "a1", node: "n1", cpu: 2, priority: 2},
++				{name: "a2", cq: "a2", node: "n1", cpu: 2, priority: 2},
++				{name: "a3", cq: "a3", node: "n2", cpu: 1, priority: 5},
++			},
++			incoming:    limitsResources{cpu: 4},
++			wantTargets: []string{"a1", "a2"},
++		},
++		// "b" borrows 1 CPU, so it may give up b1, but not bx and then b1;
++		// freeing n1 needs only b1.
++		"a cheap victim the placement does not need": {
++			cqs: []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").ResourceGroup(cpu("5")).Preemption(reclaim).Obj(),
++				utiltestingapi.MakeClusterQueue("b").Cohort("shared").ResourceGroup(cpu("3")).Obj(),
++			},
++			nodes: map[string]limitsResources{"n1": {cpu: 4}},
++			workloads: []limitsWorkload{
++				{name: "bx", cq: "b", node: "n1", cpu: 1, priority: 1},
++				{name: "b1", cq: "b", node: "n1", cpu: 3, priority: 2},
++			},
++			incoming:    limitsResources{cpu: 3},
++			wantTargets: []string{"b1"},
++		},
++		// "b" borrows 2 CPUs, so it may give up b1 and then bx, but not bx and
++		// then b1, the order the strategy takes them in when it prefers both;
++		// freeing the GPU of n1 needs only b1.
++		"a cheap victim that uses up a lender before the one the placement needs": {
++			cqs: []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").ResourceGroup(cpuGPU("5", "1")).Preemption(reclaim).Obj(),
++				utiltestingapi.MakeClusterQueue("b").Cohort("shared").ResourceGroup(cpuGPU("3", "1")).Obj(),
++			},
++			nodes: map[string]limitsResources{"n1": {cpu: 4, gpu: 1}, "n2": {cpu: 1}},
++			workloads: []limitsWorkload{
++				{name: "bx", cq: "b", node: "n1", cpu: 3, priority: 1},
++				{name: "b1", cq: "b", node: "n1", cpu: 1, gpu: 1, priority: 2},
++				{name: "b2", cq: "b", node: "n2", cpu: 1, priority: 5},
++			},
++			incoming:    limitsResources{cpu: 1, gpu: 1},
++			wantTargets: []string{"b1"},
++		},
++	}
++	modes := []struct {
++		name         string
++		cacheEnabled bool
++		fairSharing  *config.FairSharing
++	}{
++		{name: "classical/cache=false"},
++		{name: "classical/cache=true", cacheEnabled: true},
++		{name: "fairsharing", fairSharing: &config.FairSharing{}},
++	}
++	for _, mode := range modes {
++		for name, tc := range cases {
++			t.Run(mode.name+"/"+name, func(t *testing.T) {
++				features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++				features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++				ctx, log := utiltesting.ContextWithLog(t)
++				now := time.Now().Truncate(time.Second)
++				var admitted []kueue.Workload
++				for i, w := range tc.workloads {
++					podSet := utiltestingapi.MakePodSet("main", 1).UnconstrainedTopologyRequest()
++					podSetAssignment := utiltestingapi.MakePodSetAssignment("main").Count(1)
++					for resourceName, quantity := range requests(limitsResources{cpu: w.cpu, gpu: w.gpu}) {
++						podSet.Request(resourceName, quantity.String())
++						podSetAssignment.Assignment(resourceName, "tas", quantity.String())
++					}
++					admitted = append(admitted, *utiltestingapi.MakeWorkload(w.name, "default").UID(types.UID(w.name)).Priority(w.priority).
++						PodSets(*podSet.Obj()).
++						ReserveQuotaAt(utiltestingapi.MakeAdmission(w.cq).PodSets(
++							podSetAssignment.TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{w.node}, 1).Obj()).Obj()).Obj()).Obj(),
++							now.Add(-time.Duration(i)*time.Second)).Obj())
++				}
++				cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: admitted}).
++					WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).Build()
++				cache := schdcache.New(cl)
++				cache.AddOrUpdateTopology(log, utiltestingapi.MakeTopology("hostname").Levels(corev1.LabelHostname).Obj())
++				cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("tas").NodeLabel("pool", "tas").TopologyName("hostname").Obj())
++				for node, capacity := range tc.nodes {
++					allocatable := requests(capacity)
++					allocatable[corev1.ResourcePods] = resource.MustParse("100")
++					cache.TASCache().SyncNode(testingnode.MakeNode(node).Label("pool", "tas").Label(corev1.LabelHostname, node).
++						StatusAllocatable(allocatable).Ready().Obj())
++				}
++				for _, cohort := range tc.cohorts {
++					if err := cache.AddOrUpdateCohort(cohort); err != nil {
++						t.Fatal(err)
++					}
++				}
++				for _, cq := range tc.cqs {
++					if err := cache.AddClusterQueue(ctx, cq); err != nil {
++						t.Fatal(err)
++					}
++				}
++				snapshot, err := cache.Snapshot(ctx)
++				if err != nil {
++					t.Fatal(err)
++				}
++				incomingPodSet := utiltestingapi.MakePodSet("main", 1).UnconstrainedTopologyRequest()
++				flavors := flavorassigner.ResourceAssignment{}
++				for resourceName, quantity := range requests(tc.incoming) {
++					incomingPodSet.Request(resourceName, quantity.String())
++					flavors[resourceName] = &flavorassigner.FlavorAssignment{Name: "tas", Mode: flavorassigner.Preempt}
++				}
++				incoming := workload.NewInfo(log, utiltestingapi.MakeWorkload("incoming", "default").UID("incoming").Priority(3).
++					PodSets(*incomingPodSet.Obj()).Obj())
++				incoming.ClusterQueue = "incoming"
++				assignment := flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++					Name: "main", Count: 1, Requests: requests(tc.incoming), Flavors: flavors,
++				}}}
++
++				preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
++				targets, retry := preemptor.GetTargets(ctx, *incoming, snapshot, assignment)
++				if len(targets) > 0 || retry == nil {
++					t.Fatalf("ordinary preemption found %d targets and retry=%t, want no targets and a retry", len(targets), retry != nil)
++				}
++				var gotTargets []string
++				for _, target := range retry(ctx) {
++					gotTargets = append(gotTargets, target.WorkloadInfo.Obj.Name)
++				}
++				slices.Sort(gotTargets)
++				if diff := gocmp.Diff(tc.wantTargets, gotTargets); diff != "" {
++					t.Errorf("unexpected preemption targets (-want/+got):\n%s", diff)
++				}
++			})
++		}
++	}
++}
+diff --git a/pkg/scheduler/preemption/topology_retry_test.go b/pkg/scheduler/preemption/topology_retry_test.go
+new file mode 100644
+index 0000000..44cd7fd
+--- /dev/null
++++ b/pkg/scheduler/preemption/topology_retry_test.go
+@@ -0,0 +1,362 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package preemption
++
++import (
++	"context"
++	"fmt"
++	"slices"
++	"strconv"
++	"testing"
++	"time"
++
++	"github.com/go-logr/logr"
++	gocmp "github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	"k8s.io/apimachinery/pkg/types"
++	clocktesting "k8s.io/utils/clock/testing"
++
++	config "sigs.k8s.io/kueue/apis/config/v1beta2"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/controller/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// topologyRetryCluster is a cohort where ClusterQueue "borrower" fills every
++// slot of nodes that each hold slots one-CPU workloads, and borrows exactly
++// one node's worth of CPU from ClusterQueue "incoming", which may reclaim it.
++// ClusterQueue "other", outside the cohort, has one workload on node n00.
++type topologyRetryCluster struct {
++	snapshot   *schdcache.Snapshot
++	incoming   workload.Info
++	assignment flavorassigner.Assignment
++}
++
++// newTopologyRetryCluster builds the cluster with priorities[n] holding the
++// priorities of node n's workloads. The last node's workloads were admitted
++// first, so ordinary preemption, which takes the newest workloads first among
++// equal priorities, spreads its victims over the other nodes.
++func newTopologyRetryCluster(ctx context.Context, t testing.TB, log logr.Logger, priorities [][]int32) topologyRetryCluster {
++	t.Helper()
++	now := time.Now().Truncate(time.Second)
++	nodes, slots := len(priorities), len(priorities[0])
++	admission := func(cq kueue.ClusterQueueReference, node string) *kueue.Admission {
++		return utiltestingapi.MakeAdmission(cq).PodSets(
++			utiltestingapi.MakePodSetAssignment("main").Count(1).
++				Assignment(corev1.ResourceCPU, "tas", "1").
++				TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++					Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{node}, 1).Obj()).Obj()).Obj()).Obj()
++	}
++	worker := func(name string, priority int32) *utiltestingapi.WorkloadWrapper {
++		return utiltestingapi.MakeWorkload(name, "default").UID(types.UID(name)).Priority(priority).
++			PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj())
++	}
++	var admitted []kueue.Workload
++	for n, nodePriorities := range priorities {
++		node := fmt.Sprintf("n%02d", n)
++		for s, p := range nodePriorities {
++			age := s*nodes + n
++			if n == nodes-1 {
++				age = nodes*slots + s
++			}
++			admitted = append(admitted, *worker(fmt.Sprintf("%s-%d", node, s), p).
++				ReserveQuotaAt(admission("borrower", node), now.Add(-time.Duration(age)*time.Second)).Obj())
++		}
++	}
++	admitted = append(admitted, *worker("other", 1).ReserveQuotaAt(admission("other", "n00"), now).Obj())
++
++	cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: admitted}).
++		WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).Build()
++	cache := schdcache.New(cl)
++	cache.AddOrUpdateTopology(log, utiltestingapi.MakeTopology("hostname").Levels(corev1.LabelHostname).Obj())
++	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("tas").NodeLabel("pool", "tas").TopologyName("hostname").Obj())
++	for n := range nodes {
++		node := fmt.Sprintf("n%02d", n)
++		// Node n00 has one more slot, used by the workload of ClusterQueue "other".
++		capacity := slots
++		if n == 0 {
++			capacity++
++		}
++		cache.TASCache().SyncNode(testingnode.MakeNode(node).Label("pool", "tas").Label(corev1.LabelHostname, node).
++			StatusAllocatable(corev1.ResourceList{
++				corev1.ResourceCPU:  resource.MustParse(strconv.Itoa(capacity)),
++				corev1.ResourcePods: resource.MustParse("100"),
++			}).Ready().Obj())
++	}
++	slotsQuantity := strconv.Itoa(slots)
++	for _, cq := range []*kueue.ClusterQueue{
++		utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, slotsQuantity, "0").Obj()).
++			Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyLowerPriority}).Obj(),
++		utiltestingapi.MakeClusterQueue("borrower").Cohort("shared").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, strconv.Itoa(nodes*slots-slots)).Obj()).Obj(),
++		utiltestingapi.MakeClusterQueue("other").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "1").Obj()).Obj(),
++	} {
++		if err := cache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++	}
++	snapshot, err := cache.Snapshot(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	incoming := workload.NewInfo(log, utiltestingapi.MakeWorkload("incoming", "default").UID("incoming").Priority(3).
++		PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, slotsQuantity).UnconstrainedTopologyRequest().Obj()).Obj())
++	incoming.ClusterQueue = "incoming"
++	return topologyRetryCluster{
++		snapshot: snapshot,
++		incoming: *incoming,
++		assignment: flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++			Name: "main", Count: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(slotsQuantity)},
++			Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "tas", Mode: flavorassigner.Preempt}},
++		}}},
++	}
++}
++
++// uniformPriorities returns the priorities of the given number of nodes that
++// each hold the workloads of priorities, except for the last node, which
++// holds those of last.
++func uniformPriorities(nodes int, priorities, last []int32) [][]int32 {
++	result := make([][]int32, nodes)
++	for n := range nodes - 1 {
++		result[n] = priorities
++	}
++	result[nodes-1] = last
++	return result
++}
++
++func TestTopologyRetryComparesEveryDomain(t *testing.T) {
++	cases := map[string]struct {
++		priorities  [][]int32
++		wantTargets []string
++	}{
++		"only the last of 10 nodes can be freed without a priority-2 victim": {
++			priorities:  uniformPriorities(10, []int32{2, 1}, []int32{1, 1}),
++			wantTargets: []string{"n09-0", "n09-1"},
++		},
++		"only the last of 64 nodes can be freed without a priority-2 victim": {
++			priorities:  uniformPriorities(64, []int32{2, 1, 1}, []int32{1, 1, 1}),
++			wantTargets: []string{"n63-0", "n63-1", "n63-2"},
++		},
++		"the last of 64 nodes has the lowest next-highest victims": {
++			priorities:  uniformPriorities(64, []int32{2, 1, 1}, []int32{2, 1, 0}),
++			wantTargets: []string{"n63-0", "n63-1", "n63-2"},
++		},
++	}
++	modes := []struct {
++		name         string
++		cacheEnabled bool
++		fairSharing  *config.FairSharing
++	}{
++		{name: "classical/cache=false"},
++		{name: "classical/cache=true", cacheEnabled: true},
++		{name: "fairsharing", fairSharing: &config.FairSharing{}},
++	}
++	for _, mode := range modes {
++		t.Run(mode.name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++			for name, tc := range cases {
++				t.Run(name, func(t *testing.T) {
++					features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++					ctx, log := utiltesting.ContextWithLog(t)
++					cluster := newTopologyRetryCluster(ctx, t, log, tc.priorities)
++					preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++					targets, retry := preemptor.GetTargets(ctx, cluster.incoming, cluster.snapshot, cluster.assignment)
++					if len(targets) > 0 || retry == nil {
++						t.Fatalf("ordinary preemption found %d targets and retry=%t, want no targets and a retry", len(targets), retry != nil)
++					}
++					var gotTargets []string
++					for _, target := range retry(ctx) {
++						gotTargets = append(gotTargets, target.WorkloadInfo.Obj.Name)
++					}
++					slices.Sort(gotTargets)
++					if diff := gocmp.Diff(tc.wantTargets, gotTargets); diff != "" {
++						t.Errorf("unexpected preemption targets (-want/+got):\n%s", diff)
++					}
++				})
++			}
++		})
++	}
++}
++
++func TestTopologyRetryRemembersFailures(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++	ctx, log := utiltesting.ContextWithLog(t)
++	// Every node holds a workload of the incoming workload's priority, so no
++	// node can be freed, and node n00 stays blocked without the workload of
++	// ClusterQueue "other".
++	priorities := uniformPriorities(4, []int32{3, 1}, []int32{3, 1})
++	priorities[0] = []int32{3, 3}
++	cluster := newTopologyRetryCluster(ctx, t, log, priorities)
++	preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, nil, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++	pCtx := preemptor.buildContext(ctx, cluster.incoming, cluster.assignment, cluster.snapshot)
++	runs := 0
++	var retryTargets []*Target
++	retry := func() []*Target {
++		runs++
++		return preemptor.topologyRetryTargets(ctx, pCtx)
++	}
++	attempt := func(step string, wantRuns int) {
++		t.Helper()
++		if targets := preemptor.topologyRetryFailures.run(ctx, preemptor, pCtx, retry); len(targets) != len(retryTargets) {
++			t.Errorf("%s: got %d targets, want %d", step, len(targets), len(retryTargets))
++		}
++		if runs != wantRuns {
++			t.Errorf("%s: the retry ran %d times, want %d", step, runs, wantRuns)
++		}
++	}
++	attempt("first attempt", 1)
++	attempt("same state", 1)
++
++	other := cluster.snapshot.ClusterQueue("other").Workloads[workload.NewReference("default", "other")]
++	cluster.snapshot.RemoveWorkload(other)
++	attempt("TAS usage outside the cohort changed", 2)
++	attempt("same state after the TAS change", 2)
++	cluster.snapshot.AddWorkload(other)
++	attempt("TAS usage outside the cohort restored", 3)
++
++	victim := cluster.snapshot.ClusterQueue("borrower").Workloads[workload.NewReference("default", "n01-1")]
++	cluster.snapshot.RemoveWorkload(victim)
++	attempt("workload in the cohort removed", 4)
++	cluster.snapshot.AddWorkload(victim)
++	attempt("workload in the cohort restored", 5)
++
++	otherAssignment := cluster.assignment
++	otherAssignment.PodSets = slices.Clone(cluster.assignment.PodSets)
++	otherAssignment.PodSets[0].Count = 2
++	pCtx = preemptor.buildContext(ctx, cluster.incoming, otherAssignment, cluster.snapshot)
++	attempt("another assignment", 6)
++	attempt("same assignment again", 6)
++
++	// A retry that finds targets clears the memory.
++	retryTargets = []*Target{{WorkloadInfo: victim}}
++	retry = func() []*Target {
++		runs++
++		return retryTargets
++	}
++	cluster.snapshot.RemoveWorkload(victim)
++	attempt("retry succeeds", 7)
++	if len(preemptor.topologyRetryFailures.failed) != 0 {
++		t.Errorf("a successful retry left %d remembered failures", len(preemptor.topologyRetryFailures.failed))
++	}
++}
++
++func TestTopologyRetryForgetsFailuresAfterPriorityBoost(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++	features.SetFeatureGateDuringTest(t, features.PriorityBoost, true)
++	ctx, log := utiltesting.ContextWithLog(t)
++	// Every node holds a workload of the incoming workload's priority, so the
++	// retry fails until a priority boost lets the incoming workload preempt
++	// them.
++	cluster := newTopologyRetryCluster(ctx, t, log, uniformPriorities(4, []int32{3, 1}, []int32{3, 1}))
++	preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, nil, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++	runs := 0
++	attempt := func() []*Target {
++		pCtx := preemptor.buildContext(ctx, cluster.incoming, cluster.assignment, cluster.snapshot)
++		return preemptor.topologyRetryFailures.run(ctx, preemptor, pCtx, func() []*Target {
++			runs++
++			return preemptor.topologyRetryTargets(ctx, pCtx)
++		})
++	}
++	if targets := attempt(); len(targets) != 0 || runs != 1 {
++		t.Fatalf("before the boost: got %d targets after %d runs, want none after 1", len(targets), runs)
++	}
++	// The boost annotation changes the effective priority, not the generation.
++	cluster.incoming.Obj.Annotations = map[string]string{constants.PriorityBoostAnnotationKey: "1"}
++	targets := attempt()
++	if runs != 2 {
++		t.Errorf("after the boost: the retry ran %d times, want 2", runs)
++	}
++	if len(targets) != 2 {
++		t.Errorf("after the boost: got %d targets, want the 2 workloads of one node", len(targets))
++	}
++}
++
++// distinctPriorities returns the priorities of the given number of nodes,
++// each with slots workloads, that all differ, with the lowest ones spread
++// over the nodes, so node n00 is the only one that can be freed below the
++// highest priorities and ordinary preemption takes its victims on different
++// nodes.
++func distinctPriorities(nodes, slots int) [][]int32 {
++	priorities := make([][]int32, nodes)
++	for n := range nodes {
++		priorities[n] = make([]int32, slots)
++		for s := range slots {
++			priorities[n][s] = int32(s*nodes + n + 1)
++		}
++	}
++	return priorities
++}
++
++func TestTopologyRetryWithDistinctPriorities(t *testing.T) {
++	const nodes, slots = 64, 4
++	for _, fairSharing := range []*config.FairSharing{nil, {}} {
++		t.Run(fmt.Sprintf("fairsharing=%t", fairSharing != nil), func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++			ctx, log := utiltesting.ContextWithLog(t)
++			cluster := newTopologyRetryCluster(ctx, t, log, distinctPriorities(nodes, slots))
++			incomingPriority := int32(nodes*slots + 1)
++			cluster.incoming.Obj.Spec.Priority = &incomingPriority
++			preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, fairSharing, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++			var gotTargets []string
++			for _, target := range getTargetsWithTopologyRetry(ctx, preemptor, cluster.incoming, cluster.snapshot, cluster.assignment) {
++				gotTargets = append(gotTargets, target.WorkloadInfo.Obj.Name)
++			}
++			slices.Sort(gotTargets)
++			if diff := gocmp.Diff([]string{"n00-0", "n00-1", "n00-2", "n00-3"}, gotTargets); diff != "" {
++				t.Errorf("unexpected preemption targets (-want/+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++// BenchmarkTopologyRetryDistinctPriorities measures a retry whose candidates
++// all have different priorities, so the lowest priority ceiling at which a
++// node can be freed is three quarters of the way up.
++func BenchmarkTopologyRetryDistinctPriorities(b *testing.B) {
++	const slots = 4
++	for _, nodes := range []int{64, 256, 1024} {
++		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
++			features.SetFeatureGateDuringTest(b, features.TopologyAwareScheduling, true)
++			ctx, log := utiltesting.ContextWithLog(b)
++			cluster := newTopologyRetryCluster(ctx, b, log, distinctPriorities(nodes, slots))
++			incomingPriority := int32(nodes*slots + 1)
++			cluster.incoming.Obj.Spec.Priority = &incomingPriority
++			b.ReportAllocs()
++			b.ResetTimer()
++			targetCount := 0
++			for range b.N {
++				b.StopTimer()
++				preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, nil, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++				b.StartTimer()
++				targetCount += len(getTargetsWithTopologyRetry(ctx, preemptor, cluster.incoming, cluster.snapshot, cluster.assignment))
++			}
++			b.StopTimer()
++			b.ReportMetric(float64(targetCount)/float64(b.N), "targets/op")
++		})
++	}
++}
+diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
+index a5128fb..e4ef72f 100644
+--- a/pkg/scheduler/scheduler.go
++++ b/pkg/scheduler/scheduler.go
+@@ -1571,6 +1571,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+ 	initialAssignment := flvAssigner.AssignFlavors(ctx, log, nil)
+ 	planner := nativeplanner.NewPlanner(wl, snap, s.preemptor, flvAssigner)
+ 	assignmentPlan := planner.Plan(ctx, &initialAssignment)
++	topologyRetry := assignmentPlan.TopologyRetry
+ 
+ 	if !assignmentPlan.CanFit() && workload.MinCountsUsable(wl.Obj) && wl.CanBePartiallyAdmitted() {
+ 		// bestPA is tracked here, not returned by fitsFn(), so it can't drift from
+@@ -1592,6 +1593,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+ 			assignmentPlan = *bestPartialPlan
+ 		}
+ 	}
++	// Topology-guided preemption runs once, for the full count, and only when
++	// ordinary preemption failed at every count.
++	if !assignmentPlan.CanFit() && topologyRetry != nil {
++		assignmentPlan = topologyRetry(ctx)
++	}
+ 
+ 	fullAssignment, targets = *assignmentPlan.Assignment, assignmentPlan.PreemptionTargets
+ 	if assignmentPlan.CanFit() {
+diff --git a/pkg/scheduler/scheduler_tas_topology_retry_test.go b/pkg/scheduler/scheduler_tas_topology_retry_test.go
+new file mode 100644
+index 0000000..bca7285
+--- /dev/null
++++ b/pkg/scheduler/scheduler_tas_topology_retry_test.go
+@@ -0,0 +1,156 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package scheduler
++
++import (
++	"slices"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	testingclock "k8s.io/utils/clock/testing"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// TestTopologyRetryWithPartialAdmission checks that a workload that can be
++// partially admitted takes ordinary preemption at a reduced count whenever
++// one succeeds, and otherwise frees a whole node at the full count.
++func TestTopologyRetryWithPartialAdmission(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	cases := map[string]struct {
++		oldX1CPU    string
++		wantCount   int32
++		wantTargets []string
++		wantDomain  string
++	}{
++		"ordinary preemption at a reduced count wins over the retry": {
++			oldX1CPU:    "1",
++			wantCount:   3,
++			wantTargets: []string{"new-x1"},
++			wantDomain:  "x1",
++		},
++		"the retry frees a whole node when no count fits ordinarily": {
++			oldX1CPU:    "2",
++			wantCount:   4,
++			wantTargets: []string{"new-x1", "old-x1"},
++			wantDomain:  "x1",
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++			ctx, log := utiltesting.ContextWithLog(t)
++			borrower := func(name, node, cpu string, priority int32, age time.Duration) kueue.Workload {
++				return *utiltestingapi.MakeWorkload(name, "default").Priority(priority).
++					PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, cpu).
++						RequiredTopologyRequest(corev1.LabelHostname).Obj()).
++					ReserveQuotaAt(utiltestingapi.MakeAdmission("borrower").PodSets(
++						utiltestingapi.MakePodSetAssignment("main").Count(1).
++							Assignment(corev1.ResourceCPU, "tas", cpu).
++							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{node}, 1).Obj()).Obj()).Obj()).Obj(),
++						now.Add(-age)).
++					AdmittedAt(true, now.Add(-age)).Obj()
++			}
++			// The borrower borrows from the incoming queue, and its newest
++			// workloads sit on different nodes, so the ordinary search stops at
++			// the nominal quota with no node free enough.
++			admitted := []kueue.Workload{
++				borrower("old-x1", "x1", tc.oldX1CPU, 1, 2*time.Hour),
++				borrower("old-x2", "x2", "2", 2, time.Hour),
++				borrower("new-x1", "x1", "2", 1, time.Minute),
++				borrower("new-x2", "x2", "2", 1, 0),
++			}
++			clientBuilder := utiltesting.NewClientBuilder().
++				WithLists(&kueue.WorkloadList{Items: admitted}).
++				WithObjects(utiltesting.MakeNamespace("default")).
++				WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).
++				WithStatusSubresource(&kueue.Workload{})
++			_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
++			cl := clientBuilder.Build()
++			cqCache := schdcache.New(cl)
++			topology := utiltestingapi.MakeTopology("hostname").Levels(corev1.LabelHostname).Obj()
++			cqCache.AddOrUpdateTopology(log, topology)
++			cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("tas").NodeLabel("pool", "tas").TopologyName("hostname").Obj())
++			for _, node := range []string{"x1", "x2"} {
++				cqCache.TASCache().SyncNode(testingnode.MakeNode(node).Label("pool", "tas").Label(corev1.LabelHostname, node).
++					StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourcePods: resource.MustParse("10")}).
++					Ready().Obj())
++			}
++			fakeClock := testingclock.NewFakeClock(now)
++			qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
++			for _, cq := range []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "4").Obj()).
++					Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyLowerPriority}).Obj(),
++				utiltestingapi.MakeClusterQueue("borrower").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "4").Obj()).Obj(),
++			} {
++				if err := cqCache.AddClusterQueue(ctx, cq); err != nil {
++					t.Fatal(err)
++				}
++			}
++			scheduler := New(qManager, cqCache, cl, &utiltesting.EventRecorder{}, WithClock(t, fakeClock), WithPreemptionExpectations(preemptexpectations.New()))
++			snapshot, err := cqCache.Snapshot(ctx)
++			if err != nil {
++				t.Fatal(err)
++			}
++			info := workload.NewInfo(log, utiltestingapi.MakeWorkload("incoming", "default").Priority(3).
++				PodSets(*utiltestingapi.MakePodSet("main", 4).SetMinimumCount(3).Request(corev1.ResourceCPU, "1").
++					RequiredTopologyRequest(corev1.LabelHostname).Obj()).Obj())
++			info.ClusterQueue = "incoming"
++
++			assignment, targets := scheduler.getAssignments(ctx, info, snapshot)
++
++			var gotTargets []string
++			for _, target := range targets {
++				gotTargets = append(gotTargets, target.WorkloadInfo.Obj.Name)
++			}
++			slices.Sort(gotTargets)
++			if diff := cmp.Diff(tc.wantTargets, gotTargets); diff != "" {
++				t.Errorf("unexpected preemption targets (-want/+got):\n%s", diff)
++			}
++			podSet := assignment.PodSets[0]
++			if podSet.Count != tc.wantCount {
++				t.Errorf("unexpected pod count: want %d, got %d", tc.wantCount, podSet.Count)
++			}
++			if podSet.TopologyAssignment == nil {
++				t.Fatal("missing topology assignment")
++			}
++			var gotDomains []string
++			for _, domain := range podSet.TopologyAssignment.Domains {
++				gotDomains = append(gotDomains, domain.Values...)
++			}
++			if diff := cmp.Diff([]string{tc.wantDomain}, gotDomains); diff != "" {
++				t.Errorf("unexpected topology domains (-want/+got):\n%s", diff)
++			}
++		})
++	}
 +}
 diff --git a/test/integration/singlecluster/tas/tas_preemption_topology_test.go b/test/integration/singlecluster/tas/tas_preemption_topology_test.go
 new file mode 100644
-index 000000000..8b39b318a
+index 0000000..8b39b31
 --- /dev/null
 +++ b/test/integration/singlecluster/tas/tas_preemption_topology_test.go
 @@ -0,0 +1,309 @@

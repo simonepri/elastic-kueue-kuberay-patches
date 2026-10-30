@@ -101,7 +101,7 @@ index 0000000..3657518
 +	return sum
 +}
 diff --git a/pkg/scheduler/assignment/native/native.go b/pkg/scheduler/assignment/native/native.go
-index 94b2dcc..2130c58 100644
+index fe2de12..c4b1119 100644
 --- a/pkg/scheduler/assignment/native/native.go
 +++ b/pkg/scheduler/assignment/native/native.go
 @@ -22,11 +22,13 @@ import (
@@ -374,8 +374,21 @@ index 0587106..6da3b27 100644
 +	}
 +	return candidates
 +}
+diff --git a/pkg/scheduler/preemption/elastic_shrink.go b/pkg/scheduler/preemption/elastic_shrink.go
+index 0e24952..39e7f07 100644
+--- a/pkg/scheduler/preemption/elastic_shrink.go
++++ b/pkg/scheduler/preemption/elastic_shrink.go
+@@ -160,7 +160,7 @@ func (s *shrinks) unshrink(t *Target) {
+ // the minimum does not fit, it puts the target back whole, drops it, and
+ // reports that the preemptor no longer fits.
+ func (s *shrinks) shrink(ctx context.Context, strategy PreemptionStrategy, targets []*Target) ([]*Target, bool) {
+-	fits := func() bool { return workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) }
++	fits := func() bool { return workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) }
+ 	for i := len(targets) - 1; i >= 0; i-- {
+ 		t := targets[i]
+ 		elastic, ok := s.elasticPodSet(ctx, t)
 diff --git a/pkg/scheduler/preemption/fair_strategy.go b/pkg/scheduler/preemption/fair_strategy.go
-index 18edca5..2c801ec 100644
+index 866f02d..21475e2 100644
 --- a/pkg/scheduler/preemption/fair_strategy.go
 +++ b/pkg/scheduler/preemption/fair_strategy.go
 @@ -61,12 +61,45 @@ func fairPreemptionStrategy(
@@ -426,7 +439,7 @@ index 18edca5..2c801ec 100644
  	}
  	slices.SortFunc(candidateWls, preemptor.candidatesOrdering(log, preemptionCtx.preemptorCQ.Name))
  	if logV := log.V(5); logV.Enabled() {
-@@ -80,7 +113,20 @@ func fairPreemptionStrategy(
+@@ -80,7 +113,19 @@ func fairPreemptionStrategy(
  			klog.KObj(preemptionCtx.preemptor.Obj),
  		)
  	}
@@ -434,8 +447,7 @@ index 18edca5..2c801ec 100644
 +}
  
 +// fairStrategy builds the fair sharing strategy that offers candidateWls in
-+// the given order, within the order of ClusterQueues by share. The strategy
-+// consumes candidateWls, so each strategy needs its own slice.
++// the given order, within the order of ClusterQueues by share.
 +func fairStrategy(
 +	ctx context.Context,
 +	preemptionCtx *preemptionCtx,
@@ -445,9 +457,9 @@ index 18edca5..2c801ec 100644
 +	log := log.FromContext(ctx)
 +	allowBorrowing := true
  	candidatesIter := func(yieldCandidate func(*Target) bool) {
- 		var cont bool
- 		targetsInPreemptorCQ := false
-@@ -148,16 +194,14 @@ func fairPreemptionStrategy(
+ 		// Each run starts from every candidate, so that the candidates can be
+ 		// iterated more than once.
+@@ -151,16 +196,14 @@ func fairPreemptionStrategy(
  		}
  	}
  
@@ -550,18 +562,18 @@ index 558ed94..3d4afd7 100644
  }
  
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index 6b4d76a..4a3e4cb 100644
+index fbf1bfa..2295c9d 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
-@@ -76,6 +76,7 @@ type Preemptor struct {
- 	roleTracker            *roletracker.RoleTracker
+@@ -77,6 +77,7 @@ type Preemptor struct {
  	customLabels           *metrics.CustomLabels
  	preemptionExpectations *expectations.Store
+ 	scaleDownSteps         ScaleDownSteps
 +	topologyRetryFailures  *topologyRetryFailures
  }
  
  // PreemptionStrategy represents a singular set of ordered potential preemption candidates.
-@@ -132,6 +133,10 @@ type preemptionCtx struct {
+@@ -133,6 +134,10 @@ type preemptionCtx struct {
  	assignment            flavorassigner.Assignment
  	frsNeedPreemption     sets.Set[resources.FlavorResource]
  	configurableEvaluator *configurable.PreemptionEvaluator
@@ -572,7 +584,7 @@ index 6b4d76a..4a3e4cb 100644
  }
  
  func New(
-@@ -156,6 +161,7 @@ func New(
+@@ -157,6 +162,7 @@ func New(
  		roleTracker:            tracker,
  		customLabels:           customLabels,
  		preemptionExpectations: preemptionExpectations,
@@ -580,25 +592,16 @@ index 6b4d76a..4a3e4cb 100644
  	}
  	return p
  }
-@@ -406,7 +412,7 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
- 		var targets []*Target
- 		for candidate := range strategy.candidates {
- 			targets = append(targets, candidate)
--			if workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
-+			if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
- 				if psName, currentCount, minCount, isElastic := getElasticInfo(candidate.WorkloadInfo); isElastic {
- 					if !shrinkTarget(ctx, strategy, candidate, psName, currentCount, minCount) {
- 						// Min-viable guard: candidate cannot be shrunk without violating minReplicas.
-@@ -520,7 +526,7 @@ func shrinkTarget(ctx context.Context, strategy PreemptionStrategy, candidate *T
- 	for count := currentCount - 1; count >= minCount; count-- {
- 		kept := shrunkUsage(candidate.WorkloadInfo, psName, count)
- 		snapshot.AddWorkloadUsage(candidate.WorkloadInfo, kept)
--		if workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
-+		if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
- 			candidate.NewCount = ptr.To(count)
- 			candidate.PodSetName = psName
- 			candidate.KeptUsage = kept
-@@ -714,6 +720,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
+@@ -441,7 +447,7 @@ func (p *Preemptor) strategyTargets(ctx context.Context, strategy PreemptionStra
+ 			shrunk.offer(ctx, candidate)
+ 		}
+ 		targets = append(targets, candidate)
+-		if !workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
++		if !workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
+ 			continue
+ 		}
+ 		var fits bool
+@@ -656,6 +662,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
  	return workloadQuotaFits(preemptionCtx, allowBorrowing) && workloadTopologyFits(ctx, preemptionCtx)
  }
  
@@ -1048,7 +1051,7 @@ index 0000000..fcae8a2
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry.go b/pkg/scheduler/preemption/topology_retry.go
 new file mode 100644
-index 0000000..7125571
+index 0000000..8d69685
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry.go
 @@ -0,0 +1,557 @@
@@ -1214,7 +1217,7 @@ index 0000000..7125571
 +	candidates := make([]*retryCandidate, 0, len(attempt.candidates))
 +	leaves := sets.New[flavorDomain]()
 +	for _, wl := range attempt.candidates {
-+		quota, tas := freeableUsage(wl)
++		quota, tas := p.freeableUsage(ctx, wl)
 +		candidate := &retryCandidate{
 +			wl:       wl,
 +			priority: priority.EffectivePriority(log, wl.Obj),
@@ -1583,13 +1586,13 @@ index 0000000..7125571
 +// as getTargets preempts it. An elastic workload is only shrunk, down to its
 +// minimum count, which frees the quota of the pods it gives up and no topology
 +// capacity, so placements never count on its topology domains.
-+func freeableUsage(wl *workload.Info) (quota, tas workload.Usage) {
-+	usage := wl.Usage()
-+	psName, _, minCount, isElastic := getElasticInfo(wl)
-+	if !isElastic {
++func (p *Preemptor) freeableUsage(ctx context.Context, wl *workload.Info) (quota, tas workload.Usage) {
++	elastic, ok := p.elasticPodSet(ctx, wl)
++	if !ok {
++		usage := wl.Usage()
 +		return workload.Usage{Quota: usage.Quota}, workload.Usage{TAS: usage.TAS}
 +	}
-+	shrunk := &Target{WorkloadInfo: wl, NewCount: &minCount, KeptUsage: shrunkUsage(wl, psName, minCount)}
++	shrunk := &Target{WorkloadInfo: wl, NewCount: &elastic.minCount, KeptUsage: shrunkUsage(wl, elastic.name, elastic.minCount)}
 +	return releasedUsage(shrunk), workload.Usage{}
 +}
 +
@@ -2439,10 +2442,10 @@ index 0000000..940121a
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_test.go b/pkg/scheduler/preemption/topology_retry_test.go
 new file mode 100644
-index 0000000..80f4ff7
+index 0000000..6a3c452
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_test.go
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,586 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2475,6 +2478,7 @@ index 0000000..80f4ff7
 +	"k8s.io/apimachinery/pkg/api/resource"
 +	"k8s.io/apimachinery/pkg/types"
 +	clocktesting "k8s.io/utils/clock/testing"
++	"k8s.io/utils/ptr"
 +
 +	config "sigs.k8s.io/kueue/apis/config/v1beta2"
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -2482,6 +2486,7 @@ index 0000000..80f4ff7
 +	"sigs.k8s.io/kueue/pkg/controller/constants"
 +	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 +	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
 +	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
 +	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
 +	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
@@ -2835,7 +2840,7 @@ index 0000000..80f4ff7
 +			ctx, log := utiltesting.ContextWithLog(t)
 +			setup := cluster.build(ctx, t, log)
 +			check := checkSnapshotUnchanged(t, setup.snapshot)
-+			preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++			preemptor := newShrinkingPreemptor(mode.fairSharing)
 +			targets, retry := preemptor.GetTargets(ctx, setup.incoming, setup.snapshot, setup.assignment)
 +			if len(targets) > 0 || retry == nil {
 +				t.Fatalf("ordinary preemption found targets %v and retry=%t, want no targets and a retry", targetNames(targets), retry != nil)
@@ -2877,7 +2882,7 @@ index 0000000..80f4ff7
 +			ctx, log := utiltesting.ContextWithLog(t)
 +			setup := cluster.build(ctx, t, log)
 +			check := checkSnapshotUnchanged(t, setup.snapshot)
-+			preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++			preemptor := newShrinkingPreemptor(mode.fairSharing)
 +			targets, retry := preemptor.GetTargets(ctx, setup.incoming, setup.snapshot, setup.assignment)
 +			if len(targets) > 0 || retry == nil {
 +				t.Fatalf("ordinary preemption found targets %v and retry=%t, want no targets and a retry", targetNames(targets), retry != nil)
@@ -2970,7 +2975,7 @@ index 0000000..80f4ff7
 +				Name: "main", Count: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
 +				Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "tas", Mode: flavorassigner.Preempt}},
 +			}}}
-+			preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
++			preemptor := newShrinkingPreemptor(mode.fairSharing)
 +			targets, retry := preemptor.GetTargets(ctx, *incoming, snapshot, assignment)
 +			if len(targets) > 0 || retry == nil {
 +				t.Fatalf("ordinary preemption found targets %v and retry=%t, want no targets and a retry", targetNames(targets), retry != nil)
@@ -2982,11 +2987,56 @@ index 0000000..80f4ff7
 +		})
 +	}
 +}
++
++func TestTopologyRetryCountsWhatAShrinkFrees(t *testing.T) {
++	// An elastic workload frees only the quota of its pods above its minimum
++	// and no topology capacity; any other workload frees all of its usage.
++	ctx, log := utiltesting.ContextWithLog(t)
++	admission := utiltestingapi.MakeAdmission("borrower").PodSets(
++		utiltestingapi.MakePodSetAssignment("main").Count(4).
++			Assignment(corev1.ResourceCPU, "tas", "4").
++			TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++				Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"x1"}, 4).Obj()).Obj()).Obj()).Obj()
++	wl := func(name string, minCount *int32) *workload.Info {
++		podSet := utiltestingapi.MakePodSet("main", 4).Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest()
++		if minCount != nil {
++			podSet.SetMinimumCount(*minCount)
++		}
++		return workload.NewInfo(log, utiltestingapi.MakeWorkload(name, "default").PodSets(*podSet.Obj()).
++			ReserveQuotaAt(admission.DeepCopy(), time.Now()).Obj())
++	}
++	features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++	preemptor := newShrinkingPreemptor(nil)
++	cpu := resources.FlavorResource{Flavor: "tas", Resource: corev1.ResourceCPU}
++	cases := map[string]struct {
++		wl        *workload.Info
++		wantQuota int64
++		wantTAS   bool
++	}{
++		"an elastic workload frees the quota above its minimum and no topology capacity": {
++			wl: wl("elastic", ptr.To[int32](1)), wantQuota: 3000,
++		},
++		"another workload frees all of its usage": {
++			wl: wl("fixed", nil), wantQuota: 4000, wantTAS: true,
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			quota, tas := preemptor.freeableUsage(ctx, tc.wl)
++			if got, _ := quota.Quota.Assigned[cpu].Int64(); got != tc.wantQuota {
++				t.Errorf("freeable CPU is %dm, want %dm", got, tc.wantQuota)
++			}
++			if got := len(tas.TAS) > 0; got != tc.wantTAS {
++				t.Errorf("frees TAS usage = %t, want %t", got, tc.wantTAS)
++			}
++		})
++	}
++}
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index 84756ee..e8c34e6 100644
+index 344cac5..44645ec 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
-@@ -1576,6 +1576,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1573,6 +1573,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  	initialAssignment := flvAssigner.AssignFlavors(ctx, log, nil)
  	planner := nativeplanner.NewPlanner(wl, snap, s.preemptor, flvAssigner)
  	assignmentPlan := planner.Plan(ctx, &initialAssignment)
@@ -2994,7 +3044,7 @@ index 84756ee..e8c34e6 100644
  
  	if !assignmentPlan.CanFit() && workload.MinCountsUsable(wl.Obj) && wl.CanBePartiallyAdmitted() {
  		// bestPA is tracked here, not returned by fitsFn(), so it can't drift from
-@@ -1597,6 +1598,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1594,6 +1595,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  			assignmentPlan = *bestPartialPlan
  		}
  	}

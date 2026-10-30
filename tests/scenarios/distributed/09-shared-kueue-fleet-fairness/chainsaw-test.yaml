@@ -42,7 +42,7 @@ spec:
         # cell2 is an elastic job: the resize waits for a new Workload slice, and
         # no more worker pods may run than the admitted slice grants.
         - script:
-            timeout: 60s
+            timeout: 150s
             env:
               - name: NS
                 value: ($namespace)

@@ -2635,10 +2635,18 @@ index 52f022d..2bce666 100644
  
  		if !jobPodSetsCounts.HasSamePodSetKeys(selectedCounts) {
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
-index 393620e..a72eacb 100644
+index 393620e..00c6a35 100644
 --- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
-@@ -1013,6 +1013,110 @@ var _ = ginkgo.Describe("RayCluster with elastic jobs via workload-slices suppor
+@@ -18,6 +18,7 @@ package raycluster
+ 
+ import (
+ 	"fmt"
++	"slices"
+ 	"strconv"
+ 	"time"
+ 
+@@ -1013,6 +1014,142 @@ var _ = ginkgo.Describe("RayCluster with elastic jobs via workload-slices suppor
  		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
  	})
  
@@ -2689,10 +2697,11 @@ index 393620e..a72eacb 100644
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +	})
 +
-+	ginkgo.It("Should keep an elastic RayCluster resized past its admission at its admitted slice", framework.SlowSpec, func() {
++	ginkgo.It("Should run an elastic RayCluster resized past its admission only on admitted workers", framework.SlowSpec, func() {
 +		// The cluster is an elastic job, so a resize asks for a new Workload
-+		// slice: the cluster keeps running on the slice already admitted, and
-+		// grows only once a slice for the new size is admitted.
++		// slice, which the queue's 6 CPUs admit only in part. The cluster
++		// keeps running, and only as many worker pods as the admitted slice
++		// grants are ungated; the rest stay gated.
 +		testRayCluster := testingraycluster.MakeCluster("elastic", ns.Name).
 +			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
 +			Queue(localQueue.Name).
@@ -2705,13 +2714,11 @@ index 393620e..a72eacb 100644
 +		behavioral.MustCreate(ctx, k8sClient, testRayCluster)
 +
 +		ginkgo.By("admitting the raycluster at 2 workers")
-+		var admitted *kueue.Workload
 +		gomega.Eventually(func(g gomega.Gomega) {
 +			workloads := &kueue.WorkloadList{}
 +			g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name))).Should(gomega.Succeed())
 +			g.Expect(workloads.Items).Should(gomega.HaveLen(1))
-+			admitted = &workloads.Items[0]
-+			g.Expect(workload.IsAdmitted(admitted)).Should(gomega.BeTrue())
++			g.Expect(workload.IsAdmitted(&workloads.Items[0])).Should(gomega.BeTrue())
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +
 +		ginkgo.By("resizing the raycluster to 8 workers, past what the queue can admit")
@@ -2722,28 +2729,61 @@ index 393620e..a72eacb 100644
 +			g.Expect(k8sClient.Update(ctx, testRayCluster)).Should(gomega.Succeed())
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +
-+		ginkgo.By("the admitted slice keeps 2 workers while the slice for 8 waits, and the cluster keeps running")
++		ginkgo.By("a slice for the resize is admitted for fewer than 8 workers and the cluster keeps running")
++		var active *kueue.Workload
 +		gomega.Eventually(func(g gomega.Gomega) {
 +			workloads := &kueue.WorkloadList{}
 +			g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name))).Should(gomega.Succeed())
-+			g.Expect(workloads.Items).Should(gomega.HaveLen(2))
++			active = nil
 +			for i := range workloads.Items {
-+				wl := &workloads.Items[i]
-+				if wl.UID == admitted.UID {
-+					g.Expect(workload.IsAdmitted(wl)).Should(gomega.BeTrue())
-+					g.Expect(ptr.Deref(wl.Status.Admission.PodSetAssignments[1].Count, 0)).Should(gomega.Equal(int32(2)))
-+				} else {
-+					g.Expect(wl.Spec.PodSets[1].Count).Should(gomega.Equal(int32(8)))
-+					g.Expect(workload.HasQuotaReservation(wl)).Should(gomega.BeFalse())
++				if wl := &workloads.Items[i]; workload.IsAdmitted(wl) && !workloadfinish.IsFinished(wl) {
++					active = wl
 +				}
 +			}
++			g.Expect(active).ShouldNot(gomega.BeNil())
++			g.Expect(active.Spec.PodSets[1].Count).Should(gomega.Equal(int32(8)))
 +			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
 +			g.Expect(ptr.Deref(testRayCluster.Spec.Suspend, false)).Should(gomega.BeFalse())
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		granted := workload.ExtractGrantedPodSetCounts(active)[active.Spec.PodSets[1].Name]
++		gomega.Expect(granted).Should(gomega.BeNumerically("<", 8))
++
++		ginkgo.By("creating the 8 gated worker pods the resized cluster asks for")
++		for i := range 8 {
++			pod := testingpod.MakePod(fmt.Sprintf("worker-%d", i), ns.Name).
++				Annotation(kueue.WorkloadAnnotation, active.Name).
++				Annotation(kueue.WorkloadSliceNameAnnotation, workloadslicing.SliceName(active)).
++				Label(constants.PodSetLabel, string(active.Spec.PodSets[1].Name)).
++				Gate(kueue.ElasticJobSchedulingGate).
++				Obj()
++			pod.OwnerReferences = []metav1.OwnerReference{{
++				APIVersion: rayv1.SchemeGroupVersion.String(),
++				Kind:       "RayCluster",
++				Name:       testRayCluster.Name,
++				UID:        testRayCluster.UID,
++				Controller: new(true),
++			}}
++			behavioral.MustCreate(ctx, k8sClient, pod)
++		}
++
++		ginkgo.By("only the granted workers are ungated; the others stay gated")
++		ungated := func(g gomega.Gomega) int32 {
++			pods := &corev1.PodList{}
++			g.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name))).Should(gomega.Succeed())
++			var count int32
++			for _, pod := range pods.Items {
++				if !slices.Contains(pod.Spec.SchedulingGates, corev1.PodSchedulingGate{Name: kueue.ElasticJobSchedulingGate}) {
++					count++
++				}
++			}
++			return count
++		}
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(ungated(g)).Should(gomega.Equal(granted))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +		gomega.Consistently(func(g gomega.Gomega) {
-+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(admitted), admitted)).Should(gomega.Succeed())
-+			g.Expect(ptr.Deref(admitted.Status.Admission.PodSetAssignments[1].Count, 0)).Should(gomega.Equal(int32(2)))
-+		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
++			g.Expect(ungated(g)).Should(gomega.Equal(granted))
++		}, behavioral.ConsistentDuration*10, behavioral.ShortInterval).Should(gomega.Succeed())
 +	})
 +
  	ginkgo.It("Should support scheduling pending workload after freeing capacity on scale-down", framework.SlowSpec, func() {

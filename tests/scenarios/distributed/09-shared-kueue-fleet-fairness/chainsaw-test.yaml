@@ -39,3 +39,25 @@ spec:
             file: 04-cell2-overcapacity-attempt.yaml
         - assert:
             file: 04-assert-clamped.yaml
+        # cell2 is an elastic job: the resize waits for a new Workload slice, and
+        # no more worker pods may run than the admitted slice grants.
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-workers-within-admission.sh cell2-raycluster-spot spot-workers
+      catch:
+        - get:
+            apiVersion: ray.io/v1
+            kind: RayCluster
+            name: cell2-raycluster-spot
+            format: yaml
+        - get:
+            apiVersion: kueue.x-k8s.io/v1beta2
+            kind: Workload
+            format: yaml
+        - podLogs:
+            namespace: default
+            selector: app.kubernetes.io/name=kuberay-operator
+            tail: 300

@@ -11,6 +11,9 @@ spec:
       rayStartParams: {}
       template:
         spec:
+          # Kueue gates the pods of an elastic job; the template keeps the gate.
+          schedulingGates:
+            - name: kueue.x-k8s.io/elastic-job
           nodeSelector:
             cell.example.com/name: cell-2
             node-tier: spot

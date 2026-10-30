@@ -218,6 +218,116 @@ index 666564b..5b16a9d 100644
  	WorkloadInfo *workload.Info
  	Reason       string
  	WorkloadCq   *scheduler.ClusterQueueSnapshot
+diff --git a/pkg/scheduler/preemption/preempted_workloads.go b/pkg/scheduler/preemption/preempted_workloads.go
+index cb1b8af..fb84777 100644
+--- a/pkg/scheduler/preemption/preempted_workloads.go
++++ b/pkg/scheduler/preemption/preempted_workloads.go
+@@ -18,12 +18,14 @@ package preemption
+ 
+ import (
+ 	"maps"
+-	"slices"
+ 
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+ 	"sigs.k8s.io/kueue/pkg/workload"
+ )
+ 
+-type PreemptedWorkloads map[workload.Reference]*workload.Info
++// PreemptedWorkloads holds the targets of the preemptions decided in a
++// scheduling cycle, by workload key.
++type PreemptedWorkloads map[workload.Reference]*Target
+ 
+ func (p PreemptedWorkloads) HasAny(newTargets []*Target) bool {
+ 	for _, target := range newTargets {
+@@ -36,7 +38,7 @@ func (p PreemptedWorkloads) HasAny(newTargets []*Target) bool {
+ 
+ func (p PreemptedWorkloads) Insert(newTargets []*Target) {
+ 	for _, target := range newTargets {
+-		p[workload.Key(target.WorkloadInfo.Obj)] = target.WorkloadInfo
++		p[workload.Key(target.WorkloadInfo.Obj)] = target
+ 	}
+ }
+ 
+@@ -52,6 +54,35 @@ func (p PreemptedWorkloads) MergeWithTargets(targets []*Target) PreemptedWorkloa
+ 	return merged
+ }
+ 
+-func (p PreemptedWorkloads) Workloads() []*workload.Info {
+-	return slices.Collect(maps.Values(p))
++// Evicted returns the workloads of the targets that are evicted, rather than
++// shrunk.
++func (p PreemptedWorkloads) Evicted() []*workload.Info {
++	var evicted []*workload.Info
++	for _, target := range p {
++		if target.NewCount == nil {
++			evicted = append(evicted, target.WorkloadInfo)
++		}
++	}
++	return evicted
++}
++
++// SimulateShrinks removes from the snapshot the usage that the shrunk targets
++// give up, which is their usage beyond what they keep, KeptUsage, and returns
++// a function that adds it back. The shrunk targets stay in their
++// ClusterQueues.
++func (p PreemptedWorkloads) SimulateShrinks(snapshot *schdcache.Snapshot) func() {
++	var shrunk []*Target
++	for _, target := range p {
++		if target.NewCount != nil {
++			shrunk = append(shrunk, target)
++			snapshot.RemoveWorkloadUsage(target.WorkloadInfo, target.WorkloadInfo.Usage())
++			snapshot.AddWorkloadUsage(target.WorkloadInfo, target.KeptUsage)
++		}
++	}
++	return func() {
++		for _, target := range shrunk {
++			snapshot.RemoveWorkloadUsage(target.WorkloadInfo, target.KeptUsage)
++			snapshot.AddWorkloadUsage(target.WorkloadInfo, target.WorkloadInfo.Usage())
++		}
++	}
+ }
+diff --git a/pkg/scheduler/preemption/preempted_workloads_test.go b/pkg/scheduler/preemption/preempted_workloads_test.go
+index 2461007..746a6d8 100644
+--- a/pkg/scheduler/preemption/preempted_workloads_test.go
++++ b/pkg/scheduler/preemption/preempted_workloads_test.go
+@@ -30,16 +30,16 @@ func TestWorkloadsToRemove(t *testing.T) {
+ 	originalKey := workload.Key(original.Obj)
+ 	additionalKey := workload.Key(additional.Obj)
+ 
+-	preempted := PreemptedWorkloads{originalKey: original}
++	preempted := PreemptedWorkloads{originalKey: {WorkloadInfo: original}}
+ 	got := preempted.MergeWithTargets([]*Target{
+ 		{WorkloadInfo: replacement},
+ 		{WorkloadInfo: additional},
+-	}).Workloads()
++	}).Evicted()
+ 
+ 	if len(got) != 2 {
+ 		t.Fatalf("WorkloadsToRemove() returned %d workloads, want 2", len(got))
+ 	}
+-	gotByKey := make(PreemptedWorkloads, len(got))
++	gotByKey := make(map[workload.Reference]*workload.Info, len(got))
+ 	for _, info := range got {
+ 		gotByKey[workload.Key(info.Obj)] = info
+ 	}
+@@ -49,7 +49,7 @@ func TestWorkloadsToRemove(t *testing.T) {
+ 	if gotByKey[additionalKey] != additional {
+ 		t.Errorf("new target was not included")
+ 	}
+-	if len(preempted) != 1 || preempted[originalKey] != original {
++	if len(preempted) != 1 || preempted[originalKey].WorkloadInfo != original {
+ 		t.Errorf("WorkloadsToRemove() mutated receiver: %#v", preempted)
+ 	}
+ }
+@@ -58,7 +58,7 @@ func TestWorkloadsToRemoveNilReceiver(t *testing.T) {
+ 	target := workloadInfoForTest("ns", "victim")
+ 	var preempted PreemptedWorkloads
+ 
+-	got := preempted.MergeWithTargets([]*Target{{WorkloadInfo: target}}).Workloads()
++	got := preempted.MergeWithTargets([]*Target{{WorkloadInfo: target}}).Evicted()
+ 	if len(got) != 1 || workload.Key(got[0].Obj) != workload.Key(target.Obj) {
+ 		t.Fatalf("WorkloadsToRemove() = %#v, want the target workload", got)
+ 	}
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
 index 5a5071f..4f5e699 100644
 --- a/pkg/scheduler/preemption/preemption.go
@@ -719,6 +829,193 @@ index 0000000..eb5dc7a
 +		})
 +	}
 +}
+diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
+index a5128fb..84756ee 100644
+--- a/pkg/scheduler/scheduler.go
++++ b/pkg/scheduler/scheduler.go
+@@ -21,7 +21,6 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
+-	"maps"
+ 	"slices"
+ 	"strings"
+ 	"testing"
+@@ -934,8 +933,10 @@ func (s *Scheduler) updateAssignmentIfNeeded(
+ func fits(snapshot *schdcache.Snapshot, cq *schdcache.ClusterQueueSnapshot, usage *workload.Usage, preemptedWorkloads preemption.PreemptedWorkloads,
+ 	newTargets []*preemption.Target) schdcache.FitsCheck {
+ 	merged := preemptedWorkloads.MergeWithTargets(newTargets)
+-	revertUsage := snapshot.SimulateWorkloadUsageRemoval(merged.Workloads())
++	revertUsage := snapshot.SimulateWorkloadUsageRemoval(merged.Evicted())
+ 	defer revertUsage()
++	revertShrinks := merged.SimulateShrinks(snapshot)
++	defer revertShrinks()
+ 	return cq.Fits(*usage)
+ }
+ 
+@@ -994,12 +995,16 @@ func (s *Scheduler) evictWorkloadAfterFailedTASReplacement(ctx context.Context,
+ // simulateOtherPreemptions projects the victims of preemptions already decided this cycle
+ // out of the snapshot and returns the single undo. Freeing their quota is not enough:
+ // until the simulator is told, it still reports their Pods and their host ports.
++// A shrunk victim only gives up the usage beyond what it keeps, and keeps its Pods in
++// the simulator, since which of them the job deletes is not known.
+ func simulateOtherPreemptions(ctx context.Context, log logr.Logger, snapshot *schdcache.Snapshot, preemptedWorkloads preemption.PreemptedWorkloads) func() {
+-	victims := slices.Collect(maps.Values(preemptedWorkloads))
++	victims := preemptedWorkloads.Evicted()
+ 	revertUsage := snapshot.SimulateWorkloadRemoval(victims)
++	revertShrinks := preemptedWorkloads.SimulateShrinks(snapshot)
+ 	revertPods := snapshot.SimulatePodRemoval(ctx, log, victims)
+ 	return func() {
+ 		revertPods()
++		revertShrinks()
+ 		revertUsage()
+ 	}
+ }
+diff --git a/pkg/scheduler/scheduler_partial_preemption_test.go b/pkg/scheduler/scheduler_partial_preemption_test.go
+new file mode 100644
+index 0000000..8098146
+--- /dev/null
++++ b/pkg/scheduler/scheduler_partial_preemption_test.go
+@@ -0,0 +1,126 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package scheduler
++
++import (
++	"slices"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	testingclock "k8s.io/utils/clock/testing"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	"sigs.k8s.io/kueue/pkg/util/routine"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++)
++
++// TestScheduleCountsWhatAShrunkVictimKeeps checks that a preemptor whose
++// victim is only shrunk does not leave the quota of the victim's kept pods to
++// another preemptor in the same cycle.
++//
++// ClusterQueues "a" and "b" share a Cohort of 4 CPUs. Elastic workload
++// "elastic" of "a" runs 2 pods of 1 CPU with a minimum of 1, and "worker" of
++// "b" runs one pod of 1 CPU. Preemptor "a-new" needs 2 CPUs: shrinking
++// "elastic" to 1 pod frees enough, borrowing the CPU "b" does not use.
++// Preemptor "b-new" needs 2 CPUs: evicting "worker" frees enough at the start
++// of the cycle. After either one books its usage, the other fits only if
++// "elastic" gives up both pods, so only the first may preempt.
++func TestScheduleCountsWhatAShrunkVictimKeeps(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	ctx, log := utiltesting.ContextWithLog(t)
++	admission := func(cq kueue.ClusterQueueReference, count int32, cpu string) *kueue.Admission {
++		return utiltestingapi.MakeAdmission(cq).PodSets(
++			utiltestingapi.MakePodSetAssignment("main").Count(count).
++				Assignment(corev1.ResourceCPU, "default", cpu).Obj()).Obj()
++	}
++	workloads := []kueue.Workload{
++		*utiltestingapi.MakeWorkload("elastic", "default").Priority(1).
++			PodSets(*utiltestingapi.MakePodSet("main", 2).SetMinimumCount(1).Request(corev1.ResourceCPU, "1").Obj()).
++			ReserveQuotaAt(admission("a", 2, "2"), now.Add(-time.Hour)).AdmittedAt(true, now.Add(-time.Hour)).Obj(),
++		*utiltestingapi.MakeWorkload("worker", "default").Priority(1).
++			PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "1").Obj()).
++			ReserveQuotaAt(admission("b", 1, "1"), now.Add(-time.Hour)).AdmittedAt(true, now.Add(-time.Hour)).Obj(),
++		*utiltestingapi.MakeWorkload("a-new", "default").Queue("a").Priority(3).Creation(now.Add(-2 * time.Minute)).
++			PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "2").Obj()).Obj(),
++		*utiltestingapi.MakeWorkload("b-new", "default").Queue("b").Priority(3).Creation(now.Add(-time.Minute)).
++			PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "2").Obj()).Obj(),
++	}
++	localQueues := []kueue.LocalQueue{
++		*utiltestingapi.MakeLocalQueue("a", "default").ClusterQueue("a").Obj(),
++		*utiltestingapi.MakeLocalQueue("b", "default").ClusterQueue("b").Obj(),
++	}
++	cl := utiltesting.NewClientBuilder().
++		WithLists(&kueue.WorkloadList{Items: workloads}, &kueue.LocalQueueList{Items: localQueues}).
++		WithObjects(utiltesting.MakeNamespace("default")).
++		WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).
++		WithStatusSubresource(&kueue.Workload{}).Build()
++	cqCache := schdcache.New(cl)
++	cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
++	fakeClock := testingclock.NewFakeClock(now)
++	qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
++	for _, cq := range []*kueue.ClusterQueue{
++		utiltestingapi.MakeClusterQueue("a").Cohort("shared").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "2").Obj()).
++			Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).Obj(),
++		utiltestingapi.MakeClusterQueue("b").Cohort("shared").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "2").Obj()).
++			Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).Obj(),
++	} {
++		if err := cqCache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++		if err := qManager.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++	}
++	for i := range localQueues {
++		if err := qManager.AddLocalQueue(ctx, &localQueues[i]); err != nil {
++			t.Fatal(err)
++		}
++	}
++	scheduler := New(qManager, cqCache, cl, &utiltesting.EventRecorder{}, WithClock(t, fakeClock), WithPreemptionExpectations(preemptexpectations.New()))
++	wg := sync.WaitGroup{}
++	scheduler.setAdmissionRoutineWrapper(routine.NewWrapper(func() { wg.Add(1) }, func() { wg.Done() }))
++
++	scheduler.schedule(ctx)
++	wg.Wait()
++
++	var got kueue.WorkloadList
++	if err := cl.List(ctx, &got); err != nil {
++		t.Fatal(err)
++	}
++	var preempted []string
++	for _, wl := range got.Items {
++		if apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadPreempted) {
++			preempted = append(preempted, wl.Name)
++		}
++	}
++	slices.Sort(preempted)
++	// "a-new" comes first, as it was created first.
++	if diff := cmp.Diff([]string{"elastic"}, preempted); diff != "" {
++		t.Errorf("unexpected preempted workloads (-want/+got):\n%s", diff)
++	}
++}
+diff --git a/pkg/scheduler/scheduler_test.go b/pkg/scheduler/scheduler_test.go
+index 54388cc..9559465 100644
+--- a/pkg/scheduler/scheduler_test.go
++++ b/pkg/scheduler/scheduler_test.go
+@@ -12301,7 +12301,7 @@ func TestFitsDedupsOverlappingVictims(t *testing.T) {
+ 		},
+ 	}
+ 	preempted := preemption.PreemptedWorkloads{
+-		workload.Key(victimWL): victimInfo,
++		workload.Key(victimWL): {WorkloadInfo: victimInfo},
+ 	}
+ 	targets := []*preemption.Target{{WorkloadInfo: victimInfo}}
+ 
 diff --git a/pkg/webhooks/workload_webhook.go b/pkg/webhooks/workload_webhook.go
 index 7caf243..e5b72be 100644
 --- a/pkg/webhooks/workload_webhook.go

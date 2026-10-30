@@ -2876,10 +2876,10 @@ index 0000000..d3870b7
 +	}
 +}
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index a5128fb..e4ef72f 100644
+index 84756ee..e8c34e6 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
-@@ -1571,6 +1571,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1576,6 +1576,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  	initialAssignment := flvAssigner.AssignFlavors(ctx, log, nil)
  	planner := nativeplanner.NewPlanner(wl, snap, s.preemptor, flvAssigner)
  	assignmentPlan := planner.Plan(ctx, &initialAssignment)
@@ -2887,7 +2887,7 @@ index a5128fb..e4ef72f 100644
  
  	if !assignmentPlan.CanFit() && workload.MinCountsUsable(wl.Obj) && wl.CanBePartiallyAdmitted() {
  		// bestPA is tracked here, not returned by fitsFn(), so it can't drift from
-@@ -1592,6 +1593,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1597,6 +1598,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  			assignmentPlan = *bestPartialPlan
  		}
  	}

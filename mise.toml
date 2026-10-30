@@ -240,14 +240,19 @@ dir = "third_party/kueue"
 run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobframework/... ./pkg/controller/jobs/... ./pkg/scheduler/... ./pkg/webhooks/..."
 
 [tasks."test:kueue-integration"]
-description = "Run the patched Kueue topology-aware reclaim integration suite against envtest"
+description = "Run the patched Kueue topology-aware reclaim and RayCluster resize integration suites against envtest"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
 run = """
+set -e
 make test-integration \
   INTEGRATION_TARGET=./test/integration/singlecluster/tas/... \
   INTEGRATION_NPROCS=1 \
   'INTEGRATION_FILTERS=--focus="Topology-aware cohort reclaim"'
+make test-integration \
+  INTEGRATION_TARGET=./test/integration/singlecluster/controller/jobs/raycluster/... \
+  INTEGRATION_NPROCS=1 \
+  'INTEGRATION_FILTERS=--focus="resized past its admission"'
 """
 
 [tasks."test:kuberay"]

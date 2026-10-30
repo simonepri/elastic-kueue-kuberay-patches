@@ -237,10 +237,7 @@ docker run --rm -v "$PWD/tests/ray:/tests:ro" -v "$PWD/third_party/ray/python/ra
 description = "Run unit tests of the packages the partial preemption, Karpenter AdmissionCheck, deployment queue, and topology-aware reclaim patches change"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
-run = [
-  "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/ ./pkg/controller/jobs/deployment/ ./pkg/scheduler/...",
-  "go test ./pkg/controller/jobs/raycluster/ -run TestScaleDownByWholeReplicas",
-]
+run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobframework/... ./pkg/controller/jobs/... ./pkg/scheduler/... ./pkg/webhooks/..."
 
 [tasks."test:kueue-integration"]
 description = "Run the patched Kueue topology-aware reclaim integration suite against envtest"

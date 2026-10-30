@@ -374,19 +374,6 @@ index 0587106..6da3b27 100644
 +	}
 +	return candidates
 +}
-diff --git a/pkg/scheduler/preemption/elastic_shrink.go b/pkg/scheduler/preemption/elastic_shrink.go
-index 0e24952..39e7f07 100644
---- a/pkg/scheduler/preemption/elastic_shrink.go
-+++ b/pkg/scheduler/preemption/elastic_shrink.go
-@@ -160,7 +160,7 @@ func (s *shrinks) unshrink(t *Target) {
- // the minimum does not fit, it puts the target back whole, drops it, and
- // reports that the preemptor no longer fits.
- func (s *shrinks) shrink(ctx context.Context, strategy PreemptionStrategy, targets []*Target) ([]*Target, bool) {
--	fits := func() bool { return workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) }
-+	fits := func() bool { return workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) }
- 	for i := len(targets) - 1; i >= 0; i-- {
- 		t := targets[i]
- 		elastic, ok := s.elasticPodSet(ctx, t)
 diff --git a/pkg/scheduler/preemption/fair_strategy.go b/pkg/scheduler/preemption/fair_strategy.go
 index 866f02d..21475e2 100644
 --- a/pkg/scheduler/preemption/fair_strategy.go
@@ -562,13 +549,13 @@ index 558ed94..3d4afd7 100644
  }
  
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index fbf1bfa..2295c9d 100644
+index 64057dc..9eb6b61 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
 @@ -77,6 +77,7 @@ type Preemptor struct {
  	customLabels           *metrics.CustomLabels
  	preemptionExpectations *expectations.Store
- 	scaleDownSteps         ScaleDownSteps
+ 	scaleDownLimits        ScaleDownLimits
 +	topologyRetryFailures  *topologyRetryFailures
  }
  
@@ -592,16 +579,16 @@ index fbf1bfa..2295c9d 100644
  	}
  	return p
  }
-@@ -441,7 +447,7 @@ func (p *Preemptor) strategyTargets(ctx context.Context, strategy PreemptionStra
- 			shrunk.offer(ctx, candidate)
+@@ -447,7 +453,7 @@ func (p *Preemptor) strategyTargets(ctx context.Context, strategy PreemptionStra
+ 			sawElastic = true
  		}
  		targets = append(targets, candidate)
 -		if !workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
 +		if !workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
  			continue
  		}
- 		var fits bool
-@@ -656,6 +662,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
+ 		targets = fillBackWorkloads(ctx, strategy.pCtx, targets, strategy.allowBorrowing)
+@@ -673,6 +679,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
  	return workloadQuotaFits(preemptionCtx, allowBorrowing) && workloadTopologyFits(ctx, preemptionCtx)
  }
  
@@ -3033,10 +3020,10 @@ index 0000000..6a3c452
 +	}
 +}
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index 344cac5..44645ec 100644
+index 2ff465d..65ff6d7 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
-@@ -1573,6 +1573,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1576,6 +1576,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  	initialAssignment := flvAssigner.AssignFlavors(ctx, log, nil)
  	planner := nativeplanner.NewPlanner(wl, snap, s.preemptor, flvAssigner)
  	assignmentPlan := planner.Plan(ctx, &initialAssignment)
@@ -3044,7 +3031,7 @@ index 344cac5..44645ec 100644
  
  	if !assignmentPlan.CanFit() && workload.MinCountsUsable(wl.Obj) && wl.CanBePartiallyAdmitted() {
  		// bestPA is tracked here, not returned by fitsFn(), so it can't drift from
-@@ -1594,6 +1595,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1598,6 +1599,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  			assignmentPlan = *bestPartialPlan
  		}
  	}

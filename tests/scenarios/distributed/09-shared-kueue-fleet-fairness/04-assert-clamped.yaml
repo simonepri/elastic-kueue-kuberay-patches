@@ -1,6 +1,3 @@
-# The scale gate clamps the burst to the 8 workers the queue's quota allows.
-# The cluster is not an elastic job, so Kueue requeues it at its new size
-# instead of letting it run beyond its admission.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -8,5 +5,8 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: spot-workers
-      replicas: 8
+      replicas: 4
       maxReplicas: 8
+status:
+  (conditions[?type == 'ScaleGateClamped']):
+    - status: "True"

@@ -1,0 +1,39 @@
+# A worker group whose minReplicas of 6 already exceeds the 4 GPUs the ClusterQueue holds.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: oversized-minimum
+  labels:
+    kueue.x-k8s.io/queue-name: sg-floor-local-queue
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "1"
+                memory: "1Gi"
+  workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 8
+      minReplicas: 6
+      maxReplicas: 10
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "1Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"

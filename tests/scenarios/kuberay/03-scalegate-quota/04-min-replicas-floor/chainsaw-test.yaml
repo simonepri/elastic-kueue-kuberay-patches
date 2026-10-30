@@ -1,0 +1,22 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 23-scalegate-min-replicas-floor
+spec:
+  description: >
+    Verifies that ScaleGate never clamps a worker group below its minReplicas: when the quota holds fewer workers
+    than minReplicas, maxReplicas and replicas stop at minReplicas, so the operator never sees minReplicas greater
+    than maxReplicas.
+  steps:
+    - name: setup-queue
+      try:
+        - apply:
+            file: 00-queue.yaml
+    - name: submit-raycluster
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+    - name: assert-clamped-to-min-replicas
+      try:
+        - assert:
+            file: 02-assert-clamped-to-min.yaml

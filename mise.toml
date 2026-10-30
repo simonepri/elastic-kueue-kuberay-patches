@@ -250,6 +250,12 @@ make test-integration \
   'INTEGRATION_FILTERS=--focus="Topology-aware cohort reclaim"'
 """
 
+[tasks."test:kuberay"]
+description = "Run unit tests of the ScaleGate quota clamp the KubeRay patches add"
+depends = ["patch:kuberay"]
+dir = "third_party/kuberay/ray-operator"
+run = "go test ./controllers/ray/ -run 'TestScaleGate|TestClusterQueueQuota'"
+
 [tasks."test:interlink"]
 description = "Run patched interLink virtual kubelet unit tests"
 depends = ["patch:interlink"]
@@ -382,7 +388,7 @@ rules:
   resources: ["configmaps"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: ["kueue.x-k8s.io"]
-  resources: ["clusterqueues", "localqueues", "workloads", "workloads/status"]
+  resources: ["clusterqueues", "localqueues", "cohorts", "workloads", "workloads/status"]
   verbs: ["get", "list", "watch", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

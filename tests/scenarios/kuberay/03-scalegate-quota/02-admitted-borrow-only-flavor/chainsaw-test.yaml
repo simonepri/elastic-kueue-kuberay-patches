@@ -1,0 +1,26 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 21-scalegate-admitted-borrow-only-flavor
+spec:
+  description: >
+    Verifies that ScaleGate does not shrink a fixed-size RayCluster gang that Kueue admitted onto a flavor with no
+    nominal GPU quota and no borrowingLimit, which borrows from the cohort without limit, even though another flavor
+    of the same ClusterQueue holds fewer GPUs than the gang needs.
+  steps:
+    - name: setup-borrowing-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-fixed-size-gang
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+        - assert:
+            file: 02-assert-admitted.yaml
+    - name: assert-gang-not-clamped
+      try:
+        - sleep:
+            duration: 10s
+        - assert:
+            file: 03-assert-not-clamped.yaml

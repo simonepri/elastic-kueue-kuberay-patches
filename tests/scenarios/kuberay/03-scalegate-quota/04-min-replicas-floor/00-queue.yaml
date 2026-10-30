@@ -1,0 +1,31 @@
+# A ClusterQueue outside any cohort with 4 GPUs.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: sg-floor-gpu-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: sg-floor-queue
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: sg-floor-gpu-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: 100
+            - name: "memory"
+              nominalQuota: 500Gi
+            - name: "nvidia.com/gpu"
+              nominalQuota: 4
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: sg-floor-local-queue
+spec:
+  clusterQueue: sg-floor-queue

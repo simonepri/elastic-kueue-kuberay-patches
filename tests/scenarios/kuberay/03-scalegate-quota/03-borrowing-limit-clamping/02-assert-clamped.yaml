@@ -1,0 +1,14 @@
+# ScaleGate caps maxReplicas at nominal quota plus borrowingLimit: 2 + 2 GPUs fit 4 workers.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: elastic-borrower
+spec:
+  workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 4
+status:
+  (conditions[?type == 'ScaleGateClamped']):
+    - status: "True"

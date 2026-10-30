@@ -1,0 +1,52 @@
+# A team ClusterQueue with 2 nominal GPUs and a borrowingLimit of 2, in a cohort whose lender owns 16 more.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: sg-limit-gpu-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: sg-limit-team-queue
+spec:
+  cohortName: sg-limit-cohort
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: sg-limit-gpu-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: 100
+            - name: "memory"
+              nominalQuota: 500Gi
+            - name: "nvidia.com/gpu"
+              nominalQuota: 2
+              borrowingLimit: 2
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: sg-limit-lender-queue
+spec:
+  cohortName: sg-limit-cohort
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: sg-limit-gpu-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: 100
+            - name: "memory"
+              nominalQuota: 500Gi
+            - name: "nvidia.com/gpu"
+              nominalQuota: 16
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: sg-limit-local-queue
+spec:
+  clusterQueue: sg-limit-team-queue

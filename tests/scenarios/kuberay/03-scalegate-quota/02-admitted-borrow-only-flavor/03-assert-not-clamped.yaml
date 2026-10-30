@@ -1,0 +1,14 @@
+# ScaleGate leaves the admitted gang at its full size and valid, and records no clamp.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: fixed-gang
+spec:
+  workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 6
+      minReplicas: 6
+      maxReplicas: 6
+status:
+  desiredWorkerReplicas: 6
+  (length((conditions || `[]`)[?type == 'ScaleGateClamped'])): 0

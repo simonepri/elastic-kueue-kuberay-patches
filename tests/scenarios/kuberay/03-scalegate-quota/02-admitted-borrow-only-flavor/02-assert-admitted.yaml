@@ -1,0 +1,10 @@
+# Kueue admits the gang onto the borrow-only GPU flavor, borrowing from the lender's quota.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+status:
+  admission:
+    clusterQueue: sg-borrow-team-queue
+    (podSetAssignments[?name == 'gpu-workers']):
+      - count: 6
+        flavors:
+          nvidia.com/gpu: sg-borrow-shared-gpu-flavor

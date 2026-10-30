@@ -1,0 +1,39 @@
+# A fixed-size gang of 6 GPU workers: replicas, minReplicas, and maxReplicas are equal.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: fixed-gang
+  labels:
+    kueue.x-k8s.io/queue-name: sg-borrow-local-queue
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "1"
+                memory: "1Gi"
+  workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 6
+      minReplicas: 6
+      maxReplicas: 6
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "1Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  nvidia.com/gpu: "1"

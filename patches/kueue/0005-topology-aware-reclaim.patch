@@ -375,7 +375,7 @@ index 0587106..6da3b27 100644
 +	return candidates
 +}
 diff --git a/pkg/scheduler/preemption/fair_strategy.go b/pkg/scheduler/preemption/fair_strategy.go
-index eb81adb..ab8c21e 100644
+index 18edca5..2c801ec 100644
 --- a/pkg/scheduler/preemption/fair_strategy.go
 +++ b/pkg/scheduler/preemption/fair_strategy.go
 @@ -61,12 +61,45 @@ func fairPreemptionStrategy(
@@ -550,7 +550,7 @@ index 558ed94..3d4afd7 100644
  }
  
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index 4f5e699..1c6bd63 100644
+index 6b4d76a..4a3e4cb 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
 @@ -76,6 +76,7 @@ type Preemptor struct {
@@ -589,7 +589,7 @@ index 4f5e699..1c6bd63 100644
  				if psName, currentCount, minCount, isElastic := getElasticInfo(candidate.WorkloadInfo); isElastic {
  					if !shrinkTarget(ctx, strategy, candidate, psName, currentCount, minCount) {
  						// Min-viable guard: candidate cannot be shrunk without violating minReplicas.
-@@ -507,7 +513,7 @@ func shrinkTarget(ctx context.Context, strategy PreemptionStrategy, candidate *T
+@@ -520,7 +526,7 @@ func shrinkTarget(ctx context.Context, strategy PreemptionStrategy, candidate *T
  	for count := currentCount - 1; count >= minCount; count-- {
  		kept := shrunkUsage(candidate.WorkloadInfo, psName, count)
  		snapshot.AddWorkloadUsage(candidate.WorkloadInfo, kept)
@@ -598,7 +598,7 @@ index 4f5e699..1c6bd63 100644
  			candidate.NewCount = ptr.To(count)
  			candidate.PodSetName = psName
  			candidate.KeptUsage = kept
-@@ -701,6 +707,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
+@@ -714,6 +720,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
  	return workloadQuotaFits(preemptionCtx, allowBorrowing) && workloadTopologyFits(ctx, preemptionCtx)
  }
  
@@ -1048,10 +1048,10 @@ index 0000000..fcae8a2
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry.go b/pkg/scheduler/preemption/topology_retry.go
 new file mode 100644
-index 0000000..30ffa6b
+index 0000000..7125571
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry.go
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,557 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1214,13 +1214,13 @@ index 0000000..30ffa6b
 +	candidates := make([]*retryCandidate, 0, len(attempt.candidates))
 +	leaves := sets.New[flavorDomain]()
 +	for _, wl := range attempt.candidates {
-+		usage := wl.Usage()
++		quota, tas := freeableUsage(wl)
 +		candidate := &retryCandidate{
 +			wl:       wl,
 +			priority: priority.EffectivePriority(log, wl.Obj),
-+			quota:    workload.Usage{Quota: usage.Quota},
-+			tas:      workload.Usage{TAS: usage.TAS},
-+			domains:  candidateDomains(usage.TAS),
++			quota:    quota,
++			tas:      tas,
++			domains:  candidateDomains(tas.TAS),
 +		}
 +		leaves.Insert(candidate.domains...)
 +		candidates = append(candidates, candidate)
@@ -1577,6 +1577,20 @@ index 0000000..30ffa6b
 +		}
 +	}
 +	return best
++}
++
++// freeableUsage returns the most quota and TAS usage preempting wl can free,
++// as getTargets preempts it. An elastic workload is only shrunk, down to its
++// minimum count, which frees the quota of the pods it gives up and no topology
++// capacity, so placements never count on its topology domains.
++func freeableUsage(wl *workload.Info) (quota, tas workload.Usage) {
++	usage := wl.Usage()
++	psName, _, minCount, isElastic := getElasticInfo(wl)
++	if !isElastic {
++		return workload.Usage{Quota: usage.Quota}, workload.Usage{TAS: usage.TAS}
++	}
++	shrunk := &Target{WorkloadInfo: wl, NewCount: &minCount, KeptUsage: shrunkUsage(wl, psName, minCount)}
++	return releasedUsage(shrunk), workload.Usage{}
 +}
 +
 +// flavorDomain identifies a topology domain of a resource flavor.
@@ -2425,10 +2439,10 @@ index 0000000..940121a
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_test.go b/pkg/scheduler/preemption/topology_retry_test.go
 new file mode 100644
-index 0000000..d3870b7
+index 0000000..80f4ff7
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_test.go
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,539 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2872,6 +2886,99 @@ index 0000000..d3870b7
 +				t.Errorf("unexpected topology retry targets (-want/+got):\n%s", diff)
 +			}
 +			check()
++		})
++	}
++}
++
++func TestTopologyRetrySkipsPlacementsThatNeedAShrunkVictimsNodes(t *testing.T) {
++	// Nodes n0 to n7 each hold an elastic workload of priority 1 with 2 pods
++	// and a minimum of 1, and nodes n8 and n9 each hold two one-pod workloads
++	// of priority 2, the newer of which ordinary preemption takes after it
++	// fails to shrink any elastic workload enough. Freeing n0 to n7 would need
++	// the cheapest victims gone, but they can only be shrunk, which frees no
++	// node, so the retry must not spend its evaluations on them and frees n8
++	// or n9 instead.
++	now := time.Now().Truncate(time.Second)
++	admission := func(node string, pods int32) *kueue.Admission {
++		return utiltestingapi.MakeAdmission("borrower").PodSets(
++			utiltestingapi.MakePodSetAssignment("main").Count(pods).
++				Assignment(corev1.ResourceCPU, "tas", strconv.Itoa(int(pods))).
++				TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++					Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{node}, pods).Obj()).Obj()).Obj()).Obj()
++	}
++	var admitted []kueue.Workload
++	for n := range 8 {
++		node := fmt.Sprintf("n%d", n)
++		admitted = append(admitted, *utiltestingapi.MakeWorkload("elastic-"+node, "default").UID(types.UID("elastic-"+node)).Priority(1).
++			PodSets(*utiltestingapi.MakePodSet("main", 2).SetMinimumCount(1).Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
++			ReserveQuotaAt(admission(node, 2), now.Add(-time.Duration(n+10)*time.Hour)).Obj())
++	}
++	for _, w := range []struct {
++		name, node string
++		age        time.Duration
++	}{
++		{"n8-old", "n8", 3 * time.Hour}, {"n9-old", "n9", 2 * time.Hour}, {"n8-new", "n8", time.Hour}, {"n9-new", "n9", 0},
++	} {
++		admitted = append(admitted, *utiltestingapi.MakeWorkload(w.name, "default").UID(types.UID(w.name)).Priority(2).
++			PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
++			ReserveQuotaAt(admission(w.node, 1), now.Add(-w.age)).Obj())
++	}
++	modes := []struct {
++		name         string
++		cacheEnabled bool
++		fairSharing  *config.FairSharing
++	}{
++		{name: "classical/cache=false"},
++		{name: "classical/cache=true", cacheEnabled: true},
++		{name: "fairsharing", fairSharing: &config.FairSharing{}},
++	}
++	for _, mode := range modes {
++		t.Run(mode.name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++			features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++			ctx, log := utiltesting.ContextWithLog(t)
++			cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: admitted}).
++				WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).Build()
++			cache := schdcache.New(cl)
++			cache.AddOrUpdateTopology(log, utiltestingapi.MakeTopology("hostname").Levels(corev1.LabelHostname).Obj())
++			cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("tas").NodeLabel("pool", "tas").TopologyName("hostname").Obj())
++			for n := range 10 {
++				node := fmt.Sprintf("n%d", n)
++				cache.TASCache().SyncNode(testingnode.MakeNode(node).Label("pool", "tas").Label(corev1.LabelHostname, node).
++					StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourcePods: resource.MustParse("10")}).
++					Ready().Obj())
++			}
++			for _, cq := range []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "2", "0").Obj()).
++					Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyLowerPriority}).Obj(),
++				utiltestingapi.MakeClusterQueue("borrower").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "18").Obj()).Obj(),
++			} {
++				if err := cache.AddClusterQueue(ctx, cq); err != nil {
++					t.Fatal(err)
++				}
++			}
++			snapshot, err := cache.Snapshot(ctx)
++			if err != nil {
++				t.Fatal(err)
++			}
++			incoming := workload.NewInfo(log, utiltestingapi.MakeWorkload("incoming", "default").UID("incoming").Priority(3).
++				PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "2").UnconstrainedTopologyRequest().Obj()).Obj())
++			incoming.ClusterQueue = "incoming"
++			assignment := flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++				Name: "main", Count: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
++				Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "tas", Mode: flavorassigner.Preempt}},
++			}}}
++			preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
++			targets, retry := preemptor.GetTargets(ctx, *incoming, snapshot, assignment)
++			if len(targets) > 0 || retry == nil {
++				t.Fatalf("ordinary preemption found targets %v and retry=%t, want no targets and a retry", targetNames(targets), retry != nil)
++			}
++			got := targetNames(retry(ctx))
++			if !slices.Equal(got, []string{"n8-new", "n8-old"}) && !slices.Equal(got, []string{"n9-new", "n9-old"}) {
++				t.Errorf("topology retry found targets %v, want the workloads of node n8 or n9", got)
++			}
 +		})
 +	}
 +}

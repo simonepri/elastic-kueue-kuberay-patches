@@ -9,54 +9,6 @@ and picks the one whose victims cost the least.
 
 Builds on the upstream draft https://github.com/kubernetes-sigs/kueue/pull/17834.
 
-diff --git a/pkg/cache/scheduler/snapshot_workload_usage.go b/pkg/cache/scheduler/snapshot_workload_usage.go
-new file mode 100644
-index 0000000..063231e
---- /dev/null
-+++ b/pkg/cache/scheduler/snapshot_workload_usage.go
-@@ -0,0 +1,42 @@
-+/*
-+Copyright The Kubernetes Authors.
-+
-+Licensed under the Apache License, Version 2.0 (the "License");
-+you may not use this file except in compliance with the License.
-+You may obtain a copy of the License at
-+
-+    http://www.apache.org/licenses/LICENSE-2.0
-+
-+Unless required by applicable law or agreed to in writing, software
-+distributed under the License is distributed on an "AS IS" BASIS,
-+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+See the License for the specific language governing permissions and
-+limitations under the License.
-+*/
-+
-+package scheduler
-+
-+import (
-+	"sigs.k8s.io/kueue/pkg/workload"
-+)
-+
-+// RemoveWorkloadUsage removes usage, a part of wl's usage such as only its
-+// quota or only its TAS usage, from wl's ClusterQueue and the overlapping TAS
-+// flavors, and keeps wl in the ClusterQueue. It lets a search see the
-+// snapshot as if one kind of wl's usage were gone, at a fraction of the cost
-+// of RemoveWorkload. AddWorkloadUsage reverts it. Neither changes a workload
-+// whose usage was released.
-+func (s *Snapshot) RemoveWorkloadUsage(wl *workload.Info, usage workload.Usage) {
-+	cq := s.ClusterQueue(wl.ClusterQueue)
-+	if !cq.released.Has(workload.Key(wl.Obj)) {
-+		s.removeUsage(cq, usage)
-+	}
-+}
-+
-+// AddWorkloadUsage adds back usage removed by RemoveWorkloadUsage.
-+func (s *Snapshot) AddWorkloadUsage(wl *workload.Info, usage workload.Usage) {
-+	cq := s.ClusterQueue(wl.ClusterQueue)
-+	if !cq.released.Has(workload.Key(wl.Obj)) {
-+		s.AddUsage(cq, usage)
-+	}
-+}
 diff --git a/pkg/cache/scheduler/tas_flavor_snapshot_fingerprint.go b/pkg/cache/scheduler/tas_flavor_snapshot_fingerprint.go
 new file mode 100644
 index 0000000..3657518
@@ -598,7 +550,7 @@ index 558ed94..3d4afd7 100644
  }
  
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index e4f1814..56b0fe9 100644
+index 005a123..42de983 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
 @@ -76,6 +76,7 @@ type Preemptor struct {
@@ -637,7 +589,7 @@ index e4f1814..56b0fe9 100644
  				if psName, currentCount, minCount, isElastic := getElasticInfo(candidate.WorkloadInfo); isElastic {
  					totalUsage := candidate.WorkloadInfo.Usage()
  					perPodQuota := make(resources.FlavorResourceQuantities)
-@@ -690,6 +696,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
+@@ -702,6 +708,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
  	return workloadQuotaFits(preemptionCtx, allowBorrowing) && workloadTopologyFits(ctx, preemptionCtx)
  }
  
@@ -2464,10 +2416,10 @@ index 0000000..940121a
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_test.go b/pkg/scheduler/preemption/topology_retry_test.go
 new file mode 100644
-index 0000000..44cd7fd
+index 0000000..686f6df
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_test.go
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,404 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2827,6 +2779,48 @@ index 0000000..44cd7fd
 +			}
 +			b.StopTimer()
 +			b.ReportMetric(float64(targetCount)/float64(b.N), "targets/op")
++		})
++	}
++}
++
++func TestTopologyRetryShrinksElasticVictimKeepingTopologyUsage(t *testing.T) {
++	// Ordinary preemption stops after the newest victim, "x2-worker", returns
++	// ClusterQueue "borrower" to its nominal quota, while ClusterQueue "other"
++	// still holds the rest of node x2. Only freeing node x1 places the
++	// incoming workload, and shrinking "elastic" leaves its kept pod there.
++	cluster := elasticTopologyCluster{
++		nodes: []string{"x1", "x2"}, borrowerNominal: "2",
++		elasticPods: map[string]int32{"x1": 2}, elasticAge: time.Hour,
++		others: []elasticTopologyOther{
++			{name: "x2-worker", clusterQueue: "borrower", node: "x2"},
++			{name: "x2-other", clusterQueue: "other", node: "x2", age: time.Hour},
++		},
++	}
++	modes := []struct {
++		name         string
++		cacheEnabled bool
++		fairSharing  *config.FairSharing
++	}{
++		{name: "classical/cache=false"},
++		{name: "classical/cache=true", cacheEnabled: true},
++		{name: "fairsharing", fairSharing: &config.FairSharing{}},
++	}
++	for _, mode := range modes {
++		t.Run(mode.name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++			features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++			ctx, log := utiltesting.ContextWithLog(t)
++			setup := cluster.build(ctx, t, log)
++			check := checkSnapshotUnchanged(t, setup.snapshot)
++			preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++			targets, retry := preemptor.GetTargets(ctx, setup.incoming, setup.snapshot, setup.assignment)
++			if len(targets) > 0 || retry == nil {
++				t.Fatalf("ordinary preemption found targets %v and retry=%t, want no targets and a retry", targetNames(targets), retry != nil)
++			}
++			if got := targetNames(retry(ctx)); len(got) > 0 {
++				t.Errorf("topology retry found targets %v, want none", got)
++			}
++			check()
 +		})
 +	}
 +}

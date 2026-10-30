@@ -1,3 +1,53 @@
+diff --git a/pkg/cache/scheduler/snapshot_workload_usage.go b/pkg/cache/scheduler/snapshot_workload_usage.go
+new file mode 100644
+index 0000000..4601bd0
+--- /dev/null
++++ b/pkg/cache/scheduler/snapshot_workload_usage.go
+@@ -0,0 +1,44 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package scheduler
++
++import (
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// RemoveWorkloadUsage removes usage, a part of wl's usage such as only its
++// quota or only its TAS usage, from wl's ClusterQueue and the overlapping TAS
++// flavors, and keeps wl in the ClusterQueue. It lets a search see the
++// snapshot as if one kind of wl's usage were gone, at a fraction of the cost
++// of RemoveWorkload. AddWorkloadUsage reverts it. Neither changes a workload
++// whose usage was released.
++func (s *Snapshot) RemoveWorkloadUsage(wl *workload.Info, usage workload.Usage) {
++	cq := s.ClusterQueue(wl.ClusterQueue)
++	if !cq.released.Has(workload.Key(wl.Obj)) {
++		s.removeUsage(cq, usage)
++	}
++}
++
++// AddWorkloadUsage adds usage, a part of wl's usage, to wl's ClusterQueue and
++// the overlapping TAS flavors without adding wl to the ClusterQueue, such as
++// usage removed by RemoveWorkloadUsage or the part a removed wl keeps.
++func (s *Snapshot) AddWorkloadUsage(wl *workload.Info, usage workload.Usage) {
++	cq := s.ClusterQueue(wl.ClusterQueue)
++	if !cq.released.Has(workload.Key(wl.Obj)) {
++		s.AddUsage(cq, usage)
++	}
++}
 diff --git a/pkg/controller/jobframework/interface.go b/pkg/controller/jobframework/interface.go
 index 35462b3..e4d17f2 100644
 --- a/pkg/controller/jobframework/interface.go
@@ -168,7 +218,7 @@ index 666564b..af13c71 100644
  	Reason       string
  	WorkloadCq   *scheduler.ClusterQueueSnapshot
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index 5a5071f..e4f1814 100644
+index 5a5071f..005a123 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
 @@ -33,6 +33,7 @@ import (
@@ -210,7 +260,7 @@ index 5a5071f..e4f1814 100644
  		if workloadevict.IsEvicted(target.WorkloadInfo.Obj) {
  			log.V(3).Info("Preemption ongoing", "targetWorkload", klog.KObj(target.WorkloadInfo.Obj), "preemptingWorkload", klog.KObj(preemptor.Obj))
  			successfullyPreempted.Add(1)
-@@ -389,6 +407,51 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
+@@ -389,6 +407,58 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
  		for candidate := range strategy.candidates {
  			targets = append(targets, candidate)
  			if workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
@@ -221,6 +271,12 @@ index 5a5071f..e4f1814 100644
 +						perPodQuota[fr] = q.QuoInt64(int64(currentCount))
 +					}
 +					candCQ := strategy.pCtx.snapshot.ClusterQueue(candidate.WorkloadInfo.ClusterQueue)
++					// A shrink frees quota but no topology capacity: the
++					// shrunk workload keeps its TopologyAssignment, from
++					// which Kueue counts its TAS usage, and which pods the
++					// job deletes is not known here.
++					keptTAS := workload.Usage{TAS: candidate.WorkloadInfo.TASUsage()}
++					strategy.pCtx.snapshot.AddWorkloadUsage(candidate.WorkloadInfo, keptTAS)
 +
 +					kept := int32(0)
 +					for k := currentCount - 1; k >= minCount; k-- {
@@ -254,6 +310,7 @@ index 5a5071f..e4f1814 100644
 +					} else {
 +						// Min-viable guard: candidate cannot be shrunk without violating minReplicas.
 +						// Protect the elastic workload from full eviction.
++						strategy.pCtx.snapshot.RemoveWorkloadUsage(candidate.WorkloadInfo, keptTAS)
 +						strategy.pCtx.snapshot.AddWorkload(candidate.WorkloadInfo)
 +						targets = targets[:len(targets)-1]
 +						continue
@@ -262,7 +319,21 @@ index 5a5071f..e4f1814 100644
  				targets = fillBackWorkloads(ctx, strategy.pCtx, targets, strategy.allowBorrowing)
  				if strategy.verify != nil {
  					if valid, reason := strategy.verify(targets); !valid {
-@@ -425,6 +488,10 @@ func restoreSnapshot(snapshot *schdcache.Snapshot, targets []*Target) {
+@@ -416,8 +486,13 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
+ 	return nil
+ }
+ 
++// restoreSnapshot adds the targets back to the snapshot, including the TAS
++// usage of shrunk targets, which getTargets leaves in it.
+ func restoreSnapshot(snapshot *schdcache.Snapshot, targets []*Target) {
+ 	for _, t := range targets {
++		if t.NewCount != nil {
++			snapshot.RemoveWorkloadUsage(t.WorkloadInfo, workload.Usage{TAS: t.WorkloadInfo.TASUsage()})
++		}
+ 		snapshot.AddWorkload(t.WorkloadInfo)
+ 	}
+ }
+@@ -425,6 +500,10 @@ func restoreSnapshot(snapshot *schdcache.Snapshot, targets []*Target) {
  // fillBackWorkloads checks in the reverse order if any of the workloads can be added back.
  func fillBackWorkloads(ctx context.Context, preemptionCtx *preemptionCtx, targets []*Target, allowBorrowing bool) []*Target {
  	for i := len(targets) - 2; i >= 0; i-- {
@@ -273,7 +344,7 @@ index 5a5071f..e4f1814 100644
  		preemptionCtx.snapshot.AddWorkload(targets[i].WorkloadInfo)
  		if workloadFits(ctx, preemptionCtx, allowBorrowing) {
  			// O(1) deletion: copy the last element into index i and reduce size.
-@@ -437,6 +504,61 @@ func fillBackWorkloads(ctx context.Context, preemptionCtx *preemptionCtx, target
+@@ -437,6 +516,61 @@ func fillBackWorkloads(ctx context.Context, preemptionCtx *preemptionCtx, target
  	return targets
  }
  
@@ -335,6 +406,262 @@ index 5a5071f..e4f1814 100644
  // parseStrategies converts the configured FairSharing preemption strategies into
  // the functions to be used by the algorithm.
  // This function takes advantage of the properties of the preemption algorithm and
+diff --git a/pkg/scheduler/preemption/preemption_elastic_tas_test.go b/pkg/scheduler/preemption/preemption_elastic_tas_test.go
+new file mode 100644
+index 0000000..acbf588
+--- /dev/null
++++ b/pkg/scheduler/preemption/preemption_elastic_tas_test.go
+@@ -0,0 +1,250 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package preemption
++
++import (
++	"context"
++	"fmt"
++	"maps"
++	"slices"
++	"testing"
++	"time"
++
++	"github.com/go-logr/logr"
++	gocmp "github.com/google/go-cmp/cmp"
++	"github.com/google/go-cmp/cmp/cmpopts"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	clocktesting "k8s.io/utils/clock/testing"
++
++	config "sigs.k8s.io/kueue/apis/config/v1beta2"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// elasticTopologyCluster describes a cohort where ClusterQueue "incoming",
++// with a nominal quota of 2 CPUs it does not lend, reclaims CPU that
++// ClusterQueue "borrower" borrows from it. Every node has 2 CPUs. Workload
++// "elastic" of ClusterQueue "borrower" runs 2 pods of 1 CPU with a minimum of
++// 1, placed by elasticPods; the other workloads run one pod of 1 CPU each.
++type elasticTopologyCluster struct {
++	nodes           []string
++	borrowerNominal string
++	elasticPods     map[string]int32
++	elasticAge      time.Duration
++	others          []elasticTopologyOther
++}
++
++// elasticTopologyOther is a one-pod workload admitted age ago on node.
++type elasticTopologyOther struct {
++	name         string
++	clusterQueue kueue.ClusterQueueReference
++	node         string
++	age          time.Duration
++}
++
++type elasticTopologySetup struct {
++	snapshot   *schdcache.Snapshot
++	incoming   workload.Info
++	assignment flavorassigner.Assignment
++}
++
++// build creates the snapshot and an incoming workload of priority 3 that needs
++// 2 CPUs on one node; every admitted workload has priority 1.
++func (c elasticTopologyCluster) build(ctx context.Context, t testing.TB, log logr.Logger) elasticTopologySetup {
++	t.Helper()
++	now := time.Now().Truncate(time.Second)
++	admission := func(cq kueue.ClusterQueueReference, pods map[string]int32) *kueue.Admission {
++		topology := utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname})
++		var count int32
++		for _, node := range slices.Sorted(maps.Keys(pods)) {
++			topology.Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{node}, pods[node]).Obj())
++			count += pods[node]
++		}
++		return utiltestingapi.MakeAdmission(cq).PodSets(
++			utiltestingapi.MakePodSetAssignment("main").Count(count).
++				Assignment(corev1.ResourceCPU, "tas", fmt.Sprint(count)).
++				TopologyAssignment(topology.Obj()).Obj()).Obj()
++	}
++	admitted := []kueue.Workload{
++		*utiltestingapi.MakeWorkload("elastic", "default").UID("elastic").Priority(1).
++			PodSets(*utiltestingapi.MakePodSet("main", 2).SetMinimumCount(1).Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
++			ReserveQuotaAt(admission("borrower", c.elasticPods), now.Add(-c.elasticAge)).Obj(),
++	}
++	for _, other := range c.others {
++		admitted = append(admitted, *utiltestingapi.MakeWorkload(other.name, "default").Priority(1).
++			PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
++			ReserveQuotaAt(admission(other.clusterQueue, map[string]int32{other.node: 1}), now.Add(-other.age)).Obj())
++	}
++
++	cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: admitted}).
++		WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).Build()
++	cache := schdcache.New(cl)
++	cache.AddOrUpdateTopology(log, utiltestingapi.MakeTopology("hostname").Levels(corev1.LabelHostname).Obj())
++	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("tas").NodeLabel("pool", "tas").TopologyName("hostname").Obj())
++	for _, node := range c.nodes {
++		cache.TASCache().SyncNode(testingnode.MakeNode(node).Label("pool", "tas").Label(corev1.LabelHostname, node).
++			StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourcePods: resource.MustParse("10")}).
++			Ready().Obj())
++	}
++	for _, cq := range []*kueue.ClusterQueue{
++		utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "2", "0").Obj()).
++			Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyLowerPriority}).Obj(),
++		utiltestingapi.MakeClusterQueue("borrower").Cohort("shared").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, c.borrowerNominal).Obj()).Obj(),
++		utiltestingapi.MakeClusterQueue("other").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "1").Obj()).Obj(),
++	} {
++		if err := cache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++	}
++	snapshot, err := cache.Snapshot(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	incoming := workload.NewInfo(log, utiltestingapi.MakeWorkload("incoming", "default").UID("incoming").Priority(3).
++		PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "2").UnconstrainedTopologyRequest().Obj()).Obj())
++	incoming.ClusterQueue = "incoming"
++	return elasticTopologySetup{
++		snapshot: snapshot,
++		incoming: *incoming,
++		assignment: flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++			Name: "main", Count: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
++			Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "tas", Mode: flavorassigner.Preempt}},
++		}}},
++	}
++}
++
++// targetNames returns the sorted names of the targets, with the pod count a
++// shrunk target keeps.
++func targetNames(targets []*Target) []string {
++	var names []string
++	for _, target := range targets {
++		name := target.WorkloadInfo.Obj.Name
++		if target.NewCount != nil {
++			name = fmt.Sprintf("%s/%d", name, *target.NewCount)
++		}
++		names = append(names, name)
++	}
++	slices.Sort(names)
++	return names
++}
++
++// checkSnapshotUnchanged fails the test when the targets search left quota or
++// topology usage behind in the snapshot.
++func checkSnapshotUnchanged(t *testing.T, snapshot *schdcache.Snapshot) func() {
++	t.Helper()
++	usage := maps.Clone(snapshot.ClusterQueue("borrower").ResourceNode.Usage)
++	capacity, err := snapshot.ClusterQueue("incoming").TASFlavors["tas"].SerializeFreeCapacityPerDomain()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return func() {
++		t.Helper()
++		if diff := gocmp.Diff(usage, snapshot.ClusterQueue("borrower").ResourceNode.Usage); diff != "" {
++			t.Errorf("quota snapshot changed (-before/+after):\n%s", diff)
++		}
++		after, err := snapshot.ClusterQueue("incoming").TASFlavors["tas"].SerializeFreeCapacityPerDomain()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if diff := gocmp.Diff(capacity, after); diff != "" {
++			t.Errorf("topology snapshot changed (-before/+after):\n%s", diff)
++		}
++	}
++}
++
++func TestPreemptionShrinksElasticVictimKeepingTopologyUsage(t *testing.T) {
++	cases := map[string]struct {
++		cluster     elasticTopologyCluster
++		wantTargets []string
++	}{
++		"the pod a shrunk victim keeps still occupies the only node": {
++			cluster: elasticTopologyCluster{
++				nodes: []string{"x1"}, borrowerNominal: "1",
++				elasticPods: map[string]int32{"x1": 2},
++			},
++		},
++		"a whole victim on another node is evicted when the shrunk victim's node stays occupied": {
++			cluster: elasticTopologyCluster{
++				nodes: []string{"x1", "x2"}, borrowerNominal: "2",
++				elasticPods: map[string]int32{"x1": 2},
++				others:      []elasticTopologyOther{{name: "x2-worker", clusterQueue: "borrower", node: "x2", age: time.Hour}},
++			},
++			wantTargets: []string{"x2-worker"},
++		},
++		"shrinking a victim spread over both nodes frees neither node": {
++			cluster: elasticTopologyCluster{
++				nodes: []string{"x1", "x2"}, borrowerNominal: "1",
++				elasticPods: map[string]int32{"x1": 1, "x2": 1},
++			},
++		},
++		"the victim is shrunk when its pods occupy another node than the one the preemptor takes": {
++			cluster: elasticTopologyCluster{
++				nodes: []string{"x1", "x2"}, borrowerNominal: "1",
++				elasticPods: map[string]int32{"x2": 2},
++			},
++			wantTargets: []string{"elastic/1"},
++		},
++		"a victim whose node the preemptor takes is not added back while a shrunk victim keeps its node": {
++			cluster: elasticTopologyCluster{
++				nodes: []string{"x1", "x2"}, borrowerNominal: "1",
++				elasticPods: map[string]int32{"x1": 2}, elasticAge: time.Hour,
++				others: []elasticTopologyOther{{name: "x2-worker", clusterQueue: "borrower", node: "x2"}},
++			},
++			wantTargets: []string{"elastic/1", "x2-worker"},
++		},
++	}
++	modes := []struct {
++		name         string
++		cacheEnabled bool
++		fairSharing  *config.FairSharing
++	}{
++		{name: "classical/cache=false"},
++		{name: "classical/cache=true", cacheEnabled: true},
++		{name: "fairsharing", fairSharing: &config.FairSharing{}},
++	}
++	for _, mode := range modes {
++		t.Run(mode.name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++			for name, tc := range cases {
++				t.Run(name, func(t *testing.T) {
++					features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++					ctx, log := utiltesting.ContextWithLog(t)
++					setup := tc.cluster.build(ctx, t, log)
++					check := checkSnapshotUnchanged(t, setup.snapshot)
++					preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++					targets := preemptor.GetTargetsWithStrategy(ctx, preemptor.GetPreemptionStrategyIterator(ctx, setup.incoming, setup.snapshot, setup.assignment))
++					if diff := gocmp.Diff(tc.wantTargets, targetNames(targets), cmpopts.EquateEmpty()); diff != "" {
++						t.Errorf("unexpected preemption targets (-want/+got):\n%s", diff)
++					}
++					check()
++				})
++			}
++		})
++	}
++}
 diff --git a/pkg/webhooks/workload_webhook.go b/pkg/webhooks/workload_webhook.go
 index 7caf243..e5b72be 100644
 --- a/pkg/webhooks/workload_webhook.go

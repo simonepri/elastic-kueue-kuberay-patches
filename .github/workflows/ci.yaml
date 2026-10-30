@@ -142,6 +142,20 @@ jobs:
       - name: Run Patched Kueue Integration Tests
         run: mise run test:kueue-integration
 
+  kuberay-unit-tests:
+    name: KubeRay Unit Tests
+    needs: [validate-patches]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+
+      - name: Run Patched KubeRay Unit Tests
+        run: mise run test:kuberay
+
   interlink-unit-tests:
     name: interLink Virtual Kubelet Unit Tests
     needs: [validate-patches]

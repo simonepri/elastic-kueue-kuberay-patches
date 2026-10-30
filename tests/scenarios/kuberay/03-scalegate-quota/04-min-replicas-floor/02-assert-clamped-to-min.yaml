@@ -1,0 +1,14 @@
+# ScaleGate stops at minReplicas, so the worker group stays valid with minReplicas equal to maxReplicas.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: oversized-minimum
+spec:
+  workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 6
+      minReplicas: 6
+      maxReplicas: 6
+status:
+  (conditions[?type == 'ScaleGateClamped']):
+    - status: "True"

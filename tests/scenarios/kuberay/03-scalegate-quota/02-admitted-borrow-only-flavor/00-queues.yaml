@@ -1,0 +1,68 @@
+# A team ClusterQueue whose GPU flavors are a small reserved pool and a borrow-only pool (nominal 0, no
+# borrowingLimit), plus a lender ClusterQueue in the same cohort that owns the borrow-only pool's GPUs.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: sg-borrow-cpu-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: sg-borrow-reserved-gpu-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: sg-borrow-shared-gpu-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: sg-borrow-team-queue
+spec:
+  cohortName: sg-borrow-cohort
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: sg-borrow-cpu-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: 100
+            - name: "memory"
+              nominalQuota: 500Gi
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: sg-borrow-reserved-gpu-flavor
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 2
+        - name: sg-borrow-shared-gpu-flavor
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 0
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: sg-borrow-lender-queue
+spec:
+  cohortName: sg-borrow-cohort
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: sg-borrow-shared-gpu-flavor
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 16
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: sg-borrow-local-queue
+spec:
+  clusterQueue: sg-borrow-team-queue

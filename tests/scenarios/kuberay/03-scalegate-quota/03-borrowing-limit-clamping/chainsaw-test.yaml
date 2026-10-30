@@ -1,0 +1,21 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 22-scalegate-borrowing-limit-clamping
+spec:
+  description: >
+    Verifies that a ClusterQueue borrowingLimit still bounds a worker group: ScaleGate caps maxReplicas at the
+    nominal quota plus borrowingLimit, even though the cohort could lend more.
+  steps:
+    - name: setup-limited-borrowing-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-elastic-raycluster
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+    - name: assert-clamped-to-borrowing-limit
+      try:
+        - assert:
+            file: 02-assert-clamped.yaml

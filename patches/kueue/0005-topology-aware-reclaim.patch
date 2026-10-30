@@ -1087,10 +1087,10 @@ index 0000000..fcae8a2
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry.go b/pkg/scheduler/preemption/topology_retry.go
 new file mode 100644
-index 0000000..29bada9
+index 0000000..30ffa6b
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry.go
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,543 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1112,6 +1112,7 @@ index 0000000..29bada9
 +import (
 +	"cmp"
 +	"context"
++	"math/bits"
 +	"slices"
 +
 +	"k8s.io/apimachinery/pkg/util/sets"
@@ -1126,13 +1127,16 @@ index 0000000..29bada9
 +)
 +
 +// maxTopologyEvaluations bounds how many placements a topology retry runs the
-+// preemption strategy for in each attempt, and maxTopologySearches bounds how
-+// many topology searches it runs to find the priority ceiling and the
-+// placements, so a workload that keeps failing costs a bounded amount of work
-+// per scheduling attempt, however many candidates and priorities there are.
++// preemption strategy for in each attempt. maxTopologySearches and
++// maxMinimizingSearches bound how many topology searches it runs to find the
++// priority ceiling and the placements and to trim each placement's victims,
++// so a workload that keeps failing costs a bounded amount of work per
++// scheduling attempt, however many candidates and priorities there are; see
++// topologyRetryAttemptTargets for the bound.
 +const (
 +	maxTopologyEvaluations = 8
 +	maxTopologySearches    = 64
++	maxMinimizingSearches  = 8
 +)
 +
 +// TopologyRetry searches for preemption targets that free whole topology
@@ -1178,9 +1182,10 @@ index 0000000..29bada9
 +// priority alone. The ordinary attempts stop taking victims once each
 +// borrowing queue is back at its nominal quota, which can leave the freed
 +// capacity spread across topology domains. For the first attempt that frees a
-+// placement, it returns the targets that cost the least: the lowest
-+// highest-priority target first, then the lowest next-highest, and so on, then
-+// the fewest targets.
++// placement, it returns the targets that cost the least among the
++// placements it evaluates: the lowest highest-priority target first, then the
++// lowest next-highest, and so on, then the fewest targets. See
++// topologyRetryAttemptTargets for which of these are exact.
 +func (p *Preemptor) topologyRetryTargets(ctx context.Context, pCtx *preemptionCtx) []*Target {
 +	var attempts []topologyRetryAttempt
 +	if p.enableFairSharing {
@@ -1204,10 +1209,9 @@ index 0000000..29bada9
 +	quota    workload.Usage
 +	tas      workload.Usage
 +	domains  []flavorDomain
-+	// lenders are the ClusterQueue and Cohorts that give up the candidate's
-+	// quota, up to the first Cohort shared with the preemptor; none for a
-+	// candidate in the preemptor's ClusterQueue.
-+	lenders []reclaimNode
++	// order is the candidate's position in ascending priority, ties in the
++	// order the strategy offers them.
++	order int
 +	// removedLeaves counts the freed leaves the candidate occupies.
 +	removedLeaves int
 +	// excluded marks the occupants of a placement already found, which stay
@@ -1217,48 +1221,67 @@ index 0000000..29bada9
 +
 +// topologyRetryAttemptTargets raises a priority ceiling through the
 +// candidates' priorities, lowest first, and starts at the first ceiling where
-+// removing the candidates at or below it frees both the quota, within what
-+// each ClusterQueue may give up, and a topology placement for the preemptor.
-+// No placement can do with a lower highest-priority victim, however many
-+// topology domains there are. At that ceiling, it finds the placements whose
-+// occupants cost the least and stay within what their ClusterQueues may give
-+// up, runs the strategy for them, limited to the candidates at or below the
-+// ceiling, and returns the targets that cost the least. When the policies
-+// reject every such placement, it moves on to the next ceiling. The search
-+// removes only the quota or only the TAS usage of the candidates, and
-+// restores the snapshot before it runs a strategy.
++// removing every candidate at or below it frees both the quota and a
++// topology placement for the preemptor. Removing more candidates never frees
++// less, so no set of victims below that ceiling admits the preemptor,
++// however many topology domains there are. At each ceiling from there, it
++// finds the placements whose occupants cost the least, keeps of each only
++// the occupants the preemptor needs gone, skips those the ClusterQueues may
++// not give up together, runs the strategy for the rest, limited to the
++// candidates at or below the ceiling, and returns the targets that cost the
++// least. When the policies reject every such placement, it moves on to the
++// next ceiling. The search removes only the quota or only the TAS usage of
++// the candidates, and restores the snapshot before it runs a strategy.
++//
++// It runs the strategy at most maxTopologyEvaluations times and at most
++// maxTopologySearches + maxTopologyEvaluations*(2*bits.Len(L) +
++// maxMinimizingSearches) topology searches, where L is the number of
++// topology leaves the candidates occupy: finding the starting ceiling takes
++// about log2 of the number of distinct priorities, and each placement about
++// 2*log2(L) to find and up to maxMinimizingSearches to trim. With 8
++// evaluations and 1024 leaves that is 304 searches.
++//
++// The highest priority among the targets is the lowest any set of victims
++// that admits the preemptor can have when the strategy succeeds at the
++// starting ceiling, given that freeing more capacity never makes a topology
++// placement stop fitting. The lowest next-highest priorities and the fewest
++// targets are best effort: they compare only the placements found, at most
++// maxTopologyEvaluations, chosen by a greedy order of topology leaves.
 +func (p *Preemptor) topologyRetryAttemptTargets(ctx context.Context, pCtx *preemptionCtx, attempt topologyRetryAttempt) []*Target {
 +	log := log.FromContext(ctx)
 +	limits := newReclaimLimits(pCtx)
 +	candidates := make([]*retryCandidate, 0, len(attempt.candidates))
++	leaves := sets.New[flavorDomain]()
 +	for _, wl := range attempt.candidates {
 +		usage := wl.Usage()
-+		candidates = append(candidates, &retryCandidate{
++		candidate := &retryCandidate{
 +			wl:       wl,
 +			priority: priority.EffectivePriority(log, wl.Obj),
 +			quota:    workload.Usage{Quota: usage.Quota},
 +			tas:      workload.Usage{TAS: usage.TAS},
 +			domains:  candidateDomains(usage.TAS),
-+			lenders:  limits.lenders(pCtx.snapshot.ClusterQueue(wl.ClusterQueue)),
-+		})
++		}
++		leaves.Insert(candidate.domains...)
++		candidates = append(candidates, candidate)
 +	}
 +	slices.SortStableFunc(candidates, func(a, b *retryCandidate) int { return cmp.Compare(a.priority, b.priority) })
 +	var ceilings []int
-+	for i := range candidates {
-+		if i+1 == len(candidates) || candidates[i+1].priority != candidates[i].priority {
++	for i, candidate := range candidates {
++		candidate.order = i
++		if i+1 == len(candidates) || candidates[i+1].priority != candidate.priority {
 +			ceilings = append(ceilings, i+1)
 +		}
 +	}
 +
-+	searches := maxTopologySearches
-+	start := lowestQuotaCeiling(pCtx, limits, candidates, ceilings, attempt.allowBorrowing)
++	searches := maxTopologySearches + maxTopologyEvaluations*(2*bits.Len(uint(leaves.Len()))+maxMinimizingSearches)
++	start := lowestQuotaCeiling(pCtx, candidates, ceilings, attempt.allowBorrowing)
 +	start = lowestTopologyCeiling(ctx, pCtx, candidates, ceilings, start, &searches)
 +	evaluations := maxTopologyEvaluations
 +	for _, end := range ceilings[start:] {
 +		if evaluations == 0 || searches == 0 {
 +			break
 +		}
-+		placements := cheapestPlacements(ctx, pCtx, limits, candidates[:end], evaluations, &searches)
++		placements := cheapestPlacements(ctx, pCtx, limits, candidates[:end], attempt.allowBorrowing, evaluations, &searches)
 +		if len(placements) == 0 {
 +			continue
 +		}
@@ -1273,27 +1296,20 @@ index 0000000..29bada9
 +}
 +
 +// lowestQuotaCeiling returns the index of the first ceiling at which removing
-+// the quota usage of the candidates at or below it, lowest priority first and
-+// only while their ClusterQueues may give it up, lets the preemptor's quota
-+// fit, or len(ceilings) when none does.
-+func lowestQuotaCeiling(pCtx *preemptionCtx, limits *reclaimLimits, candidates []*retryCandidate, ceilings []int, allowBorrowing bool) int {
-+	var removed []*retryCandidate
++// the quota usage of every candidate at or below it lets the preemptor's
++// quota fit, or len(ceilings) when none does. It ignores which candidates the
++// ClusterQueues may give up, so the ceiling it returns is never above the
++// lowest one the strategies can reach.
++func lowestQuotaCeiling(pCtx *preemptionCtx, candidates []*retryCandidate, ceilings []int, allowBorrowing bool) int {
++	removed := 0
 +	defer func() {
-+		for _, candidate := range removed {
++		for _, candidate := range candidates[:removed] {
 +			pCtx.snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
 +		}
 +	}()
-+	given := limits.newTally()
-+	next := 0
 +	for i, end := range ceilings {
-+		for ; next < end; next++ {
-+			candidate := candidates[next]
-+			if !given.canGive(candidate) {
-+				continue
-+			}
-+			given.add(candidate)
-+			pCtx.snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
-+			removed = append(removed, candidate)
++		for ; removed < end; removed++ {
++			pCtx.snapshot.RemoveWorkloadUsage(candidates[removed].wl, candidates[removed].quota)
 +		}
 +		if workloadQuotaFits(pCtx, allowBorrowing) {
 +			return i
@@ -1305,8 +1321,9 @@ index 0000000..29bada9
 +// lowestTopologyCeiling returns the index of the first ceiling, from start
 +// on, at which removing the TAS usage of every candidate at or below it lets
 +// a topology placement fit, or len(ceilings) when none does. It bisects the
-+// ceilings, so its searches grow with the logarithm of the number of distinct
-+// priorities, and it charges each one to searches.
++// ceilings, which assumes that freeing more capacity never makes a placement
++// stop fitting, so its searches grow with the logarithm of the number of
++// distinct priorities, and it charges each one to searches.
 +func lowestTopologyCeiling(ctx context.Context, pCtx *preemptionCtx, candidates []*retryCandidate, ceilings []int, start int, searches *int) int {
 +	// cheapestPlacements searches with every candidate removed at the last
 +	// ceiling anyway.
@@ -1329,8 +1346,7 @@ index 0000000..29bada9
 +		}
 +		*searches--
 +		setRemoved(ceilings[i])
-+		assignments := pCtx.assignment.FindTopologyAssignments(ctx, pCtx.preemptorCQ, pCtx.tasRequests, schdcache.WithWorkloadInfo(&pCtx.preemptor))
-+		return assignments.Failure() == nil, true
++		return topologyFits(ctx, pCtx), true
 +	}
 +	// low never fits; high fits.
 +	low, high := start-1, len(ceilings)-1
@@ -1352,19 +1368,37 @@ index 0000000..29bada9
 +	return high
 +}
 +
++// topologyFits reports whether a topology placement of the preemptor fits in
++// the current state of the snapshot.
++func topologyFits(ctx context.Context, pCtx *preemptionCtx) bool {
++	return pCtx.assignment.FindTopologyAssignments(ctx, pCtx.preemptorCQ, pCtx.tasRequests, schdcache.WithWorkloadInfo(&pCtx.preemptor)).Failure() == nil
++}
++
 +// cheapestPlacements finds up to limit placements of the preemptor, cheapest
 +// first, that removing candidates makes possible within what their
-+// ClusterQueues may give up, and returns, for each, the candidates occupying
-+// its topology domains. Each topology leaf offers the cheapest of its
-+// candidates that its ClusterQueues may give up together. It orders the
-+// leaves by the priorities of those candidates, highest first, compared like
-+// victim costs, and frees the shortest run of the cheapest leaves after which
-+// a placement fits, so a placement inside one leaf is the cheapest one. It
-+// then keeps the occupants in place and looks for the next placement. A
-+// placement whose occupants together exceed what their ClusterQueues may give
-+// up is skipped and does not count toward limit. It charges each topology
-+// search to searches and returns what it found when they run out.
-+func cheapestPlacements(ctx context.Context, pCtx *preemptionCtx, limits *reclaimLimits, candidates []*retryCandidate, limit int, searches *int) []sets.Set[*workload.Info] {
++// ClusterQueues may give up, and returns, for each, the candidates the
++// preemptor needs gone from its topology domains.
++//
++// Each topology leaf offers a set of its candidates that their ClusterQueues
++// and Cohorts may give up together, built from the most expensive candidate
++// down, so a cheap candidate a placement may not need cannot use up what a
++// lender may give before one it does. It orders the leaves by the priorities
++// of those candidates, highest first, compared like victim costs, and frees
++// the shortest run of the cheapest leaves after which a placement fits, found
++// by bisection, which assumes that freeing more leaves never makes a
++// placement stop fitting, so a placement inside one leaf is the cheapest one. It then puts back the
++// occupants of the placement's leaves, most expensive first, that the
++// preemptor's topology placement and quota still fit without, keeps the rest
++// as the placement's victims, and keeps every occupant in place while it
++// looks for the next placement. A placement whose victims the ClusterQueues
++// may not give up together is skipped and does not count toward limit. It
++// charges each topology search to searches and returns what it found when
++// they run out.
++//
++// The leaf order and the occupants it puts back are greedy: they find the
++// lowest highest-priority victim the ceiling allows, but not always the
++// lowest next-highest victims or the fewest victims.
++func cheapestPlacements(ctx context.Context, pCtx *preemptionCtx, limits *reclaimLimits, candidates []*retryCandidate, allowBorrowing bool, limit int, searches *int) []sets.Set[*workload.Info] {
 +	allOccupants := make(map[flavorDomain][]*retryCandidate)
 +	for _, candidate := range candidates {
 +		candidate.removedLeaves, candidate.excluded = 0, false
@@ -1379,15 +1413,12 @@ index 0000000..29bada9
 +	byLeaf := make(map[flavorDomain][]*retryCandidate, len(allOccupants))
 +	leaves := make([]leafCost, 0, len(allOccupants))
 +	for leaf, occupants := range allOccupants {
-+		// The occupants are in ascending priority, so this keeps the cheapest
-+		// ones the ClusterQueues may give up together.
-+		var freeable []*retryCandidate
++		// The occupants are in ascending priority.
 +		group := limits.newGroup()
-+		for _, occupant := range occupants {
-+			if group.tryAdd(occupant) {
-+				freeable = append(freeable, occupant)
-+			}
++		for _, occupant := range slices.Backward(occupants) {
++			group.tryAdd(occupant)
 +		}
++		freeable := group.release()
 +		if len(freeable) == 0 {
 +			continue
 +		}
@@ -1396,7 +1427,6 @@ index 0000000..29bada9
 +		for _, occupant := range freeable {
 +			cost = append(cost, occupant.priority)
 +		}
-+		slices.SortFunc(cost, func(a, b int64) int { return cmp.Compare(b, a) })
 +		leaves = append(leaves, leafCost{leaf: leaf, cost: cost})
 +	}
 +	slices.SortFunc(leaves, func(a, b leafCost) int {
@@ -1405,25 +1435,18 @@ index 0000000..29bada9
 +
 +	// freed is the number of leading leaves whose candidates are removed.
 +	freed := 0
-+	setRemoved := func(candidate *retryCandidate, removed bool) {
-+		if removed {
-+			pCtx.snapshot.RemoveWorkloadUsage(candidate.wl, candidate.tas)
-+		} else {
-+			pCtx.snapshot.AddWorkloadUsage(candidate.wl, candidate.tas)
-+		}
-+	}
 +	freeLeaves := func(n int) {
 +		for ; freed < n; freed++ {
 +			for _, candidate := range byLeaf[leaves[freed].leaf] {
 +				if candidate.removedLeaves++; candidate.removedLeaves == 1 && !candidate.excluded {
-+					setRemoved(candidate, true)
++					pCtx.snapshot.RemoveWorkloadUsage(candidate.wl, candidate.tas)
 +				}
 +			}
 +		}
 +		for ; freed > n; freed-- {
 +			for _, candidate := range byLeaf[leaves[freed-1].leaf] {
 +				if candidate.removedLeaves--; candidate.removedLeaves == 0 && !candidate.excluded {
-+					setRemoved(candidate, false)
++					pCtx.snapshot.AddWorkloadUsage(candidate.wl, candidate.tas)
 +				}
 +			}
 +		}
@@ -1486,29 +1509,40 @@ index 0000000..29bada9
 +			}
 +		}
 +		freeLeaves(high)
++		// The occupants are every removed candidate in the placement's leaves,
++		// including one removed for another leaf it also occupies.
 +		var occupants []*retryCandidate
-+		assigned := sets.New[flavorDomain]()
 +		for _, assignment := range assignments {
 +			for _, domain := range assignment.TopologyAssignment.Domains {
-+				assigned.Insert(flavorDomain{flavor: assignment.Flavor, domain: utiltas.DomainID(domain.Values)})
-+			}
-+		}
-+		for leaf := range assigned {
-+			for _, candidate := range byLeaf[leaf] {
-+				if candidate.removedLeaves > 0 && !candidate.excluded {
-+					candidate.excluded = true
-+					setRemoved(candidate, false)
-+					occupants = append(occupants, candidate)
++				for _, candidate := range allOccupants[flavorDomain{flavor: assignment.Flavor, domain: utiltas.DomainID(domain.Values)}] {
++					if candidate.removedLeaves > 0 && !candidate.excluded {
++						candidate.excluded = true
++						occupants = append(occupants, candidate)
++					}
 +				}
 +			}
 +		}
 +		if len(occupants) == 0 {
 +			break
 +		}
-+		if limits.allows(occupants) {
++		// Excluded candidates stay in the snapshot, so restore the occupants
++		// before freeing the leaves again.
++		for _, occupant := range occupants {
++			pCtx.snapshot.AddWorkloadUsage(occupant.wl, occupant.tas)
++		}
++		freeLeaves(0)
++		// The strategy takes the occupants cheapest first; when that would
++		// leave a lender that stops borrowing before an occupant it needs,
++		// it keeps only the occupants the preemptor needs gone.
++		slices.SortFunc(occupants, func(a, b *retryCandidate) int { return cmp.Compare(a.order, b.order) })
++		victims := occupants
++		if !limits.allowsInOrder(occupants) {
++			victims = neededOccupants(ctx, pCtx, occupants, allowBorrowing, searches)
++		}
++		if limits.allows(victims) {
 +			placement := sets.New[*workload.Info]()
-+			for _, occupant := range occupants {
-+				placement.Insert(occupant.wl)
++			for _, victim := range victims {
++				placement.Insert(victim.wl)
 +			}
 +			placements = append(placements, placement)
 +		}
@@ -1516,6 +1550,43 @@ index 0000000..29bada9
 +		low = high - 1
 +	}
 +	return placements
++}
++
++// neededOccupants removes the quota and TAS usage of the occupants of a
++// placement, puts them back one at a time, most expensive first, keeping
++// back each one the preemptor's topology placement still fits without and,
++// when the quota fit with every occupant removed, its quota too, and returns
++// the occupants it could not put back. It runs a topology search for each of
++// the first maxMinimizingSearches occupants, charges it to searches, and
++// keeps the others as victims. It leaves the snapshot as it found it.
++func neededOccupants(ctx context.Context, pCtx *preemptionCtx, occupants []*retryCandidate, allowBorrowing bool, searches *int) []*retryCandidate {
++	if len(occupants) < 2 {
++		return occupants
++	}
++	slices.SortFunc(occupants, func(a, b *retryCandidate) int { return cmp.Compare(b.order, a.order) })
++	usage := func(candidate *retryCandidate) workload.Usage {
++		return workload.Usage{Quota: candidate.quota.Quota, TAS: candidate.tas.TAS}
++	}
++	for _, occupant := range occupants {
++		pCtx.snapshot.RemoveWorkloadUsage(occupant.wl, usage(occupant))
++	}
++	quotaFits := workloadQuotaFits(pCtx, allowBorrowing)
++	needed := make([]*retryCandidate, 0, len(occupants))
++	for i, occupant := range occupants {
++		if i < maxMinimizingSearches && *searches > 0 {
++			*searches--
++			pCtx.snapshot.AddWorkloadUsage(occupant.wl, usage(occupant))
++			if topologyFits(ctx, pCtx) && (!quotaFits || workloadQuotaFits(pCtx, allowBorrowing)) {
++				continue
++			}
++			pCtx.snapshot.RemoveWorkloadUsage(occupant.wl, usage(occupant))
++		}
++		needed = append(needed, occupant)
++	}
++	for _, occupant := range needed {
++		pCtx.snapshot.AddWorkloadUsage(occupant.wl, usage(occupant))
++	}
++	return needed
 +}
 +
 +// cheapestTargets runs the strategy for each placement, ordered by the cost
@@ -1825,10 +1896,10 @@ index 0000000..7b5e8b5
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_limits.go b/pkg/scheduler/preemption/topology_retry_limits.go
 new file mode 100644
-index 0000000..d8d9697
+index 0000000..089b0a0
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_limits.go
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,200 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1848,39 +1919,38 @@ index 0000000..d8d9697
 +package preemption
 +
 +import (
++	"slices"
++
 +	"k8s.io/apimachinery/pkg/util/sets"
 +
-+	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 +	"sigs.k8s.io/kueue/pkg/resources"
 +)
 +
-+// reclaimNode identifies a ClusterQueue or a Cohort.
-+type reclaimNode struct {
-+	cohort bool
-+	name   string
-+}
-+
-+// reclaimLimits holds how much each ClusterQueue and Cohort borrows in the
-+// resources that need preemption. Classical preemption and fair sharing both
-+// take a candidate from another ClusterQueue only while that ClusterQueue,
-+// and every Cohort between it and the first Cohort it shares with the
-+// preemptor, still borrows in one of these resources. A topology retry checks
-+// its placements against these limits before it runs a strategy, so it does
-+// not spend its evaluations on placements the strategy rejects.
++// reclaimLimits checks sets of candidates against the rule Classical
++// preemption and fair sharing share: a candidate of another ClusterQueue is
++// taken only while that ClusterQueue, and every Cohort between it and the
++// first Cohort it shares with the preemptor, still borrows in one of the
++// resources that need preemption. It removes the candidates' quota usage from
++// the snapshot and asks the snapshot's own resource tree whether each of them
++// still borrows, so guaranteed quota, lending limits, and nested Cohorts give
++// up usage to their parents exactly as they do when the strategy removes the
++// victims. A topology retry checks its placements with it before it runs a
++// strategy, so it does not spend its evaluations on placements the strategy
++// rejects. Fair sharing also requires every node on the path to borrow in one
++// resource the candidate uses, and checks the shares, so it may reject a set
++// this accepts, never the other way around.
 +type reclaimLimits struct {
++	pCtx               *preemptionCtx
 +	frs                sets.Set[resources.FlavorResource]
-+	preemptorCQ        kueue.ClusterQueueReference
 +	preemptorAncestors sets.Set[*schdcache.CohortSnapshot]
-+	borrowed           map[reclaimNode]resources.FlavorResourceQuantities
 +}
 +
 +func newReclaimLimits(pCtx *preemptionCtx) *reclaimLimits {
 +	limits := &reclaimLimits{
++		pCtx:               pCtx,
 +		frs:                pCtx.frsNeedPreemption,
-+		preemptorCQ:        pCtx.preemptorCQ.Name,
 +		preemptorAncestors: sets.New[*schdcache.CohortSnapshot](),
-+		borrowed:           make(map[reclaimNode]resources.FlavorResourceQuantities),
 +	}
 +	for cohort := range pCtx.preemptorCQ.PathParentToRoot() {
 +		limits.preemptorAncestors.Insert(cohort)
@@ -1888,156 +1958,154 @@ index 0000000..d8d9697
 +	return limits
 +}
 +
-+// lenders returns the ClusterQueue cq and its Cohorts below the first one it
-+// shares with the preemptor, and records how much each of them borrows.
-+func (l *reclaimLimits) lenders(cq *schdcache.ClusterQueueSnapshot) []reclaimNode {
-+	if cq.Name == l.preemptorCQ {
-+		return nil
++// mayTake reports whether the strategies may take candidate in the current
++// state of the snapshot.
++func (l *reclaimLimits) mayTake(candidate *retryCandidate) bool {
++	if candidate.wl.ClusterQueue == l.pCtx.preemptorCQ.Name {
++		return true
 +	}
-+	nodes := []reclaimNode{l.record(reclaimNode{name: string(cq.Name)}, cq.ResourceNode.Usage, cq.ResourceNode.SubtreeQuota)}
++	cq := l.pCtx.snapshot.ClusterQueue(candidate.wl.ClusterQueue)
++	if schdcache.IsWithinNominalInResources(cq, l.frs) {
++		return false
++	}
 +	for cohort := range cq.PathParentToRoot() {
 +		if l.preemptorAncestors.Has(cohort) {
 +			break
 +		}
-+		nodes = append(nodes, l.record(reclaimNode{cohort: true, name: string(cohort.Name)}, cohort.ResourceNode.Usage, cohort.ResourceNode.SubtreeQuota))
-+	}
-+	return nodes
-+}
-+
-+func (l *reclaimLimits) record(node reclaimNode, usage, quota resources.FlavorResourceQuantities) reclaimNode {
-+	if _, found := l.borrowed[node]; found {
-+		return node
-+	}
-+	borrowed := make(resources.FlavorResourceQuantities, len(l.frs))
-+	for fr := range l.frs {
-+		if amount := usage[fr].Sub(quota[fr]); amount.Sign() > 0 {
-+			borrowed[fr] = amount
++		if schdcache.IsWithinNominalInResources(cohort, l.frs) {
++			return false
 +		}
 +	}
-+	l.borrowed[node] = borrowed
-+	return node
++	return true
 +}
 +
 +// allows reports whether the strategies may take every candidate in
-+// candidates in some order.
++// candidates in some order. It answers exactly: removing usage never makes a
++// node borrow, so a candidate the rule accepts with more usage left still
++// accepts it later. Building the order backwards, from the state with every
++// candidate removed, it can add back any candidate the rule accepts as the
++// last one taken without ruling out an order for the others. It leaves the
++// snapshot as it found it and costs up to len(candidates) squared checks of the rule.
 +func (l *reclaimLimits) allows(candidates []*retryCandidate) bool {
-+	group := l.newGroup()
++	snapshot := l.pCtx.snapshot
++	pending := make([]*retryCandidate, 0, len(candidates))
 +	for _, candidate := range candidates {
-+		if !group.tryAdd(candidate) {
++		if candidate.wl.ClusterQueue == l.pCtx.preemptorCQ.Name {
++			continue
++		}
++		snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++		pending = append(pending, candidate)
++	}
++	defer func() {
++		for _, candidate := range pending {
++			snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
++		}
++	}()
++	for len(pending) > 0 {
++		last := -1
++		for i, candidate := range pending {
++			snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
++			if l.mayTake(candidate) {
++				last = i
++				break
++			}
++			snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++		}
++		if last < 0 {
 +			return false
 +		}
++		pending = append(pending[:last], pending[last+1:]...)
++	}
++	return true
++}
++
++// allowsInOrder reports whether the strategies may take candidates in the
++// order given, as they take the candidates a placement prefers. It leaves
++// the snapshot as it found it.
++func (l *reclaimLimits) allowsInOrder(candidates []*retryCandidate) bool {
++	snapshot := l.pCtx.snapshot
++	removed := 0
++	defer func() {
++		for _, candidate := range candidates[:removed] {
++			snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
++		}
++	}()
++	for _, candidate := range candidates {
++		if !l.mayTake(candidate) {
++			return false
++		}
++		snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++		removed++
 +	}
 +	return true
 +}
 +
 +// reclaimGroup is a set of candidates the strategies may take together in
-+// some order: each lender keeps borrowing until its last candidate is taken,
-+// which it does in some order exactly when, in one resource, all of its
-+// candidates but the largest add up to less than it borrows. A subset of such
-+// a set is such a set too.
++// some order. It keeps their quota usage removed from the snapshot until
++// release.
 +type reclaimGroup struct {
-+	limits *reclaimLimits
-+	given  map[reclaimNode]*reclaimGiven
-+}
-+
-+type reclaimGiven struct {
-+	sum, largest resources.FlavorResourceQuantities
++	limits  *reclaimLimits
++	members []*retryCandidate
 +}
 +
 +func (l *reclaimLimits) newGroup() *reclaimGroup {
-+	return &reclaimGroup{limits: l, given: make(map[reclaimNode]*reclaimGiven)}
++	return &reclaimGroup{limits: l}
 +}
 +
 +// tryAdd adds candidate to the group when the strategies may still take the
-+// whole group, and reports whether it did.
++// whole group, and reports whether it did. When the rule accepts candidate
++// with the group removed, candidate can be taken last, which costs one check;
++// otherwise it looks for another order the way allows does.
 +func (g *reclaimGroup) tryAdd(candidate *retryCandidate) bool {
-+	for _, node := range candidate.lenders {
-+		given := g.given[node]
-+		if !g.limits.borrowsAfter(node, func(fr resources.FlavorResource) resources.Amount {
-+			amount := candidate.quota.Quota.Assigned[fr]
-+			if given == nil {
-+				return resources.Amount{}
++	snapshot := g.limits.pCtx.snapshot
++	if g.limits.mayTake(candidate) {
++		snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++		g.members = append(g.members, candidate)
++		return true
++	}
++	snapshot.RemoveWorkloadUsage(candidate.wl, candidate.quota)
++	pending := append(slices.Clone(g.members), candidate)
++	var added []*retryCandidate
++	for len(pending) > 0 {
++		last := -1
++		for i, member := range pending {
++			snapshot.AddWorkloadUsage(member.wl, member.quota)
++			if g.limits.mayTake(member) {
++				last = i
++				break
 +			}
-+			return given.sum[fr].Add(amount).Sub(maxAmount(given.largest[fr], amount))
-+		}) {
-+			return false
++			snapshot.RemoveWorkloadUsage(member.wl, member.quota)
 +		}
++		if last < 0 {
++			break
++		}
++		added = append(added, pending[last])
++		pending = append(pending[:last], pending[last+1:]...)
 +	}
-+	for _, node := range candidate.lenders {
-+		given := g.given[node]
-+		if given == nil {
-+			given = &reclaimGiven{sum: resources.FlavorResourceQuantities{}, largest: resources.FlavorResourceQuantities{}}
-+			g.given[node] = given
-+		}
-+		for fr := range g.limits.frs {
-+			amount := candidate.quota.Quota.Assigned[fr]
-+			given.sum[fr] = given.sum[fr].Add(amount)
-+			given.largest[fr] = maxAmount(given.largest[fr], amount)
-+		}
++	for _, member := range added {
++		snapshot.RemoveWorkloadUsage(member.wl, member.quota)
 +	}
++	if len(pending) > 0 {
++		snapshot.AddWorkloadUsage(candidate.wl, candidate.quota)
++		return false
++	}
++	g.members = append(g.members, candidate)
 +	return true
 +}
 +
-+func maxAmount(a, b resources.Amount) resources.Amount {
-+	if a.Cmp(b) >= 0 {
-+		return a
++// release puts back the quota usage of the group's members and returns them.
++func (g *reclaimGroup) release() []*retryCandidate {
++	for _, member := range g.members {
++		g.limits.pCtx.snapshot.AddWorkloadUsage(member.wl, member.quota)
 +	}
-+	return b
-+}
-+
-+// borrowsAfter reports whether node still borrows in one of the resources
-+// that need preemption after giving up the amounts given returns.
-+func (l *reclaimLimits) borrowsAfter(node reclaimNode, given func(resources.FlavorResource) resources.Amount) bool {
-+	for fr, borrowed := range l.borrowed[node] {
-+		if given(fr).Cmp(borrowed) < 0 {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
-+// reclaimTally tracks the quota the lenders gave up to candidates taken one
-+// at a time.
-+type reclaimTally struct {
-+	limits *reclaimLimits
-+	given  map[reclaimNode]resources.FlavorResourceQuantities
-+}
-+
-+func (l *reclaimLimits) newTally() *reclaimTally {
-+	return &reclaimTally{limits: l, given: make(map[reclaimNode]resources.FlavorResourceQuantities)}
-+}
-+
-+// canGive reports whether the strategies may take candidate next: every
-+// lender of it still borrows.
-+func (t *reclaimTally) canGive(candidate *retryCandidate) bool {
-+	for _, node := range candidate.lenders {
-+		given := t.given[node]
-+		if !t.limits.borrowsAfter(node, func(fr resources.FlavorResource) resources.Amount { return given[fr] }) {
-+			return false
-+		}
-+	}
-+	return true
-+}
-+
-+// add records that candidate was taken.
-+func (t *reclaimTally) add(candidate *retryCandidate) {
-+	for _, node := range candidate.lenders {
-+		given := t.given[node]
-+		if given == nil {
-+			given = resources.FlavorResourceQuantities{}
-+			t.given[node] = given
-+		}
-+		for fr := range t.limits.frs {
-+			given[fr] = given[fr].Add(candidate.quota.Quota.Assigned[fr])
-+		}
-+	}
++	return g.members
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_limits_test.go b/pkg/scheduler/preemption/topology_retry_limits_test.go
 new file mode 100644
-index 0000000..7d67a66
+index 0000000..940121a
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_limits_test.go
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,356 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2193,12 +2261,213 @@ index 0000000..7d67a66
 +		}
 +	}
 +}
++
++// limitsWorkload is a one-pod workload of a ClusterQueue on one node.
++type limitsWorkload struct {
++	name     string
++	cq       kueue.ClusterQueueReference
++	node     string
++	cpu      int
++	gpu      int
++	priority int32
++}
++
++// limitsResources is the capacity of a node or the requests of a pod.
++type limitsResources struct {
++	cpu, gpu int
++}
++
++// TestTopologyRetryMatchesStrategyLimits checks that the retry offers every
++// victim set the strategies may take: a ClusterQueue or Cohort gives up
++// quota to its parent only past its guaranteed quota, and a cheap victim the
++// placement does not need must not use up what a lender may give.
++func TestTopologyRetryMatchesStrategyLimits(t *testing.T) {
++	gpu := corev1.ResourceName("example.com/gpu")
++	cpu := func(nominal string, limits ...string) kueue.FlavorQuotas {
++		return *utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, append([]string{nominal}, limits...)...).Obj()
++	}
++	cpuGPU := func(cpuNominal, gpuNominal string) kueue.FlavorQuotas {
++		return *utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, cpuNominal).Resource(gpu, gpuNominal).Obj()
++	}
++	requests := func(r limitsResources) corev1.ResourceList {
++		list := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(strconv.Itoa(r.cpu))}
++		if r.gpu > 0 {
++			list[gpu] = resource.MustParse(strconv.Itoa(r.gpu))
++		}
++		return list
++	}
++	reclaim := kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyLowerPriority}
++	cases := map[string]struct {
++		cohorts     []*kueue.Cohort
++		cqs         []*kueue.ClusterQueue
++		nodes       map[string]limitsResources
++		workloads   []limitsWorkload
++		incoming    limitsResources
++		wantTargets []string
++	}{
++		// "sub" borrows 2 CPUs, one for each ClusterQueue, which lend nothing,
++		// so removing a1 takes only the 1 CPU a1 borrows from "sub".
++		"ClusterQueues with a lending limit in a nested Cohort": {
++			cohorts: []*kueue.Cohort{utiltestingapi.MakeCohort("sub").Parent("root").Obj()},
++			cqs: []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("root").ResourceGroup(cpu("7")).Preemption(reclaim).Obj(),
++				utiltestingapi.MakeClusterQueue("a1").Cohort("sub").ResourceGroup(cpu("2", "", "0")).Obj(),
++				utiltestingapi.MakeClusterQueue("a2").Cohort("sub").ResourceGroup(cpu("1", "", "0")).Obj(),
++			},
++			nodes: map[string]limitsResources{"n0": {cpu: 2}, "n1": {cpu: 4}},
++			workloads: []limitsWorkload{
++				{name: "a1x", cq: "a1", node: "n0", cpu: 1, priority: 1},
++				{name: "a1", cq: "a1", node: "n1", cpu: 2, priority: 2},
++				{name: "a2", cq: "a2", node: "n1", cpu: 2, priority: 2},
++			},
++			incoming:    limitsResources{cpu: 4},
++			wantTargets: []string{"a1", "a2"},
++		},
++		// "sub" guarantees itself 1 CPU and borrows 2, so it still borrows
++		// after a1 gives up the CPU it borrows from "sub".
++		"Cohort with a lending limit": {
++			cohorts: []*kueue.Cohort{utiltestingapi.MakeCohort("sub").Parent("root").ResourceGroup(cpu("1", "", "0")).Obj()},
++			cqs: []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("root").ResourceGroup(cpu("7")).Preemption(reclaim).Obj(),
++				utiltestingapi.MakeClusterQueue("a1").Cohort("sub").ResourceGroup(cpu("2", "", "0")).Obj(),
++				utiltestingapi.MakeClusterQueue("a2").Cohort("sub").ResourceGroup(cpu("1", "", "0")).Obj(),
++				utiltestingapi.MakeClusterQueue("a3").Cohort("sub").ResourceGroup(cpu("0")).Obj(),
++			},
++			nodes: map[string]limitsResources{"n0": {cpu: 2}, "n1": {cpu: 4}, "n2": {cpu: 1}},
++			workloads: []limitsWorkload{
++				{name: "a1x", cq: "a1", node: "n0", cpu: 1, priority: 1},
++				{name: "a1", cq: "a1", node: "n1", cpu: 2, priority: 2},
++				{name: "a2", cq: "a2", node: "n1", cpu: 2, priority: 2},
++				{name: "a3", cq: "a3", node: "n2", cpu: 1, priority: 5},
++			},
++			incoming:    limitsResources{cpu: 4},
++			wantTargets: []string{"a1", "a2"},
++		},
++		// "b" borrows 1 CPU, so it may give up b1, but not bx and then b1;
++		// freeing n1 needs only b1.
++		"a cheap victim the placement does not need": {
++			cqs: []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").ResourceGroup(cpu("5")).Preemption(reclaim).Obj(),
++				utiltestingapi.MakeClusterQueue("b").Cohort("shared").ResourceGroup(cpu("3")).Obj(),
++			},
++			nodes: map[string]limitsResources{"n1": {cpu: 4}},
++			workloads: []limitsWorkload{
++				{name: "bx", cq: "b", node: "n1", cpu: 1, priority: 1},
++				{name: "b1", cq: "b", node: "n1", cpu: 3, priority: 2},
++			},
++			incoming:    limitsResources{cpu: 3},
++			wantTargets: []string{"b1"},
++		},
++		// "b" borrows 2 CPUs, so it may give up b1 and then bx, but not bx and
++		// then b1, the order the strategy takes them in when it prefers both;
++		// freeing the GPU of n1 needs only b1.
++		"a cheap victim that uses up a lender before the one the placement needs": {
++			cqs: []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").ResourceGroup(cpuGPU("5", "1")).Preemption(reclaim).Obj(),
++				utiltestingapi.MakeClusterQueue("b").Cohort("shared").ResourceGroup(cpuGPU("3", "1")).Obj(),
++			},
++			nodes: map[string]limitsResources{"n1": {cpu: 4, gpu: 1}, "n2": {cpu: 1}},
++			workloads: []limitsWorkload{
++				{name: "bx", cq: "b", node: "n1", cpu: 3, priority: 1},
++				{name: "b1", cq: "b", node: "n1", cpu: 1, gpu: 1, priority: 2},
++				{name: "b2", cq: "b", node: "n2", cpu: 1, priority: 5},
++			},
++			incoming:    limitsResources{cpu: 1, gpu: 1},
++			wantTargets: []string{"b1"},
++		},
++	}
++	modes := []struct {
++		name         string
++		cacheEnabled bool
++		fairSharing  *config.FairSharing
++	}{
++		{name: "classical/cache=false"},
++		{name: "classical/cache=true", cacheEnabled: true},
++		{name: "fairsharing", fairSharing: &config.FairSharing{}},
++	}
++	for _, mode := range modes {
++		for name, tc := range cases {
++			t.Run(mode.name+"/"+name, func(t *testing.T) {
++				features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++				features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++				ctx, log := utiltesting.ContextWithLog(t)
++				now := time.Now().Truncate(time.Second)
++				var admitted []kueue.Workload
++				for i, w := range tc.workloads {
++					podSet := utiltestingapi.MakePodSet("main", 1).UnconstrainedTopologyRequest()
++					podSetAssignment := utiltestingapi.MakePodSetAssignment("main").Count(1)
++					for resourceName, quantity := range requests(limitsResources{cpu: w.cpu, gpu: w.gpu}) {
++						podSet.Request(resourceName, quantity.String())
++						podSetAssignment.Assignment(resourceName, "tas", quantity.String())
++					}
++					admitted = append(admitted, *utiltestingapi.MakeWorkload(w.name, "default").UID(types.UID(w.name)).Priority(w.priority).
++						PodSets(*podSet.Obj()).
++						ReserveQuotaAt(utiltestingapi.MakeAdmission(w.cq).PodSets(
++							podSetAssignment.TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{w.node}, 1).Obj()).Obj()).Obj()).Obj(),
++							now.Add(-time.Duration(i)*time.Second)).Obj())
++				}
++				cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: admitted}).
++					WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).Build()
++				cache := schdcache.New(cl)
++				cache.AddOrUpdateTopology(log, utiltestingapi.MakeTopology("hostname").Levels(corev1.LabelHostname).Obj())
++				cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("tas").NodeLabel("pool", "tas").TopologyName("hostname").Obj())
++				for node, capacity := range tc.nodes {
++					allocatable := requests(capacity)
++					allocatable[corev1.ResourcePods] = resource.MustParse("100")
++					cache.TASCache().SyncNode(testingnode.MakeNode(node).Label("pool", "tas").Label(corev1.LabelHostname, node).
++						StatusAllocatable(allocatable).Ready().Obj())
++				}
++				for _, cohort := range tc.cohorts {
++					if err := cache.AddOrUpdateCohort(cohort); err != nil {
++						t.Fatal(err)
++					}
++				}
++				for _, cq := range tc.cqs {
++					if err := cache.AddClusterQueue(ctx, cq); err != nil {
++						t.Fatal(err)
++					}
++				}
++				snapshot, err := cache.Snapshot(ctx)
++				if err != nil {
++					t.Fatal(err)
++				}
++				incomingPodSet := utiltestingapi.MakePodSet("main", 1).UnconstrainedTopologyRequest()
++				flavors := flavorassigner.ResourceAssignment{}
++				for resourceName, quantity := range requests(tc.incoming) {
++					incomingPodSet.Request(resourceName, quantity.String())
++					flavors[resourceName] = &flavorassigner.FlavorAssignment{Name: "tas", Mode: flavorassigner.Preempt}
++				}
++				incoming := workload.NewInfo(log, utiltestingapi.MakeWorkload("incoming", "default").UID("incoming").Priority(3).
++					PodSets(*incomingPodSet.Obj()).Obj())
++				incoming.ClusterQueue = "incoming"
++				assignment := flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++					Name: "main", Count: 1, Requests: requests(tc.incoming), Flavors: flavors,
++				}}}
++
++				preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
++				targets, retry := preemptor.GetTargets(ctx, *incoming, snapshot, assignment)
++				if len(targets) > 0 || retry == nil {
++					t.Fatalf("ordinary preemption found %d targets and retry=%t, want no targets and a retry", len(targets), retry != nil)
++				}
++				var gotTargets []string
++				for _, target := range retry(ctx) {
++					gotTargets = append(gotTargets, target.WorkloadInfo.Obj.Name)
++				}
++				slices.Sort(gotTargets)
++				if diff := gocmp.Diff(tc.wantTargets, gotTargets); diff != "" {
++					t.Errorf("unexpected preemption targets (-want/+got):\n%s", diff)
++				}
++			})
++		}
++	}
++}
 diff --git a/pkg/scheduler/preemption/topology_retry_test.go b/pkg/scheduler/preemption/topology_retry_test.go
 new file mode 100644
-index 0000000..426afbf
+index 0000000..44cd7fd
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_test.go
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,362 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2338,8 +2607,9 @@ index 0000000..426afbf
 +	}
 +}
 +
-+// uniformPriorities returns the priorities of nodes nodes that each hold the
-+// workloads of priorities, except for the last node, which holds those of last.
++// uniformPriorities returns the priorities of the given number of nodes that
++// each hold the workloads of priorities, except for the last node, which
++// holds those of last.
 +func uniformPriorities(nodes int, priorities, last []int32) [][]int32 {
 +	result := make([][]int32, nodes)
 +	for n := range nodes - 1 {
@@ -2496,10 +2766,11 @@ index 0000000..426afbf
 +	}
 +}
 +
-+// distinctPriorities returns the priorities of nodes nodes of slots
-+// workloads that all differ, with the lowest ones spread over the nodes, so
-+// node n00 is the only one that can be freed below the highest
-+// priorities and ordinary preemption takes its victims on different nodes.
++// distinctPriorities returns the priorities of the given number of nodes,
++// each with slots workloads, that all differ, with the lowest ones spread
++// over the nodes, so node n00 is the only one that can be freed below the
++// highest priorities and ordinary preemption takes its victims on different
++// nodes.
 +func distinctPriorities(nodes, slots int) [][]int32 {
 +	priorities := make([][]int32, nodes)
 +	for n := range nodes {

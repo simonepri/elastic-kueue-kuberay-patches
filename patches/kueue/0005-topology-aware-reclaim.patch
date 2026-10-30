@@ -550,7 +550,7 @@ index 558ed94..3d4afd7 100644
  }
  
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index 005a123..42de983 100644
+index 4f5e699..1c6bd63 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
 @@ -76,6 +76,7 @@ type Preemptor struct {
@@ -587,9 +587,18 @@ index 005a123..42de983 100644
 -			if workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
 +			if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
  				if psName, currentCount, minCount, isElastic := getElasticInfo(candidate.WorkloadInfo); isElastic {
- 					totalUsage := candidate.WorkloadInfo.Usage()
- 					perPodQuota := make(resources.FlavorResourceQuantities)
-@@ -702,6 +708,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
+ 					if !shrinkTarget(ctx, strategy, candidate, psName, currentCount, minCount) {
+ 						// Min-viable guard: candidate cannot be shrunk without violating minReplicas.
+@@ -507,7 +513,7 @@ func shrinkTarget(ctx context.Context, strategy PreemptionStrategy, candidate *T
+ 	for count := currentCount - 1; count >= minCount; count-- {
+ 		kept := shrunkUsage(candidate.WorkloadInfo, psName, count)
+ 		snapshot.AddWorkloadUsage(candidate.WorkloadInfo, kept)
+-		if workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
++		if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
+ 			candidate.NewCount = ptr.To(count)
+ 			candidate.PodSetName = psName
+ 			candidate.KeptUsage = kept
+@@ -701,6 +707,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
  	return workloadQuotaFits(preemptionCtx, allowBorrowing) && workloadTopologyFits(ctx, preemptionCtx)
  }
  
@@ -2416,10 +2425,10 @@ index 0000000..940121a
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_test.go b/pkg/scheduler/preemption/topology_retry_test.go
 new file mode 100644
-index 0000000..686f6df
+index 0000000..d3870b7
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_test.go
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,446 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2819,6 +2828,48 @@ index 0000000..686f6df
 +			}
 +			if got := targetNames(retry(ctx)); len(got) > 0 {
 +				t.Errorf("topology retry found targets %v, want none", got)
++			}
++			check()
++		})
++	}
++}
++
++func TestTopologyRetryRunsWhenTheShrunkVictimBlocksTheTopology(t *testing.T) {
++	// Ordinary preemption takes "a", then "elastic", which frees the quota
++	// and node x1 but can only be shrunk, and its kept pods leave no node
++	// free. The retry frees node x2 instead by taking "a" and "b" and
++	// shrinking "elastic" to the 2 pods the quota allows.
++	cluster := elasticTopologyCluster{
++		nodes: []string{"x1", "x2", "x3"}, borrowerNominal: "2",
++		elasticPods: map[string]int32{"x1": 2, "x3": 1}, elasticAge: time.Hour,
++		others: []elasticTopologyOther{
++			{name: "a", clusterQueue: "borrower", node: "x2"},
++			{name: "b", clusterQueue: "borrower", node: "x2", age: 2 * time.Hour},
++		},
++	}
++	modes := []struct {
++		name         string
++		cacheEnabled bool
++		fairSharing  *config.FairSharing
++	}{
++		{name: "classical/cache=false"},
++		{name: "classical/cache=true", cacheEnabled: true},
++		{name: "fairsharing", fairSharing: &config.FairSharing{}},
++	}
++	for _, mode := range modes {
++		t.Run(mode.name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++			features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
++			ctx, log := utiltesting.ContextWithLog(t)
++			setup := cluster.build(ctx, t, log)
++			check := checkSnapshotUnchanged(t, setup.snapshot)
++			preemptor := New(nil, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clocktesting.NewFakeClock(time.Now()), nil, preemptexpectations.New(), nil)
++			targets, retry := preemptor.GetTargets(ctx, setup.incoming, setup.snapshot, setup.assignment)
++			if len(targets) > 0 || retry == nil {
++				t.Fatalf("ordinary preemption found targets %v and retry=%t, want no targets and a retry", targetNames(targets), retry != nil)
++			}
++			if diff := gocmp.Diff([]string{"a", "b", "elastic/2"}, targetNames(retry(ctx))); diff != "" {
++				t.Errorf("unexpected topology retry targets (-want/+got):\n%s", diff)
 +			}
 +			check()
 +		})

@@ -1,8 +1,18 @@
 diff --git a/pkg/controller/jobs/deployment/deployment_webhook.go b/pkg/controller/jobs/deployment/deployment_webhook.go
-index e920676..bd8f1ac 100644
+index 49fd3a5..51c44bb 100644
 --- a/pkg/controller/jobs/deployment/deployment_webhook.go
 +++ b/pkg/controller/jobs/deployment/deployment_webhook.go
-@@ -162,12 +162,13 @@ func (wh *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj *appsv1.De
+@@ -85,7 +85,8 @@ func (wh *Webhook) Default(ctx context.Context, obj *appsv1.Deployment) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	// ValidateUpdate rejects adding the label to a running Deployment that did not have it.
++	// Defaulting the label on a running Deployment would change its Pod template on any
++	// update and roll every Pod, so only an explicit label adds a class to it.
+ 	if oldDeploymentObj == nil || jobframework.CanSetWorkloadPriorityClassName(oldDeploymentObj.Status.ReadyReplicas == 0, oldDeploymentObj) {
+ 		if err := wh.integrationManager.ApplyDefaultWorkloadPriorityClass(ctx, wh.client, deployment.Object(), wh.managedJobsNamespaceSelector); err != nil {
+ 			return err
+@@ -169,14 +170,17 @@ func (wh *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj *appsv1.De
  	allErrs := jobframework.ValidateQueueName(newDeployment.Object())
  	allErrs = append(allErrs, jobframework.ValidateElasticJobAnnotation(newDeployment.Object(), newDeployment.GVK())...)
  
@@ -16,15 +26,47 @@ index e920676..bd8f1ac 100644
 +	if newQueueName == "" {
  		allErrs = append(allErrs, apivalidation.ValidateImmutableField(newQueueName, oldQueueName, queueNameLabelPath)...)
  	}
-+	isSuspended := oldDeployment.Status.ReadyReplicas == 0
++	// Adding a WorkloadPriorityClass to a running Deployment is allowed for the same reason:
++	// only Pods created after the change carry the label, so their new workloads get the class
++	// while existing workloads keep their priority. Removing it stays rejected.
  	allErrs = append(allErrs, jobframework.ValidateUpdateForWorkloadPriorityClassName(
- 		isSuspended,
+-		isSuspended,
++		true,
  		oldDeployment.Object(),
+ 		newDeployment.Object(),
+ 	)...)
 diff --git a/pkg/controller/jobs/deployment/deployment_webhook_test.go b/pkg/controller/jobs/deployment/deployment_webhook_test.go
-index 7b0953e..acb575c 100644
+index 2a45916..6588b84 100644
 --- a/pkg/controller/jobs/deployment/deployment_webhook_test.go
 +++ b/pkg/controller/jobs/deployment/deployment_webhook_test.go
-@@ -481,6 +481,15 @@ func TestValidateUpdate(t *testing.T) {
+@@ -154,6 +154,26 @@ func TestDefault(t *testing.T) {
+ 				ReadyReplicas(1).
+ 				Obj(),
+ 		},
++		"update of a ready deployment that adds the priority class label propagates it to the pod template": {
++			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
++				Queue("test-queue").
++				ReadyReplicas(1).
++				Obj(),
++			deployment: testingdeployment.MakeDeployment("test-pod", "").
++				Queue("test-queue").
++				Label(constants.WorkloadPriorityClassLabel, "test").
++				ReadyReplicas(1).
++				Obj(),
++			want: testingdeployment.MakeDeployment("test-pod", "").
++				PodTemplateSpecManagedByKueue().
++				Queue("test-queue").
++				Label(constants.WorkloadPriorityClassLabel, "test").
++				ReadyReplicas(1).
++				PodTemplateSpecQueue("test-queue").
++				PodTemplateAnnotation(podconstants.SuspendedByParentAnnotation, FrameworkName).
++				PodTemplateSpecLabel(constants.WorkloadPriorityClassLabel, "test").
++				Obj(),
++		},
+ 		"deployment with queue and priority class": {
+ 			deployment: testingdeployment.MakeDeployment("test-pod", "").
+ 				Queue("test-queue").
+@@ -528,6 +548,15 @@ func TestValidateUpdate(t *testing.T) {
  				Queue("test-queue-new").
  				ReadyReplicas(1).
  				Obj(),
@@ -40,3 +82,26 @@ index 7b0953e..acb575c 100644
  			wantErr: field.ErrorList{
  				&field.Error{
  					Type:  field.ErrorTypeInvalid,
+@@ -545,7 +574,7 @@ func TestValidateUpdate(t *testing.T) {
+ 				Label(constants.WorkloadPriorityClassLabel, "new-test").
+ 				Obj(),
+ 		},
+-		"set priority-class when replicas ready": {
++		"add priority-class when replicas ready": {
+ 			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
+ 				Queue("test-queue").
+ 				ReadyReplicas(int32(1)).
+@@ -555,12 +584,7 @@ func TestValidateUpdate(t *testing.T) {
+ 				Label(constants.WorkloadPriorityClassLabel, "test").
+ 				ReadyReplicas(int32(1)).
+ 				Obj(),
+-			wantErr: field.ErrorList{
+-				&field.Error{
+-					Type:  field.ErrorTypeInvalid,
+-					Field: "metadata.labels[kueue.x-k8s.io/priority-class]",
+-				},
+-			}.ToAggregate(),
++			wantErr: field.ErrorList{}.ToAggregate(),
+ 		},
+ 		"update priority-class when replicas ready": {
+ 			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").

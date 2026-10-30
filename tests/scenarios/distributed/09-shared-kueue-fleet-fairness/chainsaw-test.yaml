@@ -35,8 +35,17 @@ spec:
             file: 03-assert-fair-reclaim.yaml
     - name: prevent-overcapacity-burst
       try:
-        - apply:
-            file: 04-cell2-overcapacity-attempt.yaml
+        # Resize the running cluster to 16 workers the way an autoscaler or a user
+        # does, by changing only the counts, so the pod template keeps what Kueue
+        # set on it at admission.
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: >-
+              kubectl patch raycluster cell2-raycluster-spot -n "$NS" --type=json -p
+              '[{"op":"replace","path":"/spec/workerGroupSpecs/0/replicas","value":16},
+              {"op":"replace","path":"/spec/workerGroupSpecs/0/maxReplicas","value":16}]'
         - assert:
             file: 04-assert-clamped.yaml
         # cell2 is an elastic job: the resize waits for a new Workload slice, and

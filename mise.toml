@@ -30,7 +30,7 @@ RAY_PLATFORMS = "{{ get_env(name='RAY_PLATFORMS', default='linux/amd64,linux/arm
 
 # Internal patchset versions (tracks release-please manifests)
 KUEUE_PATCH_VERSION = "0.6.0"
-KUBERAY_PATCH_VERSION = "0.3.6"
+KUBERAY_PATCH_VERSION = "0.3.7"
 INTERLINK_PATCH_VERSION = "0.5.0" # x-release-please-version
 RAY_PATCH_VERSION = "0.2.0"
 

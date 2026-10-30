@@ -1,0 +1,353 @@
+diff --git a/ray-operator/controllers/ray/raycluster_controller.go b/ray-operator/controllers/ray/raycluster_controller.go
+index 869a78a..fc80006 100644
+--- a/ray-operator/controllers/ray/raycluster_controller.go
++++ b/ray-operator/controllers/ray/raycluster_controller.go
+@@ -1189,29 +1189,36 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
+ 					return fmt.Errorf("mTLS secrets not ready: %w", err)
+ 				}
+ 			}
++			// Create the missing workers of this group concurrently, in batches of 1, 2, 4, ... Pods.
++			var createWorker func(i int) error
+ 			if features.Enabled(features.RayMultiHostIndexing) {
++				// Pick every replica index before creating any Pod, since validReplicaIndices is not safe for concurrent use.
++				replicaIndices := make([]int, diff)
+ 				newReplicaIndex := 0
+-				// create all workers of this group
+ 				for i := range diff {
+ 					// Find the next available replica index.
+ 					for validReplicaIndices[newReplicaIndex] {
+ 						newReplicaIndex++
+ 					}
+ 					validReplicaIndices[newReplicaIndex] = true
+-					logger.Info("reconcilePods", "creating worker for group", worker.GroupName, "index", i, "total", diff, "replicaIndex", newReplicaIndex)
+-					if err := r.createWorkerPodWithIndex(ctx, *instance, *worker.DeepCopy(), "", newReplicaIndex, 0); err != nil {
+-						return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
+-					}
++					replicaIndices[i] = newReplicaIndex
++				}
++				createWorker = func(i int) error {
++					logger.Info("reconcilePods", "creating worker for group", worker.GroupName, "index", i, "total", diff, "replicaIndex", replicaIndices[i])
++					return r.createWorkerPodWithIndex(ctx, *instance, *worker.DeepCopy(), "", replicaIndices[i], 0)
+ 				}
+ 			} else {
+-				// create all workers of this group
+-				for i := range diff {
++				createWorker = func(i int) error {
+ 					logger.Info("reconcilePods", "creating worker for group", worker.GroupName, "index", i, "total", diff)
+-					if err := r.createWorkerPod(ctx, *instance, *worker.DeepCopy()); err != nil {
+-						return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
+-					}
++					return r.createWorkerPod(ctx, *instance, *worker.DeepCopy())
+ 				}
+ 			}
++			// A failed batch ends this reconcile; the next one creates only the Pods still missing,
++			// because the scale expectations already record the Pods created here.
++			if created, err := slowStartBatch(diff, createWorker); err != nil {
++				logger.Info("reconcilePods: stopped creating workers after a failed batch", "group", worker.GroupName, "created", created, "total", diff)
++				return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
++			}
+ 		} else if diff == 0 {
+ 			logger.Info("reconcilePods", "all workers already exist for group", worker.GroupName)
+ 			continue
+@@ -1771,8 +1778,9 @@ func (r *RayClusterReconciler) buildWorkerPod(ctx context.Context, instance rayv
+ 	headPort := common.GetHeadPort(instance.Spec.HeadGroupSpec.RayStartParams)
+ 	autoscalingEnabled := utils.IsAutoscalingEnabled(&instance.Spec)
+ 	podTemplateSpec := common.DefaultWorkerPodTemplate(ctx, instance, worker, podName, fqdnRayIP, headPort, replicaGrpName, replicaIndex, hostIndex)
+-	if len(r.options.WorkerSidecarContainers) > 0 {
+-		podTemplateSpec.Spec.Containers = append(podTemplateSpec.Spec.Containers, r.options.WorkerSidecarContainers...)
++	// Copy each sidecar so Pods built concurrently never share the slices that building a Pod appends to.
++	for _, sidecar := range r.options.WorkerSidecarContainers {
++		podTemplateSpec.Spec.Containers = append(podTemplateSpec.Spec.Containers, *sidecar.DeepCopy())
+ 	}
+ 	if len(r.options.DefaultPodAnnotations) > 0 {
+ 		if podTemplateSpec.Annotations == nil {
+diff --git a/ray-operator/controllers/ray/slow_start_batch.go b/ray-operator/controllers/ray/slow_start_batch.go
+new file mode 100644
+index 0000000..c845592
+--- /dev/null
++++ b/ray-operator/controllers/ray/slow_start_batch.go
+@@ -0,0 +1,36 @@
++package ray
++
++import (
++	errstd "errors"
++	"sync"
++)
++
++// slowStartBatch calls fn(i) for every i in [0, count) in concurrent batches of 1, 2, 4, ... calls,
++// like the ReplicaSet and Job controllers create Pods. It stops after the first batch in which any
++// call fails, so when the API server rejects every Pod, such as on a webhook denial or an exhausted
++// quota, only a few creates fail instead of all of them. It returns how many calls succeeded and the
++// joined errors of the failing batch; calls that succeeded in that batch stay done.
++func slowStartBatch(count int, fn func(i int) error) (int, error) {
++	successes := 0
++	for start, batchSize := 0, min(1, count); batchSize > 0; batchSize = min(2*batchSize, count-start) {
++		errs := make([]error, batchSize)
++		var wg sync.WaitGroup
++		for j := range batchSize {
++			wg.Go(func() {
++				errs[j] = fn(start + j)
++			})
++		}
++		wg.Wait()
++		if err := errstd.Join(errs...); err != nil {
++			for _, e := range errs {
++				if e == nil {
++					successes++
++				}
++			}
++			return successes, err
++		}
++		successes += batchSize
++		start += batchSize
++	}
++	return successes, nil
++}
+diff --git a/ray-operator/controllers/ray/slow_start_batch_unit_test.go b/ray-operator/controllers/ray/slow_start_batch_unit_test.go
+new file mode 100644
+index 0000000..486d3d0
+--- /dev/null
++++ b/ray-operator/controllers/ray/slow_start_batch_unit_test.go
+@@ -0,0 +1,242 @@
++package ray
++
++import (
++	"context"
++	errstd "errors"
++	"fmt"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/client-go/tools/events"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	clientFake "sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
++
++	"github.com/ray-project/kuberay/ray-operator/controllers/ray/expectations"
++	"github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
++	"github.com/ray-project/kuberay/ray-operator/pkg/client/clientset/versioned/scheme"
++	"github.com/ray-project/kuberay/ray-operator/pkg/features"
++)
++
++func TestSlowStartBatchRunsDoublingConcurrentBatches(t *testing.T) {
++	const count = 50
++	started := make(chan int, count)
++	release := make(chan struct{})
++	var successes int
++	var err error
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		successes, err = slowStartBatch(count, func(i int) error {
++			started <- i
++			<-release
++			return nil
++		})
++	}()
++
++	// Every call of a batch blocks until the test releases it, so receiving a whole batch proves its
++	// calls run concurrently, and no call of the next batch may start before the batch is released.
++	next := 0
++	for _, size := range []int{1, 2, 4, 8, 16, 19} {
++		batch := map[int]bool{}
++		for range size {
++			select {
++			case i := <-started:
++				batch[i] = true
++			case <-time.After(10 * time.Second):
++				t.Fatalf("batch starting at %d ran %d calls concurrently, want %d", next, len(batch), size)
++			}
++		}
++		select {
++		case i := <-started:
++			t.Fatalf("call %d started before the batch of %d calls starting at %d finished", i, size, next)
++		case <-time.After(50 * time.Millisecond):
++		}
++		for i := next; i < next+size; i++ {
++			assert.True(t, batch[i], "batch starting at %d did not call %d", next, i)
++		}
++		next += size
++		for range size {
++			release <- struct{}{}
++		}
++	}
++	<-done
++	require.NoError(t, err)
++	assert.Equal(t, count, successes)
++	assert.Empty(t, started, "calls beyond count")
++}
++
++func TestSlowStartBatchStopsAfterFailedBatch(t *testing.T) {
++	errFirst := errstd.New("first failure")
++	errSecond := errstd.New("second failure")
++	tests := []struct {
++		name          string
++		failures      map[int]error
++		wantSuccesses int
++		wantCalls     int
++	}{
++		{
++			// Batches are [0], [1 2], [3 4 5 6]: the third batch fails, so the fourth never starts.
++			name:          "one failure",
++			failures:      map[int]error{5: errFirst},
++			wantSuccesses: 6,
++			wantCalls:     7,
++		},
++		{
++			name:          "two failures in one batch",
++			failures:      map[int]error{4: errFirst, 6: errSecond},
++			wantSuccesses: 5,
++			wantCalls:     7,
++		},
++		{
++			name:          "failure in the first batch",
++			failures:      map[int]error{0: errFirst},
++			wantSuccesses: 0,
++			wantCalls:     1,
++		},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			var calls atomic.Int32
++			successes, err := slowStartBatch(50, func(i int) error {
++				calls.Add(1)
++				return tc.failures[i]
++			})
++			require.Error(t, err)
++			for _, want := range tc.failures {
++				require.ErrorIs(t, err, want)
++			}
++			assert.Equal(t, tc.wantSuccesses, successes)
++			assert.Equal(t, int32(tc.wantCalls), calls.Load())
++		})
++	}
++}
++
++func TestSlowStartBatchWithZeroCount(t *testing.T) {
++	successes, err := slowStartBatch(0, func(int) error {
++		t.Fatal("fn called for count 0")
++		return nil
++	})
++	require.NoError(t, err)
++	assert.Equal(t, 0, successes)
++}
++
++// TestSlowStartBatchReconcileCreatesWorkerGroup checks that one reconcile creates every missing worker
++// of a large group with concurrent creates, and that after a failed create the Pods already created
++// stay and the next reconcile creates only the rest.
++func TestSlowStartBatchReconcileCreatesWorkerGroup(t *testing.T) {
++	const replicas = 50
++	for _, multiHostIndexing := range []bool{false, true} {
++		t.Run(fmt.Sprintf("RayMultiHostIndexing=%t", multiHostIndexing), func(t *testing.T) {
++			setupTest(t)
++			features.SetFeatureGateDuringTest(t, features.RayMultiHostIndexing, multiHostIndexing)
++			cluster := testRayCluster.DeepCopy()
++			cluster.Spec.EnableInTreeAutoscaling = new(false)
++			cluster.Spec.WorkerGroupSpecs[0].Replicas = new(int32(replicas))
++			cluster.Spec.WorkerGroupSpecs[0].ScaleStrategy.WorkersToDelete = nil
++			headPod := testPods[0]
++
++			t.Run("one reconcile creates every worker", func(t *testing.T) {
++				var mu sync.Mutex
++				inFlight, maxInFlight := 0, 0
++				fakeClient := clientFake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
++					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
++						mu.Lock()
++						inFlight++
++						maxInFlight = max(maxInFlight, inFlight)
++						mu.Unlock()
++						defer func() {
++							mu.Lock()
++							inFlight--
++							mu.Unlock()
++						}()
++						// Hold each create long enough that the calls of a batch overlap.
++						time.Sleep(10 * time.Millisecond)
++						return c.Create(ctx, obj, opts...)
++					},
++				}).WithRuntimeObjects(headPod.DeepCopyObject()).Build()
++				r := newSlowStartBatchTestReconciler(fakeClient, events.NewFakeRecorder(4*replicas))
++
++				require.NoError(t, r.reconcilePods(context.Background(), cluster))
++				assertWorkerPods(t, fakeClient, replicas, multiHostIndexing)
++				assert.Greater(t, maxInFlight, 1, "worker Pods were created one at a time")
++			})
++
++			t.Run("a failed create keeps created workers and the next reconcile creates the rest", func(t *testing.T) {
++				var creates atomic.Int32
++				errCreate := errstd.New("admission webhook denied the request")
++				fakeClient := clientFake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
++					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
++						// Fail the 10th create, which runs in the fourth batch of 8 calls after 7 Pods exist.
++						if creates.Add(1) == 10 {
++							return errCreate
++						}
++						return c.Create(ctx, obj, opts...)
++					},
++				}).WithRuntimeObjects(headPod.DeepCopyObject()).Build()
++				recorder := events.NewFakeRecorder(4 * replicas)
++				r := newSlowStartBatchTestReconciler(fakeClient, recorder)
++
++				err := r.reconcilePods(context.Background(), cluster)
++				require.ErrorIs(t, err, utils.ErrFailedCreateWorkerPod)
++				require.ErrorIs(t, err, errCreate)
++				assertWorkerPods(t, fakeClient, 14, multiHostIndexing)
++				assert.Equal(t, int32(15), creates.Load(), "creates after the failed batch")
++				assert.Equal(t, 1, countEvents(recorder, string(utils.FailedToCreateWorkerPod)))
++
++				require.NoError(t, r.reconcilePods(context.Background(), cluster))
++				assertWorkerPods(t, fakeClient, replicas, multiHostIndexing)
++				assert.Equal(t, int32(15+replicas-14), creates.Load(), "the second reconcile created more than the missing Pods")
++			})
++		})
++	}
++}
++
++func newSlowStartBatchTestReconciler(c client.Client, recorder events.EventRecorder) *RayClusterReconciler {
++	return &RayClusterReconciler{
++		Client:                     c,
++		Recorder:                   recorder,
++		Scheme:                     scheme.Scheme,
++		rayClusterScaleExpectation: expectations.NewRayClusterScaleExpectation(c),
++	}
++}
++
++// assertWorkerPods checks the group has want worker Pods and, with RayMultiHostIndexing, that their
++// replica indices are distinct.
++func assertWorkerPods(t *testing.T, c client.Client, want int, multiHostIndexing bool) {
++	t.Helper()
++	pods := corev1.PodList{}
++	require.NoError(t, c.List(context.Background(), &pods, &client.ListOptions{LabelSelector: workerSelector, Namespace: namespaceStr}))
++	require.Len(t, pods.Items, want)
++	if !multiHostIndexing {
++		return
++	}
++	indices := map[int]bool{}
++	for _, pod := range pods.Items {
++		index, err := strconv.Atoi(pod.Labels[utils.RayWorkerReplicaIndexKey])
++		require.NoError(t, err, "Pod %s has no replica index", pod.Name)
++		assert.False(t, indices[index], "replica index %d is used twice", index)
++		indices[index] = true
++	}
++}
++
++func countEvents(recorder *events.FakeRecorder, reason string) int {
++	n := 0
++	for {
++		select {
++		case event := <-recorder.Events:
++			if strings.Contains(event, reason) {
++				n++
++			}
++		default:
++			return n
++		}
++	}
++}

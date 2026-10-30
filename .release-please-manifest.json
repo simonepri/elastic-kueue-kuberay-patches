@@ -1,6 +1,6 @@
 {
   "patches/kueue": "0.6.0",
-  "patches/kuberay": "0.3.6",
+  "patches/kuberay": "0.3.7",
   "patches/interlink": "0.5.0",
   "patches/ray": "0.2.0"
 }

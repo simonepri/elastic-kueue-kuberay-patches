@@ -5,8 +5,8 @@ metadata:
 spec:
   description: >
     Verifies that ScaleGate never clamps a worker group below its minReplicas: when the quota holds fewer workers
-    than minReplicas, maxReplicas and replicas stop at minReplicas, so the operator never sees minReplicas greater
-    than maxReplicas.
+    than minReplicas, maxReplicas stops at minReplicas, so the operator never sees minReplicas greater than
+    maxReplicas. ScaleGate leaves replicas as the user wrote it.
   steps:
     - name: setup-queue
       try:

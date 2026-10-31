@@ -1,3 +1,6 @@
+# ScaleGate caps maxReplicas at the 4 workers the quota holds, and the operator limits a group to maxReplicas, so it
+# plans 4 workers however many replicas the autoscaler asked for. replicas is not asserted: ScaleGate does not write
+# it, and Kueue admission may.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -5,7 +8,8 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: workers
-      replicas: 4
+      maxReplicas: 4
 status:
+  desiredWorkerReplicas: 4
   (conditions[?type == 'ScaleGateClamped']):
     - status: "True"

@@ -240,7 +240,7 @@ dir = "third_party/kueue"
 run = "go test -race -timeout 30m ./pkg/scheduler/... ./pkg/cache/... ./pkg/controller/... ./pkg/webhooks/... ./pkg/workload/... ./pkg/workloadslicing/... ./pkg/util/equality/..."
 
 [tasks."test:kueue-integration"]
-description = "Run the patched Kueue topology-aware reclaim and RayCluster integration suites against envtest"
+description = "Run the patched Kueue topology-aware reclaim and RayCluster integration and webhook suites against envtest, which include the elastic flavor placement and template re-apply specs"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
 run = """
@@ -252,6 +252,10 @@ make test-integration \
 make test-integration \
   INTEGRATION_TARGET=./test/integration/singlecluster/controller/jobs/raycluster/... \
   INTEGRATION_NPROCS=1
+make test-integration \
+  INTEGRATION_TARGET=./test/integration/singlecluster/webhook/jobs/... \
+  INTEGRATION_NPROCS=1 \
+  'INTEGRATION_FILTERS=--focus="RayCluster Webhook"'
 """
 
 [tasks."test:kuberay"]
@@ -410,7 +414,7 @@ subjects:
 EOF
 
 # 6. Install Kueue manifests directly patched with sed (image, ko entrypoint), the ConcurrentAdmission feature gate
-#    the Karpenter AdmissionCheck requires, and the Karpenter RBAC
+#    the Karpenter AdmissionCheck requires, the FlavorChangeFromZero gate that patch 0006 completes, and the Karpenter RBAC
 echo "Installing Kueue manifests with patched image..."
 curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml" | \
   sed -e "s|registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM|$KUEUE_IMG|g" \
@@ -448,8 +452,15 @@ subjects:
   namespace: kueue-system
 EOF
 
+# Patch 0007 re-stamps the templates of an elastic RayCluster on every write, so its webhook must also see updates;
+# the release manifests register it for CREATE only.
+raycluster_webhook=$(kubectl get mutatingwebhookconfiguration kueue-mutating-webhook-configuration -o jsonpath='{.webhooks[*].name}' |
+  awk '{for (i = 1; i <= NF; i++) if ($i == "mraycluster.kb.io") print i - 1}')
+kubectl patch mutatingwebhookconfiguration kueue-mutating-webhook-configuration --type=json \
+  -p '[{"op":"add","path":"/webhooks/'"$raycluster_webhook"'/rules/0/operations/-","value":"UPDATE"}]'
+
 kubectl patch deployment/kueue-controller-manager -n kueue-system --type=json \
-  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates=ConcurrentAdmission=true"}]'
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates=ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true"}]'
 kubectl set resources deployment/kueue-controller-manager -n kueue-system --limits=memory=2Gi --requests=memory=512Mi
 
 # 7. Wait for rollouts

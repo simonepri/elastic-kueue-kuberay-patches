@@ -1,0 +1,43 @@
+# Elastic RayCluster with two workers whose pods never schedule, so the test observes only Kueue's scheduling gate.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: reapplied-cluster
+  labels:
+    kueue.x-k8s.io/queue-name: reapply-local-queue
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+spec:
+  rayVersion: "2.38.0"
+  headGroupSpec:
+    rayStartParams: {}
+    template:
+      spec:
+        nodeSelector:
+          example.com/unschedulable: "true"
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: "250m"
+                memory: "64Mi"
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 6
+      rayStartParams: {}
+      template:
+        spec:
+          schedulingGates:
+            - name: kueue.x-k8s.io/elastic-job
+          nodeSelector:
+            example.com/unschedulable: "true"
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "250m"
+                  memory: "64Mi"

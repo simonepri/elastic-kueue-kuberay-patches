@@ -12,8 +12,8 @@ spec:
     3. Realistic 15s termination grace period latency during spot interruption without
        double-counting quota, tripping Kueue recovery timeouts, or evicting the Ray head pod.
     4. Quota release on spot interruption allowing opportunistic low-priority workload admission.
-    5. Autonomous elastic re-expansion back to target replicas while preserving maxReplicas headroom.
-    Partial preemption of the same cluster is checked in 12-interlink-cloudvm-partial-preemption.
+    Partial preemption of the same cluster, and its re-expansion after both the preemption
+    and the spot interruption, are checked in 12-interlink-cloudvm-partial-preemption.
   steps:
     - name: setup-interlink-and-queues
       try:
@@ -35,9 +35,3 @@ spec:
             file: 08-cloud-spot-interruption-notice.yaml
         - assert:
             file: 08-assert-spot-contracted.yaml
-    - name: restore-capacity-and-verify-spot-elastic-reexpansion
-      try:
-        - delete:
-            file: 09-restore-capacity.yaml
-        - assert:
-            file: 10-assert-reexpanded.yaml

@@ -10,7 +10,8 @@ spec:
     Verifies partial preemption of the hybrid Ray cluster of 10-interlink-cloudvm-virtual-kubelet:
     a higher-priority burst job shrinks the InterLink worker group with a 15s termination grace
     period, without double-counting quota or evicting the Ray head pod, and the group re-expands
-    to its target once the burst job is deleted.
+    to its target once the burst job is deleted. After a spot interruption contracts the group and
+    an opportunistic job takes the released quota, the group re-expands once the notice is removed.
   steps:
     - name: setup-interlink-and-queues
       try:
@@ -34,3 +35,19 @@ spec:
             file: 05-restore-capacity.yaml
         - assert:
             file: 06-assert-elastic-reexpanded.yaml
+    - name: queue-opportunistic-workload-pending-quota
+      try:
+        - apply:
+            file: ../10-interlink-cloudvm-virtual-kubelet/07-opportunistic-burst-job.yaml
+    - name: simulate-cloud-spot-interruption-notice-and-verify-quota-transfer
+      try:
+        - apply:
+            file: ../10-interlink-cloudvm-virtual-kubelet/08-cloud-spot-interruption-notice.yaml
+        - assert:
+            file: ../10-interlink-cloudvm-virtual-kubelet/08-assert-spot-contracted.yaml
+    - name: restore-capacity-and-verify-spot-elastic-reexpansion
+      try:
+        - delete:
+            file: 09-restore-capacity.yaml
+        - assert:
+            file: 10-assert-reexpanded.yaml

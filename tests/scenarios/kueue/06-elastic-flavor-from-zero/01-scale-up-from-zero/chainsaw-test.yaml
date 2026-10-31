@@ -4,15 +4,12 @@ kind: Test
 metadata:
   name: 06-elastic-flavor-from-zero
 spec:
-  # TODO(simonepri): run again with patch 0006-elastic-flavor-on-pods (R2), and keep its assertions;
-  # see the acceptance tests in patches/kueue/contract.md.
-  skip: true
   description: >
     Verifies that an elastic RayCluster admitted with no workers is not pinned to the flavor
     Kueue assigned to the empty worker group. When the worker group scales to six workers and
     only three fit in that flavor, the scale-up slice is admitted with all six in the next
     flavor instead of three in the first, and Kueue adds that flavor's node label and
-    toleration to each worker before ungating it.
+    toleration to each worker before ungating it, never to the worker template.
   steps:
     - name: setup-queues
       try:
@@ -24,6 +21,12 @@ spec:
             file: 01-raycluster.yaml
         - assert:
             file: 01-assert-admitted.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-template-without-placement.sh
     - name: scale-up-from-zero
       try:
         - script:
@@ -41,3 +44,8 @@ spec:
               - name: NS
                 value: ($namespace)
             content: ./assert-workers-follow-flavor.sh 6
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-template-without-placement.sh

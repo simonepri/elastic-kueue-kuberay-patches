@@ -1,0 +1,35 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 24-shared-kueue-fleet-fair-reclaim
+spec:
+  # TODO(simonepri): run again with patch 0010-partial-preemption-search (R5), and assert the cohort reclaim on pods while replicas stay unchanged;
+  # see the acceptance tests in patches/kueue/contract.md.
+  skip: true
+  description: >
+    Verifies the cohort reclaim of the two-tier fleet in 09-shared-kueue-fleet-fairness: when Cell 2
+    arrives requesting its nominal share while Cell 1 borrows, Kueue contracts Cell 1 and grants
+    Cell 2 its fair share without split-capacity deadlocks or over-subscription.
+  steps:
+    - name: setup-queues-and-cohorts
+      try:
+        - apply:
+            file: ../09-shared-kueue-fleet-fairness/00-queues-and-cohorts.yaml
+    - name: run-cell1-local-workload
+      try:
+        - apply:
+            file: ../09-shared-kueue-fleet-fairness/01-cell1-local-workload.yaml
+        - assert:
+            file: ../09-shared-kueue-fleet-fairness/01-assert-cell1-local.yaml
+    - name: trigger-cell1-spot-burst
+      try:
+        - apply:
+            file: ../09-shared-kueue-fleet-fairness/02-cell1-spot-burst.yaml
+        - assert:
+            file: ../09-shared-kueue-fleet-fairness/02-assert-cell1-burst.yaml
+    - name: cell2-arrives-and-reclaims-fair-share
+      try:
+        - apply:
+            file: ../09-shared-kueue-fleet-fairness/03-cell2-spot-arrival.yaml
+        - assert:
+            file: 03-assert-fair-reclaim.yaml

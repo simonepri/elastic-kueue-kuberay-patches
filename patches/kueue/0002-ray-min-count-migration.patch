@@ -9,6 +9,119 @@ Ray integrations now ignore minCount in that check while the Workload holds
 quota; once the quota is released, Kueue replaces the Workload's PodSets with
 the job's as usual.
 
+diff --git a/pkg/controller/jobframework/min_count_migration_test.go b/pkg/controller/jobframework/min_count_migration_test.go
+new file mode 100644
+index 0000000..0c1c003
+--- /dev/null
++++ b/pkg/controller/jobframework/min_count_migration_test.go
+@@ -0,0 +1,107 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package jobframework_test
++
++import (
++	"testing"
++	"time"
++
++	"go.uber.org/mock/gomock"
++	batchv1 "k8s.io/api/batch/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/utils/ptr"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	mocks "sigs.k8s.io/kueue/internal/mocks/controller/jobframework"
++	kueueconstants "sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// TestMinCountMigrationSliceChain pins how a new slice treats the minCount that patch
++// releases up to p0.6.x gave every Ray worker group: a job without partial scale-up takes
++// the job's own PodSets, which drops it, and only a partial scale-up job inherits it.
++func TestMinCountMigrationSliceChain(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp, true)
++	gvk := batchv1.SchemeGroupVersion.WithKind("Job")
++
++	cases := map[string]struct {
++		partialScaleUp bool
++		jobMinCount    *int32
++		wantMinCount   *int32
++	}{
++		"without partial scale-up the stale minCount is dropped": {},
++		"partial scale-up inherits the stale minCount, capped at the new count": {
++			partialScaleUp: true,
++			jobMinCount:    ptr.To[int32](4),
++			wantMinCount:   ptr.To[int32](0),
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			ctx, _ := utiltesting.ContextWithLog(t)
++			jobWrapper := testingjob.MakeJob("job", "ns").
++				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++				Queue("lq").
++				UID("job-uid")
++			if tc.partialScaleUp {
++				jobWrapper.SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, kueueconstants.ElasticJobScaleUpStrategyPartial)
++			}
++			job := jobWrapper.Obj()
++			// The predecessor slice an earlier release built: minCount = minReplicas = 0.
++			prevWl := utiltestingapi.MakeWorkload("job-prev", "ns").
++				Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++				PodSets(kueue.PodSet{Name: "workers", Count: 2, MinCount: ptr.To[int32](0)}).
++				ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++					utiltestingapi.MakePodSetAssignment("workers").
++						Assignment(corev1.ResourceCPU, "default", "1").
++						Count(2).
++						Obj(),
++				).Obj(), time.Now()).
++				ControllerReference(gvk, "job", "job-uid").
++				Obj()
++
++			mockctrl := gomock.NewController(t)
++			mgj := mocks.NewMockGenericJob(mockctrl)
++			mgj.EXPECT().Object().Return(job).AnyTimes()
++			mgj.EXPECT().GVK().Return(gvk).AnyTimes()
++			mgj.EXPECT().PodSets(gomock.Any(), gomock.Any()).
++				Return([]kueue.PodSet{{Name: "workers", Count: 4, MinCount: tc.jobMinCount}}, nil).AnyTimes()
++
++			cl := utiltesting.NewClientBuilder().
++				WithObjects([]client.Object{utiltesting.MakeNamespace("ns"), job, prevWl}...).
++				WithIndex(&kueue.Workload{}, indexer.OwnerReferenceIndexKey(gvk), indexer.WorkloadOwnerIndexFunc(gvk)).
++				Build()
++
++			wl, err := jobframework.ConstructWorkload(ctx, cl, mgj, nil, nil)
++			if err != nil {
++				t.Fatalf("ConstructWorkload() error: %v", err)
++			}
++			got := wl.Spec.PodSets[0].MinCount
++			if ptr.Deref(got, -1) != ptr.Deref(tc.wantMinCount, -1) {
++				t.Errorf("minCount = %v, want %v", ptr.Deref(got, -1), ptr.Deref(tc.wantMinCount, -1))
++			}
++		})
++	}
++}
 diff --git a/pkg/controller/jobs/raycluster/min_count_migration.go b/pkg/controller/jobs/raycluster/min_count_migration.go
 new file mode 100644
 index 0000000..f1b331c

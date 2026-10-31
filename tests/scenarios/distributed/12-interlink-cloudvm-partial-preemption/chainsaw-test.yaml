@@ -1,0 +1,36 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 25-interlink-cloudvm-partial-preemption
+spec:
+  # TODO(simonepri): run again with patch 0010-partial-preemption-search (R5) and 0011-elastic-regrow-after-reclaim (R6), and assert the shrink and regrowth on pods while replicas stay unchanged;
+  # see the acceptance tests in patches/kueue/contract.md.
+  skip: true
+  description: >
+    Verifies partial preemption of the hybrid Ray cluster of 10-interlink-cloudvm-virtual-kubelet:
+    a higher-priority burst job shrinks the InterLink worker group with a 15s termination grace
+    period, without double-counting quota or evicting the Ray head pod, and the group re-expands
+    to its target once the burst job is deleted.
+  steps:
+    - name: setup-interlink-and-queues
+      try:
+        - apply:
+            file: ../10-interlink-cloudvm-virtual-kubelet/00-interlink-setup.yaml
+    - name: submit-hybrid-raycluster-with-provisioning-latency
+      try:
+        - apply:
+            file: ../10-interlink-cloudvm-virtual-kubelet/01-raycluster-hybrid.yaml
+        - assert:
+            file: ../10-interlink-cloudvm-virtual-kubelet/02-assert-hybrid-active.yaml
+    - name: trigger-partial-preemption-with-termination-grace-latency
+      try:
+        - apply:
+            file: 03-preemptor-burst-job.yaml
+        - assert:
+            file: 04-assert-partial-preemption.yaml
+    - name: restore-quota-and-verify-elastic-reexpansion
+      try:
+        - delete:
+            file: 05-restore-capacity.yaml
+        - assert:
+            file: 06-assert-elastic-reexpanded.yaml

@@ -1,0 +1,2576 @@
+Partial preemption in the classical strategy (contract R5), behind the
+PartialPreemption gate, off by default.
+
+A preemption target can carry Remaining, the victim's workload.Info with each
+shrunk PodSet's quota scaled down and its topology usage kept. Every site that
+takes a victim out of the snapshot goes through one seam in
+pkg/scheduler/preemption/policy/partial.go. The classical strategy offers a
+victim with floors shrunk to them, evicts shrunk targets whole when the
+candidates run out without a fit, and grows them back in steps during
+fill-back. Victims whose reclaim target is pending are offered right after the
+evicted ones, and evicted whole once the target is older than 5 minutes. A
+partial target is issued as a reclaim-target annotation, never raised, without
+a preemption expectation. Fair sharing and configurable preemption still evict
+whole. Mirrors the seam of https://github.com/kubernetes-sigs/kueue/pull/17484.
+
+Until 0008 and 0009 land, pkg/constants/{partial_preemption,reclaim_floors}.go,
+pkg/workload/{partial_preemption,reclaim_floors}.go and the gate in
+pkg/features/kube_features.go are stubs of their declarations; regenerate
+this patch on top of them and drop the stubs.
+
+diff --git a/pkg/constants/partial_preemption.go b/pkg/constants/partial_preemption.go
+new file mode 100644
+index 0000000..81a8e08
+--- /dev/null
++++ b/pkg/constants/partial_preemption.go
+@@ -0,0 +1,30 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// NOTE(R3): stub of the declarations 0008 owns, kept identical to the
++// contract so that 0010 drops this file when it is regenerated on 0008.
++
++package constants
++
++const (
++	// ReclaimTargetCountsAnnotation lists the pod count each shrunk PodSet of a
++	// partially preempted Workload goes down to.
++	ReclaimTargetCountsAnnotation = "kueue.x-k8s.io/reclaim-target-counts"
++	// ReclaimPreemptorAnnotation names, as namespace/name, the Workload that set the reclaim target.
++	ReclaimPreemptorAnnotation = "kueue.x-k8s.io/reclaim-preemptor"
++	// ReclaimRequestedAtAnnotation records, in RFC 3339, when the reclaim target was first set.
++	ReclaimRequestedAtAnnotation = "kueue.x-k8s.io/reclaim-requested-at"
++)
+diff --git a/pkg/constants/reclaim_floors.go b/pkg/constants/reclaim_floors.go
+new file mode 100644
+index 0000000..2068b2f
+--- /dev/null
++++ b/pkg/constants/reclaim_floors.go
+@@ -0,0 +1,27 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// NOTE(R4): stub of the declarations 0009 owns, kept identical to the
++// contract so that 0010 drops this file when it is regenerated on 0009.
++
++package constants
++
++const (
++	// ReclaimMinCountsAnnotation lists the fewest pods each PodSet may keep under partial preemption.
++	ReclaimMinCountsAnnotation = "kueue.x-k8s.io/reclaim-min-counts"
++	// PodSetCountStepsAnnotation lists the pod count each PodSet shrinks and grows by.
++	PodSetCountStepsAnnotation = "kueue.x-k8s.io/podset-count-steps"
++)
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index bcc4dd9..959a5ac 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -181,6 +181,9 @@ const (
+ 	// owner: @sohankunkerkar
+ 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/77-dynamically-sized-jobs
+ 	//
++	// Enables preemption to shrink elastic workloads to their reclaim floor before evicting them.
++	PartialPreemption featuregate.Feature = "PartialPreemption"
++
+ 	// ElasticJobsViaWorkloadSlicesWithTAS enables TAS integration with elastic workload slices.
+ 	// Requires both ElasticJobsViaWorkloadSlices and TopologyAwareScheduling to be enabled.
+ 	ElasticJobsViaWorkloadSlicesWithTAS featuregate.Feature = "ElasticJobsViaWorkloadSlicesWithTAS"
+@@ -930,6 +933,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
+ 	TASProfileMixed:                                     {TopologyAwareScheduling},
+ 	TASRecomputeAssignmentWithinSchedulingCycle:         {TopologyAwareScheduling},
+ 	ElasticJobsViaWorkloadSlicesWithTAS:                 {ElasticJobsViaWorkloadSlices, TopologyAwareScheduling},
++	PartialPreemption:                                   {ElasticJobsViaWorkloadSlices, ReclaimablePods},
+ 	ElasticJobsViaWorkloadSlicesFlavorChangeFromZero:    {ElasticJobsViaWorkloadSlices},
+ 	MultiKueueRayInTreeAutoscaling:                      {MultiKueue, ElasticJobsViaWorkloadSlices, SkipChildJobSuspension},
+ 	KueueDRAIntegrationExtendedResource:                 {KueueDRAIntegration},
+@@ -1034,6 +1038,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+ 	ElasticJobsViaWorkloadSlicesWithTAS: {
+ 		{Version: version.MustParse("0.17"), Default: false, PreRelease: featuregate.Alpha},
+ 	},
++	PartialPreemption: {
++		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
++	},
+ 	ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: {
+ 		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
+ 	},
+diff --git a/pkg/scheduler/assignment/native/native.go b/pkg/scheduler/assignment/native/native.go
+index 2130c58..d01ea1b 100644
+--- a/pkg/scheduler/assignment/native/native.go
++++ b/pkg/scheduler/assignment/native/native.go
+@@ -28,6 +28,7 @@ import (
+ 	"sigs.k8s.io/kueue/pkg/scheduler/assignment"
+ 	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
+ 	"sigs.k8s.io/kueue/pkg/scheduler/preemption"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
+ 	"sigs.k8s.io/kueue/pkg/util/tas"
+ 	"sigs.k8s.io/kueue/pkg/workload"
+ )
+@@ -128,14 +129,10 @@ func (p *nativePlanner) updateAssignmentForTAS(
+ 		log = log.WithValues("workload", klog.KRef(p.wl.Obj.Namespace, p.wl.Obj.Name))
+ 
+ 		if len(targets) > 0 {
+-			var targetWorkloads []*workload.Info
+-			for _, target := range targets {
+-				targetWorkloads = append(targetWorkloads, target.WorkloadInfo)
+-			}
+-			revertUsage := p.snapshot.SimulateWorkloadRemoval(targetWorkloads)
++			revertUsage := policy.SimulateRemoval(p.snapshot, targets)
+ 			// Freeing the victims' quota is not enough. Until the simulator is told,
+ 			// it still reports their Pods and their nodes still look occupied.
+-			revertPods := p.snapshot.SimulatePodRemoval(ctx, log, targetWorkloads)
++			revertPods := p.snapshot.SimulatePodRemoval(ctx, log, policy.EvictedWorkloads(targets))
+ 			tasResult = asgn.FindTopologyAssignments(
+ 				ctx,
+ 				cq,
+diff --git a/pkg/scheduler/preemption/classical/cache_candidate_generator.go b/pkg/scheduler/preemption/classical/cache_candidate_generator.go
+index 656fd27..7f457c6 100644
+--- a/pkg/scheduler/preemption/classical/cache_candidate_generator.go
++++ b/pkg/scheduler/preemption/classical/cache_candidate_generator.go
+@@ -26,6 +26,7 @@ import (
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+ 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+ 	"sigs.k8s.io/kueue/pkg/resources"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
+ 	"sigs.k8s.io/kueue/pkg/workload"
+ )
+ 
+@@ -105,7 +106,13 @@ func buildBuckets(classes []classifiedClusterQueue) (evicted, nonEvicted []*buck
+ 		if len(cc.sortedWorkloads) == 0 {
+ 			continue
+ 		}
+-		ev, nonEv := cc.sortedWorkloads[:cc.evictedCount], cc.sortedWorkloads[cc.evictedCount:]
++		// Workloads whose partial preemption is in flight sort right after the
++		// evicted ones and are offered with them.
++		evictedCount := cc.evictedCount
++		for evictedCount < len(cc.sortedWorkloads) && policy.IsReclaimInFlight(cc.sortedWorkloads[evictedCount]) {
++			evictedCount++
++		}
++		ev, nonEv := cc.sortedWorkloads[:evictedCount], cc.sortedWorkloads[evictedCount:]
+ 		if len(ev) > 0 {
+ 			evicted = append(evicted, newBucket(cc, ev))
+ 		}
+diff --git a/pkg/scheduler/preemption/classical/candidate_generator.go b/pkg/scheduler/preemption/classical/candidate_generator.go
+index 4358917..b2f0532 100644
+--- a/pkg/scheduler/preemption/classical/candidate_generator.go
++++ b/pkg/scheduler/preemption/classical/candidate_generator.go
+@@ -29,6 +29,7 @@ import (
+ 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+ 	"sigs.k8s.io/kueue/pkg/features"
+ 	"sigs.k8s.io/kueue/pkg/resources"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
+ 	"sigs.k8s.io/kueue/pkg/workload"
+ 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
+ )
+@@ -83,10 +84,11 @@ func WorkloadUsesResources(wl *workload.Info, frsNeedPreemption sets.Set[resourc
+ 	return false
+ }
+ 
+-// assume a prefix of the elements has condition WorkloadEvicted = true
++// assume a prefix of the elements has condition WorkloadEvicted = true, or a
++// partial preemption in flight
+ func splitEvicted(workloads []*candidateElem) ([]*candidateElem, []*candidateElem) {
+ 	firstFalse := sort.Search(len(workloads), func(i int) bool {
+-		return !workloadevict.IsEvicted(workloads[i].wl.Obj)
++		return !workloadevict.IsEvicted(workloads[i].wl.Obj) && !policy.IsReclaimInFlight(workloads[i].wl)
+ 	})
+ 	return workloads[:firstFalse], workloads[firstFalse:]
+ }
+diff --git a/pkg/scheduler/preemption/classical_strategy.go b/pkg/scheduler/preemption/classical_strategy.go
+index 6da3b27..f39549e 100644
+--- a/pkg/scheduler/preemption/classical_strategy.go
++++ b/pkg/scheduler/preemption/classical_strategy.go
+@@ -80,7 +80,7 @@ func classicalPreemptionAttempts(ctx context.Context, preemptor *Preemptor, pree
+ 		preemptionCtx.frsNeedPreemption,
+ 		preemptionCtx.snapshot,
+ 		preemptor.clock,
+-		policy.CandidatesOrdering,
++		policy.ClassicalCandidatesOrdering,
+ 	)
+ 	var attemptPossibleOpts []preemptionAttemptOpts
+ 	borrowWithinCohortForbidden, _ := classical.IsBorrowingWithinCohortForbidden(preemptionCtx.preemptorCQ)
+@@ -119,17 +119,22 @@ func classicalTopologyRetryAttempts(ctx context.Context, preemptor *Preemptor, p
+ 	hierarchicalReclaimCtx, candidatesGenerator, attemptPossibleOpts := classicalPreemptionAttempts(ctx, preemptor, preemptionCtx)
+ 	reorderedIterator := classical.NewReorderedCandidateIterators(
+ 		hierarchicalReclaimCtx, preemptor.enabledAfs, preemptionCtx.frsNeedPreemption,
+-		preemptionCtx.snapshot, preemptor.clock, policy.CandidatesOrdering,
++		preemptionCtx.snapshot, preemptor.clock, policy.ClassicalCandidatesOrdering,
+ 	)
+ 	attempts := make([]topologyRetryAttempt, 0, len(attemptPossibleOpts))
+ 	for _, opts := range attemptPossibleOpts {
+ 		allowBorrowing := opts.borrowing
+ 		attempts = append(attempts, topologyRetryAttempt{
+ 			allowBorrowing: allowBorrowing,
+-			candidates:     eligibleCandidates(candidatesGenerator, allowBorrowing),
++			candidates:     eligibleCandidates(preemptionCtx, candidatesGenerator, allowBorrowing),
++			freedUsage: func(wl *workload.Info) workload.Usage {
++				candidate := &Target{WorkloadInfo: wl}
++				offerPartially(preemptionCtx, candidate)
++				return candidate.FreedUsage()
++			},
+ 			strategy: func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy {
+ 				iterator := reorderedIterator(func(a, b *workload.Info) int {
+-					return policy.CandidatesPreferenceOrdering(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, preferred.Has)
++					return policy.ClassicalCandidatesPreferenceOrdering(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, preferred.Has)
+ 				}, keep)
+ 				return newPreemptionStrategy(func(yieldCandidate func(*Target) bool) {
+ 					iterateOverCandidates(ctx, preemptionCtx, iterator, allowBorrowing, yieldCandidate)
+@@ -150,11 +155,13 @@ func iterateOverCandidates(
+ 	yield = policy.YieldFromSnapshot(preemptionCtx.snapshot, yield)
+ 	iterator.Reset()
+ 	for candidateWl, reason := iterator.Next(allowBorrowing); candidateWl != nil; candidateWl, reason = iterator.Next(allowBorrowing) {
++		candidateWl = snapshotCandidate(preemptionCtx, candidateWl)
+ 		candidate := &Target{
+ 			WorkloadInfo: candidateWl,
+ 			Reason:       reason,
+ 			WorkloadCq:   preemptionCtx.snapshot.ClusterQueue(candidateWl.ClusterQueue),
+ 		}
++		offerPartially(preemptionCtx, candidate)
+ 		if !yield(candidate) {
+ 			return
+ 		}
+@@ -164,11 +171,11 @@ func iterateOverCandidates(
+ 
+ // eligibleCandidates returns every candidate the iterator offers for the
+ // given borrowing option, ignoring the order.
+-func eligibleCandidates(iterator candidateIterator, allowBorrowing bool) []*workload.Info {
++func eligibleCandidates(preemptionCtx *preemptionCtx, iterator candidateIterator, allowBorrowing bool) []*workload.Info {
+ 	var candidates []*workload.Info
+ 	iterator.Reset()
+ 	for candidate, _ := iterator.Next(allowBorrowing); candidate != nil; candidate, _ = iterator.Next(allowBorrowing) {
+-		candidates = append(candidates, candidate)
++		candidates = append(candidates, snapshotCandidate(preemptionCtx, candidate))
+ 	}
+ 	return candidates
+ }
+diff --git a/pkg/scheduler/preemption/partial_preemption.go b/pkg/scheduler/preemption/partial_preemption.go
+new file mode 100644
+index 0000000..789f115
+--- /dev/null
++++ b/pkg/scheduler/preemption/partial_preemption.go
+@@ -0,0 +1,265 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Partial preemption in the classical strategy: which candidates are offered
++// shrunk, how a shrunk target escalates to a whole eviction or grows back
++// during fill-back, and how a partial target is issued as a reclaim target.
++
++package preemption
++
++import (
++	"context"
++	"maps"
++	"slices"
++	"sort"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/klog/v2"
++	"sigs.k8s.io/controller-runtime/pkg/log"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
++	utilclient "sigs.k8s.io/kueue/pkg/util/client"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
++)
++
++// reclaimTimeout is how long a reclaim target may stay pending before a
++// preemptor that needs the victim evicts it whole.
++const reclaimTimeout = 5 * time.Minute
++
++// reclaimBound is the range a PodSet of a partial target may keep: from floor
++// up to ceiling pods, in steps of step. A target is offered at initial pods.
++type reclaimBound struct {
++	floor, ceiling, initial, step int32
++}
++
++// reclaimBounds returns the bound of each PodSet of wl that partial preemption
++// may shrink, or nil when wl may only be evicted whole. A workload whose reclaim
++// target is pending keeps at most that target, and is offered at it; one whose
++// target is older than reclaimTimeout is only evicted whole. Any other workload
++// is offered at the floors of kueue.x-k8s.io/reclaim-min-counts, rounded up to
++// their steps.
++func reclaimBounds(wl *workload.Info, now time.Time) map[kueue.PodSetReference]reclaimBound {
++	if !features.Enabled(features.PartialPreemption) || workloadevict.IsEvicted(wl.Obj) {
++		return nil
++	}
++	floors := workload.ReclaimMinCounts(wl.Obj)
++	pending := workload.PendingReclaimTargetCounts(wl.Obj)
++	if len(floors) == 0 && len(pending) == 0 {
++		return nil
++	}
++	if len(pending) > 0 && reclaimTimedOut(wl.Obj, now) {
++		return nil
++	}
++	steps := workload.PodSetCountSteps(wl.Obj)
++	bounds := make(map[kueue.PodSetReference]reclaimBound)
++	for _, ps := range wl.TotalRequests {
++		step := max(1, steps[ps.Name])
++		floor, hasFloor := floors[ps.Name]
++		if hasFloor {
++			floor = (floor + step - 1) / step * step
++		}
++		if len(pending) > 0 {
++			target, found := pending[ps.Name]
++			if !found || target >= ps.Count {
++				continue
++			}
++			if !hasFloor || floor > target {
++				floor = target
++			}
++			bounds[ps.Name] = reclaimBound{floor: floor, ceiling: target, initial: target, step: step}
++		} else if hasFloor && floor < ps.Count {
++			ceiling := floor + (ps.Count-1-floor)/step*step
++			bounds[ps.Name] = reclaimBound{floor: floor, ceiling: ceiling, initial: floor, step: step}
++		}
++	}
++	if len(bounds) == 0 {
++		return nil
++	}
++	return bounds
++}
++
++func reclaimTimedOut(wl *kueue.Workload, now time.Time) bool {
++	requestedAt, err := time.Parse(time.RFC3339, wl.Annotations[constants.ReclaimRequestedAtAnnotation])
++	return err == nil && now.Sub(requestedAt) >= reclaimTimeout
++}
++
++// offerPartially sets the target's Remaining to its workload shrunk to the
++// counts partial preemption offers it at, if it may shrink.
++func offerPartially(preemptionCtx *preemptionCtx, t *Target) {
++	bounds := reclaimBounds(t.WorkloadInfo, preemptionCtx.clock.Now())
++	if bounds == nil {
++		return
++	}
++	counts := make(workload.PodSetsCounts, len(bounds))
++	for name, b := range bounds {
++		counts[name] = b.initial
++	}
++	t.Remaining = policy.ShrunkTo(t.WorkloadInfo, counts)
++}
++
++// snapshotCandidate returns the workload the snapshot holds under the key of
++// a candidate an iterator returned. They differ only when another preemption
++// this cycle shrank the candidate and the snapshot holds what remains of it,
++// which the candidate-order cache does not know.
++func snapshotCandidate(preemptionCtx *preemptionCtx, wl *workload.Info) *workload.Info {
++	if !features.Enabled(features.PartialPreemption) {
++		return wl
++	}
++	if current := preemptionCtx.snapshot.ClusterQueue(wl.ClusterQueue).Workloads[workload.Key(wl.Obj)]; current != nil {
++		return current
++	}
++	return wl
++}
++
++// escalatePartialTargets evicts the shrunk targets whole, one at a time in the
++// order they were offered, until the preemptor fits. It reports whether it
++// fits; it never escalates when no target is shrunk.
++func escalatePartialTargets(ctx context.Context, preemptionCtx *preemptionCtx, targets []*Target, allowBorrowing bool) bool {
++	for _, t := range targets {
++		if t.Remaining == nil {
++			continue
++		}
++		preemptionCtx.snapshot.RemoveWorkload(t.Remaining)
++		t.Remaining = nil
++		if workloadFitsNotingTopology(ctx, preemptionCtx, allowBorrowing) {
++			return true
++		}
++	}
++	return false
++}
++
++// growPartialTargets gives each target offered shrunk back as many pods as
++// the preemptor still fits with, in steps up to its ceiling, in reverse
++// order. A target that was escalated is shrunk to its floors again first, if
++// the preemptor still fits.
++func growPartialTargets(ctx context.Context, preemptionCtx *preemptionCtx, targets []*Target, partial []*Target, allowBorrowing bool) {
++	snapshot := preemptionCtx.snapshot
++	swap := func(from, to *workload.Info) {
++		snapshot.RemoveWorkload(from)
++		snapshot.AddWorkload(to)
++	}
++	for _, t := range slices.Backward(targets) {
++		if !slices.Contains(partial, t) {
++			continue
++		}
++		bounds := reclaimBounds(t.WorkloadInfo, preemptionCtx.clock.Now())
++		if bounds == nil {
++			continue
++		}
++		counts := make(workload.PodSetsCounts, len(bounds))
++		for name, b := range bounds {
++			counts[name] = b.floor
++		}
++		if t.Remaining == nil {
++			remaining := policy.ShrunkTo(t.WorkloadInfo, counts)
++			snapshot.AddWorkload(remaining)
++			if !workloadFits(ctx, preemptionCtx, allowBorrowing) {
++				snapshot.RemoveWorkload(remaining)
++				continue
++			}
++			t.Remaining = remaining
++		}
++		for _, ps := range t.Remaining.TotalRequests {
++			if _, found := bounds[ps.Name]; found {
++				counts[ps.Name] = ps.Count
++			}
++		}
++		for _, name := range slices.Sorted(maps.Keys(bounds)) {
++			b, current := bounds[name], counts[name]
++			grownBy := func(steps int) *workload.Info {
++				grown := maps.Clone(counts)
++				grown[name] = current + int32(steps)*b.step
++				return policy.ShrunkTo(t.WorkloadInfo, grown)
++			}
++			steps := sort.Search(int((b.ceiling-current)/b.step), func(i int) bool {
++				grown := grownBy(i + 1)
++				swap(t.Remaining, grown)
++				fits := workloadFits(ctx, preemptionCtx, allowBorrowing)
++				swap(grown, t.Remaining)
++				return !fits
++			})
++			if steps > 0 {
++				grown := grownBy(steps)
++				swap(t.Remaining, grown)
++				t.Remaining = grown
++				counts[name] += int32(steps) * b.step
++			}
++		}
++	}
++}
++
++// issuePartialPreemption writes the target's Remaining counts as the victim's
++// reclaim target, never raising a target already set. It sets no preemption
++// expectation: an admitted victim that only gains an annotation is never
++// observed as evicted, and writing the same target again changes nothing.
++func (p *Preemptor) issuePartialPreemption(ctx context.Context, preemptor *workload.Info, target *Target) error {
++	wl := target.WorkloadInfo.Obj.DeepCopy()
++	changed := false
++	err := utilclient.Patch(ctx, p.client, wl, func() (bool, error) {
++		changed = setReclaimTarget(wl, target.Remaining, workload.Key(preemptor.Obj), p.clock.Now())
++		return changed, nil
++	}, utilclient.WithRetryOnConflict())
++	if err != nil || !changed {
++		return err
++	}
++	log.FromContext(ctx).V(3).Info("Partially preempted", "targetWorkload", klog.KObj(wl), "preemptingWorkload", klog.KObj(preemptor.Obj),
++		"reason", target.Reason, "reclaimTargetCounts", wl.Annotations[constants.ReclaimTargetCountsAnnotation])
++	p.recorder.Eventf(target.WorkloadInfo.Obj, nil, corev1.EventTypeNormal, "PartiallyPreempted", "PartiallyPreempted",
++		"Shrinking to %s to accommodate a workload (UID: %s, JobUID: %s) due to %s",
++		wl.Annotations[constants.ReclaimTargetCountsAnnotation], preemptor.Obj.UID, preemptor.Obj.Labels[controllerconstants.JobUIDLabel],
++		HumanReadablePreemptionReasons[target.Reason])
++	return nil
++}
++
++// setReclaimTarget lowers wl's reclaim target of each PodSet that remaining
++// keeps fewer pods of than wl is charged for to min(existing, remaining), and
++// records the preemptor, and the time when no target was pending before. It
++// reports whether it changed wl.
++func setReclaimTarget(wl *kueue.Workload, remaining *workload.Info, preemptor workload.Reference, now time.Time) bool {
++	targets := workload.ReclaimTargetCounts(wl)
++	pendingBefore := len(workload.PendingReclaimTargetCounts(wl)) > 0
++	granted := workload.ExtractGrantedPodSetCountsAfterReclaim(wl)
++	changed := false
++	for _, ps := range remaining.TotalRequests {
++		if count, found := granted[ps.Name]; !found || ps.Count >= count {
++			continue
++		}
++		if existing, found := targets[ps.Name]; found && existing <= ps.Count {
++			continue
++		}
++		if targets == nil {
++			targets = make(workload.PodSetsCounts)
++		}
++		targets[ps.Name] = ps.Count
++		changed = true
++	}
++	if !changed {
++		return false
++	}
++	workload.SetReclaimTargetCounts(wl, targets)
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimPreemptorAnnotation, string(preemptor))
++	if !pendingBefore {
++		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimRequestedAtAnnotation, now.UTC().Format(time.RFC3339))
++	}
++	return true
++}
+diff --git a/pkg/scheduler/preemption/partial_preemption_property_test.go b/pkg/scheduler/preemption/partial_preemption_property_test.go
+new file mode 100644
+index 0000000..b44067e
+--- /dev/null
++++ b/pkg/scheduler/preemption/partial_preemption_property_test.go
+@@ -0,0 +1,210 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// A randomized property test of the partial preemption search over random
++// cohorts: the snapshot is restored, the targets admit the preemptor, shrinks
++// are minimal and respect floors and steps, and the gate alone changes nothing.
++
++package preemption
++
++import (
++	"fmt"
++	"math/rand/v2"
++	"testing"
++	"time"
++
++	gocmp "github.com/google/go-cmp/cmp"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++const propertyCases = 1500
++
++func randomScenario(r *rand.Rand) ppScenario {
++	sc := ppScenario{
++		incoming: 1 + r.Int64N(6), borrower: r.Int64N(3), lender: r.Int64N(6),
++		withinCQ: kueue.PreemptionPolicyLowerPriority,
++		priority: r.Int32N(6),
++	}
++	sc.needCPU = 1 + r.Int64N(sc.incoming)
++	capacity := sc.incoming + sc.borrower + sc.lender
++	var used int64
++	for i := range 2 + r.IntN(6) {
++		cqs := []kueue.ClusterQueueReference{"borrower", "borrower", "lender", "incoming"}
++		w := ppWorkload{name: fmt.Sprintf("w%d", i), cq: cqs[r.IntN(len(cqs))], priority: r.Int32N(5)}
++		var floors, steps, pending workload.PodSetsCounts
++		var usage int64
++		for j := range 1 + r.IntN(2) {
++			ps := ppPodSet{name: kueue.PodSetReference(fmt.Sprintf("ps%d", j)), count: 1 + r.Int32N(6), cpu: 1 + r.Int64N(2)}
++			if r.IntN(4) == 0 {
++				ps.admitted = 1 + r.Int32N(ps.count)
++			}
++			admitted := max(ps.admitted, 0)
++			if admitted == 0 {
++				admitted = ps.count
++			}
++			charged := admitted
++			if r.IntN(6) == 0 {
++				rc := r.Int32N(ps.count)
++				w.reclaimable = append(w.reclaimable, kueue.ReclaimablePod{Name: ps.name, Count: rc})
++				charged = min(admitted, ps.count-rc)
++			}
++			if r.IntN(2) == 0 {
++				step := 1 + r.Int32N(3)
++				if floors == nil {
++					floors, steps = make(workload.PodSetsCounts), make(workload.PodSetsCounts)
++				}
++				floors[ps.name] = r.Int32N(ps.count+1) / step * step
++				steps[ps.name] = step
++			}
++			if r.IntN(8) == 0 && charged > 1 {
++				if pending == nil {
++					pending = make(workload.PodSetsCounts)
++				}
++				pending[ps.name] = r.Int32N(charged)
++			}
++			usage += ps.cpu * int64(charged)
++			w.podSets = append(w.podSets, ps)
++		}
++		if used+usage > capacity {
++			continue
++		}
++		used += usage
++		w.floors, w.steps, w.pending = workload.FormatPodSetCounts(floors), workload.FormatPodSetCounts(steps), workload.FormatPodSetCounts(pending)
++		if pending != nil && r.IntN(3) == 0 {
++			w.requestedAt = 2 * reclaimTimeout
++		}
++		if r.IntN(10) == 0 {
++			w.evicted = true
++		}
++		sc.workloads = append(sc.workloads, w)
++	}
++	return sc
++}
++
++func stripPartialAnnotations(sc ppScenario) ppScenario {
++	stripped := sc
++	stripped.workloads = make([]ppWorkload, len(sc.workloads))
++	for i, w := range sc.workloads {
++		w.floors, w.steps, w.pending = "", "", ""
++		stripped.workloads[i] = w
++	}
++	return stripped
++}
++
++// fitsAfter reports whether the preemptor's quota fits once targets are
++// removed, through both the seam's removal and its usage-only removal.
++func fitsAfter(t *testing.T, run *ppRun, targets []*Target) bool {
++	t.Helper()
++	cq := run.snapshot.ClusterQueue("incoming")
++	usage := workload.Usage{Quota: workload.ResourceUsage{Assigned: run.assign.TotalRequestsFor(utiltesting.NewLogger(t), run.incoming)}}
++	revert := policy.SimulateRemoval(run.snapshot, targets)
++	removed := cq.Fits(usage) == schdcache.FitsCheckOk
++	revert()
++	revert = policy.SimulateUsageRemoval(run.snapshot, targets)
++	usageRemoved := cq.Fits(usage) == schdcache.FitsCheckOk
++	revert()
++	if removed != usageRemoved {
++		t.Errorf("SimulateRemoval and SimulateUsageRemoval disagree: %t != %t", removed, usageRemoved)
++	}
++	return removed
++}
++
++func TestPartialPreemptionSearchProperties(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	for _, mode := range classicalModes {
++		t.Run(mode.name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++			r := rand.New(rand.NewPCG(20, 4))
++			var found, shrunk int
++			for i := range propertyCases {
++				sc := randomScenario(r)
++				ok := t.Run(fmt.Sprint(i), func(t *testing.T) {
++					features.SetFeatureGateDuringTest(t, features.PartialPreemption, false)
++					off, _, _ := setUpPartial(t, sc, mode, now)
++					wantOff := describeTargets(off.targets())
++
++					features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++					stripped, _, _ := setUpPartial(t, stripPartialAnnotations(sc), mode, now)
++					if diff := gocmp.Diff(wantOff, describeTargets(stripped.targets())); diff != "" {
++						t.Errorf("without floors, the gate changed the targets (-off,+on):\n%s", diff)
++					}
++
++					run, _, _ := setUpPartial(t, sc, mode, now)
++					targets := run.targets()
++					if len(targets) == 0 {
++						return
++					}
++					found++
++					seen := make(map[workload.Reference]bool)
++					for _, target := range targets {
++						key := workload.Key(target.WorkloadInfo.Obj)
++						if seen[key] {
++							t.Errorf("%s is targeted twice", key)
++						}
++						seen[key] = true
++					}
++					if !fitsAfter(t, run, targets) {
++						t.Errorf("the preemptor does not fit after the targets %v", describeTargets(targets))
++					}
++					for i, target := range targets {
++						bounds := reclaimBounds(target.WorkloadInfo, now)
++						if target.Remaining == nil {
++							if bounds == nil {
++								continue
++							}
++							floors := make(workload.PodSetsCounts)
++							for name, b := range bounds {
++								floors[name] = b.floor
++							}
++							alternative := append([]*Target(nil), targets...)
++							alternative[i] = &Target{WorkloadInfo: target.WorkloadInfo, Remaining: policy.ShrunkTo(target.WorkloadInfo, floors)}
++							if fitsAfter(t, run, alternative) {
++								t.Errorf("%s is evicted whole although its floors %v suffice: %v", target.WorkloadInfo.Obj.Name, floors, describeTargets(targets))
++							}
++							continue
++						}
++						shrunk++
++						for j, ps := range target.Remaining.TotalRequests {
++							current := target.WorkloadInfo.TotalRequests[j].Count
++							b, found := bounds[ps.Name]
++							switch {
++							case !found:
++								if ps.Count != current {
++									t.Errorf("%s/%s shrank without a floor", target.WorkloadInfo.Obj.Name, ps.Name)
++								}
++							case ps.Count >= current || ps.Count < b.floor || ps.Count > b.ceiling:
++								t.Errorf("%s/%s keeps %d of %d pods, outside [%d, %d]", target.WorkloadInfo.Obj.Name, ps.Name, ps.Count, current, b.floor, b.ceiling)
++							case !workload.IsPartiallyPreempted(target.WorkloadInfo.Obj) && ps.Count%b.step != 0:
++								t.Errorf("%s/%s keeps %d pods, not a multiple of the step %d", target.WorkloadInfo.Obj.Name, ps.Name, ps.Count, b.step)
++							}
++						}
++					}
++				})
++				if !ok {
++					t.Logf("failing scenario %d: %+v", i, sc)
++					break
++				}
++			}
++			t.Logf("%d of %d random cohorts found targets, %d targets shrunk", found, propertyCases, shrunk)
++		})
++	}
++}
+diff --git a/pkg/scheduler/preemption/partial_preemption_test.go b/pkg/scheduler/preemption/partial_preemption_test.go
+new file mode 100644
+index 0000000..e9d1814
+--- /dev/null
++++ b/pkg/scheduler/preemption/partial_preemption_test.go
+@@ -0,0 +1,836 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests of partial preemption in the preemption search: which targets are
++// shrunk, escalated or grown back, that only the classical strategy shrinks,
++// and how a partial target is issued.
++
++package preemption
++
++import (
++	"fmt"
++	"slices"
++	"testing"
++	"time"
++
++	gocmp "github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/component-base/featuregate"
++	clocktesting "k8s.io/utils/clock/testing"
++
++	config "sigs.k8s.io/kueue/apis/config/v1beta2"
++	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
++	utilexpectations "sigs.k8s.io/kueue/pkg/util/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingalpha "sigs.k8s.io/kueue/pkg/util/testing/v1alpha1"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
++)
++
++// ppPodSet is a PodSet of an admitted test workload, with cpu whole CPUs per pod.
++type ppPodSet struct {
++	name     kueue.PodSetReference
++	count    int32
++	cpu      int64
++	admitted int32 // 0 means count
++	nilCount bool  // admit with a nil count, which means the spec count
++	minCount int32 // 0 means none
++}
++
++// ppWorkload is an admitted test workload. floors and steps are written as R4
++// writes them, and pending as R5 writes a reclaim target.
++type ppWorkload struct {
++	name        string
++	cq          kueue.ClusterQueueReference
++	priority    int32
++	podSets     []ppPodSet
++	floors      string
++	steps       string
++	pending     string
++	requestedAt time.Duration // age of the pending target
++	reclaimable []kueue.ReclaimablePod
++	evicted     bool
++	elastic     bool
++}
++
++func (w ppWorkload) obj(now time.Time, age time.Duration) *kueue.Workload {
++	wrapper := utiltestingapi.MakeWorkload(w.name, "default").Priority(w.priority)
++	var podSets []kueue.PodSet
++	admission := utiltestingapi.MakeAdmission(w.cq)
++	var assignments []kueue.PodSetAssignment
++	for _, ps := range w.podSets {
++		psw := utiltestingapi.MakePodSet(ps.name, int(ps.count)).Request(corev1.ResourceCPU, fmt.Sprint(ps.cpu))
++		if ps.minCount > 0 {
++			psw.SetMinimumCount(ps.minCount)
++		}
++		podSets = append(podSets, *psw.Obj())
++		admitted := ps.count
++		if ps.admitted > 0 {
++			admitted = ps.admitted
++		}
++		psa := utiltestingapi.MakePodSetAssignment(ps.name).Count(admitted).
++			Assignment(corev1.ResourceCPU, "default", fmt.Sprint(ps.cpu*int64(admitted))).Obj()
++		if ps.nilCount {
++			psa.Count = nil
++		}
++		assignments = append(assignments, psa)
++	}
++	wrapper.PodSets(podSets...).ReserveQuotaAt(admission.PodSets(assignments...).Obj(), now.Add(-age)).AdmittedAt(true, now.Add(-age))
++	if w.floors != "" {
++		wrapper.Annotation(constants.ReclaimMinCountsAnnotation, w.floors)
++	}
++	if w.steps != "" {
++		wrapper.Annotation(constants.PodSetCountStepsAnnotation, w.steps)
++	}
++	if w.pending != "" {
++		wrapper.Annotation(constants.ReclaimTargetCountsAnnotation, w.pending).
++			Annotation(constants.ReclaimPreemptorAnnotation, "default/earlier").
++			Annotation(constants.ReclaimRequestedAtAnnotation, now.Add(-w.requestedAt).UTC().Format(time.RFC3339))
++	}
++	if w.elastic {
++		wrapper.Annotation(constants.ElasticJobAnnotation, "true")
++	}
++	if len(w.reclaimable) > 0 {
++		wrapper.ReclaimablePods(w.reclaimable...)
++	}
++	if w.evicted {
++		wrapper.EvictedAt(now)
++	}
++	return wrapper.Obj()
++}
++
++// elastic returns a single-PodSet workload of count pods of one CPU with the given floor.
++func elastic(name string, cq kueue.ClusterQueueReference, priority, count int32, floor string) ppWorkload {
++	return ppWorkload{name: name, cq: cq, priority: priority, podSets: []ppPodSet{{name: "main", count: count, cpu: 1}}, floors: floor}
++}
++
++// whole returns a single-PodSet workload with no floor.
++func whole(name string, cq kueue.ClusterQueueReference, priority, count int32, cpu int64) ppWorkload {
++	return ppWorkload{name: name, cq: cq, priority: priority, podSets: []ppPodSet{{name: "main", count: count, cpu: cpu}}}
++}
++
++type ppScenario struct {
++	// nominal CPU of the incoming, borrower and lender ClusterQueues in one cohort.
++	incoming, borrower, lender int64
++	// withinCQ is the incoming ClusterQueue's WithinClusterQueue policy; Never when empty.
++	withinCQ  kueue.PreemptionPolicy
++	workloads []ppWorkload
++	// needCPU and priority of the incoming workload, a single pod.
++	needCPU  int64
++	priority int32
++}
++
++type ppMode struct {
++	name         string
++	cacheEnabled bool
++	fairSharing  *config.FairSharing
++}
++
++var classicalModes = []ppMode{{name: "classical/cache=false"}, {name: "classical/cache=true", cacheEnabled: true}}
++
++var fairSharingModes = []ppMode{
++	{name: "fairsharing", fairSharing: &config.FairSharing{}},
++	{name: "fairsharing/LessThanInitialShare", fairSharing: &config.FairSharing{
++		PreemptionStrategies: []config.PreemptionStrategy{config.LessThanInitialShare},
++	}},
++}
++
++type ppRun struct {
++	t         *testing.T
++	preemptor *Preemptor
++	cache     *schdcache.Cache
++	snapshot  *schdcache.Snapshot
++	incoming  *workload.Info
++	assign    flavorassigner.Assignment
++	clock     *clocktesting.FakeClock
++}
++
++// setUpPartial builds the cache, snapshot and preemptor for the scenario.
++func setUpPartial(t *testing.T, sc ppScenario, mode ppMode, now time.Time) (*ppRun, *utilexpectations.Store, func() []kueue.Workload) {
++	t.Helper()
++	ctx, log := utiltesting.ContextWithLog(t)
++	var admitted []kueue.Workload
++	for i, w := range sc.workloads {
++		admitted = append(admitted, *w.obj(now, time.Duration(len(sc.workloads)-i)*time.Minute))
++	}
++	cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: admitted}).
++		WithStatusSubresource(&kueue.Workload{}).Build()
++	cache := schdcache.New(cl)
++	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
++	withinCQ := sc.withinCQ
++	if withinCQ == "" {
++		withinCQ = kueue.PreemptionPolicyNever
++	}
++	for _, cq := range []*kueue.ClusterQueue{
++		utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, fmt.Sprint(sc.incoming)).Obj()).
++			Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyAny, WithinClusterQueue: withinCQ}).Obj(),
++		utiltestingapi.MakeClusterQueue("borrower").Cohort("shared").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, fmt.Sprint(sc.borrower)).Obj()).Obj(),
++		utiltestingapi.MakeClusterQueue("lender").Cohort("shared").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, fmt.Sprint(sc.lender)).Obj()).Obj(),
++	} {
++		if err := cache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++	}
++	snapshot, err := cache.Snapshot(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	info := workload.NewInfo(log, utiltestingapi.MakeWorkload("preemptor", "default").Priority(sc.priority).
++		PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, fmt.Sprint(sc.needCPU)).Obj()).Obj())
++	info.ClusterQueue = "incoming"
++	assignment := flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++		Name: "main", Count: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: *resource.NewQuantity(sc.needCPU, resource.DecimalSI)},
++		Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "default", Mode: flavorassigner.Preempt}},
++	}}}
++	clock := clocktesting.NewFakeClock(now)
++	expectations := preemptexpectations.New()
++	preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, mode.fairSharing, false, clock, nil, expectations, nil)
++	list := func() []kueue.Workload {
++		var wls kueue.WorkloadList
++		if err := cl.List(ctx, &wls); err != nil {
++			t.Fatal(err)
++		}
++		return wls.Items
++	}
++	return &ppRun{t: t, preemptor: preemptor, cache: cache, snapshot: snapshot, incoming: info, assign: assignment, clock: clock}, expectations, list
++}
++
++// targets runs the search and checks that it leaves the snapshot as it found it.
++func (r *ppRun) targets() []*Target {
++	r.t.Helper()
++	ctx, _ := utiltesting.ContextWithLog(r.t)
++	before, err := r.cache.Snapshot(ctx)
++	if err != nil {
++		r.t.Fatal(err)
++	}
++	targets, _ := r.preemptor.GetTargets(ctx, *r.incoming, r.snapshot, r.assign)
++	if diff := gocmp.Diff(before, r.snapshot, snapCmpOpts); diff != "" {
++		r.t.Errorf("snapshot changed by the search (-before,+after):\n%s", diff)
++	}
++	return targets
++}
++
++// describeTargets returns each target's name, and the counts a shrunk target keeps.
++func describeTargets(targets []*Target) []string {
++	var got []string
++	for _, t := range targets {
++		s := t.WorkloadInfo.Obj.Name
++		if t.Remaining != nil {
++			kept := make(workload.PodSetsCounts)
++			for i, ps := range t.Remaining.TotalRequests {
++				if ps.Count != t.WorkloadInfo.TotalRequests[i].Count {
++					kept[ps.Name] = ps.Count
++				}
++			}
++			s += ":" + workload.FormatPodSetCounts(kept)
++		}
++		got = append(got, s)
++	}
++	slices.Sort(got)
++	return got
++}
++
++func TestPartialPreemptionSearch(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	cases := map[string]struct {
++		sc ppScenario
++		// want is the result with PartialPreemption on, wantOff with it off.
++		want, wantOff []string
++	}{
++		"shrinks the elastic victim offered first and takes the next one when shrinking is not enough": {
++			sc: ppScenario{incoming: 2, lender: 1, needCPU: 2, workloads: []ppWorkload{
++				elastic("elastic", "borrower", 0, 2, "main=1"),
++				whole("w", "borrower", 1, 1, 1),
++			}},
++			want:    []string{"elastic:main=1", "w"},
++			wantOff: []string{"elastic"},
++		},
++		"shrinks instead of evicting the elastic victim whole when the next victim makes up the rest": {
++			sc: ppScenario{incoming: 3, lender: 1, needCPU: 3, workloads: []ppWorkload{
++				elastic("elastic", "borrower", 0, 2, "main=1"),
++				whole("w", "borrower", 1, 1, 2),
++			}},
++			want:    []string{"elastic:main=1", "w"},
++			wantOff: []string{"elastic", "w"},
++		},
++		"grows a shrunk victim back as far as the preemptor still fits": {
++			sc: ppScenario{incoming: 2, lender: 2, needCPU: 2, workloads: []ppWorkload{
++				elastic("elastic", "borrower", 0, 4, "main=1"),
++			}},
++			want:    []string{"elastic:main=2"},
++			wantOff: []string{"elastic"},
++		},
++		"grows back in whole steps": {
++			sc: ppScenario{incoming: 3, lender: 5, needCPU: 3, workloads: []ppWorkload{
++				{name: "elastic", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 8, cpu: 1}}, floors: "main=2", steps: "main=2"},
++			}},
++			want:    []string{"elastic:main=4"},
++			wantOff: []string{"elastic"},
++		},
++		"rounds a floor up to its step": {
++			sc: ppScenario{incoming: 6, lender: 2, needCPU: 6, workloads: []ppWorkload{
++				{name: "elastic", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 8, cpu: 1}}, floors: "main=1", steps: "main=2"},
++			}},
++			want:    []string{"elastic:main=2"},
++			wantOff: []string{"elastic"},
++		},
++		"evicts an elastic victim above its floor whole when shrinking it is not enough": {
++			sc: ppScenario{incoming: 2, needCPU: 2, workloads: []ppWorkload{
++				elastic("elastic", "borrower", 0, 2, "main=1"),
++			}},
++			want:    []string{"elastic"},
++			wantOff: []string{"elastic"},
++		},
++		"evicts an elastic victim of the preemptor's queue whole for a higher priority": {
++			sc: ppScenario{incoming: 2, needCPU: 2, priority: 3, withinCQ: kueue.PreemptionPolicyLowerPriority, workloads: []ppWorkload{
++				elastic("elastic", "incoming", 0, 2, "main=1"),
++			}},
++			want:    []string{"elastic"},
++			wantOff: []string{"elastic"},
++		},
++		"escalates the first shrunk victim and keeps the second shrunk": {
++			sc: ppScenario{incoming: 3, lender: 1, needCPU: 3, workloads: []ppWorkload{
++				elastic("first", "borrower", 0, 2, "main=1"),
++				elastic("second", "borrower", 1, 2, "main=1"),
++			}},
++			want:    []string{"first", "second:main=1"},
++			wantOff: []string{"first", "second"},
++		},
++		"drops a whole victim that an escalation made unneeded": {
++			sc: ppScenario{incoming: 4, lender: 1, needCPU: 4, workloads: []ppWorkload{
++				elastic("elastic", "borrower", 0, 4, "main=3"),
++				whole("w", "borrower", 1, 1, 1),
++			}},
++			want:    []string{"elastic"},
++			wantOff: []string{"elastic"},
++		},
++		"drops a shrunk victim that a later victim made unneeded": {
++			sc: ppScenario{incoming: 3, lender: 2, needCPU: 3, workloads: []ppWorkload{
++				elastic("elastic", "borrower", 0, 2, "main=1"),
++				whole("w", "borrower", 1, 1, 3),
++			}},
++			want:    []string{"w"},
++			wantOff: []string{"w"},
++		},
++		"offers an in-flight victim of the preemptor's queue before other queues' victims": {
++			sc: ppScenario{incoming: 6, needCPU: 2, priority: 5, withinCQ: kueue.PreemptionPolicyLowerPriority, workloads: []ppWorkload{
++				whole("cheap", "borrower", 0, 2, 1),
++				{name: "inflight", cq: "incoming", podSets: []ppPodSet{{name: "main", count: 4, cpu: 1}}, floors: "main=1", pending: "main=2"},
++			}},
++			want:    []string{"inflight:main=2"},
++			wantOff: []string{"cheap"},
++		},
++		"restores a whole victim before growing a shrunk one": {
++			sc: ppScenario{incoming: 3, lender: 3, needCPU: 3, workloads: []ppWorkload{
++				whole("w", "borrower", 0, 1, 2),
++				elastic("elastic", "borrower", 1, 4, "main=1"),
++			}},
++			want:    []string{"elastic:main=1"},
++			wantOff: []string{"elastic"},
++		},
++		"charges a multi-PodSet victim per PodSet": {
++			sc: ppScenario{incoming: 4, lender: 5, needCPU: 4, workloads: []ppWorkload{
++				{name: "elastic", cq: "borrower", podSets: []ppPodSet{{name: "head", count: 1, cpu: 1}, {name: "workers", count: 4, cpu: 2}}, floors: "workers=1"},
++			}},
++			want:    []string{"elastic:workers=2"},
++			wantOff: []string{"elastic"},
++		},
++		"counts reclaimable pods as workload.Info does": {
++			sc: ppScenario{incoming: 2, lender: 1, needCPU: 2, workloads: []ppWorkload{
++				{name: "elastic", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 4, cpu: 1}}, floors: "main=1",
++					reclaimable: []kueue.ReclaimablePod{{Name: "main", Count: 1}}},
++			}},
++			want:    []string{"elastic:main=1"},
++			wantOff: []string{"elastic"},
++		},
++		"reads a nil admitted count as the spec count": {
++			sc: ppScenario{incoming: 2, lender: 2, needCPU: 2, workloads: []ppWorkload{
++				{name: "elastic", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 4, cpu: 1, nilCount: true}}, floors: "main=1"},
++			}},
++			want:    []string{"elastic:main=2"},
++			wantOff: []string{"elastic"},
++		},
++		"never shrinks a batch job with a minimum count": {
++			sc: ppScenario{incoming: 2, lender: 2, needCPU: 2, workloads: []ppWorkload{
++				{name: "job", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 4, cpu: 1, minCount: 1}}},
++			}},
++			want:    []string{"job"},
++			wantOff: []string{"job"},
++		},
++		"evicts an elastic workload without a floor whole": {
++			sc: ppScenario{incoming: 2, lender: 2, needCPU: 2, workloads: []ppWorkload{
++				{name: "rayjob", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 4, cpu: 1}}, elastic: true},
++			}},
++			want:    []string{"rayjob"},
++			wantOff: []string{"rayjob"},
++		},
++		"offers an in-flight victim first, shrunk to its pending target": {
++			sc: ppScenario{incoming: 2, lender: 4, needCPU: 2, workloads: []ppWorkload{
++				whole("cheap", "borrower", 0, 2, 1),
++				{name: "inflight", cq: "borrower", priority: 5, podSets: []ppPodSet{{name: "main", count: 4, cpu: 1}}, floors: "main=1", pending: "main=2"},
++			}},
++			want:    []string{"inflight:main=2"},
++			wantOff: []string{"cheap"},
++		},
++		"escalates an in-flight victim to one whole target": {
++			sc: ppScenario{incoming: 4, needCPU: 4, workloads: []ppWorkload{
++				{name: "inflight", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 4, cpu: 1}}, pending: "main=2"},
++			}},
++			want:    []string{"inflight"},
++			wantOff: []string{"inflight"},
++		},
++		"evicts an in-flight victim whole once its target timed out": {
++			sc: ppScenario{incoming: 2, lender: 2, needCPU: 2, workloads: []ppWorkload{
++				{name: "inflight", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 4, cpu: 1}}, floors: "main=1", pending: "main=2", requestedAt: 2 * reclaimTimeout},
++			}},
++			want:    []string{"inflight"},
++			wantOff: []string{"inflight"},
++		},
++		"treats a released target as no target": {
++			sc: ppScenario{incoming: 1, lender: 1, needCPU: 1, workloads: []ppWorkload{
++				{name: "shrunk", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 4, cpu: 1}}, floors: "main=1", pending: "main=2",
++					reclaimable: []kueue.ReclaimablePod{{Name: "main", Count: 2}}},
++			}},
++			want:    []string{"shrunk:main=1"},
++			wantOff: []string{"shrunk"},
++		},
++	}
++	for _, mode := range classicalModes {
++		t.Run(mode.name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++			for name, tc := range cases {
++				for _, gate := range []bool{true, false} {
++					t.Run(fmt.Sprintf("%s/PartialPreemption=%t", name, gate), func(t *testing.T) {
++						features.SetFeatureGateDuringTest(t, features.PartialPreemption, gate)
++						run, _, _ := setUpPartial(t, tc.sc, mode, now)
++						want := tc.want
++						if !gate {
++							want = tc.wantOff
++						}
++						if diff := gocmp.Diff(want, describeTargets(run.targets())); diff != "" {
++							t.Errorf("unexpected targets (-want,+got):\n%s", diff)
++						}
++					})
++				}
++			}
++		})
++	}
++}
++
++// TestPartialPreemptionFairSharingYieldsWholeTargets checks that fair sharing
++// returns the targets it returns with PartialPreemption off, whole.
++func TestPartialPreemptionFairSharingYieldsWholeTargets(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	scenarios := map[string]ppScenario{
++		"one elastic victim": {incoming: 2, lender: 2, needCPU: 2, workloads: []ppWorkload{
++			elastic("elastic", "borrower", 0, 4, "main=1"),
++		}},
++		"elastic and whole victims": {incoming: 3, lender: 1, needCPU: 3, workloads: []ppWorkload{
++			elastic("elastic", "borrower", 0, 2, "main=1"),
++			whole("w", "borrower", 1, 1, 2),
++		}},
++		"an in-flight victim": {incoming: 2, lender: 4, needCPU: 2, workloads: []ppWorkload{
++			whole("cheap", "borrower", 0, 2, 1),
++			{name: "inflight", cq: "borrower", priority: 5, podSets: []ppPodSet{{name: "main", count: 4, cpu: 1}}, floors: "main=1", pending: "main=2"},
++		}},
++	}
++	for _, mode := range fairSharingModes {
++		for name, sc := range scenarios {
++			t.Run(mode.name+"/"+name, func(t *testing.T) {
++				features.SetFeatureGateDuringTest(t, features.PartialPreemption, false)
++				off, _, _ := setUpPartial(t, sc, mode, now)
++				want := describeTargets(off.targets())
++				if len(want) == 0 {
++					t.Fatal("the scenario finds no targets")
++				}
++				features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++				on, _, _ := setUpPartial(t, sc, mode, now)
++				targets := on.targets()
++				for _, target := range targets {
++					if target.Remaining != nil {
++						t.Errorf("fair sharing shrank %s", target.WorkloadInfo.Obj.Name)
++					}
++				}
++				if diff := gocmp.Diff(want, describeTargets(targets)); diff != "" {
++					t.Errorf("fair sharing targets differ from PartialPreemption off (-off,+on):\n%s", diff)
++				}
++			})
++		}
++	}
++}
++
++// TestPartialPreemptionSeam checks the usage each seam helper frees and that
++// each one is reverted exactly.
++func TestPartialPreemptionSeam(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++	now := time.Now().Truncate(time.Second)
++	sc := ppScenario{incoming: 2, lender: 20, needCPU: 1, workloads: []ppWorkload{
++		{name: "elastic", cq: "borrower", podSets: []ppPodSet{{name: "head", count: 1, cpu: 1}, {name: "workers", count: 4, cpu: 2}}, floors: "workers=1"},
++		whole("w", "borrower", 0, 1, 3),
++	}}
++	run, _, _ := setUpPartial(t, sc, classicalModes[0], now)
++	cq := run.snapshot.ClusterQueue("borrower")
++	elasticInfo, wInfo := cq.Workloads["default/elastic"], cq.Workloads["default/w"]
++	shrunk := &Target{WorkloadInfo: elasticInfo, Remaining: policy.ShrunkTo(elasticInfo, workload.PodSetsCounts{"workers": 1})}
++	evicted := &Target{WorkloadInfo: wInfo}
++	cpu := func() int64 {
++		usage := cq.ResourceNode.Usage[resources.FlavorResource{Flavor: "default", Resource: corev1.ResourceCPU}]
++		milli, _ := usage.Int64()
++		return milli / 1000
++	}
++	if got := cpu(); got != 12 {
++		t.Fatalf("borrower uses %d CPUs, want 12", got)
++	}
++	if got := shrunk.FreedUsage().Quota.Assigned[resources.FlavorResource{Flavor: "default", Resource: corev1.ResourceCPU}]; got.CmpInt64(6000) != 0 {
++		t.Errorf("FreedUsage() of the shrunk target frees %v CPUs, want 6", got)
++	}
++	targets := []*Target{shrunk, evicted}
++	revert := policy.SimulateRemoval(run.snapshot, targets)
++	if got := cpu(); got != 3 {
++		t.Errorf("after SimulateRemoval the borrower uses %d CPUs, want 3", got)
++	}
++	if cq.Workloads["default/elastic"] != shrunk.Remaining {
++		t.Error("SimulateRemoval did not leave the remaining workload in the ClusterQueue")
++	}
++	revert()
++	if got := cpu(); got != 12 || cq.Workloads["default/elastic"] != elasticInfo {
++		t.Errorf("SimulateRemoval revert left %d CPUs, want 12 and the original workload", got)
++	}
++	revert = policy.SimulateUsageRemoval(run.snapshot, targets)
++	if got := cpu(); got != 3 {
++		t.Errorf("after SimulateUsageRemoval the borrower uses %d CPUs, want 3", got)
++	}
++	revert()
++	if got := cpu(); got != 12 {
++		t.Errorf("SimulateUsageRemoval revert left %d CPUs, want 12", got)
++	}
++	if got := policy.EvictedWorkloads(targets); len(got) != 1 || got[0] != wInfo {
++		t.Errorf("EvictedWorkloads() = %v, want only the whole target's workload", got)
++	}
++	// A workload whose usage the cycle already released frees nothing again.
++	run.snapshot.ReleaseWorkloadUsage(elasticInfo)
++	revert = policy.SimulateUsageRemoval(run.snapshot, []*Target{shrunk})
++	if got := cpu(); got != 3 {
++		t.Errorf("after releasing the elastic workload, SimulateUsageRemoval left %d CPUs, want 3", got)
++	}
++	revert()
++}
++
++// TestIssuePartialPreemption checks that a partial target is written as a
++// reclaim target on the victim, only ever lowered, without an expectation.
++func TestIssuePartialPreemption(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++	now := time.Now().Truncate(time.Second)
++	cases := map[string]struct {
++		victim          ppWorkload
++		needCPU         int64
++		wantTargets     []string
++		wantAnnotations map[string]string
++	}{
++		"first target": {
++			victim:      elastic("victim", "borrower", 0, 4, "main=1"),
++			needCPU:     2,
++			wantTargets: []string{"victim:main=2"},
++			wantAnnotations: map[string]string{
++				constants.ReclaimTargetCountsAnnotation: "main=2",
++				constants.ReclaimPreemptorAnnotation:    "default/preemptor",
++				constants.ReclaimRequestedAtAnnotation:  now.UTC().Format(time.RFC3339),
++			},
++		},
++		"the same pending target again writes nothing": {
++			victim:      ppWorkload{name: "victim", cq: "borrower", podSets: []ppPodSet{{name: "main", count: 4, cpu: 1}}, floors: "main=1", pending: "main=2", requestedAt: time.Minute},
++			needCPU:     2,
++			wantTargets: []string{"victim:main=2"},
++			wantAnnotations: map[string]string{
++				constants.ReclaimTargetCountsAnnotation: "main=2",
++				constants.ReclaimPreemptorAnnotation:    "default/earlier",
++				constants.ReclaimRequestedAtAnnotation:  now.Add(-time.Minute).UTC().Format(time.RFC3339),
++			},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			sc := ppScenario{incoming: 2, lender: 2, needCPU: tc.needCPU, workloads: []ppWorkload{tc.victim}}
++			run, expectations, list := setUpPartial(t, sc, classicalModes[0], now)
++			before := list()[0].ResourceVersion
++			targets := run.targets()
++			if diff := gocmp.Diff(tc.wantTargets, describeTargets(targets)); diff != "" {
++				t.Fatalf("unexpected targets (-want,+got):\n%s", diff)
++			}
++			ctx, log := utiltesting.ContextWithLog(t)
++			cached := targets[0].WorkloadInfo.Obj.DeepCopy()
++			for range 2 {
++				preempted, failed, err := run.preemptor.IssuePreemptions(ctx, run.cache, run.incoming, targets, run.snapshot.ClusterQueue("incoming"))
++				if err != nil || preempted != 1 || failed != 0 {
++					t.Fatalf("IssuePreemptions() = %d, %d, %v; want 1, 0, nil", preempted, failed, err)
++				}
++			}
++			if diff := gocmp.Diff(cached, targets[0].WorkloadInfo.Obj); diff != "" {
++				t.Errorf("IssuePreemptions mutated the cached victim (-before,+after):\n%s", diff)
++			}
++			got := list()[0]
++			gotAnnotations := make(map[string]string)
++			for _, key := range []string{constants.ReclaimTargetCountsAnnotation, constants.ReclaimPreemptorAnnotation, constants.ReclaimRequestedAtAnnotation} {
++				if v, found := got.Annotations[key]; found {
++					gotAnnotations[key] = v
++				}
++			}
++			if diff := gocmp.Diff(tc.wantAnnotations, gotAnnotations); diff != "" {
++				t.Errorf("unexpected reclaim annotations (-want,+got):\n%s", diff)
++			}
++			if tc.victim.pending != "" && got.ResourceVersion != before {
++				t.Errorf("re-issuing the pending target wrote the victim: resourceVersion %s -> %s", before, got.ResourceVersion)
++			}
++			if got.Status.Admission == nil || workloadevict.IsEvicted(&got) {
++				t.Error("the victim of a partial preemption lost its admission or was evicted")
++			}
++			if !expectations.Satisfied(log, types.NamespacedName{Namespace: "default", Name: "victim"}) {
++				t.Error("a partial preemption left a preemption expectation pending")
++			}
++		})
++	}
++}
++
++func TestSetReclaimTargetNeverRaisesATarget(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	log := utiltesting.NewLogger(t)
++	victim := ppWorkload{name: "victim", cq: "borrower", podSets: []ppPodSet{{name: "a", count: 4, cpu: 1}, {name: "b", count: 4, cpu: 1}}, pending: "a=1"}
++	wl := victim.obj(now, time.Minute)
++	info := workload.NewInfo(log, wl)
++	remaining := policy.ShrunkTo(info, workload.PodSetsCounts{"a": 3, "b": 2})
++	if !setReclaimTarget(wl, remaining, "default/next", now) {
++		t.Fatal("setReclaimTarget() reported no change for a lower target of b")
++	}
++	if got := wl.Annotations[constants.ReclaimTargetCountsAnnotation]; got != "a=1,b=2" {
++		t.Errorf("reclaim targets = %q, want a=1,b=2", got)
++	}
++	if got := wl.Annotations[constants.ReclaimRequestedAtAnnotation]; got != now.Add(-victim.requestedAt).UTC().Format(time.RFC3339) {
++		t.Errorf("requested-at changed to %q while a target was pending", got)
++	}
++	if setReclaimTarget(wl, remaining, "default/next", now) {
++		t.Error("setReclaimTarget() changed the workload for targets already set")
++	}
++}
++
++// TestPreemptionOracleCountsShrunkTargets checks that the oracle's borrowing
++// height after preemption frees only what a shrunk target gives up.
++func TestPreemptionOracleCountsShrunkTargets(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	for _, gate := range []bool{true, false} {
++		t.Run(fmt.Sprintf("PartialPreemption=%t", gate), func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.PartialPreemption, gate)
++			ctx, log := utiltesting.ContextWithLog(t)
++			victim := elastic("victim", "borrower", 0, 7, "main=4").obj(now, time.Minute)
++			cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: []kueue.Workload{*victim}}).Build()
++			cache := schdcache.New(cl)
++			cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
++			if err := cache.AddOrUpdateCohort(utiltestingapi.MakeCohort("team").Parent("root").Obj()); err != nil {
++				t.Fatal(err)
++			}
++			for _, cq := range []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("team").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "2").Obj()).
++					Preemption(kueue.ClusterQueuePreemption{
++						ReclaimWithinCohort: kueue.PreemptionPolicyAny,
++						BorrowWithinCohort:  &kueue.BorrowWithinCohort{Policy: kueue.BorrowWithinCohortPolicyLowerPriority},
++					}).Obj(),
++				utiltestingapi.MakeClusterQueue("borrower").Cohort("team").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "0").Obj()).Obj(),
++				utiltestingapi.MakeClusterQueue("lender").Cohort("team").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "2").Obj()).Obj(),
++				utiltestingapi.MakeClusterQueue("far").Cohort("root").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "3").Obj()).Obj(),
++			} {
++				if err := cache.AddClusterQueue(ctx, cq); err != nil {
++					t.Fatal(err)
++				}
++			}
++			snapshot, err := cache.Snapshot(ctx)
++			if err != nil {
++				t.Fatal(err)
++			}
++			preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, nil, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
++			info := workload.NewInfo(log, utiltestingapi.MakeWorkload("preemptor", "default").Priority(5).
++				PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "3").Obj()).Obj())
++			info.ClusterQueue = "incoming"
++			fr := resources.FlavorResource{Flavor: "default", Resource: corev1.ResourceCPU}
++			possibility, borrow := NewOracle(preemptor, snapshot).SimulatePreemption(ctx, snapshot.ClusterQueue("incoming"), *info, fr, resources.NewAmount(3000))
++			// Shrunk to 4 pods, the victim still uses the team's whole quota, so the
++			// preemptor borrows from the root; evicted whole, the team has room for it.
++			wantBorrow := 1
++			if gate {
++				wantBorrow = 2
++			}
++			if possibility != policy.Reclaim || borrow != wantBorrow {
++				t.Errorf("SimulatePreemption() = %v, %d; want Reclaim, %d", possibility, borrow, wantBorrow)
++			}
++		})
++	}
++}
++
++// TestPartialPreemptionConfigurableRulesYieldWholeTargets checks that the
++// candidates of configurable preemption rules are evicted whole.
++func TestPartialPreemptionConfigurableRulesYieldWholeTargets(t *testing.T) {
++	features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{features.ConfigurablePreemptions: true, features.PartialPreemption: true})
++	now := time.Now().Truncate(time.Second)
++	ctx, log := utiltesting.ContextWithLog(t)
++	victim := elastic("victim", "a", 0, 2, "main=1").obj(now, time.Minute)
++	preemptionConfig := *utiltestingalpha.MakePreemptionConfig("config").
++		Rule("rule", kueuealpha.Always, utiltestingalpha.MakeCandidateSelector(kueuealpha.WithinClusterQueue).Obj()).Obj()
++	cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: []kueue.Workload{*victim}}).
++		WithLists(&kueuealpha.PreemptionConfigList{Items: []kueuealpha.PreemptionConfig{preemptionConfig}}).Build()
++	cache := schdcache.New(cl)
++	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
++	if err := cache.AddClusterQueue(ctx, utiltestingapi.MakeClusterQueue("a").
++		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "2").Obj()).
++		Annotation(kueuealpha.PreemptionConfigNameAnnotation, "config").Obj()); err != nil {
++		t.Fatal(err)
++	}
++	snapshot, err := cache.Snapshot(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, nil, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
++	info := workload.NewInfo(log, utiltestingapi.MakeWorkload("preemptor", "default").
++		PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "1").Obj()).Obj())
++	info.ClusterQueue = "a"
++	assignment := flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++		Name: "main", Count: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
++		Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "default", Mode: flavorassigner.Preempt}},
++	}}}
++	targets, _ := preemptor.GetTargets(ctx, *info, snapshot, assignment)
++	if diff := gocmp.Diff([]string{"victim"}, describeTargets(targets)); diff != "" {
++		t.Errorf("unexpected targets (-want,+got):\n%s", diff)
++	}
++}
++
++// TestPartialPreemptionOffersWhatRemainsOfAShrunkVictim checks that a search
++// run while another preemption's shrink is simulated, as the scheduler's
++// overlap recompute does, offers what remains of the victim, from the flat and
++// the cached candidate order alike.
++func TestPartialPreemptionOffersWhatRemainsOfAShrunkVictim(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++	now := time.Now().Truncate(time.Second)
++	for _, mode := range classicalModes {
++		t.Run(mode.name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++			sc := ppScenario{incoming: 2, lender: 2, needCPU: 1, workloads: []ppWorkload{elastic("victim", "borrower", 0, 4, "main=1")}}
++			run, _, _ := setUpPartial(t, sc, mode, now)
++			// The first search fills the candidate-order cache with the whole victim.
++			if diff := gocmp.Diff([]string{"victim:main=3"}, describeTargets(run.targets())); diff != "" {
++				t.Fatalf("unexpected first targets (-want,+got):\n%s", diff)
++			}
++			victim := run.snapshot.ClusterQueue("borrower").Workloads["default/victim"]
++			revert := policy.SimulateRemoval(run.snapshot, []*Target{{WorkloadInfo: victim, Remaining: policy.ShrunkTo(victim, workload.PodSetsCounts{"main": 2})}})
++			defer revert()
++			run.incoming.TotalRequests[0] = *run.incoming.TotalRequests[0].ScaledTo(1)
++			run.assign.PodSets[0].Requests[corev1.ResourceCPU] = resource.MustParse("3")
++			ctx, _ := utiltesting.ContextWithLog(t)
++			targets, _ := run.preemptor.GetTargets(ctx, *run.incoming, run.snapshot, run.assign)
++			if len(targets) != 1 || targets[0].WorkloadInfo == victim || targets[0].Remaining == nil || targets[0].Remaining.TotalRequests[0].Count != 1 {
++				t.Errorf("the search did not shrink what remains of the victim from 2 to 1 pod: %v", describeTargets(targets))
++			}
++		})
++	}
++}
++
++// TestPartialPreemptionTopologyRetryCountsWhatAShrinkFrees checks that the
++// topology retry models a candidate the classical strategy shrinks as freeing
++// its quota only, so it frees the node of whole victims instead of counting
++// on the node the shrunk victim keeps.
++func TestPartialPreemptionTopologyRetryCountsWhatAShrinkFrees(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	for _, gate := range []bool{true, false} {
++		t.Run(fmt.Sprintf("PartialPreemption=%t", gate), func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{features.TopologyAwareScheduling: true, features.PartialPreemption: gate})
++			ctx, log := utiltesting.ContextWithLog(t)
++			onNode := func(name, node string, count int32, age time.Duration) kueue.Workload {
++				return *utiltestingapi.MakeWorkload(name, "default").Priority(1).
++					PodSets(*utiltestingapi.MakePodSet("main", int(count)).Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj()).
++					ReserveQuotaAt(utiltestingapi.MakeAdmission("borrower").PodSets(
++						utiltestingapi.MakePodSetAssignment("main").Count(count).
++							Assignment(corev1.ResourceCPU, "tas", fmt.Sprint(count)).
++							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{node}, count).Obj()).Obj()).Obj()).Obj(), now.Add(-age)).Obj()
++			}
++			elasticOnX1 := onNode("elastic", "x1", 2, 0)
++			elasticOnX1.Annotations = map[string]string{constants.ReclaimMinCountsAnnotation: "main=1"}
++			admitted := []kueue.Workload{
++				elasticOnX1,
++				onNode("a", "x2", 1, time.Minute),
++				onNode("b", "x2", 1, 2*time.Minute),
++				onNode("d", "x2", 1, 3*time.Minute),
++				onNode("c", "x1", 1, 4*time.Minute),
++			}
++			cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: admitted}).
++				WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).Build()
++			cache := schdcache.New(cl)
++			cache.AddOrUpdateTopology(log, utiltestingapi.MakeTopology("hostname").Levels(corev1.LabelHostname).Obj())
++			cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("tas").NodeLabel("pool", "tas").TopologyName("hostname").Obj())
++			for _, node := range []string{"x1", "x2"} {
++				cache.TASCache().SyncNode(testingnode.MakeNode(node).Label("pool", "tas").Label(corev1.LabelHostname, node).
++					StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourcePods: resource.MustParse("10")}).Ready().Obj())
++			}
++			for _, cq := range []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "3", "0").Obj()).
++					Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyLowerPriority}).Obj(),
++				utiltestingapi.MakeClusterQueue("borrower").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "3").Obj()).Obj(),
++			} {
++				if err := cache.AddClusterQueue(ctx, cq); err != nil {
++					t.Fatal(err)
++				}
++			}
++			snapshot, err := cache.Snapshot(ctx)
++			if err != nil {
++				t.Fatal(err)
++			}
++			info := workload.NewInfo(log, utiltestingapi.MakeWorkload("incoming", "default").Priority(3).
++				PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "3").UnconstrainedTopologyRequest().Obj()).Obj())
++			info.ClusterQueue = "incoming"
++			assignment := flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++				Name: "main", Count: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
++				Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "tas", Mode: flavorassigner.Preempt}},
++			}}}
++			preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, nil, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
++			targets := getTargetsWithTopologyRetry(ctx, preemptor, *info, snapshot, assignment)
++			want := []string{"c", "elastic"}
++			if gate {
++				want = []string{"a", "b", "d"}
++			}
++			if diff := gocmp.Diff(want, describeTargets(targets)); diff != "" {
++				t.Errorf("unexpected targets (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/pkg/scheduler/preemption/policy/partial.go b/pkg/scheduler/preemption/policy/partial.go
+new file mode 100644
+index 0000000..b45b21f
+--- /dev/null
++++ b/pkg/scheduler/preemption/policy/partial.go
+@@ -0,0 +1,185 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// The partial preemption seam: how a target shrunk instead of evicted leaves
++// and re-enters the snapshot, and the usage it frees. Every site that takes
++// a victim out of the snapshot goes through these helpers.
++
++package policy
++
++import (
++	"slices"
++	"time"
++
++	"github.com/go-logr/logr"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
++	cmputil "sigs.k8s.io/kueue/pkg/util/cmp"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
++)
++
++// RemoveFrom removes the target's workload from the snapshot and adds back Remaining.
++func (t *Target) RemoveFrom(snapshot *schdcache.Snapshot) {
++	snapshot.RemoveWorkload(t.WorkloadInfo)
++	if t.Remaining != nil {
++		snapshot.AddWorkload(t.Remaining)
++	}
++}
++
++// AddTo reverts RemoveFrom.
++func (t *Target) AddTo(snapshot *schdcache.Snapshot) {
++	if t.Remaining != nil {
++		snapshot.RemoveWorkload(t.Remaining)
++	}
++	snapshot.AddWorkload(t.WorkloadInfo)
++}
++
++// FreedUsage returns the usage RemoveFrom frees: the workload's usage minus Remaining's.
++func (t *Target) FreedUsage() workload.Usage {
++	usage := t.WorkloadInfo.Usage()
++	if t.Remaining == nil {
++		return usage
++	}
++	kept := t.Remaining.ResourceUsage().Assigned
++	freed := workload.Usage{Quota: workload.ResourceUsage{Assigned: make(resources.FlavorResourceQuantities, len(usage.Quota.Assigned))}}
++	for fr, q := range usage.Quota.Assigned {
++		if d := q.Sub(kept[fr]); d.CmpInt64(0) > 0 {
++			freed.Quota.Assigned[fr] = d
++		}
++	}
++	// Remaining keeps the TAS usage of every PodSet that still has pods, so only
++	// a PodSet shrunk to zero pods frees its topology domains.
++	var dropped []workload.PodSetResources
++	for i := range t.WorkloadInfo.TotalRequests {
++		if len(podSetTASUsage(t.WorkloadInfo.TotalRequests[i])) > 0 && len(podSetTASUsage(t.Remaining.TotalRequests[i])) == 0 {
++			dropped = append(dropped, t.WorkloadInfo.TotalRequests[i])
++		}
++	}
++	if len(dropped) > 0 {
++		freed.TAS = (&workload.Info{TotalRequests: dropped}).TASUsage()
++	}
++	return freed
++}
++
++func podSetTASUsage(ps workload.PodSetResources) workload.TASUsage {
++	return (&workload.Info{TotalRequests: []workload.PodSetResources{ps}}).TASUsage()
++}
++
++// SimulateRemoval calls RemoveFrom on each target and returns a function that calls AddTo in reverse order.
++func SimulateRemoval(snapshot *schdcache.Snapshot, targets []*Target) (revert func()) {
++	for _, t := range targets {
++		t.RemoveFrom(snapshot)
++	}
++	return func() {
++		for _, t := range slices.Backward(targets) {
++			t.AddTo(snapshot)
++		}
++	}
++}
++
++// SimulateUsageRemoval removes each target's FreedUsage from its ClusterQueue, skipping
++// workloads whose usage the cycle already released, and returns the revert. With no
++// Remaining set it does what Snapshot.SimulateWorkloadUsageRemoval does.
++func SimulateUsageRemoval(snapshot *schdcache.Snapshot, targets []*Target) (revert func()) {
++	if !slices.ContainsFunc(targets, func(t *Target) bool { return t.Remaining != nil }) {
++		return snapshot.SimulateWorkloadUsageRemoval(EvictedWorkloads(targets))
++	}
++	usages := make([]workload.Usage, len(targets))
++	for i, t := range targets {
++		usages[i] = t.FreedUsage()
++		snapshot.RemoveWorkloadUsage(t.WorkloadInfo, usages[i])
++	}
++	return func() {
++		for i, t := range slices.Backward(targets) {
++			snapshot.AddWorkloadUsage(t.WorkloadInfo, usages[i])
++		}
++	}
++}
++
++// EvictedWorkloads returns the workloads of the targets without Remaining, the only
++// ones whose pods leave the scheduling simulator.
++func EvictedWorkloads(targets []*Target) []*workload.Info {
++	evicted := make([]*workload.Info, 0, len(targets))
++	for _, t := range targets {
++		if t.Remaining == nil {
++			evicted = append(evicted, t.WorkloadInfo)
++		}
++	}
++	return evicted
++}
++
++// ShrunkTo returns wl as it stays admitted with each PodSet in counts down to
++// its count: the PodSet's quota scaled to the count and its whole TAS usage
++// kept. PodSets missing from counts, or already at or below their count, are
++// unchanged.
++func ShrunkTo(wl *workload.Info, counts workload.PodSetsCounts) *workload.Info {
++	remaining := *wl
++	remaining.TotalRequests = slices.Clone(wl.TotalRequests)
++	for i := range remaining.TotalRequests {
++		ps := &remaining.TotalRequests[i]
++		count, found := counts[ps.Name]
++		if !found || count >= ps.Count {
++			continue
++		}
++		// ScaledTo leaves a PodSet with a topology request unscaled.
++		quotaOnly := *ps
++		quotaOnly.TopologyRequest = nil
++		scaled := *quotaOnly.ScaledTo(count)
++		scaled.TopologyRequest = ps.TopologyRequest
++		scaled.DelayedTopologyRequest = ps.DelayedTopologyRequest
++		*ps = scaled
++	}
++	return &remaining
++}
++
++// IsReclaimInFlight reports whether partial preemption set a reclaim target on
++// wl whose quota is not released yet, so its pods above the target are on
++// their way out.
++func IsReclaimInFlight(wl *workload.Info) bool {
++	return features.Enabled(features.PartialPreemption) && !workloadevict.IsEvicted(wl.Obj) &&
++		workload.IsPartiallyPreempted(wl.Obj) && len(workload.PendingReclaimTargetCounts(wl.Obj)) > 0
++}
++
++// ClassicalCandidatesOrdering is CandidatesOrdering with the workloads whose
++// partial preemption is in flight sorted right after the evicted ones, so the
++// classical strategy offers both first and a later preemptor counts the quota
++// already on its way out.
++func ClassicalCandidatesOrdering(log logr.Logger, afsEnabled bool, a, b *workload.Info, cq kueue.ClusterQueueReference, now time.Time) int {
++	return cmputil.LazyOr(
++		func() int { return compareEvictedThenReclaimInFlight(a, b) },
++		func() int { return CandidatesOrdering(log, afsEnabled, a, b, cq, now) },
++	)
++}
++
++// ClassicalCandidatesPreferenceOrdering is CandidatesPreferenceOrdering with
++// the order of ClassicalCandidatesOrdering.
++func ClassicalCandidatesPreferenceOrdering(log logr.Logger, afsEnabled bool, a, b *workload.Info, cq kueue.ClusterQueueReference, preferred func(*workload.Info) bool) int {
++	return cmputil.LazyOr(
++		func() int { return compareEvictedThenReclaimInFlight(a, b) },
++		func() int { return CandidatesPreferenceOrdering(log, afsEnabled, a, b, cq, preferred) },
++	)
++}
++
++func compareEvictedThenReclaimInFlight(a, b *workload.Info) int {
++	return cmputil.LazyOr(
++		func() int { return cmputil.CompareBool(workloadevict.IsEvicted(b.Obj), workloadevict.IsEvicted(a.Obj)) },
++		func() int { return cmputil.CompareBool(IsReclaimInFlight(b), IsReclaimInFlight(a)) },
++	)
++}
+diff --git a/pkg/scheduler/preemption/policy/types.go b/pkg/scheduler/preemption/policy/types.go
+index 666564b..8ab4c91 100644
+--- a/pkg/scheduler/preemption/policy/types.go
++++ b/pkg/scheduler/preemption/policy/types.go
+@@ -37,6 +37,12 @@ type Target struct {
+ 	// ConfigurablePreemptionReasonData stores data which resulted in eviction.
+ 	// Specified only when eviction is due to configurable preemption.
+ 	ConfigurablePreemptionReasonData *ConfigurablePreemptionReasonData
++
++	// Remaining is the part of the workload that stays admitted when the target is shrunk
++	// instead of evicted: the victim's workload.Info, under the same key, with each shrunk
++	// PodSet's TotalRequests replaced by PodSetResources.ScaledTo(target count), keeping its
++	// whole TAS usage. Nil for a whole eviction.
++	Remaining *workload.Info
+ }
+ 
+ type ConfigurablePreemptionReasonData struct {
+@@ -65,7 +71,7 @@ type yieldCandidate = func(*Target) bool
+ // logic removing the candidate from the provided snapshot.
+ func YieldFromSnapshot(snapshot *scheduler.Snapshot, yield yieldCandidate) yieldCandidate {
+ 	return func(t *Target) bool {
+-		snapshot.RemoveWorkload(t.WorkloadInfo)
++		t.RemoveFrom(snapshot)
+ 		return yield(t)
+ 	}
+ }
+diff --git a/pkg/scheduler/preemption/preempted_workloads.go b/pkg/scheduler/preemption/preempted_workloads.go
+index cb1b8af..6ef7d02 100644
+--- a/pkg/scheduler/preemption/preempted_workloads.go
++++ b/pkg/scheduler/preemption/preempted_workloads.go
+@@ -23,7 +23,7 @@ import (
+ 	"sigs.k8s.io/kueue/pkg/workload"
+ )
+ 
+-type PreemptedWorkloads map[workload.Reference]*workload.Info
++type PreemptedWorkloads map[workload.Reference]*Target
+ 
+ func (p PreemptedWorkloads) HasAny(newTargets []*Target) bool {
+ 	for _, target := range newTargets {
+@@ -36,7 +36,7 @@ func (p PreemptedWorkloads) HasAny(newTargets []*Target) bool {
+ 
+ func (p PreemptedWorkloads) Insert(newTargets []*Target) {
+ 	for _, target := range newTargets {
+-		p[workload.Key(target.WorkloadInfo.Obj)] = target.WorkloadInfo
++		p[workload.Key(target.WorkloadInfo.Obj)] = target
+ 	}
+ }
+ 
+@@ -52,6 +52,6 @@ func (p PreemptedWorkloads) MergeWithTargets(targets []*Target) PreemptedWorkloa
+ 	return merged
+ }
+ 
+-func (p PreemptedWorkloads) Workloads() []*workload.Info {
++func (p PreemptedWorkloads) Targets() []*Target {
+ 	return slices.Collect(maps.Values(p))
+ }
+diff --git a/pkg/scheduler/preemption/preempted_workloads_test.go b/pkg/scheduler/preemption/preempted_workloads_test.go
+index 2461007..554ab4c 100644
+--- a/pkg/scheduler/preemption/preempted_workloads_test.go
++++ b/pkg/scheduler/preemption/preempted_workloads_test.go
+@@ -30,18 +30,18 @@ func TestWorkloadsToRemove(t *testing.T) {
+ 	originalKey := workload.Key(original.Obj)
+ 	additionalKey := workload.Key(additional.Obj)
+ 
+-	preempted := PreemptedWorkloads{originalKey: original}
++	preempted := PreemptedWorkloads{originalKey: {WorkloadInfo: original}}
+ 	got := preempted.MergeWithTargets([]*Target{
+ 		{WorkloadInfo: replacement},
+ 		{WorkloadInfo: additional},
+-	}).Workloads()
++	}).Targets()
+ 
+ 	if len(got) != 2 {
+ 		t.Fatalf("WorkloadsToRemove() returned %d workloads, want 2", len(got))
+ 	}
+-	gotByKey := make(PreemptedWorkloads, len(got))
+-	for _, info := range got {
+-		gotByKey[workload.Key(info.Obj)] = info
++	gotByKey := make(map[workload.Reference]*workload.Info, len(got))
++	for _, target := range got {
++		gotByKey[workload.Key(target.WorkloadInfo.Obj)] = target.WorkloadInfo
+ 	}
+ 	if gotByKey[originalKey] != replacement {
+ 		t.Errorf("duplicate target was not deduplicated with the new target value")
+@@ -49,7 +49,7 @@ func TestWorkloadsToRemove(t *testing.T) {
+ 	if gotByKey[additionalKey] != additional {
+ 		t.Errorf("new target was not included")
+ 	}
+-	if len(preempted) != 1 || preempted[originalKey] != original {
++	if len(preempted) != 1 || preempted[originalKey].WorkloadInfo != original {
+ 		t.Errorf("WorkloadsToRemove() mutated receiver: %#v", preempted)
+ 	}
+ }
+@@ -58,8 +58,8 @@ func TestWorkloadsToRemoveNilReceiver(t *testing.T) {
+ 	target := workloadInfoForTest("ns", "victim")
+ 	var preempted PreemptedWorkloads
+ 
+-	got := preempted.MergeWithTargets([]*Target{{WorkloadInfo: target}}).Workloads()
+-	if len(got) != 1 || workload.Key(got[0].Obj) != workload.Key(target.Obj) {
++	got := preempted.MergeWithTargets([]*Target{{WorkloadInfo: target}}).Targets()
++	if len(got) != 1 || workload.Key(got[0].WorkloadInfo.Obj) != workload.Key(target.Obj) {
+ 		t.Fatalf("WorkloadsToRemove() = %#v, want the target workload", got)
+ 	}
+ }
+diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
+index d3779d1..01cfc2c 100644
+--- a/pkg/scheduler/preemption/preemption.go
++++ b/pkg/scheduler/preemption/preemption.go
+@@ -309,6 +309,16 @@ func (p *Preemptor) IssuePreemptions(
+ 			return
+ 		}
+ 
++		if target.Remaining != nil {
++			if err := p.issuePartialPreemption(ctx, preemptor, target); err != nil {
++				errCh.SendErrorWithCancel(err, cancel)
++				preemptionErrors.Add(1)
++				return
++			}
++			successfullyPreempted.Add(1)
++			return
++		}
++
+ 		preemptorPath := buildCQPath(string(preemptor.ClusterQueue), snap)
+ 		preempteePath := buildCQPath(string(target.WorkloadInfo.ClusterQueue), target.WorkloadCq)
+ 
+@@ -391,31 +401,46 @@ type preemptionAttemptOpts struct {
+ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[PreemptionStrategy]) []*Target {
+ 	log := log.FromContext(ctx)
+ 	for strategy := range strategies {
+-		var targets []*Target
++		var targets, partial []*Target
++		accept := func(escalated bool) bool {
++			targets = fillBackWorkloads(ctx, strategy.pCtx, targets, partial, strategy.allowBorrowing, escalated)
++			if strategy.verify != nil {
++				if valid, reason := strategy.verify(targets); !valid {
++					if logV := log.V(5); logV.Enabled() {
++						logV.Info("Discarding preemption targets: strategy verification failed",
++							"preemptingWorkload", klog.KObj(strategy.pCtx.preemptor.Obj),
++							"targets", logging.GetObjectReferences(targets),
++							"reason", reason)
++					}
++					return false
++				}
++			}
++			restoreSnapshot(strategy.pCtx.snapshot, targets)
++			if logV := log.V(5); logV.Enabled() {
++				logV.Info("Preemption target search succeeded",
++					"preemptingWorkload", klog.KObj(strategy.pCtx.preemptor.Obj),
++					"targets", logging.GetObjectReferences(targets))
++			}
++			return true
++		}
++		fit := false
+ 		for candidate := range strategy.candidates {
+ 			targets = append(targets, candidate)
++			if candidate.Remaining != nil {
++				partial = append(partial, candidate)
++			}
+ 			if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
+-				targets = fillBackWorkloads(ctx, strategy.pCtx, targets, strategy.allowBorrowing)
+-				if strategy.verify != nil {
+-					if valid, reason := strategy.verify(targets); !valid {
+-						if logV := log.V(5); logV.Enabled() {
+-							logV.Info("Discarding preemption targets: strategy verification failed",
+-								"preemptingWorkload", klog.KObj(strategy.pCtx.preemptor.Obj),
+-								"targets", logging.GetObjectReferences(targets),
+-								"reason", reason)
+-						}
+-						break
+-					}
++				if accept(false) {
++					return targets
+ 				}
+-				restoreSnapshot(strategy.pCtx.snapshot, targets)
+-				if logV := log.V(5); logV.Enabled() {
+-					logV.Info("Preemption target search succeeded",
+-						"preemptingWorkload", klog.KObj(strategy.pCtx.preemptor.Obj),
+-						"targets", logging.GetObjectReferences(targets))
+-				}
+-				return targets
++				fit = true
++				break
+ 			}
+ 		}
++		// A shrunk target that is not enough is evicted whole.
++		if !fit && escalatePartialTargets(ctx, strategy.pCtx, partial, strategy.allowBorrowing) && accept(true) {
++			return targets
++		}
+ 		restoreSnapshot(strategy.pCtx.snapshot, targets)
+ 	}
+ 	log.V(5).Info("Preemption target search found no suitable targets")
+@@ -424,22 +449,31 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
+ 
+ func restoreSnapshot(snapshot *schdcache.Snapshot, targets []*Target) {
+ 	for _, t := range targets {
+-		snapshot.AddWorkload(t.WorkloadInfo)
++		t.AddTo(snapshot)
+ 	}
+ }
+ 
+-// fillBackWorkloads checks in the reverse order if any of the workloads can be added back.
+-func fillBackWorkloads(ctx context.Context, preemptionCtx *preemptionCtx, targets []*Target, allowBorrowing bool) []*Target {
+-	for i := len(targets) - 2; i >= 0; i-- {
+-		preemptionCtx.snapshot.AddWorkload(targets[i].WorkloadInfo)
++// fillBackWorkloads checks in the reverse order if any of the workloads can be added back,
++// and then grows the targets offered shrunk back as far as the workload still fits. The
++// last target is checked too after an escalation, which can make it unneeded.
++func fillBackWorkloads(ctx context.Context, preemptionCtx *preemptionCtx, targets, partial []*Target, allowBorrowing, escalated bool) []*Target {
++	start := len(targets) - 2
++	if escalated {
++		start = len(targets) - 1
++	}
++	for i := start; i >= 0; i-- {
++		targets[i].AddTo(preemptionCtx.snapshot)
+ 		if workloadFits(ctx, preemptionCtx, allowBorrowing) {
+ 			// O(1) deletion: copy the last element into index i and reduce size.
+ 			targets[i] = targets[len(targets)-1]
+ 			targets = targets[:len(targets)-1]
+ 		} else {
+-			preemptionCtx.snapshot.RemoveWorkload(targets[i].WorkloadInfo)
++			targets[i].RemoveFrom(preemptionCtx.snapshot)
+ 		}
+ 	}
++	if len(partial) > 0 {
++		growPartialTargets(ctx, preemptionCtx, targets, partial, allowBorrowing)
++	}
+ 	return targets
+ }
+ 
+diff --git a/pkg/scheduler/preemption/preemption_oracle.go b/pkg/scheduler/preemption/preemption_oracle.go
+index d6288aa..b1ebf56 100644
+--- a/pkg/scheduler/preemption/preemption_oracle.go
++++ b/pkg/scheduler/preemption/preemption_oracle.go
+@@ -69,11 +69,7 @@ func (p *PreemptionOracle) SimulatePreemption(
+ 		return policy.NoCandidates, borrow
+ 	}
+ 
+-	workloadsToPreempt := make([]*workload.Info, len(candidates))
+-	for i, c := range candidates {
+-		workloadsToPreempt[i] = c.WorkloadInfo
+-	}
+-	revertRemoval := p.snapshot.SimulateWorkloadUsageRemoval(workloadsToPreempt)
++	revertRemoval := policy.SimulateUsageRemoval(p.snapshot, candidates)
+ 	borrowAfterPreemptions, _ := classical.FindHeightOfLowestSubtreeThatFits(cq, fr, quantity)
+ 	revertRemoval()
+ 
+diff --git a/pkg/scheduler/preemption/topology_retry.go b/pkg/scheduler/preemption/topology_retry.go
+index 30ffa6b..8822d40 100644
+--- a/pkg/scheduler/preemption/topology_retry.go
++++ b/pkg/scheduler/preemption/topology_retry.go
+@@ -82,7 +82,10 @@ func (p *Preemptor) GetTargets(
+ type topologyRetryAttempt struct {
+ 	allowBorrowing bool
+ 	candidates     []*workload.Info
+-	strategy       func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy
++	// freedUsage returns the usage the strategy frees by preempting a
++	// candidate; nil means the candidate's whole usage.
++	freedUsage func(*workload.Info) workload.Usage
++	strategy   func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy
+ }
+ 
+ // topologyRetryTargets takes victims by topology placement instead of by
+@@ -161,6 +164,9 @@ func (p *Preemptor) topologyRetryAttemptTargets(ctx context.Context, pCtx *preem
+ 	leaves := sets.New[flavorDomain]()
+ 	for _, wl := range attempt.candidates {
+ 		usage := wl.Usage()
++		if attempt.freedUsage != nil {
++			usage = attempt.freedUsage(wl)
++		}
+ 		candidate := &retryCandidate{
+ 			wl:       wl,
+ 			priority: priority.EffectivePriority(log, wl.Obj),
+diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
+index e4ef72f..8571fd5 100644
+--- a/pkg/scheduler/scheduler.go
++++ b/pkg/scheduler/scheduler.go
+@@ -21,7 +21,6 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
+-	"maps"
+ 	"slices"
+ 	"strings"
+ 	"testing"
+@@ -53,6 +52,7 @@ import (
+ 	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
+ 	"sigs.k8s.io/kueue/pkg/scheduler/preemption"
+ 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/fairsharing"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
+ 	afs "sigs.k8s.io/kueue/pkg/util/admissionfairsharing"
+ 	"sigs.k8s.io/kueue/pkg/util/api"
+ 	"sigs.k8s.io/kueue/pkg/util/expectations"
+@@ -934,7 +934,7 @@ func (s *Scheduler) updateAssignmentIfNeeded(
+ func fits(snapshot *schdcache.Snapshot, cq *schdcache.ClusterQueueSnapshot, usage *workload.Usage, preemptedWorkloads preemption.PreemptedWorkloads,
+ 	newTargets []*preemption.Target) schdcache.FitsCheck {
+ 	merged := preemptedWorkloads.MergeWithTargets(newTargets)
+-	revertUsage := snapshot.SimulateWorkloadUsageRemoval(merged.Workloads())
++	revertUsage := policy.SimulateUsageRemoval(snapshot, merged.Targets())
+ 	defer revertUsage()
+ 	return cq.Fits(*usage)
+ }
+@@ -995,9 +995,9 @@ func (s *Scheduler) evictWorkloadAfterFailedTASReplacement(ctx context.Context,
+ // out of the snapshot and returns the single undo. Freeing their quota is not enough:
+ // until the simulator is told, it still reports their Pods and their host ports.
+ func simulateOtherPreemptions(ctx context.Context, log logr.Logger, snapshot *schdcache.Snapshot, preemptedWorkloads preemption.PreemptedWorkloads) func() {
+-	victims := slices.Collect(maps.Values(preemptedWorkloads))
+-	revertUsage := snapshot.SimulateWorkloadRemoval(victims)
+-	revertPods := snapshot.SimulatePodRemoval(ctx, log, victims)
++	victims := preemptedWorkloads.Targets()
++	revertUsage := policy.SimulateRemoval(snapshot, victims)
++	revertPods := snapshot.SimulatePodRemoval(ctx, log, policy.EvictedWorkloads(victims))
+ 	return func() {
+ 		revertPods()
+ 		revertUsage()
+diff --git a/pkg/scheduler/scheduler_partial_preemption_test.go b/pkg/scheduler/scheduler_partial_preemption_test.go
+new file mode 100644
+index 0000000..0b11b0a
+--- /dev/null
++++ b/pkg/scheduler/scheduler_partial_preemption_test.go
+@@ -0,0 +1,312 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests that the scheduler's own checks, the in-cycle fit check, the TAS
++// planner and the overlap recompute, count a shrunk victim's remaining pods.
++
++package scheduler
++
++import (
++	"context"
++	"fmt"
++	"slices"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/meta"
++	"k8s.io/apimachinery/pkg/api/resource"
++	"k8s.io/component-base/featuregate"
++	testingclock "k8s.io/utils/clock/testing"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
++	"sigs.k8s.io/kueue/pkg/util/routine"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
++)
++
++// TestFitsCountsShrunkVictimsRemainingPods checks that the in-cycle fit check
++// frees only what a shrunk victim gives up.
++func TestFitsCountsShrunkVictimsRemainingPods(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++	ctx, log := utiltesting.ContextWithLog(t)
++	cl := utiltesting.NewClientBuilder().Build()
++	cqCache := schdcache.New(cl)
++	cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
++	if err := cqCache.AddClusterQueue(ctx, utiltestingapi.MakeClusterQueue("cq").
++		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "4").Obj()).Obj()); err != nil {
++		t.Fatal(err)
++	}
++	snapshot, err := cqCache.Snapshot(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	victim := workload.NewInfo(log, utiltestingapi.MakeWorkload("victim", "default").
++		PodSets(*utiltestingapi.MakePodSet("main", 4).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(utiltestingapi.MakePodSetAssignment("main").Count(4).
++			Assignment(corev1.ResourceCPU, "default", "4").Obj()).Obj(), time.Now()).Obj())
++	snapshot.AddWorkload(victim)
++	cq := snapshot.ClusterQueue("cq")
++	need := func(cpu int64) *workload.Usage {
++		return &workload.Usage{Quota: workload.ResourceUsage{Assigned: resources.FlavorResourceQuantities{
++			{Flavor: "default", Resource: corev1.ResourceCPU}: resources.NewAmount(cpu * 1000),
++		}}}
++	}
++	shrunk := &preemption.Target{WorkloadInfo: victim, Remaining: policy.ShrunkTo(victim, workload.PodSetsCounts{"main": 2})}
++	if got := fits(snapshot, cq, need(2), nil, []*preemption.Target{shrunk}); got != schdcache.FitsCheckOk {
++		t.Errorf("fits() for what the shrink frees = %v, want Ok", got)
++	}
++	if got := fits(snapshot, cq, need(3), nil, []*preemption.Target{shrunk}); got != schdcache.FitsCheckNoQuota {
++		t.Errorf("fits() for more than the shrink frees = %v, want NoQuota", got)
++	}
++	preempted := preemption.PreemptedWorkloads{workload.Key(victim.Obj): shrunk}
++	if got := fits(snapshot, cq, need(3), preempted, nil); got != schdcache.FitsCheckNoQuota {
++		t.Errorf("fits() after another preemptor shrank the victim = %v, want NoQuota", got)
++	}
++}
++
++// TestPartialPreemptionWithTAS checks that the planner and the in-cycle fit
++// check accept a shrink plan that places the preemptor beside the victim, and
++// that a preemptor needing the victim's node gets it evicted whole.
++func TestPartialPreemptionWithTAS(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	cases := map[string]struct {
++		blockerCPU  string
++		wantTargets []string
++		wantDomain  string
++	}{
++		"a shrink frees quota and the preemptor goes to the other node": {
++			blockerCPU:  "1",
++			wantTargets: []string{"elastic:main=1"},
++			wantDomain:  "x2",
++		},
++		"a preemptor that needs the victim's node evicts it whole": {
++			blockerCPU:  "4",
++			wantTargets: []string{"elastic"},
++			wantDomain:  "x1",
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{features.TopologyAwareScheduling: true, features.PartialPreemption: true})
++			ctx, log := utiltesting.ContextWithLog(t)
++			onNode := func(name string, cq kueue.ClusterQueueReference, node string, count int32) *utiltestingapi.WorkloadWrapper {
++				return utiltestingapi.MakeWorkload(name, "default").
++					PodSets(*utiltestingapi.MakePodSet("main", int(count)).Request(corev1.ResourceCPU, "1").
++						RequiredTopologyRequest(corev1.LabelHostname).Obj()).
++					ReserveQuotaAt(utiltestingapi.MakeAdmission(cq).PodSets(
++						utiltestingapi.MakePodSetAssignment("main").Count(count).
++							Assignment(corev1.ResourceCPU, "tas", fmt.Sprint(count)).
++							TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++								Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{node}, count).Obj()).Obj()).Obj()).Obj(), now).
++					AdmittedAt(true, now)
++			}
++			blockerQuantity := resource.MustParse(tc.blockerCPU)
++			blockerCount := int32(blockerQuantity.Value())
++			admitted := []kueue.Workload{
++				*onNode("elastic", "borrower", "x1", 2).Annotation(constants.ReclaimMinCountsAnnotation, "main=1").Obj(),
++				*onNode("blocker", "other", "x2", blockerCount).Obj(),
++			}
++			clientBuilder := utiltesting.NewClientBuilder().
++				WithLists(&kueue.WorkloadList{Items: admitted}).
++				WithObjects(utiltesting.MakeNamespace("default")).
++				WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).
++				WithStatusSubresource(&kueue.Workload{})
++			_ = tasindexer.SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder))
++			cl := clientBuilder.Build()
++			cqCache := schdcache.New(cl)
++			cqCache.AddOrUpdateTopology(log, utiltestingapi.MakeTopology("hostname").Levels(corev1.LabelHostname).Obj())
++			cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("tas").NodeLabel("pool", "tas").TopologyName("hostname").Obj())
++			for node, cpu := range map[string]string{"x1": "2", "x2": "4"} {
++				cqCache.TASCache().SyncNode(testingnode.MakeNode(node).Label("pool", "tas").Label(corev1.LabelHostname, node).
++					StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu), corev1.ResourcePods: resource.MustParse("10")}).
++					Ready().Obj())
++			}
++			for _, cq := range []*kueue.ClusterQueue{
++				utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "2").Obj()).
++					Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyAny}).Obj(),
++				utiltestingapi.MakeClusterQueue("borrower").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "0").Obj()).Obj(),
++				utiltestingapi.MakeClusterQueue("other").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, tc.blockerCPU).Obj()).Obj(),
++				utiltestingapi.MakeClusterQueue("lender").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas").Resource(corev1.ResourceCPU, "1").Obj()).Obj(),
++			} {
++				if err := cqCache.AddClusterQueue(ctx, cq); err != nil {
++					t.Fatal(err)
++				}
++			}
++			fakeClock := testingclock.NewFakeClock(now)
++			qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
++			scheduler := New(qManager, cqCache, cl, &utiltesting.EventRecorder{}, WithClock(t, fakeClock), WithPreemptionExpectations(preemptexpectations.New()))
++			snapshot, err := cqCache.Snapshot(ctx)
++			if err != nil {
++				t.Fatal(err)
++			}
++			info := workload.NewInfo(log, utiltestingapi.MakeWorkload("incoming", "default").Priority(3).
++				PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "2").
++					RequiredTopologyRequest(corev1.LabelHostname).Obj()).Obj())
++			info.ClusterQueue = "incoming"
++
++			assignment, targets := scheduler.getAssignments(ctx, info, snapshot)
++			if diff := cmp.Diff(tc.wantTargets, describeTargets(targets)); diff != "" {
++				t.Fatalf("unexpected preemption targets (-want/+got):\n%s", diff)
++			}
++			podSet := assignment.PodSets[0]
++			if podSet.TopologyAssignment == nil {
++				t.Fatal("the planner found no topology assignment")
++			}
++			if diff := cmp.Diff([]string{tc.wantDomain}, podSet.TopologyAssignment.Domains[0].Values); diff != "" {
++				t.Errorf("unexpected topology domain (-want/+got):\n%s", diff)
++			}
++			e := entry{Head: qcache.Head{Info: *info}, clusterQueueSnapshot: snapshot.ClusterQueue("incoming")}
++			e.recordAssignment(assignment, targets)
++			if got := e.checkFits(log, snapshot, snapshot.ClusterQueue("incoming"), nil); got != schdcache.FitsCheckOk {
++				t.Errorf("the in-cycle fit check rejects the plan: %v", got)
++			}
++		})
++	}
++}
++
++// TestPartialPreemptionTwoPreemptorsInOneCycle checks that a second preemptor
++// whose victim another preemptor shrank this cycle sees the pods the victim
++// keeps, so it neither counts on their quota nor reserves it.
++func TestPartialPreemptionTwoPreemptorsInOneCycle(t *testing.T) {
++	for _, cacheEnabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("ClassicalPreemptionCandidateOrderCache=%t", cacheEnabled), func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.PartialPreemption:                      true,
++				features.ClassicalPreemptionCandidateOrderCache: cacheEnabled,
++			})
++			now := time.Now().Truncate(time.Second)
++			ctx, log := utiltesting.ContextWithLog(t)
++			victim := *utiltestingapi.MakeWorkload("victim", "default").
++				PodSets(*utiltestingapi.MakePodSet("main", 4).Request(corev1.ResourceCPU, "1").Obj()).
++				Annotation(constants.ReclaimMinCountsAnnotation, "main=1").
++				ReserveQuotaAt(utiltestingapi.MakeAdmission("borrower").PodSets(utiltestingapi.MakePodSetAssignment("main").Count(4).
++					Assignment(corev1.ResourceCPU, "default", "4").Obj()).Obj(), now.Add(-time.Hour)).
++				AdmittedAt(true, now.Add(-time.Hour)).Obj()
++			pending := func(name, queue string, priority int32) kueue.Workload {
++				return *utiltestingapi.MakeWorkload(name, "default").Queue(kueue.LocalQueueName(queue)).Priority(priority).
++					Creation(now.Add(-time.Duration(priority) * time.Minute)).
++					PodSets(*utiltestingapi.MakePodSet("main", 1).Request(corev1.ResourceCPU, "2").Obj()).Obj()
++			}
++			workloads := []kueue.Workload{victim, pending("first", "first", 10), pending("second", "second", 5)}
++			cqs := []kueue.ClusterQueue{
++				*utiltestingapi.MakeClusterQueue("first").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "2").Obj()).
++					Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyAny}).Obj(),
++				*utiltestingapi.MakeClusterQueue("second").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "2").Obj()).
++					Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyAny}).Obj(),
++				*utiltestingapi.MakeClusterQueue("borrower").Cohort("shared").
++					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "0").Obj()).Obj(),
++			}
++			queues := []kueue.LocalQueue{
++				*utiltestingapi.MakeLocalQueue("first", "default").ClusterQueue("first").Obj(),
++				*utiltestingapi.MakeLocalQueue("second", "default").ClusterQueue("second").Obj(),
++			}
++			cl := utiltesting.NewClientBuilder().
++				WithLists(&kueue.WorkloadList{Items: workloads}, &kueue.ClusterQueueList{Items: cqs}, &kueue.LocalQueueList{Items: queues}).
++				WithObjects(utiltesting.MakeNamespace("default")).
++				WithStatusSubresource(&kueue.Workload{}).Build()
++			cqCache := schdcache.New(cl)
++			qManager := qcache.NewManagerForUnitTests(cl, cqCache)
++			cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
++			for i := range cqs {
++				if err := cqCache.AddClusterQueue(ctx, &cqs[i]); err != nil {
++					t.Fatal(err)
++				}
++				if err := qManager.AddClusterQueue(ctx, &cqs[i]); err != nil {
++					t.Fatal(err)
++				}
++			}
++			for i := range queues {
++				if err := qManager.AddLocalQueue(ctx, &queues[i]); err != nil {
++					t.Fatal(err)
++				}
++			}
++			scheduler := New(qManager, cqCache, cl, &utiltesting.EventRecorder{},
++				WithClock(t, testingclock.NewFakeClock(now)), WithPreemptionExpectations(preemptexpectations.New()))
++			wg := sync.WaitGroup{}
++			scheduler.setAdmissionRoutineWrapper(routine.NewWrapper(func() { wg.Add(1) }, func() { wg.Done() }))
++			ctx, cancel := context.WithTimeout(ctx, queueingTimeout)
++			defer cancel()
++			go qManager.CleanUpOnContext(ctx)
++			scheduler.schedule(ctx)
++			wg.Wait()
++
++			var got kueue.WorkloadList
++			if err := cl.List(ctx, &got); err != nil {
++				t.Fatal(err)
++			}
++			byName := make(map[string]*kueue.Workload)
++			for i := range got.Items {
++				byName[got.Items[i].Name] = &got.Items[i]
++			}
++			if v := byName["victim"]; workloadevict.IsEvicted(v) || v.Annotations[constants.ReclaimTargetCountsAnnotation] != "main=2" ||
++				v.Annotations[constants.ReclaimPreemptorAnnotation] != "default/first" {
++				t.Errorf("victim: evicted=%t annotations=%v; want not evicted, shrunk to main=2 by default/first", workloadevict.IsEvicted(v), v.Annotations)
++			}
++			for _, name := range []string{"first", "second"} {
++				if workload.HasQuotaReservation(byName[name]) {
++					t.Errorf("%s was admitted while the victim's pods still run", name)
++				}
++			}
++			if cond := meta.FindStatusCondition(byName["second"].Status.Conditions, kueue.WorkloadQuotaReserved); cond != nil &&
++				strings.Contains(cond.Message, "will fit after these preemptions complete") {
++				t.Errorf("second counts on quota the shrunk victim keeps: %s", cond.Message)
++			}
++		})
++	}
++}
++
++// describeTargets returns each target's name, and the counts a shrunk target keeps.
++func describeTargets(targets []*preemption.Target) []string {
++	var got []string
++	for _, t := range targets {
++		s := t.WorkloadInfo.Obj.Name
++		if t.Remaining != nil {
++			kept := make(workload.PodSetsCounts)
++			for i, ps := range t.Remaining.TotalRequests {
++				if ps.Count != t.WorkloadInfo.TotalRequests[i].Count {
++					kept[ps.Name] = ps.Count
++				}
++			}
++			s += ":" + workload.FormatPodSetCounts(kept)
++		}
++		got = append(got, s)
++	}
++	slices.Sort(got)
++	return got
++}
+diff --git a/pkg/scheduler/scheduler_test.go b/pkg/scheduler/scheduler_test.go
+index 54388cc..9559465 100644
+--- a/pkg/scheduler/scheduler_test.go
++++ b/pkg/scheduler/scheduler_test.go
+@@ -12301,7 +12301,7 @@ func TestFitsDedupsOverlappingVictims(t *testing.T) {
+ 		},
+ 	}
+ 	preempted := preemption.PreemptedWorkloads{
+-		workload.Key(victimWL): victimInfo,
++		workload.Key(victimWL): {WorkloadInfo: victimInfo},
+ 	}
+ 	targets := []*preemption.Target{{WorkloadInfo: victimInfo}}
+ 
+diff --git a/pkg/workload/partial_preemption.go b/pkg/workload/partial_preemption.go
+new file mode 100644
+index 0000000..d1ec5d7
+--- /dev/null
++++ b/pkg/workload/partial_preemption.go
+@@ -0,0 +1,94 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// NOTE(R3): stub of the readers and writers 0008 owns, with the semantics of
++// kubernetes-sigs/kueue#17484; 0010 drops this file when it is regenerated on 0008.
++
++package workload
++
++import (
++	"fmt"
++	"maps"
++	"slices"
++	"strconv"
++	"strings"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++// ParsePodSetCounts parses a "<podSet>=<count>[,...]" list, ignoring malformed entries.
++func ParsePodSetCounts(value string) PodSetsCounts {
++	if value == "" {
++		return nil
++	}
++	counts := make(PodSetsCounts)
++	for entry := range strings.SplitSeq(value, ",") {
++		name, count, found := strings.Cut(entry, "=")
++		n, err := strconv.ParseInt(count, 10, 32)
++		if found && name != "" && err == nil && n >= 0 {
++			counts[kueue.PodSetReference(name)] = int32(n)
++		}
++	}
++	return counts
++}
++
++// FormatPodSetCounts formats counts as a "<podSet>=<count>[,...]" list sorted by PodSet name.
++func FormatPodSetCounts(counts PodSetsCounts) string {
++	entries := make([]string, 0, len(counts))
++	for _, name := range slices.Sorted(maps.Keys(counts)) {
++		entries = append(entries, fmt.Sprintf("%s=%d", name, counts[name]))
++	}
++	return strings.Join(entries, ",")
++}
++
++// IsPartiallyPreempted reports whether partial preemption shrank, or is shrinking, the workload.
++func IsPartiallyPreempted(wl *kueue.Workload) bool {
++	_, found := wl.Annotations[constants.ReclaimTargetCountsAnnotation]
++	return found
++}
++
++// ReclaimTargetCounts returns the reclaim target counts set by partial preemption.
++func ReclaimTargetCounts(wl *kueue.Workload) PodSetsCounts {
++	return ParsePodSetCounts(wl.Annotations[constants.ReclaimTargetCountsAnnotation])
++}
++
++// SetReclaimTargetCounts sets the reclaim target counts of partial preemption.
++func SetReclaimTargetCounts(wl *kueue.Workload, targets PodSetsCounts) {
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimTargetCountsAnnotation, FormatPodSetCounts(targets))
++}
++
++// PendingReclaimTargetCounts returns the reclaim target counts of the PodSets
++// that are still charged above them, so their quota is not released yet.
++func PendingReclaimTargetCounts(wl *kueue.Workload) PodSetsCounts {
++	targets := ReclaimTargetCounts(wl)
++	if len(targets) == 0 {
++		return nil
++	}
++	granted := ExtractGrantedPodSetCountsAfterReclaim(wl)
++	var pending PodSetsCounts
++	for name, target := range targets {
++		if count, found := granted[name]; found && target < count {
++			if pending == nil {
++				pending = make(PodSetsCounts)
++			}
++			pending[name] = target
++		}
++	}
++	return pending
++}
+diff --git a/pkg/workload/reclaim_floors.go b/pkg/workload/reclaim_floors.go
+new file mode 100644
+index 0000000..05cffc5
+--- /dev/null
++++ b/pkg/workload/reclaim_floors.go
+@@ -0,0 +1,35 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// NOTE(R4): stub of the readers 0009 owns; 0010 drops this file when it is
++// regenerated on 0009.
++
++package workload
++
++import (
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++// ReclaimMinCounts reads kueue.x-k8s.io/reclaim-min-counts.
++func ReclaimMinCounts(wl *kueue.Workload) PodSetsCounts {
++	return ParsePodSetCounts(wl.Annotations[constants.ReclaimMinCountsAnnotation])
++}
++
++// PodSetCountSteps reads kueue.x-k8s.io/podset-count-steps; a missing PodSet has step 1.
++func PodSetCountSteps(wl *kueue.Workload) PodSetsCounts {
++	return ParsePodSetCounts(wl.Annotations[constants.PodSetCountStepsAnnotation])
++}

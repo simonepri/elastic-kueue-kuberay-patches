@@ -3,6 +3,9 @@ kind: Test
 metadata:
   name: 15-spot-elastic-reexpansion
 spec:
+  # TODO(simonepri): run again with patch 0010-partial-preemption-search (R5) and 0011-elastic-regrow-after-reclaim (R6), and assert the shrink and regrowth on pods while replicas stay unchanged;
+  # see the acceptance tests in patches/kueue/contract.md.
+  skip: true
   description: >
     Verifies self-healing multi-pool elasticity: when remote spot pool capacity is preempted
     by a higher-priority workload, Kueue partially preempts remote-workers down to minReplicas

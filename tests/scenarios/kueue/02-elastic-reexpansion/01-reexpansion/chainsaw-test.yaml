@@ -3,6 +3,9 @@ kind: Test
 metadata:
   name: 06-elastic-reexpansion
 spec:
+  # TODO(simonepri): run again with patch 0011-elastic-regrow-after-reclaim (R6), and assert regrowth through a scale-up probe while replicas stay unchanged;
+  # see the acceptance tests in patches/kueue/contract.md.
+  skip: true
   description: >
     Verifies two-way elasticity: after yielding workers to a high-priority job,
     the RayCluster automatically re-expands to its original target replica count

@@ -1,0 +1,7 @@
+# The elastic cluster takes cell2's fair share of 4 workers.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: cell2-elastic-spot
+status:
+  desiredWorkerReplicas: 4

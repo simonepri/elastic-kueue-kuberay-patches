@@ -35,9 +35,8 @@ spec:
             file: 03-assert-fair-reclaim.yaml
     - name: prevent-overcapacity-burst
       try:
-        # Resize the running cluster to 16 workers the way an autoscaler or a user
-        # does, by changing only the counts, so the pod template keeps what Kueue
-        # set on it at admission.
+        # Resize the running fixed-size cluster to 16 workers the way an autoscaler
+        # or a user does, by changing only the counts.
         - script:
             env:
               - name: NS
@@ -47,20 +46,59 @@ spec:
               '[{"op":"replace","path":"/spec/workerGroupSpecs/0/replicas","value":16},
               {"op":"replace","path":"/spec/workerGroupSpecs/0/maxReplicas","value":16}]'
         - assert:
-            file: 04-assert-clamped.yaml
-        # cell2 is an elastic job: the resize waits for a new Workload slice, and
-        # no more worker pods may run than the admitted slice grants.
+            file: 04-assert-requeued.yaml
+        # cell2 is not an elastic job, so Kueue requeues it at its new size and it
+        # runs no workers until a Workload for 8 is admitted.
         - script:
             timeout: 150s
             env:
               - name: NS
                 value: ($namespace)
-            content: ./assert-workers-within-admission.sh cell2-raycluster-spot spot-workers
+            content: ./assert-requeued.sh cell2-raycluster-spot spot-workers 8
       catch:
         - get:
             apiVersion: ray.io/v1
             kind: RayCluster
             name: cell2-raycluster-spot
+            format: yaml
+        - get:
+            apiVersion: kueue.x-k8s.io/v1beta2
+            kind: Workload
+            format: yaml
+    - name: elastic-cluster-grows-only-through-admission
+      try:
+        - delete:
+            ref:
+              apiVersion: ray.io/v1
+              kind: RayCluster
+              name: cell2-raycluster-spot
+        - apply:
+            file: 05-cell2-elastic-spot.yaml
+        - assert:
+            file: 05-assert-elastic-admitted.yaml
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: >-
+              kubectl patch raycluster cell2-elastic-spot -n "$NS" --type=json -p
+              '[{"op":"replace","path":"/spec/workerGroupSpecs/0/replicas","value":16},
+              {"op":"replace","path":"/spec/workerGroupSpecs/0/maxReplicas","value":16}]'
+        - assert:
+            file: 05-assert-elastic-clamped.yaml
+        # The elastic cluster keeps its 4 admitted workers running, and a Workload
+        # slice for 8 waits: 8 worker pods exist, and only 4 are ungated.
+        - script:
+            timeout: 150s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-workers-within-admission.sh cell2-elastic-spot spot-workers 4 8
+      catch:
+        - get:
+            apiVersion: ray.io/v1
+            kind: RayCluster
+            name: cell2-elastic-spot
             format: yaml
         - get:
             apiVersion: kueue.x-k8s.io/v1beta2

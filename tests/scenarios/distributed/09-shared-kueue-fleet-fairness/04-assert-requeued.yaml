@@ -1,0 +1,12 @@
+# The scale gate clamps the fixed-size cluster's resize from 16 to the 8 workers the queue could ever hold, and
+# Kueue suspends the cluster, whose Workload no longer matches it, to requeue it at the new size.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: cell2-raycluster-spot
+spec:
+  suspend: true
+  workerGroupSpecs:
+    - groupName: spot-workers
+      replicas: 8
+      maxReplicas: 8

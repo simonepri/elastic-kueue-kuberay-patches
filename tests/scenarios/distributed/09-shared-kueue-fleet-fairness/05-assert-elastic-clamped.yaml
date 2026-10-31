@@ -1,0 +1,14 @@
+# The scale gate clamps the elastic cluster's resize from 16 to the 8 workers the queue could ever hold; the
+# cluster keeps that request while a Workload slice for it waits.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: cell2-elastic-spot
+spec:
+  workerGroupSpecs:
+    - groupName: spot-workers
+      replicas: 8
+      maxReplicas: 8
+status:
+  (conditions[?type == 'ScaleGateClamped']):
+    - status: "True"

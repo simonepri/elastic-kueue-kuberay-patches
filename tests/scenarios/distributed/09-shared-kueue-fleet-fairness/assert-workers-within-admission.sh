@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Checks that a resized elastic RayCluster runs exactly the worker pods its admitted Workload slice grants: never more.
-# Usage: NS=<namespace> assert-workers-within-admission.sh <raycluster> <podset>
+# Checks that a resized elastic RayCluster has the expected worker pods and that exactly as many are ungated as
+# its admitted Workload slice grants, which must be the expected count: never more.
+# Usage: NS=<namespace> assert-workers-within-admission.sh <raycluster> <podset> <granted> <total>
 set -euo pipefail
 cluster=$1
 podset=$2
+want_granted=$3
+want_total=$4
 gate=kueue.x-k8s.io/elastic-job
 
 # granted prints the workers the admitted, unfinished Workload slice of the cluster grants the pod set.
@@ -45,8 +48,8 @@ for _ in $(seq 1 45); do
     dump
     exit 1
   fi
-  state="$want/$ungated"
-  if [ "$ungated" -ge 1 ] && [ "$ungated" -eq "$want" ] && [ "$state" = "$last" ]; then
+  state="$want/$total/$ungated"
+  if [ "$want" -eq "$want_granted" ] && [ "$total" -eq "$want_total" ] && [ "$ungated" -eq "$want" ] && [ "$state" = "$last" ]; then
     stable=$((stable + 1))
     if [ "$stable" -ge 3 ]; then
       exit 0
@@ -57,6 +60,6 @@ for _ in $(seq 1 45); do
   last=$state
   sleep 2
 done
-echo "the ungated workers did not settle at the granted count" >&2
+echo "the workers did not settle at granted=$want_granted total=$want_total with the granted workers ungated" >&2
 dump
 exit 1

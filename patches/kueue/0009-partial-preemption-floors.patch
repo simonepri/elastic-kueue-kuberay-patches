@@ -1,0 +1,1141 @@
+Floors and steps for partial preemption of elastic RayClusters.
+
+Partial preemption needs to know how far a victim may shrink. Workload
+minCount keeps its upstream meaning, so the floor travels in two Workload
+annotations instead: kueue.x-k8s.io/reclaim-min-counts and
+kueue.x-k8s.io/podset-count-steps. With the PartialPreemption gate on, the job
+reconciler writes them when it builds the Workload of an elastic RayCluster:
+floor = minReplicas and step 1 for each single-host worker group.
+EnsureWorkloadSlices keeps them current on the slice it returns, in a
+metadata-only update that leaves spec, minCount and admission alone. Multi-host
+groups, the head, non-elastic RayClusters, RayJobs and RayServices get no entry.
+With the gate off, nothing is written or updated.
+
+diff --git a/pkg/constants/reclaim_floors.go b/pkg/constants/reclaim_floors.go
+new file mode 100644
+index 0000000..0faae28
+--- /dev/null
++++ b/pkg/constants/reclaim_floors.go
+@@ -0,0 +1,29 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package constants
++
++const (
++	// ReclaimMinCountsAnnotation is the Workload annotation that lists the fewest pods each
++	// PodSet may keep when partial preemption shrinks it, as <podSet>=<count>[,<podSet>=<count>].
++	// A PodSet missing from the list is only evicted whole.
++	ReclaimMinCountsAnnotation = "kueue.x-k8s.io/reclaim-min-counts"
++
++	// PodSetCountStepsAnnotation is the Workload annotation that lists the pod count each
++	// PodSet shrinks and grows by, in the format of ReclaimMinCountsAnnotation.
++	// A PodSet missing from the list has step 1.
++	PodSetCountStepsAnnotation = "kueue.x-k8s.io/podset-count-steps"
++)
+diff --git a/pkg/controller/jobframework/reclaim_floors.go b/pkg/controller/jobframework/reclaim_floors.go
+new file mode 100644
+index 0000000..c399ca5
+--- /dev/null
++++ b/pkg/controller/jobframework/reclaim_floors.go
+@@ -0,0 +1,74 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package jobframework
++
++import (
++	"maps"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// JobWithReclaimMinCounts is implemented by elastic jobs whose PodSets partial preemption may shrink.
++type JobWithReclaimMinCounts interface {
++	// ReclaimMinCounts returns the fewest pods each shrinkable PodSet may keep, a multiple
++	// of its step and at most its count. A PodSet it leaves out is only evicted whole.
++	ReclaimMinCounts() workload.PodSetsCounts
++}
++
++// JobWithPodSetCountSteps is implemented by jobs whose PodSets grow and shrink in steps.
++type JobWithPodSetCountSteps interface {
++	// PodSetCountSteps returns the pod count each PodSet grows and shrinks by, at least 1.
++	PodSetCountSteps() workload.PodSetsCounts
++}
++
++// ReclaimFloors returns the floors and steps the job asks its Workload to carry. Both are
++// empty unless PartialPreemption is on and the job uses workload slices.
++func ReclaimFloors(job GenericJob) (floors, steps workload.PodSetsCounts) {
++	if !features.Enabled(features.PartialPreemption) || !WorkloadSliceEnabled(job) {
++		return nil, nil
++	}
++	if j, ok := job.(JobWithReclaimMinCounts); ok {
++		floors = maps.Clone(j.ReclaimMinCounts())
++	}
++	if j, ok := job.(JobWithPodSetCountSteps); ok {
++		steps = maps.Clone(j.PodSetCountSteps())
++	}
++	return floors, steps
++}
++
++// applyReclaimFloors writes the job's floors and steps on a Workload built for it.
++func applyReclaimFloors(job GenericJob, wl *kueue.Workload) {
++	if !features.Enabled(features.PartialPreemption) {
++		return
++	}
++	floors, steps := ReclaimFloors(job)
++	workload.SetReclaimMinCounts(wl, floors)
++	workload.SetPodSetCountSteps(wl, steps)
++}
++
++// reclaimFloorsOption makes EnsureWorkloadSlices keep the floors and steps of the job's
++// Workload current. It is nil with PartialPreemption off, which leaves the Workload alone.
++func reclaimFloorsOption(job GenericJob) workloadslicing.EnsureOption {
++	if !features.Enabled(features.PartialPreemption) {
++		return nil
++	}
++	floors, steps := ReclaimFloors(job)
++	return workloadslicing.WithReclaimFloors(floors, steps)
++}
+diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
+index 31ef492..abd1689 100644
+--- a/pkg/controller/jobframework/reconciler.go
++++ b/pkg/controller/jobframework/reconciler.go
+@@ -1226,7 +1226,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
+ 		// Workload slices allow modifications only to PodSet.Count.
+ 		// Any other changes will result in the slice being marked as incompatible,
+ 		// and the workload will fall back to being processed by the original ensureOneWorkload function.
+-		wl, compatible, err := r.workloadSlices.EnsureWorkloadSlices(ctx, podSets, object, job.GVK())
++		wl, compatible, err := r.workloadSlices.EnsureWorkloadSlices(ctx, podSets, object, job.GVK(), reclaimFloorsOption(job))
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -1993,6 +1993,7 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
+ 	}
+ 
+ 	wl := NewWorkload(newWorkloadName(job, extra), object, podSets, labelKeysToCopy, annotationsToCopy)
++	applyReclaimFloors(job, wl)
+ 	if wl.Labels == nil {
+ 		wl.Labels = make(map[string]string)
+ 	}
+diff --git a/pkg/controller/jobs/raycluster/common.go b/pkg/controller/jobs/raycluster/common.go
+index 6509710..8d6556f 100644
+--- a/pkg/controller/jobs/raycluster/common.go
++++ b/pkg/controller/jobs/raycluster/common.go
+@@ -48,6 +48,7 @@ import (
+ 	"sigs.k8s.io/kueue/pkg/podset"
+ 	utilpodset "sigs.k8s.io/kueue/pkg/util/podset"
+ 	utilresource "sigs.k8s.io/kueue/pkg/util/resource"
++	"sigs.k8s.io/kueue/pkg/workload"
+ 	"sigs.k8s.io/kueue/pkg/workloadslicing"
+ )
+ 
+@@ -96,6 +97,38 @@ func effectiveWorkerCount(wgs *rayv1.WorkerGroupSpec) int32 {
+ 	return replicas * max(wgs.NumOfHosts, 1)
+ }
+ 
++// ReclaimMinCounts implements jobframework.JobWithReclaimMinCounts. Partial preemption may
++// shrink a single-host worker group down to its minReplicas. A multi-host group has no
++// floor, so it is only evicted whole.
++func (j *RayCluster) ReclaimMinCounts() workload.PodSetsCounts {
++	floors := workload.PodSetsCounts{}
++	for i := range j.Spec.WorkerGroupSpecs {
++		wgs := &j.Spec.WorkerGroupSpecs[i]
++		if !isSingleHost(wgs) {
++			continue
++		}
++		floors[kueue.NewPodSetReference(wgs.GroupName)] = min(ptr.Deref(wgs.MinReplicas, 0), effectiveWorkerCount(wgs))
++	}
++	return floors
++}
++
++// PodSetCountSteps implements jobframework.JobWithPodSetCountSteps. A pod of a single-host
++// worker group is a whole replica, so the group changes by 1.
++func (j *RayCluster) PodSetCountSteps() workload.PodSetsCounts {
++	steps := workload.PodSetsCounts{}
++	for i := range j.Spec.WorkerGroupSpecs {
++		wgs := &j.Spec.WorkerGroupSpecs[i]
++		if isSingleHost(wgs) {
++			steps[kueue.NewPodSetReference(wgs.GroupName)] = 1
++		}
++	}
++	return steps
++}
++
++func isSingleHost(wgs *rayv1.WorkerGroupSpec) bool {
++	return max(wgs.NumOfHosts, 1) == 1
++}
++
+ // BuildPodSets builds PodSets from RayClusterSpec.
+ func BuildPodSets(rayClusterSpec *rayv1.RayClusterSpec, annotations map[string]string) ([]kueue.PodSet, error) {
+ 	podSets := make([]kueue.PodSet, 0)
+diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
+index 71d289b..c555e3b 100644
+--- a/pkg/controller/jobs/raycluster/raycluster_controller.go
++++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
+@@ -81,6 +81,8 @@ type RayCluster rayv1.RayCluster
+ var _ jobframework.GenericJob = (*RayCluster)(nil)
+ var _ jobframework.JobWithManagedBy = (*RayCluster)(nil)
+ var _ jobframework.JobWithCustomEquivalenceOptions = (*RayCluster)(nil)
++var _ jobframework.JobWithReclaimMinCounts = (*RayCluster)(nil)
++var _ jobframework.JobWithPodSetCountSteps = (*RayCluster)(nil)
+ 
+ func (j *RayCluster) CustomEquivalenceOptions(_ context.Context, _ client.Client, wl *kueue.Workload) []equality.ComparePodSetsOption {
+ 	opts := MinCountMigrationOptions(wl)
+diff --git a/pkg/controller/jobs/raycluster/reclaim_floors_external_test.go b/pkg/controller/jobs/raycluster/reclaim_floors_external_test.go
+new file mode 100644
+index 0000000..ffec8d0
+--- /dev/null
++++ b/pkg/controller/jobs/raycluster/reclaim_floors_external_test.go
+@@ -0,0 +1,41 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package raycluster_test
++
++import (
++	"testing"
++
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/controller/jobs/rayjob"
++	"sigs.k8s.io/kueue/pkg/controller/jobs/rayservice"
++)
++
++func TestRayJobAndRayServiceHaveNoFloors(t *testing.T) {
++	for name, job := range map[string]jobframework.GenericJob{
++		"RayJob":     (*rayjob.RayJob)(nil),
++		"RayService": (*rayservice.RayService)(nil),
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, ok := job.(jobframework.JobWithReclaimMinCounts); ok {
++				t.Error("implements JobWithReclaimMinCounts")
++			}
++			if _, ok := job.(jobframework.JobWithPodSetCountSteps); ok {
++				t.Error("implements JobWithPodSetCountSteps")
++			}
++		})
++	}
++}
+diff --git a/pkg/controller/jobs/raycluster/reclaim_floors_test.go b/pkg/controller/jobs/raycluster/reclaim_floors_test.go
+new file mode 100644
+index 0000000..95b47d0
+--- /dev/null
++++ b/pkg/controller/jobs/raycluster/reclaim_floors_test.go
+@@ -0,0 +1,127 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package raycluster
++
++import (
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	testingrayutil "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func elasticRayCluster() *testingrayutil.ClusterWrapper {
++	return testingrayutil.MakeCluster("rc", "ns").UID("rc-uid").
++		SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		WithWorkerGroups(
++			*testingrayutil.MakeWorkerGroup("small", 4).MinReplicas(1).Obj(),
++			*testingrayutil.MakeWorkerGroup("zero", 2).Obj(),
++			*testingrayutil.MakeWorkerGroup("tpu", 3).MinReplicas(1).Obj(),
++			*testingrayutil.MakeWorkerGroup("capped", 9).MinReplicas(2).MaxReplicas(3).Obj(),
++		).
++		WithNumOfHosts("tpu", 4)
++}
++
++func TestRayClusterReclaimFloorsAndSteps(t *testing.T) {
++	rc := (*RayCluster)(elasticRayCluster().Obj())
++
++	wantFloors := workload.PodSetsCounts{"small": 1, "zero": 0, "capped": 2}
++	if diff := cmp.Diff(wantFloors, rc.ReclaimMinCounts()); diff != "" {
++		t.Errorf("ReclaimMinCounts() (-want,+got):\n%s", diff)
++	}
++	wantSteps := workload.PodSetsCounts{"small": 1, "zero": 1, "capped": 1}
++	if diff := cmp.Diff(wantSteps, rc.PodSetCountSteps()); diff != "" {
++		t.Errorf("PodSetCountSteps() (-want,+got):\n%s", diff)
++	}
++}
++
++func TestConstructWorkloadReclaimFloors(t *testing.T) {
++	testCases := map[string]struct {
++		cluster        *testingrayutil.ClusterWrapper
++		partialPreempt bool
++		partialScaleUp bool
++		wantFloors     string
++		wantSteps      string
++		wantMinCounts  map[kueue.PodSetReference]*int32
++	}{
++		"gate off: elastic cluster gets no annotation": {
++			cluster:       elasticRayCluster(),
++			wantMinCounts: map[kueue.PodSetReference]*int32{},
++		},
++		"gate on: elastic cluster gets floors and steps of its single-host groups": {
++			cluster:        elasticRayCluster(),
++			partialPreempt: true,
++			wantFloors:     "capped=2,small=1,zero=0",
++			wantSteps:      "capped=1,small=1,zero=1",
++		},
++		"gate on: non-elastic cluster gets no annotation": {
++			cluster: testingrayutil.MakeCluster("rc", "ns").UID("rc-uid").
++				WithWorkerGroups(*testingrayutil.MakeWorkerGroup("small", 4).MinReplicas(1).Obj()),
++			partialPreempt: true,
++		},
++		"gate on: floors do not change minCount": {
++			cluster:        elasticRayCluster().SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial),
++			partialPreempt: true,
++			partialScaleUp: true,
++			wantFloors:     "capped=2,small=1,zero=0",
++			wantSteps:      "capped=1,small=1,zero=1",
++			wantMinCounts:  map[kueue.PodSetReference]*int32{"small": new(int32(4)), "zero": new(int32(2)), "tpu": new(int32(12)), "capped": new(int32(3))},
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++			features.SetFeatureGateDuringTest(t, features.PartialPreemption, tc.partialPreempt)
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp, tc.partialScaleUp)
++			ctx, _ := utiltesting.ContextWithLog(t)
++
++			job := (*RayCluster)(tc.cluster.Obj())
++			wl, err := jobframework.ConstructWorkload(ctx, utiltesting.NewClientBuilder(rayv1.AddToScheme).
++				WithIndex(&kueue.Workload{}, indexer.OwnerReferenceIndexKey(gvk), indexer.WorkloadOwnerIndexFunc(gvk)).Build(), job, nil, nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got := wl.Annotations[constants.ReclaimMinCountsAnnotation]; got != tc.wantFloors {
++				t.Errorf("floors = %q, want %q", got, tc.wantFloors)
++			}
++			if got := wl.Annotations[constants.PodSetCountStepsAnnotation]; got != tc.wantSteps {
++				t.Errorf("steps = %q, want %q", got, tc.wantSteps)
++			}
++			gotMinCounts := map[kueue.PodSetReference]*int32{}
++			for _, ps := range wl.Spec.PodSets {
++				if ps.MinCount != nil {
++					gotMinCounts[ps.Name] = ps.MinCount
++				}
++			}
++			if tc.wantMinCounts == nil {
++				tc.wantMinCounts = map[kueue.PodSetReference]*int32{}
++			}
++			if diff := cmp.Diff(tc.wantMinCounts, gotMinCounts); diff != "" {
++				t.Errorf("minCounts (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index bcc4dd9..10b466a 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -45,6 +45,9 @@ const (
+ 	// Enables partial scale up for elastic jobs.
+ 	ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp featuregate.Feature = "ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp"
+ 
++	// Enables preemption to shrink elastic workloads to their reclaim floor before evicting them.
++	PartialPreemption featuregate.Feature = "PartialPreemption"
++
+ 	// owner: @KunWuLuan
+ 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/582-preempt-based-on-flavor-order
+ 	//
+@@ -946,6 +949,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
+ 	TASPartialSlices:                                    {TopologyAwareScheduling},
+ 	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {ElasticJobsViaWorkloadSlices},
+ 	SchedulerLibraryIntegration:                         {TopologyAwareScheduling},
++	PartialPreemption:                                   {ElasticJobsViaWorkloadSlices, ReclaimablePods},
+ }
+ 
+ // defaultVersionedFeatureGates consists of all known Kueue-specific feature keys.
+@@ -966,6 +970,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+ 	ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: {
+ 		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
+ 	},
++	PartialPreemption: {
++		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
++	},
+ 	FlavorFungibility: {
+ 		{Version: version.MustParse("0.5"), Default: true, PreRelease: featuregate.Beta},
+ 	},
+diff --git a/pkg/workload/reclaim_floors.go b/pkg/workload/reclaim_floors.go
+new file mode 100644
+index 0000000..df02f9e
+--- /dev/null
++++ b/pkg/workload/reclaim_floors.go
+@@ -0,0 +1,101 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package workload
++
++import (
++	"fmt"
++	"slices"
++	"strconv"
++	"strings"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++// ReclaimMinCounts reads kueue.x-k8s.io/reclaim-min-counts. A malformed entry is ignored.
++func ReclaimMinCounts(wl *kueue.Workload) PodSetsCounts {
++	return parseFloorCounts(wl.Annotations[constants.ReclaimMinCountsAnnotation], 0)
++}
++
++// SetReclaimMinCounts writes kueue.x-k8s.io/reclaim-min-counts, or removes it when counts is empty.
++func SetReclaimMinCounts(wl *kueue.Workload, counts PodSetsCounts) {
++	setFloorCounts(wl, constants.ReclaimMinCountsAnnotation, counts)
++}
++
++// PodSetCountSteps reads kueue.x-k8s.io/podset-count-steps. Every PodSet of the Workload
++// is in the result; one the annotation leaves out, or lists with a malformed or non-positive
++// step, has step 1.
++func PodSetCountSteps(wl *kueue.Workload) PodSetsCounts {
++	listed := parseFloorCounts(wl.Annotations[constants.PodSetCountStepsAnnotation], 1)
++	steps := make(PodSetsCounts, len(wl.Spec.PodSets))
++	for i := range wl.Spec.PodSets {
++		name := wl.Spec.PodSets[i].Name
++		steps[name] = 1
++		if step, ok := listed[name]; ok {
++			steps[name] = step
++		}
++	}
++	return steps
++}
++
++// SetPodSetCountSteps writes kueue.x-k8s.io/podset-count-steps, or removes it when steps is empty.
++func SetPodSetCountSteps(wl *kueue.Workload, steps PodSetsCounts) {
++	setFloorCounts(wl, constants.PodSetCountStepsAnnotation, steps)
++}
++
++// FormatFloorCounts renders counts as <podSet>=<count>[,<podSet>=<count>], PodSets sorted by name.
++func FormatFloorCounts(counts PodSetsCounts) string {
++	names := make([]string, 0, len(counts))
++	for name := range counts {
++		names = append(names, string(name))
++	}
++	slices.Sort(names)
++	entries := make([]string, len(names))
++	for i, name := range names {
++		entries[i] = fmt.Sprintf("%s=%d", name, counts[kueue.PodSetReference(name)])
++	}
++	return strings.Join(entries, ",")
++}
++
++func setFloorCounts(wl *kueue.Workload, key string, counts PodSetsCounts) {
++	if len(counts) == 0 {
++		delete(wl.Annotations, key)
++		return
++	}
++	if wl.Annotations == nil {
++		wl.Annotations = make(map[string]string, 1)
++	}
++	wl.Annotations[key] = FormatFloorCounts(counts)
++}
++
++// parseFloorCounts parses a count list and ignores every entry that is malformed or whose
++// count is below minCount.
++func parseFloorCounts(value string, minCount int32) PodSetsCounts {
++	counts := PodSetsCounts{}
++	for entry := range strings.SplitSeq(value, ",") {
++		name, countStr, found := strings.Cut(entry, "=")
++		if !found || name == "" {
++			continue
++		}
++		count, err := strconv.ParseInt(countStr, 10, 32)
++		if err != nil || int32(count) < minCount {
++			continue
++		}
++		counts[kueue.PodSetReference(name)] = int32(count)
++	}
++	return counts
++}
+diff --git a/pkg/workload/reclaim_floors_test.go b/pkg/workload/reclaim_floors_test.go
+new file mode 100644
+index 0000000..648a89f
+--- /dev/null
++++ b/pkg/workload/reclaim_floors_test.go
+@@ -0,0 +1,93 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package workload
++
++import (
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++func TestReclaimMinCounts(t *testing.T) {
++	cases := map[string]struct {
++		annotations map[string]string
++		want        PodSetsCounts
++	}{
++		"missing": {want: PodSetsCounts{}},
++		"sorted list": {
++			annotations: map[string]string{constants.ReclaimMinCountsAnnotation: "a=1,b=0,c=7"},
++			want:        PodSetsCounts{"a": 1, "b": 0, "c": 7},
++		},
++		"malformed entries are ignored": {
++			annotations: map[string]string{constants.ReclaimMinCountsAnnotation: "a=1,b,=3,c=x,d=-1,e=99999999999,f=2"},
++			want:        PodSetsCounts{"a": 1, "f": 2},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			wl := &kueue.Workload{}
++			wl.Annotations = tc.annotations
++			if diff := cmp.Diff(tc.want, ReclaimMinCounts(wl)); diff != "" {
++				t.Errorf("ReclaimMinCounts() (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestSetReclaimMinCounts(t *testing.T) {
++	wl := &kueue.Workload{}
++	SetReclaimMinCounts(wl, PodSetsCounts{"b": 2, "a": 1})
++	if got, want := wl.Annotations[constants.ReclaimMinCountsAnnotation], "a=1,b=2"; got != want {
++		t.Errorf("annotation = %q, want %q", got, want)
++	}
++	if _, ok := wl.Annotations[constants.PodSetCountStepsAnnotation]; ok {
++		t.Error("SetReclaimMinCounts wrote the steps annotation")
++	}
++	SetReclaimMinCounts(wl, nil)
++	if _, ok := wl.Annotations[constants.ReclaimMinCountsAnnotation]; ok {
++		t.Error("empty counts did not remove the annotation")
++	}
++}
++
++func TestPodSetCountSteps(t *testing.T) {
++	wl := &kueue.Workload{}
++	wl.Spec.PodSets = []kueue.PodSet{{Name: "a"}, {Name: "b"}, {Name: "c"}}
++	wl.Annotations = map[string]string{constants.PodSetCountStepsAnnotation: "a=4,b=0,zzz=3"}
++	// b has a non-positive step and c is missing; both default to 1.
++	want := PodSetsCounts{"a": 4, "b": 1, "c": 1}
++	if diff := cmp.Diff(want, PodSetCountSteps(wl)); diff != "" {
++		t.Errorf("PodSetCountSteps() (-want,+got):\n%s", diff)
++	}
++}
++
++func TestSetPodSetCountSteps(t *testing.T) {
++	wl := &kueue.Workload{}
++	SetPodSetCountSteps(wl, PodSetsCounts{"w": 2})
++	if got, want := wl.Annotations[constants.PodSetCountStepsAnnotation], "w=2"; got != want {
++		t.Errorf("annotation = %q, want %q", got, want)
++	}
++	if _, ok := wl.Annotations[constants.ReclaimMinCountsAnnotation]; ok {
++		t.Error("SetPodSetCountSteps wrote the floors annotation")
++	}
++	SetPodSetCountSteps(wl, nil)
++	if _, ok := wl.Annotations[constants.PodSetCountStepsAnnotation]; ok {
++		t.Error("empty steps did not remove the annotation")
++	}
++}
+diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
+index 209983e..4ea8056 100644
+--- a/pkg/workloadslicing/manager.go
++++ b/pkg/workloadslicing/manager.go
+@@ -53,10 +53,13 @@ func (r *Manager) EnsureWorkloadSlices(
+ 	jobPodSets []kueue.PodSet,
+ 	jobObject client.Object,
+ 	jobObjectGVK schema.GroupVersionKind,
++	opts ...EnsureOption,
+ ) (*kueue.Workload, bool, error) {
++	options := newEnsureOptions(opts)
+ 	jobPodSetsCounts := workload.ExtractPodSetCounts(jobPodSets)
+ 	applyPodSetCounts := func(wl *kueue.Workload) {
+ 		workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
++		options.apply(wl)
+ 		// Only initial admission follows the job's current minimum. Replacements
+ 		// and readmissions retain their baseline, even after a zero-second admission.
+ 		if workload.HasQuotaReservation(wl) || workload.IsAdmitted(wl) ||
+@@ -120,7 +123,7 @@ func (r *Manager) EnsureWorkloadSlices(
+ 					}
+ 				}
+ 			}
+-			return wl, true, nil
++			return r.refreshFloors(ctx, wl, options)
+ 		}
+ 
+ 		// Allow updating the existing slice if:
+@@ -153,7 +156,7 @@ func (r *Manager) EnsureWorkloadSlices(
+ 		}
+ 
+ 		if jobPodSetsCounts.EqualTo(selectedCounts) {
+-			return selectedWorkload, true, nil
++			return r.refreshFloors(ctx, selectedWorkload, options)
+ 		}
+ 
+ 		if !workload.HasQuotaReservation(selectedWorkload) || ScaledDown(selectedCounts, jobPodSetsCounts) {
+@@ -168,3 +171,14 @@ func (r *Manager) EnsureWorkloadSlices(
+ 		return nil, true, nil
+ 	}
+ }
++
++// refreshFloors returns wl after it brings the reclaim floor and step annotations up to
++// the job's, when the caller asked for that.
++func (r *Manager) refreshFloors(ctx context.Context, wl *kueue.Workload, options ensureOptions) (*kueue.Workload, bool, error) {
++	if options.apply(wl) {
++		if err := r.Client.Update(ctx, wl); err != nil {
++			return nil, true, fmt.Errorf("failed to update workload's reclaim floors: %w", err)
++		}
++	}
++	return wl, true, nil
++}
+diff --git a/pkg/workloadslicing/reclaim_floors.go b/pkg/workloadslicing/reclaim_floors.go
+new file mode 100644
+index 0000000..48e3c7d
+--- /dev/null
++++ b/pkg/workloadslicing/reclaim_floors.go
+@@ -0,0 +1,72 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package workloadslicing
++
++import (
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// EnsureOption changes how EnsureWorkloadSlices treats the slice it returns.
++type EnsureOption func(*ensureOptions)
++
++type ensureOptions struct {
++	// floors and steps are the job's current reclaim floors and count steps; refreshFloors
++	// reports whether to keep the slice's annotations equal to them.
++	floors, steps workload.PodSetsCounts
++	refreshFloors bool
++}
++
++// WithReclaimFloors makes EnsureWorkloadSlices write the job's reclaim floors and count
++// steps on the slice it returns, in the update it already makes or, when the PodSet counts
++// match, in a metadata update of its own. Empty counts remove the annotation. The update
++// changes no spec field, so a slice that holds quota stays admitted.
++func WithReclaimFloors(floors, steps workload.PodSetsCounts) EnsureOption {
++	return func(o *ensureOptions) {
++		o.floors, o.steps, o.refreshFloors = floors, steps, true
++	}
++}
++
++func newEnsureOptions(opts []EnsureOption) ensureOptions {
++	var o ensureOptions
++	for _, opt := range opts {
++		if opt != nil {
++			opt(&o)
++		}
++	}
++	return o
++}
++
++// apply sets the annotations on wl and reports whether they changed.
++func (o *ensureOptions) apply(wl *kueue.Workload) bool {
++	if !o.refreshFloors {
++		return false
++	}
++	changed := syncAnnotation(wl, constants.ReclaimMinCountsAnnotation, o.floors, workload.SetReclaimMinCounts)
++	return syncAnnotation(wl, constants.PodSetCountStepsAnnotation, o.steps, workload.SetPodSetCountSteps) || changed
++}
++
++func syncAnnotation(wl *kueue.Workload, key string, counts workload.PodSetsCounts, set func(*kueue.Workload, workload.PodSetsCounts)) bool {
++	want := workload.FormatFloorCounts(counts)
++	got, found := wl.Annotations[key]
++	if got == want && found == (want != "") {
++		return false
++	}
++	set(wl, counts)
++	return true
++}
+diff --git a/pkg/workloadslicing/reclaim_floors_test.go b/pkg/workloadslicing/reclaim_floors_test.go
+new file mode 100644
+index 0000000..ca808cb
+--- /dev/null
++++ b/pkg/workloadslicing/reclaim_floors_test.go
+@@ -0,0 +1,176 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package workloadslicing
++
++import (
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/equality"
++	testingclock "k8s.io/utils/clock/testing"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++func TestEnsureWorkloadSlicesReclaimFloors(t *testing.T) {
++	now := time.Now()
++	workerSet := func(count int32) []kueue.PodSet {
++		return []kueue.PodSet{*utiltestingapi.MakePodSet("workers", int(count)).Request(corev1.ResourceCPU, "1").Obj()}
++	}
++	cases := map[string]struct {
++		// existing builds the stored slice.
++		existing func(*utiltestingapi.WorkloadWrapper) *utiltestingapi.WorkloadWrapper
++		jobCount int32
++		opts     []EnsureOption
++
++		wantFloors     string
++		wantSteps      string
++		wantCount      int32
++		wantUpdate     bool
++		wantMinCount   *int32
++		wantStillQuota bool
++	}{
++		"admitted slice without annotations gets them and keeps its spec": {
++			existing: func(w *utiltestingapi.WorkloadWrapper) *utiltestingapi.WorkloadWrapper {
++				return w.PodSets(*utiltestingapi.MakePodSet("workers", 4).SetMinimumCount(2).Request(corev1.ResourceCPU, "1").Obj()).
++					SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++			},
++			jobCount:       4,
++			opts:           []EnsureOption{WithReclaimFloors(workload.PodSetsCounts{"workers": 1}, workload.PodSetsCounts{"workers": 1})},
++			wantFloors:     "workers=1",
++			wantSteps:      "workers=1",
++			wantCount:      4,
++			wantUpdate:     true,
++			wantMinCount:   new(int32(2)),
++			wantStillQuota: true,
++		},
++		"a changed floor refreshes the annotation": {
++			existing: func(w *utiltestingapi.WorkloadWrapper) *utiltestingapi.WorkloadWrapper {
++				return w.PodSets(workerSet(4)...).
++					Annotation(constants.ReclaimMinCountsAnnotation, "workers=2").
++					Annotation(constants.PodSetCountStepsAnnotation, "workers=1").
++					SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++			},
++			jobCount:       4,
++			opts:           []EnsureOption{WithReclaimFloors(workload.PodSetsCounts{"workers": 3}, workload.PodSetsCounts{"workers": 1})},
++			wantFloors:     "workers=3",
++			wantSteps:      "workers=1",
++			wantCount:      4,
++			wantUpdate:     true,
++			wantStillQuota: true,
++		},
++		"matching annotations cause no write": {
++			existing: func(w *utiltestingapi.WorkloadWrapper) *utiltestingapi.WorkloadWrapper {
++				return w.PodSets(workerSet(4)...).
++					Annotation(constants.ReclaimMinCountsAnnotation, "workers=2").
++					Annotation(constants.PodSetCountStepsAnnotation, "workers=1").
++					SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++			},
++			jobCount:       4,
++			opts:           []EnsureOption{WithReclaimFloors(workload.PodSetsCounts{"workers": 2}, workload.PodSetsCounts{"workers": 1})},
++			wantFloors:     "workers=2",
++			wantSteps:      "workers=1",
++			wantCount:      4,
++			wantStillQuota: true,
++		},
++		"without the option nothing is written": {
++			existing: func(w *utiltestingapi.WorkloadWrapper) *utiltestingapi.WorkloadWrapper {
++				return w.PodSets(workerSet(4)...).Annotation(constants.ReclaimMinCountsAnnotation, "workers=2").
++					SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++			},
++			jobCount:       4,
++			wantFloors:     "workers=2",
++			wantCount:      4,
++			wantStillQuota: true,
++		},
++		"a job without floors removes the annotations": {
++			existing: func(w *utiltestingapi.WorkloadWrapper) *utiltestingapi.WorkloadWrapper {
++				return w.PodSets(workerSet(4)...).
++					Annotation(constants.ReclaimMinCountsAnnotation, "workers=2").
++					Annotation(constants.PodSetCountStepsAnnotation, "workers=1").
++					SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++			},
++			jobCount:       4,
++			opts:           []EnsureOption{WithReclaimFloors(nil, nil)},
++			wantCount:      4,
++			wantUpdate:     true,
++			wantStillQuota: true,
++		},
++		"an in-place scale-down writes the count and the annotation together": {
++			existing: func(w *utiltestingapi.WorkloadWrapper) *utiltestingapi.WorkloadWrapper {
++				return w.PodSets(workerSet(4)...).
++					Annotation(constants.ReclaimMinCountsAnnotation, "workers=2").
++					SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++			},
++			jobCount:       3,
++			opts:           []EnsureOption{WithReclaimFloors(workload.PodSetsCounts{"workers": 1}, workload.PodSetsCounts{"workers": 1})},
++			wantFloors:     "workers=1",
++			wantSteps:      "workers=1",
++			wantCount:      3,
++			wantUpdate:     true,
++			wantStillQuota: true,
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			wl := tc.existing(utiltestingapi.MakeWorkload(testJobObject.Name+"-1", testJobObject.Namespace).
++				OwnerReference(testJobGVK, testJobObject.Name, string(testJobObject.UID)).
++				ResourceVersion("1").Creation(now)).Obj()
++			clnt := testWorkloadClientBuilder().WithObjects(wl).Build()
++			ctx, _ := utiltesting.ContextWithLog(t)
++			manager := Manager{Client: clnt, Clock: testingclock.NewFakeClock(now)}
++			got, compatible, err := manager.EnsureWorkloadSlices(ctx, workerSet(tc.jobCount), testJobObject, testJobGVK, tc.opts...)
++			if err != nil || !compatible || got == nil {
++				t.Fatalf("EnsureWorkloadSlices() = %v, %v, %v", got, compatible, err)
++			}
++			var stored kueue.Workload
++			if err := clnt.Get(ctx, client.ObjectKeyFromObject(wl), &stored); err != nil {
++				t.Fatal(err)
++			}
++			for _, w := range []*kueue.Workload{got, &stored} {
++				if v := w.Annotations[constants.ReclaimMinCountsAnnotation]; v != tc.wantFloors {
++					t.Errorf("floors = %q, want %q", v, tc.wantFloors)
++				}
++				if v := w.Annotations[constants.PodSetCountStepsAnnotation]; v != tc.wantSteps {
++					t.Errorf("steps = %q, want %q", v, tc.wantSteps)
++				}
++				if w.Spec.PodSets[0].Count != tc.wantCount {
++					t.Errorf("count = %d, want %d", w.Spec.PodSets[0].Count, tc.wantCount)
++				}
++				if diff := cmp.Diff(tc.wantMinCount, w.Spec.PodSets[0].MinCount); tc.wantMinCount != nil && diff != "" {
++					t.Errorf("minCount (-want,+got):\n%s", diff)
++				}
++				if workload.HasQuotaReservation(w) != tc.wantStillQuota || workload.IsAdmitted(w) != tc.wantStillQuota {
++					t.Errorf("quota reserved = %v, admitted = %v, want %v", workload.HasQuotaReservation(w), workload.IsAdmitted(w), tc.wantStillQuota)
++				}
++			}
++			if updated := stored.ResourceVersion != wl.ResourceVersion; updated != tc.wantUpdate {
++				t.Errorf("updated = %v, want %v", updated, tc.wantUpdate)
++			}
++			if !tc.wantUpdate && !equality.Semantic.DeepEqual(wl.Annotations, stored.Annotations) {
++				t.Errorf("annotations changed without an update")
++			}
++		})
++	}
++}
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
+new file mode 100644
+index 0000000..8553e97
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
+@@ -0,0 +1,193 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package raycluster
++
++import (
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/component-base/featuregate"
++	"k8s.io/utils/ptr"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++var _ = ginkgo.Describe("RayCluster reclaim floors", ginkgo.Label("job:ray", "area:jobs"), func() {
++	var (
++		ns             *corev1.Namespace
++		resourceFlavor *kueue.ResourceFlavor
++		clusterQueue   *kueue.ClusterQueue
++		localQueue     *kueue.LocalQueue
++	)
++
++	setup := func(partialPreemption bool) {
++		ginkgo.BeforeEach(func() {
++			features.SetFeatureGatesDuringTest(ginkgo.GinkgoTB(), map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlices:                          true,
++				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++				features.PartialPreemption:                                     partialPreemption,
++			})
++			fwk.StartManager(ctx, cfg, managerAndSchedulerSetup())
++
++			ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "floors-")
++			resourceFlavor = utiltestingapi.MakeResourceFlavor("default").Obj()
++			behavioral.MustCreate(ctx, k8sClient, resourceFlavor)
++			clusterQueue = utiltestingapi.MakeClusterQueue("default").
++				ResourceGroup(*utiltestingapi.MakeFlavorQuotas(resourceFlavor.Name).
++					Resource(corev1.ResourceCPU, "100").
++					Resource(corev1.ResourceMemory, "100Gi").
++					Obj()).
++				Obj()
++			behavioral.MustCreate(ctx, k8sClient, clusterQueue)
++			localQueue = utiltestingapi.MakeLocalQueue("default", ns.Name).ClusterQueue(clusterQueue.Name).Obj()
++			behavioral.MustCreate(ctx, k8sClient, localQueue)
++		})
++		ginkgo.AfterEach(func() {
++			gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, localQueue, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, resourceFlavor, true)
++			fwk.StopManager(ctx)
++		})
++	}
++
++	elasticCluster := func() *testingraycluster.ClusterWrapper {
++		return testingraycluster.MakeCluster("foo", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue(localQueue.Name).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			FirstWorkerGroupReplicas(4, 2, 8)
++	}
++
++	// onlyWorkload waits for the cluster's single admitted Workload.
++	onlyWorkload := func() *kueue.Workload {
++		ginkgo.GinkgoHelper()
++		var wl *kueue.Workload
++		gomega.Eventually(func(g gomega.Gomega) {
++			wls := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, wls, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			g.Expect(wls.Items).To(gomega.HaveLen(1))
++			g.Expect(workload.IsAdmitted(&wls.Items[0])).To(gomega.BeTrue())
++			wl = &wls.Items[0]
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		return wl
++	}
++
++	ginkgo.When("PartialPreemption is on", func() {
++		setup(true)
++
++		ginkgo.It("Should write the floor and step of an elastic cluster's worker group and refresh them when minReplicas changes", func() {
++			rc := elasticCluster().Obj()
++			behavioral.MustCreate(ctx, k8sClient, rc)
++
++			wl := onlyWorkload()
++			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.ReclaimMinCountsAnnotation, "workers-group-0=2"))
++			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.PodSetCountStepsAnnotation, "workers-group-0=1"))
++			for _, ps := range wl.Spec.PodSets {
++				gomega.Expect(ps.MinCount).To(gomega.BeNil(), "PodSet %s", ps.Name)
++			}
++
++			ginkgo.By("raising minReplicas without changing the size")
++			gomega.Eventually(func(g gomega.Gomega) {
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rc), rc)).To(gomega.Succeed())
++				rc.Spec.WorkerGroupSpecs[0].MinReplicas = new(int32(3))
++				g.Expect(k8sClient.Update(ctx, rc)).To(gomega.Succeed())
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++			gomega.Eventually(func(g gomega.Gomega) {
++				got := &kueue.Workload{}
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).To(gomega.Succeed())
++				g.Expect(got.Annotations).To(gomega.HaveKeyWithValue(constants.ReclaimMinCountsAnnotation, "workers-group-0=3"))
++				g.Expect(got.UID).To(gomega.Equal(wl.UID))
++				g.Expect(workload.IsAdmitted(got)).To(gomega.BeTrue())
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		})
++
++		ginkgo.It("Should give a multi-host worker group no floor", func() {
++			rc := elasticCluster().WithNumOfHosts("workers-group-0", 2).Obj()
++			behavioral.MustCreate(ctx, k8sClient, rc)
++
++			wl := onlyWorkload()
++			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.ReclaimMinCountsAnnotation))
++			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.PodSetCountStepsAnnotation))
++		})
++
++		ginkgo.It("Should give a non-elastic cluster no floor", func() {
++			rc := testingraycluster.MakeCluster("foo", ns.Name).Queue(localQueue.Name).
++				RequestWorkerGroup(corev1.ResourceCPU, "1").FirstWorkerGroupReplicas(4, 2, 8).Obj()
++			behavioral.MustCreate(ctx, k8sClient, rc)
++
++			wl := onlyWorkload()
++			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.ReclaimMinCountsAnnotation))
++			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.PodSetCountStepsAnnotation))
++		})
++
++		ginkgo.It("Should keep a Workload that carries minCount admitted while it adds the annotations", func() {
++			rc := elasticCluster().SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial).Obj()
++			behavioral.MustCreate(ctx, k8sClient, rc)
++			wl := onlyWorkload()
++			workerSet := wl.Spec.PodSets[1]
++			gomega.Expect(workerSet.MinCount).To(gomega.Equal(ptr.To(int32(4))))
++
++			ginkgo.By("removing the annotations an older release did not write")
++			gomega.Eventually(func(g gomega.Gomega) {
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
++				delete(wl.Annotations, constants.ReclaimMinCountsAnnotation)
++				delete(wl.Annotations, constants.PodSetCountStepsAnnotation)
++				g.Expect(k8sClient.Update(ctx, wl)).To(gomega.Succeed())
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++			ginkgo.By("expecting the annotations back, and the Workload and cluster untouched otherwise")
++			gomega.Eventually(func(g gomega.Gomega) {
++				got := &kueue.Workload{}
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).To(gomega.Succeed())
++				g.Expect(got.Annotations).To(gomega.HaveKeyWithValue(constants.ReclaimMinCountsAnnotation, "workers-group-0=2"))
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++			gomega.Consistently(func(g gomega.Gomega) {
++				got := &kueue.Workload{}
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).To(gomega.Succeed())
++				g.Expect(got.UID).To(gomega.Equal(wl.UID))
++				g.Expect(workload.IsAdmitted(got)).To(gomega.BeTrue())
++				g.Expect(got.Spec.PodSets[1].MinCount).To(gomega.Equal(workerSet.MinCount))
++				g.Expect(got.Spec.PodSets[1].Count).To(gomega.Equal(workerSet.Count))
++				g.Expect(got.Status.Conditions).NotTo(gomega.ContainElement(gomega.HaveField("Type", kueue.WorkloadEvicted)))
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rc), rc)).To(gomega.Succeed())
++				g.Expect(ptr.Deref(rc.Spec.Suspend, false)).To(gomega.BeFalse())
++			}, behavioral.ConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
++		})
++	})
++
++	ginkgo.When("PartialPreemption is off", func() {
++		setup(false)
++
++		ginkgo.It("Should write no annotation", func() {
++			behavioral.MustCreate(ctx, k8sClient, elasticCluster().Obj())
++
++			wl := onlyWorkload()
++			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.ReclaimMinCountsAnnotation))
++			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.PodSetCountStepsAnnotation))
++		})
++	})
++})

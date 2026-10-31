@@ -237,7 +237,7 @@ docker run --rm -v "$PWD/tests/ray:/tests:ro" -v "$PWD/third_party/ray/python/ra
 description = "Run the unit tests of every package the Kueue patches change or build on, with the race detector, so each upstream test that passes on vanilla Kueue must pass on the patched tree"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
-run = "go test -race -timeout 30m ./pkg/scheduler/... ./pkg/cache/... ./pkg/controller/... ./pkg/webhooks/... ./pkg/workload/... ./pkg/workloadslicing/... ./pkg/util/equality/..."
+run = "go test -race -timeout 30m ./pkg/scheduler/... ./pkg/cache/... ./pkg/controller/... ./pkg/features/... ./pkg/webhooks/... ./pkg/workload/... ./pkg/workloadslicing/... ./pkg/util/equality/..."
 
 [tasks."test:kueue-integration"]
 description = "Run the patched Kueue topology-aware reclaim and RayCluster integration suites against envtest"

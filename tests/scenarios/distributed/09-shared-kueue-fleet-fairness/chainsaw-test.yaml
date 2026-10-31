@@ -4,7 +4,9 @@ metadata:
   name: 19-shared-kueue-fleet-fairness
 spec:
   # TODO(simonepri): run again with patch 0010-partial-preemption-search (R5), and assert the cohort reclaim on pods while replicas stay unchanged;
-  # The ScaleGate step stays skipped too: the clamp it asserts holds only after Cell 1 is reclaimed.
+  # The ScaleGate step stays skipped with it: it asserts replicas 4, which only the earlier patches' replica
+  # sync produced, and it cannot run without step 3. Its maxReplicas 8 is the static quota bound (nominal 4
+  # plus borrowingLimit 4), which kuberay/03-scalegate-quota/03-borrowing-limit-clamping covers.
   # See the acceptance tests in patches/kueue/contract.md.
   skip: true
   description: >

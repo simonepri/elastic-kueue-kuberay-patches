@@ -162,7 +162,7 @@ index d6122b4..69c0952 100644
  // of a long-lived elastic job template. A Job template is immutable once
  // created, and the API server only allows *adding* nodeSelector keys to a
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index b0135af..0e436ce 100644
+index 90887e6..7dd04a5 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -23,6 +23,7 @@ import (
@@ -171,9 +171,9 @@ index b0135af..0e436ce 100644
  	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 +	corev1 "k8s.io/api/core/v1"
  	apimeta "k8s.io/apimachinery/pkg/api/meta"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
  	"k8s.io/apimachinery/pkg/runtime"
- 	"k8s.io/apimachinery/pkg/runtime/schema"
-@@ -32,6 +33,7 @@ import (
+@@ -33,6 +34,7 @@ import (
  	"sigs.k8s.io/controller-runtime/pkg/client"
  
  	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -181,7 +181,7 @@ index b0135af..0e436ce 100644
  	"sigs.k8s.io/kueue/pkg/controller/jobframework"
  	"sigs.k8s.io/kueue/pkg/controller/jobs/ray"
  	"sigs.k8s.io/kueue/pkg/features"
-@@ -146,6 +148,30 @@ func (j *RayCluster) RunWithPodSetsInfo(ctx context.Context, _ client.Client, po
+@@ -148,6 +150,30 @@ func (j *RayCluster) RunWithPodSetsInfo(ctx context.Context, _ client.Client, po
  	return nil
  }
  
@@ -213,7 +213,7 @@ index b0135af..0e436ce 100644
  	changed := RestorePodSetsInfo(ctx, &j.Spec, podSetsInfo)
  	return ClearRuntimeWorkerStateAnnotations(j.Object()) || changed
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
-index 5898680..7f2cd86 100644
+index 5898680..e95933b 100644
 --- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
 @@ -17,7 +17,9 @@ limitations under the License.
@@ -226,14 +226,14 @@ index 5898680..7f2cd86 100644
  	"strconv"
  	"time"
  
-@@ -27,6 +29,7 @@ import (
- 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+@@ -28,6 +30,7 @@ import (
  	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
  	corev1 "k8s.io/api/core/v1"
-+	apierrors "k8s.io/apimachinery/pkg/api/errors"
  	schedulingv1 "k8s.io/api/scheduling/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
  	apimeta "k8s.io/apimachinery/pkg/api/meta"
  	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 @@ -46,6 +49,7 @@ import (
  	"sigs.k8s.io/kueue/pkg/controller/jobframework"
  	workloadraycluster "sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"

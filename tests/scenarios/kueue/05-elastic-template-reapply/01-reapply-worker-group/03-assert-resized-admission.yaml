@@ -1,4 +1,4 @@
-# Kueue restores its PodSet label on the re-applied worker template and admits three of the four workers.
+# Kueue restores its PodSet label on the re-applied worker template and admits the three workers.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:

@@ -1,8 +1,8 @@
-# The worker group of 01-raycluster.yaml resized to four workers, which replaces the whole worker template on patch.
+# The worker group of 01-raycluster.yaml resized to three workers, which replaces the whole worker template on patch.
 spec:
   workerGroupSpecs:
     - groupName: workers
-      replicas: 4
+      replicas: 3
       minReplicas: 1
       maxReplicas: 6
       rayStartParams: {}

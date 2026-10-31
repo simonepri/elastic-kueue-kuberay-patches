@@ -1,8 +1,8 @@
 diff --git a/pkg/controller/core/workload_controller.go b/pkg/controller/core/workload_controller.go
-index 523bf8a..9e77839 100644
+index 5f0a6bd..47feb8f 100644
 --- a/pkg/controller/core/workload_controller.go
 +++ b/pkg/controller/core/workload_controller.go
-@@ -459,6 +459,9 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
+@@ -465,6 +465,9 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
  			return ctrl.Result{}, err
  		}
  	}
@@ -12,7 +12,7 @@ index 523bf8a..9e77839 100644
  
  	if features.Enabled(features.MultiKueueOrchestratedPreemption) {
  		updateErr := workloadpatching.PatchAdmissionStatus(ctx, r.client, &wl, r.clock, func(wl *kueue.Workload) (bool, error) {
-@@ -482,6 +485,7 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
+@@ -488,6 +491,7 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
  
  	finishedCond := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadFinished)
  	if finishedCond != nil && finishedCond.Status == metav1.ConditionTrue {
@@ -20,7 +20,7 @@ index 523bf8a..9e77839 100644
  		if r.workloadRetention == nil || r.workloadRetention.afterFinished == nil {
  			return ctrl.Result{}, nil
  		}
-@@ -866,6 +870,9 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
+@@ -868,6 +872,9 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
  		if recheckAfter == 0 {
  			recheckAfter = max(podsReadyRecheckAfter, maxExecRecheckAfter)
  		}
@@ -30,7 +30,7 @@ index 523bf8a..9e77839 100644
  		return ctrl.Result{RequeueAfter: recheckAfter}, nil
  	}
  
-@@ -1369,6 +1376,10 @@ func (r *WorkloadReconciler) handleDelete(ctx context.Context, e event.TypedDele
+@@ -1363,6 +1370,10 @@ func (r *WorkloadReconciler) handleDelete(ctx context.Context, e event.TypedDele
  		if err := r.cache.DeleteWorkload(log, wlKey); err != nil {
  			log.Error(err, "Failed to delete workload from cache")
  		}
@@ -41,7 +41,7 @@ index 523bf8a..9e77839 100644
  	})
  
  	// Even if the state is unknown, the last cached state tells us whether the
-@@ -1501,6 +1512,7 @@ func (r *WorkloadReconciler) handleUpdate(ctx context.Context, e event.TypedUpda
+@@ -1494,6 +1505,7 @@ func (r *WorkloadReconciler) handleUpdate(ctx context.Context, e event.TypedUpda
  			}
  		})
  	case prevStatus == workload.StatusAdmitted && status == workload.StatusAdmitted && !equality.Semantic.DeepEqual(e.ObjectOld.Status.ReclaimablePods, e.ObjectNew.Status.ReclaimablePods),
@@ -49,7 +49,7 @@ index 523bf8a..9e77839 100644
  		features.Enabled(features.ElasticJobsViaWorkloadSlices) && workloadslicing.ScaledDown(workload.ExtractPodSetCountsFromWorkload(e.ObjectOld), workload.ExtractPodSetCountsFromWorkload(e.ObjectNew)),
  		workload.PriorityChanged(log, e.ObjectOld, e.ObjectNew):
  		// trigger the move of associated inadmissibleWorkloads, if there are any.
-@@ -2347,3 +2359,109 @@ func (r *WorkloadReconciler) needsDRAReconcile(ctx context.Context, wl *kueue.Wo
+@@ -2383,3 +2395,116 @@ func (r *WorkloadReconciler) needsDRAReconcile(ctx context.Context, wl *kueue.Wo
  	}
  	return dra.NeedsDRAReconcile(wi, r.draBackedResources)
  }
@@ -115,7 +115,14 @@ index 523bf8a..9e77839 100644
 +	}
 +	if changed {
 +		err := workloadpatching.PatchAdmissionStatus(ctx, r.client, wlCopy, r.clock, func(w *kueue.Workload) (bool, error) {
-+			apimeta.RemoveStatusCondition(&w.Status.Conditions, kueue.WorkloadPreempted)
++			apimeta.SetStatusCondition(&w.Status.Conditions, metav1.Condition{
++				Type:               kueue.WorkloadPreempted,
++				Status:             metav1.ConditionFalse,
++				Reason:             workloadslicing.ReexpandedReason,
++				Message:            "Workload re-expanded to spec count",
++				ObservedGeneration: w.Generation,
++				LastTransitionTime: metav1.NewTime(r.clock.Now()),
++			})
 +			if w.Status.Admission != nil {
 +				w.Status.Admission.PodSetAssignments = wlCopy.Status.Admission.PodSetAssignments
 +			}

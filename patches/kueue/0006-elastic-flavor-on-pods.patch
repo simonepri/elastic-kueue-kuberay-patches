@@ -1,0 +1,826 @@
+Elastic flavor placement on pods, behind ElasticJobsViaWorkloadSlicesFlavorChangeFromZero.
+
+A worker group admitted with no pods may move to another flavor when it scales
+up. The first admission wrote the first flavor's node labels and tolerations
+into the job template, and every later pod is created from that template, so
+the moved group ran where the first flavor ran, and a gated pod whose template
+label conflicts with the new flavor's could never be fixed: the API server lets
+a gated pod only gain nodeSelector keys.
+
+With the gate on, the job reconciler leaves the flavors' node labels and
+tolerations out of the template when it starts an elastic job, extending
+deferAdmissionCheckNodeSelectorsToPods, and the ElasticJobUngater adds those of
+the flavors the active slice assigns to each pod before it removes the gate. A
+gated pod that an older template gave a conflicting value is deleted, so its
+owner recreates it, unless the slice's own template conflicts too. The gate's
+default stays false.
+
+diff --git a/pkg/controller/elasticjobs/elastic_flavor_placement.go b/pkg/controller/elasticjobs/elastic_flavor_placement.go
+new file mode 100644
+index 0000000..58de707
+--- /dev/null
++++ b/pkg/controller/elasticjobs/elastic_flavor_placement.go
+@@ -0,0 +1,126 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package elasticjobs
++
++import (
++	"context"
++	"fmt"
++	"slices"
++
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/klog/v2"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/podset"
++	utilmaps "sigs.k8s.io/kueue/pkg/util/maps"
++)
++
++// admissionUpdate returns what the ungater adds to a gated Pod of the PodSet: the
++// admission check updates and, with ElasticJobsViaWorkloadSlicesFlavorChangeFromZero,
++// the placement of the ResourceFlavors that wl assigns to the PodSet.
++func (r *elasticJobUngater) admissionUpdate(ctx context.Context, wl *kueue.Workload, podSetName kueue.PodSetReference) (podAdmissionUpdate, error) {
++	update, err := admissionUpdateForPodSet(wl, podSetName)
++	if err != nil {
++		return podAdmissionUpdate{}, err
++	}
++	if err := addFlavorPlacement(ctx, r.client, wl, podSetName, &update); err != nil {
++		return podAdmissionUpdate{}, err
++	}
++	return update, nil
++}
++
++// addFlavorPlacement adds the node labels and tolerations of the ResourceFlavors
++// that wl assigns to the PodSet. The job template does not carry them (see
++// deferFlavorPlacementToPods in the job framework), because a PodSet that had no
++// Pods may move to another flavor, and only the Pods can follow it.
++func addFlavorPlacement(ctx context.Context, c client.Client, wl *kueue.Workload, podSetName kueue.PodSetReference, update *podAdmissionUpdate) error {
++	if !features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero) || wl.Status.Admission == nil {
++		return nil
++	}
++	psIdx := slices.IndexFunc(wl.Spec.PodSets, func(ps kueue.PodSet) bool { return ps.Name == podSetName })
++	psaIdx := slices.IndexFunc(wl.Status.Admission.PodSetAssignments, func(psa kueue.PodSetAssignment) bool { return psa.Name == podSetName })
++	if psIdx == -1 || psaIdx == -1 {
++		return nil
++	}
++	info, err := podset.FromAssignment(ctx, c, &wl.Status.Admission.PodSetAssignments[psaIdx], &wl.Spec.PodSets[psIdx])
++	if err != nil {
++		return fmt.Errorf("reading the ResourceFlavors of PodSet %q: %w", podSetName, err)
++	}
++	for key, value := range info.NodeSelector {
++		if old, exists := update.nodeSelector[key]; exists && old != value {
++			return fmt.Errorf("conflicting %q node selector updates for PodSet %q", key, podSetName)
++		}
++	}
++	utilmaps.Copy(&update.nodeSelector, info.NodeSelector)
++	update.tolerations = append(update.tolerations, info.Tolerations...)
++	return nil
++}
++
++// addTolerations adds the tolerations that the Pod does not have yet. The API
++// server accepts added tolerations on a gated Pod.
++func addTolerations(pod *corev1.Pod, tolerations []corev1.Toleration) bool {
++	changed := false
++	for _, toleration := range tolerations {
++		if !slices.ContainsFunc(pod.Spec.Tolerations, func(t corev1.Toleration) bool { return toleration.MatchToleration(&t) }) {
++			pod.Spec.Tolerations = append(pod.Spec.Tolerations, toleration)
++			changed = true
++		}
++	}
++	return changed
++}
++
++// stalePlacement reports whether the gated Pod carries a nodeSelector value that
++// conflicts with the flavor placement in update, which cannot be changed in place,
++// while the PodSet template of the slice does not: the Pod comes from an older
++// template, so a Pod that the job's owner creates now takes the placement. A
++// template that conflicts too would make the owner recreate the same Pod.
++func stalePlacement(pod *corev1.Pod, template *corev1.PodTemplateSpec, update podAdmissionUpdate) bool {
++	conflicts := func(selector map[string]string) bool {
++		for key, value := range update.nodeSelector {
++			if existing, found := selector[key]; found && existing != value {
++				return true
++			}
++		}
++		return false
++	}
++	return conflicts(pod.Spec.NodeSelector) && !conflicts(template.Spec.NodeSelector)
++}
++
++// recycleStalePod deletes a gated Pod whose nodeSelector conflicts with the flavor
++// placement of its PodSet, so that the job's owner recreates it from the current
++// template. A gated Pod has not run, and the API server rejects changing the value
++// of one of its nodeSelector keys. It reports whether it deleted the Pod.
++func (r *elasticJobUngater) recycleStalePod(ctx context.Context, wl *kueue.Workload, pod *corev1.Pod, podSetName kueue.PodSetReference, update podAdmissionUpdate) (bool, error) {
++	if !features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero) || !pod.DeletionTimestamp.IsZero() {
++		return false, nil
++	}
++	psIdx := slices.IndexFunc(wl.Spec.PodSets, func(ps kueue.PodSet) bool { return ps.Name == podSetName })
++	if psIdx == -1 || !stalePlacement(pod, &wl.Spec.PodSets[psIdx].Template, update) {
++		return false, nil
++	}
++	ctrl.LoggerFrom(ctx).Info("deleting gated elastic pod whose node selector conflicts with the current flavor of its PodSet",
++		"pod", klog.KObj(pod), "podSet", podSetName)
++	err := r.client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID})
++	if err != nil && !apierrors.IsNotFound(err) {
++		return false, fmt.Errorf("deleting stale elastic pod: %w", err)
++	}
++	return true, nil
++}
+diff --git a/pkg/controller/elasticjobs/elastic_flavor_placement_test.go b/pkg/controller/elasticjobs/elastic_flavor_placement_test.go
+new file mode 100644
+index 0000000..b226338
+--- /dev/null
++++ b/pkg/controller/elasticjobs/elastic_flavor_placement_test.go
+@@ -0,0 +1,174 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package elasticjobs
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	gocmp "github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	testingclock "k8s.io/utils/clock/testing"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/util/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func withSelector(pod *testingpod.PodWrapper, selector map[string]string) *testingpod.PodWrapper {
++	for key, value := range selector {
++		pod = pod.NodeSelector(key, value)
++	}
++	return pod
++}
++
++func TestFlavorPlacementOnPods(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	remoteToleration := corev1.Toleration{
++		Key:      "example.com/provider",
++		Operator: corev1.TolerationOpEqual,
++		Value:    "remote",
++		Effect:   corev1.TaintEffectNoSchedule,
++	}
++	remote := func() *utiltestingapi.ResourceFlavorWrapper {
++		return utiltestingapi.MakeResourceFlavor("remote").
++			NodeLabel("example.com/class", "test").
++			NodeLabel("example.com/provider", "remote").
++			Toleration(remoteToleration)
++	}
++	// The slice moved the PodSet to "remote"; its template is what the job's owner
++	// creates Pods from now.
++	workloadWith := func(templateSelector map[string]string) *kueue.Workload {
++		return utiltestingapi.MakeWorkload("wl", "ns").
++			Finalizers(kueue.ResourceInUseFinalizerName).
++			Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			ControllerReference(rayClusterGVK, "ray", "ray-uid").
++			PodSets(*utiltestingapi.MakePodSet(workersPodSet, 1).
++				Request(corev1.ResourceCPU, "1").
++				NodeSelector(templateSelector).
++				Obj()).
++			ReserveQuotaAt(
++				utiltestingapi.MakeAdmission("cq").
++					PodSets(utiltestingapi.MakePodSetAssignment(workersPodSet).
++						Assignment(corev1.ResourceCPU, "remote", "1").
++						Obj()).
++					Obj(), now,
++			).
++			AdmittedAt(true, now).
++			Obj()
++	}
++	gatedPod := func(selector map[string]string) *testingpod.PodWrapper {
++		return withSelector(makeElasticPodForPodSet("pod", workersPodSet), selector).
++			Gate(kueue.ElasticJobSchedulingGate)
++	}
++	ungatedOnRemote := func(selector map[string]string) corev1.Pod {
++		pod := withSelector(makeElasticPodForPodSet("pod", workersPodSet), selector).Obj()
++		pod.Spec.Tolerations = []corev1.Toleration{remoteToleration}
++		return *pod
++	}
++	onRemote := map[string]string{"example.com/class": "test", "example.com/provider": "remote"}
++	staleOnLocal := map[string]string{"example.com/class": "test", "example.com/provider": "local"}
++
++	testCases := map[string]struct {
++		gate      bool
++		workload  *kueue.Workload
++		pod       *corev1.Pod
++		wantPods  []corev1.Pod
++		wantError bool
++	}{
++		"add the node labels and tolerations of the PodSet's flavor before ungating": {
++			gate:     true,
++			workload: workloadWith(nil),
++			pod:      gatedPod(map[string]string{"example.com/class": "test"}).Obj(),
++			wantPods: []corev1.Pod{ungatedOnRemote(onRemote)},
++		},
++		"add them to a pod whose template carried no placement": {
++			gate:     true,
++			workload: workloadWith(nil),
++			pod:      gatedPod(nil).Obj(),
++			wantPods: []corev1.Pod{ungatedOnRemote(onRemote)},
++		},
++		"leave the placement to the template with the gate off": {
++			workload: workloadWith(nil),
++			pod:      gatedPod(nil).Obj(),
++			wantPods: []corev1.Pod{*makeElasticPodForPodSet("pod", workersPodSet).Obj()},
++		},
++		"delete a gated pod whose template carried the first flavor's selector, so the owner recreates it": {
++			gate:     true,
++			workload: workloadWith(nil),
++			pod:      gatedPod(staleOnLocal).Obj(),
++		},
++		"keep a gated pod when the template still conflicts, so the owner would recreate the same pod": {
++			gate:     true,
++			workload: workloadWith(staleOnLocal),
++			pod:      gatedPod(staleOnLocal).Obj(),
++			wantPods: []corev1.Pod{*gatedPod(staleOnLocal).Obj()},
++		},
++		"ungate a pod with the first flavor's selector unchanged with the gate off": {
++			workload: workloadWith(nil),
++			pod:      gatedPod(staleOnLocal).Obj(),
++			wantPods: []corev1.Pod{*withSelector(makeElasticPodForPodSet("pod", workersPodSet), staleOnLocal).Obj()},
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero, tc.gate)
++			ctx, _ := utiltesting.ContextWithLog(t)
++
++			kClient := utiltesting.NewClientBuilder().
++				WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).
++				WithIndex(&kueue.Workload{}, coreindexer.OwnerReferenceIndexKey(rayClusterGVK), coreindexer.WorkloadOwnerIndexFunc(rayClusterGVK)).
++				WithIndex(&kueue.Workload{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexWorkloadSliceName).
++				WithInterceptorFuncs(interceptor.Funcs{
++					Patch: func(ctx context.Context, clnt client.WithWatch, obj client.Object, _ client.Patch, _ ...client.PatchOption) error {
++						return clnt.Update(ctx, obj)
++					},
++				}).
++				WithObjects(remote().Obj(), tc.pod).
++				WithStatusSubresource(tc.workload).
++				Build()
++			if err := kClient.Create(ctx, tc.workload); err != nil {
++				t.Fatalf("Could not create workload: %v", err)
++			}
++			ungater := &elasticJobUngater{
++				client:            kClient,
++				clock:             testingclock.NewFakeClock(now),
++				expectationsStore: expectations.NewStore(ControllerName),
++			}
++			if _, err := ungater.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(tc.workload)}); err != nil {
++				t.Fatalf("Reconcile returned error: %v", err)
++			}
++			var gotPods corev1.PodList
++			if err := kClient.List(ctx, &gotPods); err != nil {
++				t.Fatalf("Could not list pods: %v", err)
++			}
++			if diff := gocmp.Diff(tc.wantPods, gotPods.Items, podCmpOpts...); diff != "" {
++				t.Errorf("Pods after reconcile (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
+index 069957c..4a04b50 100644
+--- a/pkg/controller/elasticjobs/elastic_job_ungater.go
++++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
+@@ -71,7 +71,7 @@ type elasticJobUngater struct {
+ var _ reconcile.Reconciler = (*elasticJobUngater)(nil)
+ var _ predicate.TypedPredicate[*kueue.Workload] = (*elasticJobUngater)(nil)
+ 
+-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
++// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch;delete
+ // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads,verbs=get;list;watch
+ 
+ func SetupWithManager(mgr ctrl.Manager, cfg *configapi.Configuration, roleTracker *roletracker.RoleTracker, customLabels *metrics.CustomLabels) (string, error) {
+@@ -155,7 +155,7 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
+ 		var ungated bool
+ 		e := utilclient.Patch(ctx, r.client, pod, func() (bool, error) {
+ 			podSetName := kueue.PodSetReference(pod.Labels[constants.PodSetLabel])
+-			update, err := admissionUpdateForPodSet(active, podSetName)
++			update, err := r.admissionUpdate(ctx, active, podSetName)
+ 			if err != nil {
+ 				return false, err
+ 			}
+@@ -187,6 +187,7 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
+ type podAdmissionUpdate struct {
+ 	annotations  map[string]string
+ 	nodeSelector map[string]string
++	tolerations  []corev1.Toleration
+ }
+ 
+ func admissionUpdateForPodSet(wl *kueue.Workload, podSetName kueue.PodSetReference) (podAdmissionUpdate, error) {
+@@ -255,6 +256,9 @@ func refreshPodAdmission(pod *corev1.Pod, update podAdmissionUpdate) (bool, erro
+ 		utilmaps.Copy(&pod.Annotations, update.annotations)
+ 		utilmaps.Copy(&pod.Spec.NodeSelector, update.nodeSelector)
+ 	}
++	if addTolerations(pod, update.tolerations) {
++		changed = true
++	}
+ 	return changed, nil
+ }
+ 
+@@ -284,13 +288,18 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
+ 			update, found := admissionUpdates[ps]
+ 			if !found {
+ 				var err error
+-				update, err = admissionUpdateForPodSet(wl, ps)
++				update, err = r.admissionUpdate(ctx, wl, ps)
+ 				if err != nil {
+ 					return nil, err
+ 				}
+ 				admissionUpdates[ps] = update
+ 			}
+ 			if !podAdmissionCompatible(p, update) {
++				if recycled, err := r.recycleStalePod(ctx, wl, p, ps, update); err != nil {
++					return nil, err
++				} else if recycled {
++					continue
++				}
+ 				ctrl.LoggerFrom(ctx).Info("leaving elastic pod gated because immutable admission metadata is stale; recycle the pod after its template refreshes",
+ 					"pod", klog.KObj(p), "podSet", ps)
+ 				continue
+diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
+index 31ef492..9a72f6b 100644
+--- a/pkg/controller/jobframework/reconciler.go
++++ b/pkg/controller/jobframework/reconciler.go
+@@ -1698,6 +1698,9 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
+ 	if err != nil {
+ 		return nil
+ 	}
++	if err := deferFlavorPlacementToPods(ctx, c, wl, info); err != nil {
++		return nil
++	}
+ 	infoMap := slices.ToRefMap(info, func(psi *podset.PodSetInfo) kueue.PodSetReference { return psi.Name })
+ 	runningPodSets := wl.Spec.DeepCopy().PodSets
+ 	canBePartiallyAdmitted := workload.CanBePartiallyAdmitted(wl)
+@@ -1807,6 +1810,9 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
+ 			return err
+ 		}
+ 	}
++	if err := deferFlavorPlacementToPods(ctx, r.client, wl, info); err != nil {
++		return err
++	}
+ 	msg := fmt.Sprintf("Admitted by clusterQueue %v", wl.Status.Admission.ClusterQueue)
+ 
+ 	log := ctrl.LoggerFrom(ctx)
+@@ -1857,18 +1863,10 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
+ 	for i := range info {
+ 		infoByName[info[i].Name] = &info[i]
+ 	}
+-	assignments, err := podSetAssignmentsInSpecOrder(wl)
++	baseByName, err := flavorInfoByPodSet(ctx, c, wl)
+ 	if err != nil {
+ 		return err
+ 	}
+-	baseByName := make(map[kueue.PodSetReference]podset.PodSetInfo, len(assignments))
+-	for i := range assignments {
+-		base, err := podset.FromAssignment(ctx, c, &assignments[i], &wl.Spec.PodSets[i])
+-		if err != nil {
+-			return err
+-		}
+-		baseByName[base.Name] = base
+-	}
+ 	for _, check := range wl.Status.AdmissionChecks {
+ 		for _, update := range check.PodSetUpdates {
+ 			podSetInfo := infoByName[update.Name]
+@@ -1887,6 +1885,61 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
+ 	return nil
+ }
+ 
++// deferFlavorPlacementToPods removes the node labels and tolerations of the
++// assigned ResourceFlavors from info when the ElasticJobUngater adds them to
++// each Pod instead (ElasticJobsViaWorkloadSlicesFlavorChangeFromZero). A
++// PodSet admitted with no Pods may move to another flavor when it scales up,
++// and a Pod can only gain nodeSelector keys while it is gated, so placement
++// baked into the job template by the first admission would conflict with the
++// new flavor's. Selectors and tolerations from admission checks stay in info.
++func deferFlavorPlacementToPods(ctx context.Context, c client.Client, wl *kueue.Workload, info []podset.PodSetInfo) error {
++	if !features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero) || !workloadslicing.IsElasticWorkload(wl) {
++		return nil
++	}
++	baseByName, err := flavorInfoByPodSet(ctx, c, wl)
++	if err != nil {
++		return err
++	}
++	for i := range info {
++		base, found := baseByName[info[i].Name]
++		if !found {
++			continue
++		}
++		for key, value := range base.NodeSelector {
++			if info[i].NodeSelector[key] == value {
++				delete(info[i].NodeSelector, key)
++			}
++		}
++		info[i].Tolerations = slices.Pick(info[i].Tolerations, func(t *corev1.Toleration) bool {
++			for j := range base.Tolerations {
++				if base.Tolerations[j].MatchToleration(t) {
++					return false
++				}
++			}
++			return true
++		})
++	}
++	return nil
++}
++
++// flavorInfoByPodSet returns, by PodSet name, the placement the ResourceFlavors
++// assigned to each PodSet of wl contribute.
++func flavorInfoByPodSet(ctx context.Context, c client.Client, wl *kueue.Workload) (map[kueue.PodSetReference]podset.PodSetInfo, error) {
++	assignments, err := podSetAssignmentsInSpecOrder(wl)
++	if err != nil {
++		return nil, err
++	}
++	baseByName := make(map[kueue.PodSetReference]podset.PodSetInfo, len(assignments))
++	for i := range assignments {
++		base, err := podset.FromAssignment(ctx, c, &assignments[i], &wl.Spec.PodSets[i])
++		if err != nil {
++			return nil, err
++		}
++		baseByName[base.Name] = base
++	}
++	return baseByName, nil
++}
++
+ // stopJob will suspend the job, and also restore node affinity, reset job status if needed.
+ // Returns whether any operation was done to stop the job or an error.
+ func (r *JobReconciler) stopJob(ctx context.Context, job GenericJob, wl *kueue.Workload, stopReason StopReason, eventMsg string) error {
+diff --git a/pkg/controller/jobframework/reconciler_flavor_placement_test.go b/pkg/controller/jobframework/reconciler_flavor_placement_test.go
+new file mode 100644
+index 0000000..17000a0
+--- /dev/null
++++ b/pkg/controller/jobframework/reconciler_flavor_placement_test.go
+@@ -0,0 +1,132 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package jobframework
++
++import (
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	"github.com/google/go-cmp/cmp/cmpopts"
++	corev1 "k8s.io/api/core/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/podset"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func TestDeferFlavorPlacementToPods(t *testing.T) {
++	provider := corev1.Toleration{Key: "example.com/provider", Operator: corev1.TolerationOpEqual, Value: "remote", Effect: corev1.TaintEffectNoSchedule}
++	other := corev1.Toleration{Key: "example.com/other", Operator: corev1.TolerationOpExists}
++	flavor := utiltestingapi.MakeResourceFlavor("remote").
++		NodeLabel("example.com/class", "test").
++		NodeLabel("example.com/provider", "remote").
++		Toleration(provider).
++		Obj()
++	newWorkload := func(elastic bool) *kueue.Workload {
++		wl := utiltestingapi.MakeWorkload("wl", "ns").
++			PodSets(*utiltestingapi.MakePodSet("workers", 1).Obj()).
++			ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").
++				PodSets(utiltestingapi.MakePodSetAssignment("workers").Assignment(corev1.ResourceCPU, "remote", "1").Obj()).
++				Obj(), time.Now()).
++			AdmissionChecks(kueue.AdmissionCheckState{
++				Name: "check",
++				PodSetUpdates: []kueue.PodSetUpdate{{
++					Name:         "workers",
++					NodeSelector: map[string]string{"example.com/check": "yes"},
++				}},
++			}).
++			Obj()
++		if elastic {
++			wl.Annotations = map[string]string{workloadslicing.EnabledAnnotationKey: workloadslicing.EnabledAnnotationValue}
++		}
++		return wl
++	}
++	newInfo := func() []podset.PodSetInfo {
++		return []podset.PodSetInfo{{
++			Name: "workers",
++			NodeSelector: map[string]string{
++				"example.com/class":    "test",
++				"example.com/provider": "remote",
++				"example.com/check":    "yes",
++			},
++			Tolerations: []corev1.Toleration{provider, other},
++		}}
++	}
++	cases := map[string]struct {
++		gate    bool
++		elastic bool
++		want    podset.PodSetInfo
++	}{
++		"remove the flavor's node labels and tolerations, keeping the admission checks'": {
++			gate:    true,
++			elastic: true,
++			want: podset.PodSetInfo{
++				Name:         "workers",
++				NodeSelector: map[string]string{"example.com/check": "yes"},
++				Tolerations:  []corev1.Toleration{other},
++			},
++		},
++		"keep them with the gate off": {elastic: true, want: newInfo()[0]},
++		"keep them for a workload that is not elastic": {gate: true, want: newInfo()[0]},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero, tc.gate)
++			cl := utiltesting.NewClientBuilder(kueue.AddToScheme).WithObjects(flavor).Build()
++			info := newInfo()
++			if err := deferFlavorPlacementToPods(t.Context(), cl, newWorkload(tc.elastic), info); err != nil {
++				t.Fatalf("deferFlavorPlacementToPods() error: %v", err)
++			}
++			if diff := cmp.Diff(tc.want, info[0], cmpopts.EquateEmpty()); diff != "" {
++				t.Errorf("PodSetInfo mismatch (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++// The job template of an elastic workload started with the gate on carries no
++// flavor placement, so the expected running PodSets must not either.
++func TestExpectedRunningPodSetsDefersFlavorPlacement(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero, true)
++	flavor := utiltestingapi.MakeResourceFlavor("remote").
++		NodeLabel("example.com/provider", "remote").
++		Toleration(corev1.Toleration{Key: "example.com/provider", Operator: corev1.TolerationOpExists}).
++		Obj()
++	wl := utiltestingapi.MakeWorkload("wl", "ns").
++		Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		PodSets(*utiltestingapi.MakePodSet("workers", 1).Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").
++			PodSets(utiltestingapi.MakePodSetAssignment("workers").Assignment(corev1.ResourceCPU, "remote", "1").Obj()).
++			Obj(), time.Now()).
++		Obj()
++	cl := utiltesting.NewClientBuilder(kueue.AddToScheme).WithObjects(flavor).Build()
++
++	got := expectedRunningPodSets(t.Context(), cl, wl)
++	if len(got) != 1 {
++		t.Fatalf("expectedRunningPodSets() returned %d PodSets, want 1", len(got))
++	}
++	if len(got[0].Template.Spec.Tolerations) != 0 || len(got[0].Template.Spec.NodeSelector) != 0 {
++		t.Errorf("running PodSet carries flavor placement: nodeSelector=%v tolerations=%v",
++			got[0].Template.Spec.NodeSelector, got[0].Template.Spec.Tolerations)
++	}
++}
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_elastic_flavor_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_elastic_flavor_test.go
+new file mode 100644
+index 0000000..c415733
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_elastic_flavor_test.go
+@@ -0,0 +1,187 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package raycluster
++
++import (
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/component-base/featuregate"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++// A worker group admitted with no workers moves to another flavor when it scales up, so
++// the flavor's node labels and tolerations go on each worker and never on the template.
++var _ = ginkgo.Describe("RayCluster elastic flavor change from zero", ginkgo.Label("job:ray", "area:jobs"), ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
++	const (
++		classLabel    = "example.com/class"
++		providerLabel = "example.com/provider"
++	)
++	var (
++		ns           *corev1.Namespace
++		local        *kueue.ResourceFlavor
++		remote       *kueue.ResourceFlavor
++		clusterQueue *kueue.ClusterQueue
++		localQueue   *kueue.LocalQueue
++	)
++	providerToleration := corev1.Toleration{
++		Key:      providerLabel,
++		Operator: corev1.TolerationOpEqual,
++		Value:    "remote",
++		Effect:   corev1.TaintEffectNoSchedule,
++	}
++
++	ginkgo.BeforeAll(func() {
++		features.SetFeatureGatesDuringTest(ginkgo.GinkgoTB(), map[featuregate.Feature]bool{
++			features.ElasticJobsViaWorkloadSlices:                     true,
++			features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: true,
++		})
++		fwk.StartManager(ctx, cfg, managerAndSchedulerSetup())
++	})
++	ginkgo.AfterAll(func() {
++		fwk.StopManager(ctx)
++	})
++
++	ginkgo.BeforeEach(func() {
++		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "flavor-")
++
++		// "local" fits the head and three workers, "remote" fits eight workers.
++		local = utiltestingapi.MakeResourceFlavor("local").NodeLabel(classLabel, "test").Obj()
++		remote = utiltestingapi.MakeResourceFlavor("remote").
++			NodeLabel(classLabel, "test").
++			NodeLabel(providerLabel, "remote").
++			Toleration(providerToleration).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, local)
++		behavioral.MustCreate(ctx, k8sClient, remote)
++		clusterQueue = utiltestingapi.MakeClusterQueue("default").
++			ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas(local.Name).Resource(corev1.ResourceCPU, "1").Obj(),
++				*utiltestingapi.MakeFlavorQuotas(remote.Name).Resource(corev1.ResourceCPU, "2").Obj(),
++			).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, clusterQueue)
++		localQueue = utiltestingapi.MakeLocalQueue("default", ns.Name).ClusterQueue(clusterQueue.Name).Obj()
++		behavioral.MustCreate(ctx, k8sClient, localQueue)
++	})
++	ginkgo.AfterEach(func() {
++		gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, localQueue, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, local, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, remote, true)
++	})
++
++	ginkgo.It("Should add the new flavor's placement to each worker and keep it off the template", func() {
++		rayCluster := testingraycluster.MakeCluster("foo", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue(localQueue.Name).
++			RequestHead(corev1.ResourceCPU, "250m").
++			RequestWorkerGroup(corev1.ResourceCPU, "250m").
++			FirstWorkerGroupReplicas(0, 0, 8).
++			Obj()
++
++		ginkgo.By("admitting the worker group with no workers in the first flavor")
++		behavioral.MustCreate(ctx, k8sClient, rayCluster)
++		initial := &behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 1)[0]
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, initial, workersGroupName, 0)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(initial), initial)).Should(gomega.Succeed())
++			g.Expect(workload.IsAdmitted(initial)).Should(gomega.BeTrue())
++			g.Expect(initial.Status.Admission.PodSetAssignments[workersPodSetIdx].Flavors).
++				Should(gomega.HaveKeyWithValue(corev1.ResourceCPU, kueue.ResourceFlavorReference(local.Name)))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("starting the cluster without the first flavor's placement on its templates")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), rayCluster)).Should(gomega.Succeed())
++			g.Expect(rayCluster.Spec.Suspend).Should(gomega.Equal(new(false)))
++			for _, template := range []corev1.PodTemplateSpec{rayCluster.Spec.HeadGroupSpec.Template, rayCluster.Spec.WorkerGroupSpecs[0].Template} {
++				g.Expect(template.Spec.NodeSelector).ShouldNot(gomega.HaveKey(classLabel))
++				g.Expect(template.Spec.Tolerations).Should(gomega.BeEmpty())
++			}
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("scaling up to six workers, of which only three fit in the first flavor")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), rayCluster)).Should(gomega.Succeed())
++			rayCluster.Spec.WorkerGroupSpecs[0].Replicas = new(int32(6))
++			g.Expect(k8sClient.Update(ctx, rayCluster)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("admitting all six in the next flavor")
++		moved := behavioral.ExpectNewWorkloadSlice(ctx, k8sClient, initial)
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, moved, workersGroupName, 6)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(moved), moved)).Should(gomega.Succeed())
++			g.Expect(workload.IsAdmitted(moved)).Should(gomega.BeTrue())
++			g.Expect(moved.Status.Admission.PodSetAssignments[workersPodSetIdx].Flavors).
++				Should(gomega.HaveKeyWithValue(corev1.ResourceCPU, kueue.ResourceFlavorReference(remote.Name)))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("creating the gated workers the KubeRay controller would create, one with the first flavor's selector")
++		newWorker := func(name string, selector map[string]string) *corev1.Pod {
++			pod := testingpod.MakePod(name, ns.Name).
++				Annotation(kueue.WorkloadAnnotation, moved.Name).
++				Annotation(kueue.WorkloadSliceNameAnnotation, workloadslicing.SliceName(moved)).
++				Label(constants.PodSetLabel, workersGroupName).
++				Gate(kueue.ElasticJobSchedulingGate).
++				Obj()
++			pod.Spec.NodeSelector = selector
++			return pod
++		}
++		for i := range 6 {
++			behavioral.MustCreate(ctx, k8sClient, newWorker("worker-"+string(rune('a'+i)), nil))
++		}
++		stale := newWorker("worker-stale", map[string]string{classLabel: "test", providerLabel: "local"})
++		behavioral.MustCreate(ctx, k8sClient, stale)
++
++		ginkgo.By("recycling the worker whose selector conflicts with the new flavor")
++		gomega.Eventually(func(g gomega.Gomega) {
++			err := k8sClient.Get(ctx, client.ObjectKeyFromObject(stale), &corev1.Pod{})
++			g.Expect(apierrors.IsNotFound(err)).Should(gomega.BeTrue(), "worker-stale still exists: %v", err)
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("ungating each of the six workers with the new flavor's node labels and toleration")
++		gomega.Eventually(func(g gomega.Gomega) {
++			pods := &corev1.PodList{}
++			g.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name))).Should(gomega.Succeed())
++			g.Expect(pods.Items).Should(gomega.HaveLen(6))
++			for _, pod := range pods.Items {
++				g.Expect(pod.Spec.SchedulingGates).Should(gomega.BeEmpty(), pod.Name)
++				g.Expect(pod.Spec.NodeSelector).Should(gomega.Equal(map[string]string{classLabel: "test", providerLabel: "remote"}), pod.Name)
++				g.Expect(pod.Spec.Tolerations).Should(gomega.ContainElement(providerToleration), pod.Name)
++			}
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("keeping the placement off the template")
++		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), rayCluster)).Should(gomega.Succeed())
++		gomega.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Template.Spec.NodeSelector).ShouldNot(gomega.HaveKey(providerLabel))
++		gomega.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Template.Spec.Tolerations).Should(gomega.BeEmpty())
++	})
++})

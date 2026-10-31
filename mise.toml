@@ -240,7 +240,7 @@ dir = "third_party/kueue"
 run = "go test -race -timeout 30m ./pkg/scheduler/... ./pkg/cache/... ./pkg/controller/... ./pkg/webhooks/... ./pkg/workload/... ./pkg/workloadslicing/... ./pkg/util/equality/..."
 
 [tasks."test:kueue-integration"]
-description = "Run the patched Kueue topology-aware reclaim and RayCluster integration suites against envtest"
+description = "Run the patched Kueue topology-aware reclaim and RayCluster integration suites against envtest, which include the elastic flavor placement specs"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
 run = """
@@ -410,7 +410,7 @@ subjects:
 EOF
 
 # 6. Install Kueue manifests directly patched with sed (image, ko entrypoint), the ConcurrentAdmission feature gate
-#    the Karpenter AdmissionCheck requires, and the Karpenter RBAC
+#    the Karpenter AdmissionCheck requires, the FlavorChangeFromZero gate that patch 0006 completes, and the Karpenter RBAC
 echo "Installing Kueue manifests with patched image..."
 curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml" | \
   sed -e "s|registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM|$KUEUE_IMG|g" \
@@ -449,7 +449,7 @@ subjects:
 EOF
 
 kubectl patch deployment/kueue-controller-manager -n kueue-system --type=json \
-  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates=ConcurrentAdmission=true"}]'
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates=ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true"}]'
 kubectl set resources deployment/kueue-controller-manager -n kueue-system --limits=memory=2Gi --requests=memory=512Mi
 
 # 7. Wait for rollouts

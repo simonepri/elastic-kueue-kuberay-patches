@@ -1,0 +1,25 @@
+# Kueue admits the empty worker group in the first flavor and stamps its node label on the worker template.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: from-zero-cluster
+spec:
+  suspend: false
+  workerGroupSpecs:
+    - groupName: workers
+      template:
+        spec:
+          nodeSelector:
+            example.com/class: test
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+status:
+  admission:
+    podSetAssignments:
+      - name: head
+        flavors:
+          cpu: fz-local
+      - name: workers
+        flavors:
+          cpu: fz-local

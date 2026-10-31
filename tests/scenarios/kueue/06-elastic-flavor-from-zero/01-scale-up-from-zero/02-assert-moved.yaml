@@ -1,0 +1,14 @@
+# The scale-up slice moves the worker group, which had no pods, to the flavor that fits all six workers instead of admitting three in the first one.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+status:
+  admission:
+    podSetAssignments:
+      - name: head
+        flavors:
+          cpu: fz-local
+      - name: workers
+        count: 6
+        flavors:
+          cpu: fz-remote
+          memory: fz-remote

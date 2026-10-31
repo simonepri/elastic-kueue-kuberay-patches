@@ -91,7 +91,7 @@ index 6509710..4164def 100644
  			return err
  		}
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index 6d273d3..f475ff5 100644
+index 6d273d3..b0135af 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -19,6 +19,7 @@ package raycluster
@@ -102,35 +102,48 @@ index 6d273d3..f475ff5 100644
  
  	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
  	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
-@@ -150,6 +151,37 @@ func (j *RayCluster) RestorePodSetsInfo(ctx context.Context, podSetsInfo []podse
+@@ -150,6 +151,50 @@ func (j *RayCluster) RestorePodSetsInfo(ctx context.Context, podSetsInfo []podse
  	return ClearRuntimeWorkerStateAnnotations(j.Object()) || changed
  }
  
++// SyncScale lowers each worker group to the count that partial preemption left
++// admitted, which the workload records with its Preempted condition until the
++// next admission or re-expansion clears it. An elastic RayCluster only follows
++// such a shrink: workload slicing tracks its other resizes, so raising replicas
++// would revert a scale-down and lowering them on a partial admission would
++// revert a pending scale-up. A RayCluster without workload slicing runs the
++// admitted count in either direction, which re-expansion relies on.
 +func (j *RayCluster) SyncScale(wl *kueue.Workload) bool {
 +	if wl == nil || wl.Status.Admission == nil {
 +		return false
 +	}
++	elastic := isAnElasticJob((*rayv1.RayCluster)(j))
++	if elastic && !apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadPreempted) {
++		return false
++	}
 +	changed := false
 +	for _, psa := range wl.Status.Admission.PodSetAssignments {
-+		if psa.Name == headGroupPodSetName {
++		if psa.Name == headGroupPodSetName || psa.Count == nil {
 +			continue
 +		}
 +		for i := range j.Spec.WorkerGroupSpecs {
 +			wgs := &j.Spec.WorkerGroupSpecs[i]
-+			if strings.EqualFold(wgs.GroupName, string(psa.Name)) {
-+				if psa.Count != nil {
-+					targetCount := *psa.Count
-+					if wgs.NumOfHosts > 1 {
-+						targetCount = targetCount / wgs.NumOfHosts
-+					}
-+					if wgs.MaxReplicas != nil && targetCount > *wgs.MaxReplicas {
-+						targetCount = *wgs.MaxReplicas
-+					}
-+					if wgs.Replicas == nil || *wgs.Replicas != targetCount {
-+						wgs.Replicas = ptr.To(targetCount)
-+						changed = true
-+					}
-+				}
++			if !strings.EqualFold(wgs.GroupName, string(psa.Name)) {
++				continue
++			}
++			targetCount := *psa.Count
++			if wgs.NumOfHosts > 1 {
++				targetCount /= wgs.NumOfHosts
++			}
++			if wgs.MaxReplicas != nil && targetCount > *wgs.MaxReplicas {
++				targetCount = *wgs.MaxReplicas
++			}
++			if elastic && (wgs.Replicas == nil || *wgs.Replicas <= targetCount) {
++				continue
++			}
++			if wgs.Replicas == nil || *wgs.Replicas != targetCount {
++				wgs.Replicas = ptr.To(targetCount)
++				changed = true
 +			}
 +		}
 +	}
@@ -168,7 +181,7 @@ index 666564b..af13c71 100644
  	Reason       string
  	WorkloadCq   *scheduler.ClusterQueueSnapshot
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index 5a5071f..e4f1814 100644
+index 5a5071f..8238dd0 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
 @@ -33,6 +33,7 @@ import (
@@ -194,7 +207,7 @@ index 5a5071f..e4f1814 100644
 +		if target.NewCount != nil {
 +			message := fmt.Sprintf("Partially preempted %s to %d pods to accommodate workload (UID: %s) due to %s",
 +				target.PodSetName, *target.NewCount, preemptor.Obj.UID, HumanReadablePreemptionReasons[target.Reason])
-+			err := p.applyPartialPreemption(ctx, target.WorkloadInfo.Obj, target.PodSetName, *target.NewCount, target.Reason, message)
++			err := p.applyPartialPreemption(ctx, target.WorkloadInfo.Obj.DeepCopy(), target.PodSetName, *target.NewCount, target.Reason, message)
 +			if err != nil {
 +				p.preemptionExpectations.ObservedUID(log, targetKey, target.WorkloadInfo.Obj.UID)
 +				errCh.SendErrorWithCancel(err, cancel)
@@ -406,3 +419,136 @@ index 52f022d..2bce666 100644
  		selectedCounts := workload.ExtractPodSetCountsFromWorkload(selectedWorkload)
  
  		if !jobPodSetsCounts.HasSamePodSetKeys(selectedCounts) {
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
+index 393620e..5898680 100644
+--- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
+@@ -1013,6 +1013,128 @@ var _ = ginkgo.Describe("RayCluster with elastic jobs via workload-slices suppor
+ 		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+ 	})
+ 
++	ginkgo.It("Should lower the replicas of an elastic raycluster to the count partial preemption keeps", framework.SlowSpec, func() {
++		highPriorityClass := utiltesting.MakePriorityClass("shrink-high").PriorityValue(100).Obj()
++		behavioral.MustCreate(ctx, k8sClient, highPriorityClass)
++		ginkgo.DeferCleanup(func() {
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, highPriorityClass, true)
++		})
++
++		testRayCluster := testingraycluster.MakeCluster("shrinkable", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue(localQueue.Name).
++			Request(rayv1.HeadNode, corev1.ResourceCPU, "1").
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			WithEnableAutoscaling(new(true)).
++			FirstWorkerGroupReplicas(4, 1, 4).
++			Obj()
++
++		ginkgo.By("admitting the raycluster at 4 workers")
++		behavioral.MustCreate(ctx, k8sClient, testRayCluster)
++		gomega.Eventually(func(g gomega.Gomega) {
++			workloads := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name))).Should(gomega.Succeed())
++			g.Expect(workloads.Items).Should(gomega.HaveLen(1))
++			g.Expect(workload.IsAdmitted(&workloads.Items[0])).Should(gomega.BeTrue())
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			g.Expect(ptr.Deref(testRayCluster.Spec.Suspend, false)).Should(gomega.BeFalse())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("creating a higher priority raycluster that needs 2 of the 4 workers' CPUs")
++		preemptor := testingraycluster.MakeCluster("preemptor", ns.Name).
++			Queue(localQueue.Name).
++			WithPriorityClassName(highPriorityClass.Name).
++			Request(rayv1.HeadNode, corev1.ResourceCPU, "1").
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, preemptor)
++
++		ginkgo.By("partial preemption shrinks the raycluster's admitted workers to 2 and the raycluster follows")
++		gomega.Eventually(func(g gomega.Gomega) {
++			workloads := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name),
++				client.MatchingLabels{controllerconstants.JobUIDLabel: string(testRayCluster.UID)})).Should(gomega.Succeed())
++			g.Expect(workloads.Items).Should(gomega.HaveLen(1))
++			shrunk := &workloads.Items[0]
++			g.Expect(workload.IsAdmitted(shrunk)).Should(gomega.BeTrue())
++			g.Expect(shrunk.Status.Conditions).Should(utiltesting.HaveConditionStatusTrue(kueue.WorkloadPreempted))
++			g.Expect(shrunk.Status.Admission.PodSetAssignments[1].Count).Should(gomega.Equal(new(int32(2))))
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			g.Expect(testRayCluster.Spec.WorkerGroupSpecs[0].Replicas).Should(gomega.Equal(new(int32(2))))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("the autoscaler scales the shrunk raycluster down to 1 worker")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			testRayCluster.Spec.WorkerGroupSpecs[0].Replicas = new(int32(1))
++			g.Expect(k8sClient.Update(ctx, testRayCluster)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("Kueue keeps the raycluster at 1 worker")
++		gomega.Consistently(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			g.Expect(testRayCluster.Spec.WorkerGroupSpecs[0].Replicas).Should(gomega.Equal(new(int32(1))))
++		}, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
++	})
++
++	ginkgo.It("Should keep a pending raycluster scale-up when the replacement slice is partially admitted", framework.SlowSpec, func() {
++		testRayCluster := testingraycluster.MakeCluster("growing", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue(localQueue.Name).
++			Request(rayv1.HeadNode, corev1.ResourceCPU, "1").
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			WithEnableAutoscaling(new(true)).
++			FirstWorkerGroupReplicas(2, 1, 8).
++			Obj()
++
++		ginkgo.By("admitting the raycluster at 2 workers")
++		behavioral.MustCreate(ctx, k8sClient, testRayCluster)
++		gomega.Eventually(func(g gomega.Gomega) {
++			workloads := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name))).Should(gomega.Succeed())
++			g.Expect(workloads.Items).Should(gomega.HaveLen(1))
++			g.Expect(workload.IsAdmitted(&workloads.Items[0])).Should(gomega.BeTrue())
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			g.Expect(ptr.Deref(testRayCluster.Spec.Suspend, false)).Should(gomega.BeFalse())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("scaling the raycluster up to 6 workers, of which the queue can admit 4")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			testRayCluster.Spec.WorkerGroupSpecs[0].Replicas = new(int32(6))
++			g.Expect(k8sClient.Update(ctx, testRayCluster)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("a replacement slice is admitted for 4 workers")
++		gomega.Eventually(func(g gomega.Gomega) {
++			workloads := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name))).Should(gomega.Succeed())
++			admitted := 0
++			for i := range workloads.Items {
++				wl := &workloads.Items[i]
++				if workloadfinish.IsFinished(wl) || !workload.IsAdmitted(wl) {
++					continue
++				}
++				admitted++
++				g.Expect(wl.Status.Admission.PodSetAssignments[1].Count).Should(gomega.Equal(new(int32(4))))
++			}
++			g.Expect(admitted).Should(gomega.Equal(1))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("the autoscaler lowers its request to 5 workers, still above the 4 admitted")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			testRayCluster.Spec.WorkerGroupSpecs[0].Replicas = new(int32(5))
++			g.Expect(k8sClient.Update(ctx, testRayCluster)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("Kueue keeps the raycluster's pending scale-up to 5 workers")
++		gomega.Consistently(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			g.Expect(testRayCluster.Spec.WorkerGroupSpecs[0].Replicas).Should(gomega.Equal(new(int32(5))))
++		}, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
++	})
++
+ 	ginkgo.It("Should support scheduling pending workload after freeing capacity on scale-down", framework.SlowSpec, func() {
+ 		var (
+ 			testRayClusterAWorkload *kueue.Workload

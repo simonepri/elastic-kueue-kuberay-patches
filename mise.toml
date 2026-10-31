@@ -240,14 +240,14 @@ dir = "third_party/kueue"
 run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/deployment/ ./pkg/scheduler/..."
 
 [tasks."test:kueue-integration"]
-description = "Run the patched Kueue topology-aware reclaim integration suite against envtest"
+description = "Run the patched Kueue topology-aware reclaim and elastic RayCluster resize integration specs against envtest"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
 run = """
 make test-integration \
-  INTEGRATION_TARGET=./test/integration/singlecluster/tas/... \
+  'INTEGRATION_TARGET=./test/integration/singlecluster/tas/... ./test/integration/singlecluster/controller/jobs/raycluster/...' \
   INTEGRATION_NPROCS=1 \
-  'INTEGRATION_FILTERS=--focus="Topology-aware cohort reclaim"'
+  'INTEGRATION_FILTERS=--focus="Topology-aware cohort reclaim|Should support raycluster scale-down and scale-up|partial preemption keeps|pending raycluster scale-up|re-applied with its original template"'
 """
 
 [tasks."test:kuberay"]

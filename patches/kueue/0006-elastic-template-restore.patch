@@ -1,0 +1,376 @@
+Restore Kueue's admission metadata on the pod templates of a running elastic job.
+
+Kueue merges the PodSet label, the workload slice annotation and the flavor's
+node selector and tolerations into an elastic job's pod templates once, when
+the job starts, and the ElasticJobUngater finds Pods only by them. Re-applying
+a running RayCluster's manifest replaces the atomic workerGroupSpecs list and
+drops that metadata, so every later worker stays gated while the Workload holds
+its quota. While the Workload is admitted, the job reconciler merges the
+admitted PodSet info back into each template that lacks the PodSet label,
+without changing replicas, and then deletes the job's gated Pods that lack it,
+which never ran and are recreated from the restored templates.
+
+diff --git a/pkg/controller/jobframework/interface.go b/pkg/controller/jobframework/interface.go
+index e4d17f2..b3f8a54 100644
+--- a/pkg/controller/jobframework/interface.go
++++ b/pkg/controller/jobframework/interface.go
+@@ -107,6 +107,16 @@ type JobWithPodLabelSelector interface {
+ 	PodLabelSelector() string
+ }
+ 
++// JobWithPodTemplateRestore is an optional interface for elastic jobs whose pod
++// templates a client can replace while the job runs, such as by re-applying the
++// job's manifest, which drops the PodSet info Kueue merged in at admission.
++type JobWithPodTemplateRestore interface {
++	// RestorePodTemplates merges podSetsInfo into each pod template that lacks
++	// the constants.PodSetLabel, without changing the job's scale or
++	// suspension, and returns whether any template changed.
++	RestorePodTemplates(ctx context.Context, podSetsInfo []podset.PodSetInfo) (bool, error)
++}
++
+ // JobWithReclaimablePods is an optional interface that should be implemented by generic jobs
+ // when reclaimable pod information is needed.
+ type JobWithReclaimablePods interface {
+diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
+index d6122b4..69c0952 100644
+--- a/pkg/controller/jobframework/reconciler.go
++++ b/pkg/controller/jobframework/reconciler.go
+@@ -65,6 +65,7 @@ import (
+ 	clientutil "sigs.k8s.io/kueue/pkg/util/client"
+ 	"sigs.k8s.io/kueue/pkg/util/equality"
+ 	"sigs.k8s.io/kueue/pkg/util/kubeversion"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
+ 	utilpriority "sigs.k8s.io/kueue/pkg/util/priority"
+ 	utilqueue "sigs.k8s.io/kueue/pkg/util/queue"
+ 	"sigs.k8s.io/kueue/pkg/util/roletracker"
+@@ -703,6 +704,12 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
+ 		}
+ 	}
+ 
++	if WorkloadSliceEnabled(job) {
++		if restored, err := r.restoreElasticPodTemplates(ctx, job, wl); err != nil || restored {
++			return ctrl.Result{}, err
++		}
++	}
++
+ 	// Workload is admitted and job is running, nothing to do. For elastic jobs,
+ 	// pod ungating is handled by the ElasticJobUngater controller.
+ 	log.V(3).Info("Job running with admitted workload, nothing to do")
+@@ -1831,15 +1838,10 @@ func (r *JobReconciler) updateWorkloadToMatchJob(ctx context.Context, job Generi
+ 
+ // startJob will unsuspend the job, and also inject the node affinity.
+ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object client.Object, wl *kueue.Workload) error {
+-	info, err := getPodSetsInfoFromStatus(ctx, r.client, wl, r.podsScheduledTrackingEnabled())
++	info, err := r.podSetsInfoForTemplates(ctx, wl)
+ 	if err != nil {
+ 		return err
+ 	}
+-	if workloadslicing.IsEnabledForProvisioningRequests(wl) {
+-		if err := deferAdmissionCheckNodeSelectorsToPods(ctx, r.client, wl, info); err != nil {
+-			return err
+-		}
+-	}
+ 	msg := fmt.Sprintf("Admitted by clusterQueue %v", wl.Status.Admission.ClusterQueue)
+ 
+ 	log := ctrl.LoggerFrom(ctx)
+@@ -1875,6 +1877,87 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
+ 	return nil
+ }
+ 
++// podSetsInfoForTemplates returns the PodSet info from wl's admission that
++// Kueue merges into the job's pod templates.
++func (r *JobReconciler) podSetsInfoForTemplates(ctx context.Context, wl *kueue.Workload) ([]podset.PodSetInfo, error) {
++	info, err := getPodSetsInfoFromStatus(ctx, r.client, wl, r.podsScheduledTrackingEnabled())
++	if err != nil {
++		return nil, err
++	}
++	if workloadslicing.IsEnabledForProvisioningRequests(wl) {
++		if err := deferAdmissionCheckNodeSelectorsToPods(ctx, r.client, wl, info); err != nil {
++			return nil, err
++		}
++	}
++	return info, nil
++}
++
++// restoreElasticPodTemplates merges wl's PodSet info back into the pod
++// templates of a running elastic job that lost it, as when a client re-applies
++// the job's manifest and replaces its templates. Once the templates carry it
++// again, it deletes the gated Pods created from the stripped templates: the
++// ElasticJobUngater finds Pods only by the PodSet info, so those Pods would
++// stay gated while wl holds their quota, and having never been scheduled they
++// lose no work when the job recreates them. It returns whether it updated the
++// job.
++func (r *JobReconciler) restoreElasticPodTemplates(ctx context.Context, job GenericJob, wl *kueue.Workload) (bool, error) {
++	restorer, ok := job.(JobWithPodTemplateRestore)
++	if !ok {
++		return false, nil
++	}
++	info, err := r.podSetsInfoForTemplates(ctx, wl)
++	if err != nil {
++		return false, err
++	}
++	object := job.Object()
++	restored := false
++	if err := clientutil.Patch(ctx, r.client, object, func() (bool, error) {
++		var err error
++		restored, err = restorer.RestorePodTemplates(ctx, info)
++		return restored, err
++	}); err != nil {
++		return false, err
++	}
++	if restored {
++		ctrl.LoggerFrom(ctx).V(2).Info("Restored the admitted PodSet info on the pod templates of a running elastic job")
++		return true, nil
++	}
++	return false, r.deleteStaleElasticPods(ctx, job)
++}
++
++// deleteStaleElasticPods deletes the job's Pods that wait on the elastic job
++// scheduling gate without the constants.PodSetLabel.
++func (r *JobReconciler) deleteStaleElasticPods(ctx context.Context, job GenericJob) error {
++	selectorJob, ok := job.(JobWithPodLabelSelector)
++	if !ok {
++		return nil
++	}
++	selector, err := labels.Parse(selectorJob.PodLabelSelector())
++	if err != nil {
++		return err
++	}
++	object := job.Object()
++	var pods corev1.PodList
++	if err := r.client.List(ctx, &pods, client.InNamespace(object.GetNamespace()), client.MatchingLabelsSelector{Selector: selector}); err != nil {
++		return err
++	}
++	for i := range pods.Items {
++		pod := &pods.Items[i]
++		if !metav1.IsControlledBy(pod, object) || !pod.DeletionTimestamp.IsZero() ||
++			!utilpod.HasGate(pod, kueue.ElasticJobSchedulingGate) {
++			continue
++		}
++		if _, found := pod.Labels[constants.PodSetLabel]; found {
++			continue
++		}
++		ctrl.LoggerFrom(ctx).V(2).Info("Deleting an elastic Pod created from a pod template without the admitted PodSet info", "pod", klog.KObj(pod))
++		if err := r.client.Delete(ctx, pod); client.IgnoreNotFound(err) != nil {
++			return err
++		}
++	}
++	return nil
++}
++
+ // deferAdmissionCheckNodeSelectorsToPods keeps request-specific placement out
+ // of a long-lived elastic job template. A Job template is immutable once
+ // created, and the API server only allows *adding* nodeSelector keys to a
+diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
+index b0135af..0e436ce 100644
+--- a/pkg/controller/jobs/raycluster/raycluster_controller.go
++++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
+@@ -23,6 +23,7 @@ import (
+ 
+ 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+ 	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
++	corev1 "k8s.io/api/core/v1"
+ 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+@@ -32,6 +33,7 @@ import (
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobs/ray"
+ 	"sigs.k8s.io/kueue/pkg/features"
+@@ -146,6 +148,30 @@ func (j *RayCluster) RunWithPodSetsInfo(ctx context.Context, _ client.Client, po
+ 	return nil
+ }
+ 
++// RestorePodTemplates merges podSetsInfo into the head and worker templates
++// that lack the constants.PodSetLabel, leaving replicas and suspension as they are.
++func (j *RayCluster) RestorePodTemplates(ctx context.Context, podSetsInfo []podset.PodSetInfo) (bool, error) {
++	if expectedLen := ExpectedPodSetsCount(&j.Spec); len(podSetsInfo) != expectedLen {
++		return false, podset.BadPodSetsInfoLenError(expectedLen, len(podSetsInfo))
++	}
++	templates := []*corev1.PodTemplateSpec{&j.Spec.HeadGroupSpec.Template}
++	for i := range j.Spec.WorkerGroupSpecs {
++		templates = append(templates, &j.Spec.WorkerGroupSpecs[i].Template)
++	}
++	changed := false
++	for i, template := range templates {
++		if _, found := template.Labels[constants.PodSetLabel]; found {
++			continue
++		}
++		if err := podset.Merge(ctrl.LoggerFrom(ctx), &template.ObjectMeta, &template.Spec, podSetsInfo[i]); err != nil {
++			return false, err
++		}
++		jobframework.DefaultPodIndexOffsetForPodSetGroup(&template.ObjectMeta)
++		changed = true
++	}
++	return changed, nil
++}
++
+ func (j *RayCluster) RestorePodSetsInfo(ctx context.Context, podSetsInfo []podset.PodSetInfo) bool {
+ 	changed := RestorePodSetsInfo(ctx, &j.Spec, podSetsInfo)
+ 	return ClearRuntimeWorkerStateAnnotations(j.Object()) || changed
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
+index 5898680..7f2cd86 100644
+--- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_test.go
+@@ -17,7 +17,9 @@ limitations under the License.
+ package raycluster
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
++	"maps"
+ 	"strconv"
+ 	"time"
+ 
+@@ -27,6 +29,7 @@ import (
+ 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+ 	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
+ 	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	schedulingv1 "k8s.io/api/scheduling/v1"
+ 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+@@ -46,6 +49,7 @@ import (
+ 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+ 	workloadraycluster "sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
+ 	"sigs.k8s.io/kueue/pkg/features"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
+ 	"sigs.k8s.io/kueue/pkg/util/tas"
+ 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
+ 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
+@@ -1135,6 +1139,131 @@ var _ = ginkgo.Describe("RayCluster with elastic jobs via workload-slices suppor
+ 		}, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
+ 	})
+ 
++	ginkgo.It("Should ungate new workers after the worker group is re-applied with its original template", framework.SlowSpec, func() {
++		original := testingraycluster.MakeCluster("reapplied", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue(localQueue.Name).
++			Request(rayv1.HeadNode, corev1.ResourceCPU, "1").
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			WithEnableAutoscaling(new(true)).
++			FirstWorkerGroupReplicas(2, 1, 8).
++			Obj()
++		// A manifest kept in version control declares the elastic gate, which the
++		// webhook requires on every update.
++		utilpod.GateTemplate(&original.Spec.WorkerGroupSpecs[0].Template, kueue.ElasticJobSchedulingGate)
++		manifestWorkerGroups := original.DeepCopy().Spec.WorkerGroupSpecs
++		testRayCluster := original.DeepCopy()
++
++		ginkgo.By("admitting the raycluster at 2 workers")
++		behavioral.MustCreate(ctx, k8sClient, testRayCluster)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			g.Expect(ptr.Deref(testRayCluster.Spec.Suspend, false)).Should(gomega.BeFalse())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		// createWorker emulates KubeRay creating a worker Pod from the current template.
++		createWorker := func(name string) *corev1.Pod {
++			ginkgo.GinkgoHelper()
++			current := &rayv1.RayCluster{}
++			gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), current)).Should(gomega.Succeed())
++			template := current.Spec.WorkerGroupSpecs[0].Template
++			pod := &corev1.Pod{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:        name,
++					Namespace:   ns.Name,
++					Labels:      maps.Clone(template.Labels),
++					Annotations: maps.Clone(template.Annotations),
++				},
++				Spec: *template.Spec.DeepCopy(),
++			}
++			for i := range pod.Spec.Containers {
++				pod.Spec.Containers[i].Image = "ray"
++			}
++			if pod.Labels == nil {
++				pod.Labels = map[string]string{}
++			}
++			pod.Labels[rayutils.RayClusterLabelKey] = current.Name
++			pod.Labels[rayutils.RayNodeGroupLabelKey] = current.Spec.WorkerGroupSpecs[0].GroupName
++			pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(current, rayv1.GroupVersion.WithKind("RayCluster"))}
++			behavioral.MustCreate(ctx, k8sClient, pod)
++			return pod
++		}
++		ungated := func(g gomega.Gomega) int {
++			pods := &corev1.PodList{}
++			g.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name),
++				client.MatchingLabels{rayutils.RayClusterLabelKey: testRayCluster.Name})).Should(gomega.Succeed())
++			count := 0
++			for i := range pods.Items {
++				if pods.Items[i].DeletionTimestamp.IsZero() && !utilpod.HasGate(&pods.Items[i], kueue.ElasticJobSchedulingGate) {
++					count++
++				}
++			}
++			return count
++		}
++
++		ginkgo.By("the ungater ungates the 2 admitted workers")
++		createWorker("worker-0")
++		createWorker("worker-1")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(ungated(g)).Should(gomega.Equal(2))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("re-applying the manifest's worker group with 3 workers as a JSON merge patch")
++		manifestWorkerGroups[0].Replicas = new(int32(3))
++		patch, err := json.Marshal(map[string]any{"spec": map[string]any{"workerGroupSpecs": manifestWorkerGroups}})
++		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
++		gomega.Expect(k8sClient.Patch(ctx, testRayCluster, client.RawPatch(types.MergePatchType, patch))).Should(gomega.Succeed())
++
++		ginkgo.By("KubeRay creates the third worker from the re-applied template")
++		stale := createWorker("worker-2")
++
++		ginkgo.By("a slice is admitted for 3 workers")
++		gomega.Eventually(func(g gomega.Gomega) {
++			workloads := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name))).Should(gomega.Succeed())
++			admitted := 0
++			for i := range workloads.Items {
++				wl := &workloads.Items[i]
++				if workloadfinish.IsFinished(wl) || !workload.IsAdmitted(wl) {
++					continue
++				}
++				admitted++
++				g.Expect(wl.Status.Admission.PodSetAssignments[1].Count).Should(gomega.Equal(new(int32(3))))
++			}
++			g.Expect(admitted).Should(gomega.Equal(1))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("Kueue restores its PodSet label and slice annotation on the worker template")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(testRayCluster), testRayCluster)).Should(gomega.Succeed())
++			template := testRayCluster.Spec.WorkerGroupSpecs[0].Template
++			g.Expect(template.Labels).Should(gomega.HaveKeyWithValue(constants.PodSetLabel, testRayCluster.Spec.WorkerGroupSpecs[0].GroupName))
++			g.Expect(template.Annotations).Should(gomega.HaveKey(kueue.WorkloadSliceNameAnnotation))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("Kueue deletes the gated worker created from the stripped template")
++		gomega.Eventually(func(g gomega.Gomega) {
++			err := k8sClient.Get(ctx, client.ObjectKeyFromObject(stale), stale)
++			if err == nil {
++				g.Expect(stale.DeletionTimestamp.IsZero()).Should(gomega.BeFalse())
++			} else {
++				g.Expect(apierrors.IsNotFound(err)).Should(gomega.BeTrue())
++			}
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("the replacement for the third worker is ungated")
++		createWorker("worker-3")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(ungated(g)).Should(gomega.Equal(3))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("a worker beyond the admitted count stays gated")
++		createWorker("worker-4")
++		gomega.Consistently(func(g gomega.Gomega) {
++			g.Expect(ungated(g)).Should(gomega.Equal(3))
++		}, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
++	})
++
+ 	ginkgo.It("Should support scheduling pending workload after freeing capacity on scale-down", framework.SlowSpec, func() {
+ 		var (
+ 			testRayClusterAWorkload *kueue.Workload

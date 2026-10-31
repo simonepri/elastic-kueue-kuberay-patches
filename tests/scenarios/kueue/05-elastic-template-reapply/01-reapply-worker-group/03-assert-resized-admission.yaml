@@ -1,0 +1,21 @@
+# Kueue restores its PodSet label on the re-applied worker template and admits three of the four workers.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: reapplied-cluster
+spec:
+  workerGroupSpecs:
+    - groupName: workers
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/podset: workers
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+status:
+  admission:
+    podSetAssignments:
+      - name: head
+      - name: workers
+        count: 3

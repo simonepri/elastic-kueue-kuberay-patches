@@ -1,0 +1,44 @@
+# Re-applies the full worker group of a running elastic RayCluster and checks that Kueue ungates new workers only up to the admitted count.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 05-elastic-template-reapply
+spec:
+  description: >
+    Verifies that re-applying the worker group of a running elastic RayCluster as a JSON merge
+    patch, which replaces the worker template and drops the PodSet label, slice annotation and
+    node selector Kueue stamped at admission, does not leave new workers gated. Kueue restores
+    its metadata on the template and recycles the gated workers KubeRay created from the
+    stripped template, so workers are ungated up to the admitted count and never beyond it.
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-elastic-raycluster
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+        - assert:
+            file: 01-assert-admitted.yaml
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-ungated-workers.sh 2
+    - name: reapply-worker-group-with-more-workers
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: kubectl -n "$NS" patch raycluster reapplied-cluster --type=merge --patch-file 02-reapply-worker-group.yaml
+        - assert:
+            file: 03-assert-resized-admission.yaml
+        - script:
+            timeout: 150s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-ungated-workers.sh 3

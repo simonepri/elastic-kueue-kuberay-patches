@@ -1,0 +1,21 @@
+# The worker group of 01-raycluster.yaml resized to four workers, which replaces the whole worker template on patch.
+spec:
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 4
+      minReplicas: 1
+      maxReplicas: 6
+      rayStartParams: {}
+      template:
+        spec:
+          schedulingGates:
+            - name: kueue.x-k8s.io/elastic-job
+          nodeSelector:
+            example.com/unschedulable: "true"
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "250m"
+                  memory: "64Mi"

@@ -1,0 +1,51 @@
+# Two flavors with the same class label: "fz-local" fits the head and three workers, "fz-remote" adds a provider label and taint toleration and fits eight.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: fz-local
+spec:
+  nodeLabels:
+    example.com/class: test
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: fz-remote
+spec:
+  nodeLabels:
+    example.com/class: test
+    example.com/provider: remote
+  tolerations:
+    - key: example.com/provider
+      operator: Equal
+      value: remote
+      effect: NoSchedule
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: fz-cluster-queue
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: fz-local
+          resources:
+            - name: "cpu"
+              nominalQuota: "1"
+            - name: "memory"
+              nominalQuota: "1Gi"
+        - name: fz-remote
+          resources:
+            - name: "cpu"
+              nominalQuota: "2"
+            - name: "memory"
+              nominalQuota: "2Gi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: fz-local-queue
+spec:
+  clusterQueue: fz-cluster-queue

@@ -1,0 +1,60 @@
+# Re-applies the worker group of a running elastic RayCluster and checks that Kueue ungates new workers only up to the admitted count.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 05-elastic-template-reapply
+spec:
+  description: >
+    Verifies that re-applying the worker group of a running elastic RayCluster as a JSON merge
+    patch with one more worker, which replaces the whole worker template and drops the PodSet
+    label and slice name annotation Kueue stamped when it started the cluster, does not leave
+    new workers gated. Kueue's RayCluster webhook stamps both again on the write itself, so the
+    workers KubeRay creates from the replaced template are ungated up to the admitted count,
+    and never beyond it once the RayCluster asks for more workers than the queue admits.
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-elastic-raycluster
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+        - assert:
+            file: 01-assert-admitted.yaml
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-ungated-workers.sh 2
+    - name: reapply-worker-group-with-three-workers
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: kubectl -n "$NS" patch raycluster reapplied-cluster --type=merge --patch-file 02-reapply-worker-group.yaml
+        - assert:
+            file: 03-assert-resized-admission.yaml
+        - script:
+            timeout: 150s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-ungated-workers.sh 3
+    - name: scale-past-the-quota
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: >-
+              kubectl -n "$NS" patch raycluster reapplied-cluster --type=json
+              -p '[{"op":"replace","path":"/spec/workerGroupSpecs/0/replicas","value":4}]'
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-ungated-workers.sh 3 4

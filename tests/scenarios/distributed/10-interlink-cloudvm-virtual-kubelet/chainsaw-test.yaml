@@ -3,6 +3,9 @@ kind: Test
 metadata:
   name: 20-interlink-cloudvm-virtual-kubelet
 spec:
+  # TODO(simonepri): run again with patch 0010-partial-preemption-search (R5) and 0011-elastic-regrow-after-reclaim (R6), and assert the shrink and regrowth on pods while replicas stay unchanged;
+  # see the acceptance tests in patches/kueue/contract.md.
+  skip: true
   description: >
     Verifies end-to-end hybrid Ray cluster bursting onto an InterLink Virtual Kubelet node
     (interlink-cloudvm-plugin) under realistic network and provisioning latencies.

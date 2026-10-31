@@ -234,20 +234,24 @@ docker run --rm -v "$PWD/tests/ray:/tests:ro" -v "$PWD/third_party/ray/python/ra
 """
 
 [tasks."test:kueue"]
-description = "Run unit tests of the packages the Karpenter AdmissionCheck, deployment queue, topology-aware reclaim, and elastic flavor change patches change"
+description = "Run the unit tests of every package the Kueue patches change or build on, with the race detector, so each upstream test that passes on vanilla Kueue must pass on the patched tree"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
-run = "go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/deployment/ ./pkg/controller/elasticjobs/ ./pkg/scheduler/..."
+run = "go test -race -timeout 30m ./pkg/scheduler/... ./pkg/cache/... ./pkg/controller/... ./pkg/webhooks/... ./pkg/workload/... ./pkg/workloadslicing/... ./pkg/util/equality/..."
 
 [tasks."test:kueue-integration"]
-description = "Run the patched Kueue topology-aware reclaim integration suite against envtest"
+description = "Run the patched Kueue topology-aware reclaim and RayCluster integration suites against envtest"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
 run = """
+set -e
 make test-integration \
   INTEGRATION_TARGET=./test/integration/singlecluster/tas/... \
   INTEGRATION_NPROCS=1 \
   'INTEGRATION_FILTERS=--focus="Topology-aware cohort reclaim"'
+make test-integration \
+  INTEGRATION_TARGET=./test/integration/singlecluster/controller/jobs/raycluster/... \
+  INTEGRATION_NPROCS=1
 """
 
 [tasks."test:kuberay"]

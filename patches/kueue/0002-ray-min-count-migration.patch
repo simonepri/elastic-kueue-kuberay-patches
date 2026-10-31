@@ -1,0 +1,366 @@
+Temporary migration shim. Delete it once no Workload that held quota under
+patch release p0.6.x or earlier remains.
+
+Those releases set every Ray worker group's minCount to its minReplicas.
+Kueue compares minCount when it checks that a job still matches its Workload,
+so after an upgrade every running RayCluster, RayJob, and RayService they
+admitted stops matching, and Kueue deletes its Workload and suspends it. The
+Ray integrations now ignore minCount in that check while the Workload holds
+quota; once the quota is released, Kueue replaces the Workload's PodSets with
+the job's as usual.
+
+diff --git a/pkg/controller/jobs/raycluster/min_count_migration.go b/pkg/controller/jobs/raycluster/min_count_migration.go
+new file mode 100644
+index 0000000..f1b331c
+--- /dev/null
++++ b/pkg/controller/jobs/raycluster/min_count_migration.go
+@@ -0,0 +1,41 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package raycluster
++
++import (
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/util/equality"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// TODO(simonepri): remove this file, its test, equality.WithIgnoreMinCount and the
++// MinCountMigrationOptions calls of RayCluster, RayJob and RayService once no Workload
++// that held quota under patch release p0.6.x or earlier remains.
++
++// MinCountMigrationOptions keeps a Ray job running when its Workload holds quota that an
++// earlier release of these patches reserved. Those releases set every worker group's
++// minCount to its minReplicas, which the job's PodSets no longer carry, so the Workload
++// would stop matching the job and the running job would be suspended. MinCount only
++// decides the pod count a Workload may be admitted with, so it cannot change what a
++// Workload holding quota runs. Once the quota is released, the job reconciler replaces
++// the Workload's PodSets with the job's, which drops the stale minCount.
++func MinCountMigrationOptions(wl *kueue.Workload) []equality.ComparePodSetsOption {
++	if wl == nil || !workload.HasQuotaReservation(wl) {
++		return nil
++	}
++	return []equality.ComparePodSetsOption{equality.WithIgnoreMinCount()}
++}
+diff --git a/pkg/controller/jobs/raycluster/min_count_migration_test.go b/pkg/controller/jobs/raycluster/min_count_migration_test.go
+new file mode 100644
+index 0000000..454eb15
+--- /dev/null
++++ b/pkg/controller/jobs/raycluster/min_count_migration_test.go
+@@ -0,0 +1,207 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package raycluster_test
++
++import (
++	"testing"
++	"time"
++
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/utils/ptr"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/controller/jobs/rayjob"
++	"sigs.k8s.io/kueue/pkg/controller/jobs/rayservice"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	testingrayjob "sigs.k8s.io/kueue/pkg/util/testingjobs/rayjob"
++	testingrayservice "sigs.k8s.io/kueue/pkg/util/testingjobs/rayservice"
++)
++
++type quotaState int
++
++const (
++	pending quotaState = iota
++	quotaReserved
++	admitted
++)
++
++// workloadFromEarlierRelease returns the Workload that patch releases up to p0.6.x built
++// for a Ray job: the job's PodSets, with every worker group's minCount set to its
++// minReplicas, holding quota for every pod when state is quotaReserved or admitted.
++func workloadFromEarlierRelease(t *testing.T, c client.Client, job jobframework.GenericJob, spec *rayv1.RayClusterSpec, state quotaState) *kueue.Workload {
++	t.Helper()
++	podSets, err := jobframework.JobPodSets(t.Context(), job, c)
++	if err != nil {
++		t.Fatalf("Building the job's PodSets: %v", err)
++	}
++	for i := range podSets {
++		for _, wgs := range spec.WorkerGroupSpecs {
++			if podSets[i].Name == kueue.NewPodSetReference(wgs.GroupName) {
++				podSets[i].MinCount = ptr.To(ptr.Deref(wgs.MinReplicas, 0))
++			}
++		}
++	}
++	obj := job.Object()
++	wl := utiltestingapi.MakeWorkload("old-release", obj.GetNamespace()).
++		ControllerReference(job.GVK(), obj.GetName(), string(obj.GetUID())).
++		PodSets(podSets...)
++	if state == pending {
++		return wl.Obj()
++	}
++	assignments := make([]kueue.PodSetAssignment, 0, len(podSets))
++	for _, ps := range podSets {
++		assignments = append(assignments, utiltestingapi.MakePodSetAssignment(ps.Name).
++			Assignment(corev1.ResourceCPU, "default", "1").
++			Count(ps.Count).
++			Obj())
++	}
++	now := time.Now()
++	wl.ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(assignments...).Obj(), now)
++	if state == admitted {
++		wl.AdmittedAt(true, now)
++	}
++	return wl.Obj()
++}
++
++func TestMinCountMigrationEquivalence(t *testing.T) {
++	workers := *testingraycluster.MakeWorkerGroup("workers", 3).
++		MinReplicas(0).
++		MaxReplicas(3).
++		Request(corev1.ResourceCPU, "1").
++		Obj()
++	jobs := map[string]func() (jobframework.GenericJob, *rayv1.RayClusterSpec){
++		"RayCluster": func() (jobframework.GenericJob, *rayv1.RayClusterSpec) {
++			rc := testingraycluster.MakeCluster("job", "ns").UID("job-uid").WithWorkerGroups(workers).Obj()
++			return (*raycluster.RayCluster)(rc), &rc.Spec
++		},
++		"RayJob": func() (jobframework.GenericJob, *rayv1.RayClusterSpec) {
++			rj := testingrayjob.MakeJob("job", "ns").WithWorkerGroups(workers).Obj()
++			rj.UID = "job-uid"
++			return (*rayjob.RayJob)(rj), rj.Spec.RayClusterSpec
++		},
++		"RayService": func() (jobframework.GenericJob, *rayv1.RayClusterSpec) {
++			rs := testingrayservice.MakeService("job", "ns").Obj()
++			rs.UID = "job-uid"
++			rs.Spec.RayClusterSpec.WorkerGroupSpecs = []rayv1.WorkerGroupSpec{*workers.DeepCopy()}
++			return (*rayservice.RayService)(rs), &rs.Spec.RayClusterSpec
++		},
++	}
++	states := map[string]struct {
++		state quotaState
++		// A running job keeps its Workload only while the Workload matches it.
++		running        bool
++		wantEquivalent bool
++	}{
++		"admitted Workload of a running job": {
++			state:          admitted,
++			running:        true,
++			wantEquivalent: true,
++		},
++		"Workload holding quota while its admission checks run": {
++			state:          quotaReserved,
++			wantEquivalent: true,
++		},
++		// The job reconciler replaces the PodSets of a suspended job's pending Workload.
++		"pending Workload": {
++			state:          pending,
++			wantEquivalent: false,
++		},
++	}
++	for kind, makeJob := range jobs {
++		for name, tc := range states {
++			t.Run(kind+" with "+name, func(t *testing.T) {
++				job, spec := makeJob()
++				if tc.running {
++					spec.Suspend = ptr.To(false)
++					if rj, ok := job.(*rayjob.RayJob); ok {
++						rj.Spec.Suspend = false
++					}
++				}
++				c := utiltesting.NewClientBuilder(rayv1.AddToScheme).
++					WithObjects(utiltestingapi.MakeResourceFlavor("default").Obj()).
++					Build()
++				wl := workloadFromEarlierRelease(t, c, job, spec, tc.state)
++				got, err := jobframework.EquivalentToWorkload(t.Context(), c, job, wl)
++				if err != nil {
++					t.Fatalf("EquivalentToWorkload() error: %v", err)
++				}
++				if got != tc.wantEquivalent {
++					t.Errorf("EquivalentToWorkload() = %t, want %t", got, tc.wantEquivalent)
++				}
++			})
++		}
++	}
++}
++
++// TestMinCountMigrationKeepsRunningCluster checks that a running RayCluster whose Workload an
++// earlier release admitted keeps running and keeps its Workload after the upgrade.
++func TestMinCountMigrationKeepsRunningCluster(t *testing.T) {
++	ctx, _ := utiltesting.ContextWithLog(t)
++	rc := testingraycluster.MakeCluster("job", "ns").
++		UID("job-uid").
++		Suspend(false).
++		Queue("lq").
++		WithWorkerGroups(*testingraycluster.MakeWorkerGroup("workers", 2).
++			MinReplicas(0).
++			MaxReplicas(4).
++			Request(corev1.ResourceCPU, "1").
++			Obj()).
++		Obj()
++
++	builder := utiltesting.NewClientBuilder(rayv1.AddToScheme)
++	indexer := utiltesting.AsIndexer(builder)
++	if err := raycluster.SetupIndexes(ctx, indexer); err != nil {
++		t.Fatalf("Setting up indexes: %v", err)
++	}
++	c := builder.WithObjects(
++		utiltesting.MakeNamespace("ns"),
++		utiltestingapi.MakeResourceFlavor("default").Obj(),
++		rc,
++	).Build()
++	wl := workloadFromEarlierRelease(t, c, (*raycluster.RayCluster)(rc), &rc.Spec, admitted)
++	wl.Spec.QueueName = "lq"
++	if err := c.Create(ctx, wl); err != nil {
++		t.Fatalf("Creating the Workload: %v", err)
++	}
++
++	reconciler, err := raycluster.NewReconciler(ctx, c, indexer, &utiltesting.EventRecorder{})
++	if err != nil {
++		t.Fatalf("Creating the reconciler: %v", err)
++	}
++	if _, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(rc)}); err != nil {
++		t.Fatalf("Reconcile() error: %v", err)
++	}
++
++	var gotCluster rayv1.RayCluster
++	if err := c.Get(ctx, client.ObjectKeyFromObject(rc), &gotCluster); err != nil {
++		t.Fatalf("Getting the RayCluster: %v", err)
++	}
++	if ptr.Deref(gotCluster.Spec.Suspend, false) {
++		t.Errorf("RayCluster was suspended, want it running")
++	}
++	var gotWorkload kueue.Workload
++	if err := c.Get(ctx, client.ObjectKeyFromObject(wl), &gotWorkload); err != nil {
++		t.Errorf("Getting the Workload: %v, want it kept", err)
++	}
++}
+diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
+index 6d273d3..71d289b 100644
+--- a/pkg/controller/jobs/raycluster/raycluster_controller.go
++++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
+@@ -82,11 +82,12 @@ var _ jobframework.GenericJob = (*RayCluster)(nil)
+ var _ jobframework.JobWithManagedBy = (*RayCluster)(nil)
+ var _ jobframework.JobWithCustomEquivalenceOptions = (*RayCluster)(nil)
+ 
+-func (j *RayCluster) CustomEquivalenceOptions(_ context.Context, _ client.Client, _ *kueue.Workload) []equality.ComparePodSetsOption {
++func (j *RayCluster) CustomEquivalenceOptions(_ context.Context, _ client.Client, wl *kueue.Workload) []equality.ComparePodSetsOption {
++	opts := MinCountMigrationOptions(wl)
+ 	if !features.Enabled(features.KubeRayEvictOnInconsistentTopologyRequest) {
+-		return []equality.ComparePodSetsOption{equality.WithIgnoreTopologyIndexLabels()}
++		opts = append(opts, equality.WithIgnoreTopologyIndexLabels())
+ 	}
+-	return nil
++	return opts
+ }
+ 
+ func (j *RayCluster) Object() client.Object {
+diff --git a/pkg/controller/jobs/rayjob/rayjob_controller.go b/pkg/controller/jobs/rayjob/rayjob_controller.go
+index cec1eb6..a85fca5 100644
+--- a/pkg/controller/jobs/rayjob/rayjob_controller.go
++++ b/pkg/controller/jobs/rayjob/rayjob_controller.go
+@@ -95,11 +95,12 @@ var _ jobframework.JobWithCustomAnnotations = (*RayJob)(nil)
+ var _ jobframework.ElasticWorkloadNameProvider = (*RayJob)(nil)
+ var _ jobframework.JobWithCustomEquivalenceOptions = (*RayJob)(nil)
+ 
+-func (j *RayJob) CustomEquivalenceOptions(_ context.Context, _ client.Client, _ *kueue.Workload) []equality.ComparePodSetsOption {
++func (j *RayJob) CustomEquivalenceOptions(_ context.Context, _ client.Client, wl *kueue.Workload) []equality.ComparePodSetsOption {
++	opts := raycluster.MinCountMigrationOptions(wl)
+ 	if !features.Enabled(features.KubeRayEvictOnInconsistentTopologyRequest) {
+-		return []equality.ComparePodSetsOption{equality.WithIgnoreTopologyIndexLabels()}
++		opts = append(opts, equality.WithIgnoreTopologyIndexLabels())
+ 	}
+-	return nil
++	return opts
+ }
+ 
+ func (j *RayJob) Object() client.Object {
+diff --git a/pkg/controller/jobs/rayservice/rayservice_controller.go b/pkg/controller/jobs/rayservice/rayservice_controller.go
+index b8a3217..f4bc353 100644
+--- a/pkg/controller/jobs/rayservice/rayservice_controller.go
++++ b/pkg/controller/jobs/rayservice/rayservice_controller.go
+@@ -128,11 +128,12 @@ var _ jobframework.ElasticWorkloadNameProvider = (*RayService)(nil)
+ var _ jobframework.JobWithSkip = (*RayService)(nil)
+ var _ jobframework.JobWithCustomEquivalenceOptions = (*RayService)(nil)
+ 
+-func (j *RayService) CustomEquivalenceOptions(_ context.Context, _ client.Client, _ *kueue.Workload) []equality.ComparePodSetsOption {
++func (j *RayService) CustomEquivalenceOptions(_ context.Context, _ client.Client, wl *kueue.Workload) []equality.ComparePodSetsOption {
++	opts := raycluster.MinCountMigrationOptions(wl)
+ 	if !features.Enabled(features.KubeRayEvictOnInconsistentTopologyRequest) {
+-		return []equality.ComparePodSetsOption{equality.WithIgnoreTopologyIndexLabels()}
++		opts = append(opts, equality.WithIgnoreTopologyIndexLabels())
+ 	}
+-	return nil
++	return opts
+ }
+ 
+ func (j *RayService) Object() client.Object {
+diff --git a/pkg/util/equality/podset.go b/pkg/util/equality/podset.go
+index 9c081d8..6a2f750 100644
+--- a/pkg/util/equality/podset.go
++++ b/pkg/util/equality/podset.go
+@@ -30,6 +30,7 @@ type ComparePodSetsOptions struct {
+ 	ignoreTolerations         bool
+ 	ignoreTopologyRequest     bool
+ 	ignoreTopologyIndexLabels bool
++	ignoreMinCount            bool
+ }
+ 
+ type ComparePodSetsOption func(*ComparePodSetsOptions)
+@@ -52,6 +53,13 @@ func WithIgnoreTopologyIndexLabels() ComparePodSetsOption {
+ 	}
+ }
+ 
++// WithIgnoreMinCount skips comparing PodSet.MinCount.
++func WithIgnoreMinCount() ComparePodSetsOption {
++	return func(options *ComparePodSetsOptions) {
++		options.ignoreMinCount = true
++	}
++}
++
+ // TODO: Revisit this, maybe we should extend the check to everything that could potentially impact
+ // the workload scheduling (priority, nodeSelectors(when suspended), tolerations and maybe more)
+ func ComparePodTemplate(a, b *corev1.PodSpec, options ...ComparePodSetsOption) bool {
+@@ -134,7 +142,7 @@ func ComparePodSets(a, b *kueue.PodSet, options ...ComparePodSetsOption) bool {
+ 	if a.Count != b.Count {
+ 		return false
+ 	}
+-	if ptr.Deref(a.MinCount, -1) != ptr.Deref(b.MinCount, -1) {
++	if !opts.ignoreMinCount && ptr.Deref(a.MinCount, -1) != ptr.Deref(b.MinCount, -1) {
+ 		return false
+ 	}
+ 	if !opts.ignoreTopologyRequest &&

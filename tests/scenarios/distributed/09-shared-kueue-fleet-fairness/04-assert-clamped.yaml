@@ -1,3 +1,5 @@
+# ScaleGate caps maxReplicas at the 8 GPUs cell 2 can reach: its 4 nominal plus a borrowingLimit of 4.
+# replicas is not asserted: ScaleGate does not write it.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -5,7 +7,6 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: spot-workers
-      replicas: 4
       maxReplicas: 8
 status:
   (conditions[?type == 'ScaleGateClamped']):

@@ -1,3 +1,5 @@
+# ScaleGate caps maxReplicas at the 4 GPUs the quota holds, so the operator plans 4 workers whatever replicas says.
+# replicas is not asserted: ScaleGate does not write it.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -5,7 +7,6 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: gpu-workers
-      replicas: 4
       maxReplicas: 4
 status:
   desiredWorkerReplicas: 4

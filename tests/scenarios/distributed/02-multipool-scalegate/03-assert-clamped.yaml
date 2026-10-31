@@ -1,3 +1,5 @@
+# ScaleGate caps maxReplicas of the GPU group at the 4 GPUs the quota holds and leaves the 8 replicas the autoscaler
+# asked for. The operator limits each group to its maxReplicas, so it plans 6 local plus 4 remote workers.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -8,8 +10,9 @@ spec:
       replicas: 6
       maxReplicas: 8
     - groupName: remote-workers
-      replicas: 4
+      replicas: 8
       maxReplicas: 4
 status:
+  desiredWorkerReplicas: 10
   (conditions[?type == 'ScaleGateClamped']):
     - status: "True"

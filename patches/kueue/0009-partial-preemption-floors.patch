@@ -5,7 +5,8 @@ minCount keeps its upstream meaning, so the floor travels in two Workload
 annotations instead: kueue.x-k8s.io/reclaim-min-counts and
 kueue.x-k8s.io/podset-count-steps. With the PartialPreemption gate on, the job
 reconciler writes them when it builds the Workload of an elastic RayCluster:
-floor = minReplicas and step 1 for each single-host worker group.
+floor = minReplicas and step 1 for each single-host worker group; the floor only
+for a job with the partial scale-up strategy, since no other job can regrow.
 EnsureWorkloadSlices keeps them current on every active slice, capped at each
 slice's PodSet count, in a metadata-only update that leaves spec, minCount and
 admission alone. Multi-host
@@ -49,10 +50,10 @@ index 0000000..0faae28
 +)
 diff --git a/pkg/controller/jobframework/reclaim_floors.go b/pkg/controller/jobframework/reclaim_floors.go
 new file mode 100644
-index 0000000..c399ca5
+index 0000000..00f067d
 --- /dev/null
 +++ b/pkg/controller/jobframework/reclaim_floors.go
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,76 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -94,12 +95,14 @@ index 0000000..c399ca5
 +}
 +
 +// ReclaimFloors returns the floors and steps the job asks its Workload to carry. Both are
-+// empty unless PartialPreemption is on and the job uses workload slices.
++// empty unless PartialPreemption is on and the job uses workload slices. The floors are
++// also empty unless the job takes the partial scale-up path: upstream creates no scale-up
++// probe for other jobs, so a victim shrunk to its floor could never grow back.
 +func ReclaimFloors(job GenericJob) (floors, steps workload.PodSetsCounts) {
 +	if !features.Enabled(features.PartialPreemption) || !WorkloadSliceEnabled(job) {
 +		return nil, nil
 +	}
-+	if j, ok := job.(JobWithReclaimMinCounts); ok {
++	if j, ok := job.(JobWithReclaimMinCounts); ok && ElasticPartialScaleUpEnabled(job) {
 +		floors = maps.Clone(j.ReclaimMinCounts())
 +	}
 +	if j, ok := job.(JobWithPodSetCountSteps); ok {
@@ -128,7 +131,7 @@ index 0000000..c399ca5
 +	return workloadslicing.WithReclaimFloors(floors, steps)
 +}
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index 31ef492..abd1689 100644
+index 9896b68..3b092d6 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
 @@ -1226,7 +1226,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
@@ -140,7 +143,7 @@ index 31ef492..abd1689 100644
  		if err != nil {
  			return nil, err
  		}
-@@ -1993,6 +1993,7 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
+@@ -2096,6 +2096,7 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
  	}
  
  	wl := NewWorkload(newWorkloadName(job, extra), object, podSets, labelKeysToCopy, annotationsToCopy)
@@ -261,10 +264,10 @@ index 0000000..ffec8d0
 +}
 diff --git a/pkg/controller/jobs/raycluster/reclaim_floors_test.go b/pkg/controller/jobs/raycluster/reclaim_floors_test.go
 new file mode 100644
-index 0000000..95b47d0
+index 0000000..ec1aaae
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/reclaim_floors_test.go
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,132 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -338,24 +341,29 @@ index 0000000..95b47d0
 +			cluster:       elasticRayCluster(),
 +			wantMinCounts: map[kueue.PodSetReference]*int32{},
 +		},
-+		"gate on: elastic cluster gets floors and steps of its single-host groups": {
++		"gate on: elastic cluster without the partial scale-up strategy gets steps but no floor": {
 +			cluster:        elasticRayCluster(),
 +			partialPreempt: true,
-+			wantFloors:     "capped=2,small=1,zero=0",
++			partialScaleUp: true,
 +			wantSteps:      "capped=1,small=1,zero=1",
 +		},
-+		"gate on: non-elastic cluster gets no annotation": {
-+			cluster: testingrayutil.MakeCluster("rc", "ns").UID("rc-uid").
-+				WithWorkerGroups(*testingrayutil.MakeWorkerGroup("small", 4).MinReplicas(1).Obj()),
++		"gate on: partial strategy annotation without the scale-up gate gets no floor": {
++			cluster:        elasticRayCluster().SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial),
 +			partialPreempt: true,
++			wantSteps:      "capped=1,small=1,zero=1",
 +		},
-+		"gate on: floors do not change minCount": {
++		"gate on: elastic cluster with the partial strategy gets floors and steps of its single-host groups": {
 +			cluster:        elasticRayCluster().SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial),
 +			partialPreempt: true,
 +			partialScaleUp: true,
 +			wantFloors:     "capped=2,small=1,zero=0",
 +			wantSteps:      "capped=1,small=1,zero=1",
 +			wantMinCounts:  map[kueue.PodSetReference]*int32{"small": new(int32(4)), "zero": new(int32(2)), "tpu": new(int32(12)), "capped": new(int32(3))},
++		},
++		"gate on: non-elastic cluster gets no annotation": {
++			cluster: testingrayutil.MakeCluster("rc", "ns").UID("rc-uid").
++				WithWorkerGroups(*testingrayutil.MakeWorkerGroup("small", 4).MinReplicas(1).Obj()),
++			partialPreempt: true,
 +		},
 +	}
 +	for name, tc := range testCases {
@@ -1029,10 +1037,10 @@ index 0000000..fbd070f
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
 new file mode 100644
-index 0000000..8553e97
+index 0000000..5077c37
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,207 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1111,6 +1119,7 @@ index 0000000..8553e97
 +	elasticCluster := func() *testingraycluster.ClusterWrapper {
 +		return testingraycluster.MakeCluster("foo", ns.Name).
 +			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial).
 +			Queue(localQueue.Name).
 +			RequestWorkerGroup(corev1.ResourceCPU, "1").
 +			FirstWorkerGroupReplicas(4, 2, 8)
@@ -1140,9 +1149,10 @@ index 0000000..8553e97
 +			wl := onlyWorkload()
 +			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.ReclaimMinCountsAnnotation, "workers-group-0=2"))
 +			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.PodSetCountStepsAnnotation, "workers-group-0=1"))
-+			for _, ps := range wl.Spec.PodSets {
-+				gomega.Expect(ps.MinCount).To(gomega.BeNil(), "PodSet %s", ps.Name)
-+			}
++			// The floor leaves minCount at its upstream value: the head has none, the workers'
++			// partial scale-up baseline is their count.
++			gomega.Expect(wl.Spec.PodSets[0].MinCount).To(gomega.BeNil())
++			gomega.Expect(wl.Spec.PodSets[1].MinCount).To(gomega.Equal(ptr.To(int32(4))))
 +
 +			ginkgo.By("raising minReplicas without changing the size")
 +			gomega.Eventually(func(g gomega.Gomega) {
@@ -1169,6 +1179,18 @@ index 0000000..8553e97
 +			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.PodSetCountStepsAnnotation))
 +		})
 +
++		ginkgo.It("Should give an elastic cluster without the partial scale-up strategy steps but no floor", func() {
++			rc := testingraycluster.MakeCluster("foo", ns.Name).
++				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++				Queue(localQueue.Name).
++				RequestWorkerGroup(corev1.ResourceCPU, "1").FirstWorkerGroupReplicas(4, 2, 8).Obj()
++			behavioral.MustCreate(ctx, k8sClient, rc)
++
++			wl := onlyWorkload()
++			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.ReclaimMinCountsAnnotation))
++			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.PodSetCountStepsAnnotation, "workers-group-0=1"))
++		})
++
 +		ginkgo.It("Should give a non-elastic cluster no floor", func() {
 +			rc := testingraycluster.MakeCluster("foo", ns.Name).Queue(localQueue.Name).
 +				RequestWorkerGroup(corev1.ResourceCPU, "1").FirstWorkerGroupReplicas(4, 2, 8).Obj()
@@ -1180,7 +1202,7 @@ index 0000000..8553e97
 +		})
 +
 +		ginkgo.It("Should keep a Workload that carries minCount admitted while it adds the annotations", func() {
-+			rc := elasticCluster().SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial).Obj()
++			rc := elasticCluster().Obj()
 +			behavioral.MustCreate(ctx, k8sClient, rc)
 +			wl := onlyWorkload()
 +			workerSet := wl.Spec.PodSets[1]

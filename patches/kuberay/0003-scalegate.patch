@@ -1,9 +1,9 @@
 diff --git a/ray-operator/controllers/ray/scalegate_controller.go b/ray-operator/controllers/ray/scalegate_controller.go
 new file mode 100644
-index 0000000..4886245
+index 0000000..fc19a87
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller.go
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,492 @@
 +package ray
 +
 +import (
@@ -32,8 +32,10 @@ index 0000000..4886245
 +// kueueVersions lists the Kueue API versions ScaleGate reads, newest first.
 +var kueueVersions = []string{"v1beta2", "v1beta1"}
 +
-+// ScaleGateReconciler caps the replicas and maxReplicas of each worker group of a Kueue-queued RayCluster at the
-+// most workers its ClusterQueue could ever hold, so the Ray autoscaler cannot request pods Kueue can never admit.
++// ScaleGateReconciler caps the maxReplicas of each worker group of a Kueue-queued RayCluster at the most workers its
++// ClusterQueue could ever hold, so the Ray autoscaler cannot request pods Kueue can never admit. It writes nothing
++// else: the Ray autoscaler is the only writer of replicas and workersToDelete, and the operator already limits the
++// pods it creates to maxReplicas.
 +type ScaleGateReconciler struct {
 +	client.Client
 +	Scheme *runtime.Scheme
@@ -92,9 +94,10 @@ index 0000000..4886245
 +	return bound, true
 +}
 +
-+// workerGroupTarget returns the most replicas a worker group may keep under a quota bound. The target never drops below the count Kueue admitted for the group, since Kueue's admission is the authority
-+// on what fits, nor below minReplicas, since a smaller maxReplicas makes the operator reject the spec.
-+func workerGroupTarget(quotaBound int64, admitted int64, minReplicas int64) int64 {
++// maxReplicasCeiling returns the highest maxReplicas ScaleGate leaves a worker group with under a quota bound. The
++// ceiling never drops below the count Kueue admitted for the group, since Kueue's admission is the authority on what
++// fits, nor below minReplicas, since a smaller maxReplicas makes the operator reject the spec.
++func maxReplicasCeiling(quotaBound int64, admitted int64, minReplicas int64) int64 {
 +	return max(quotaBound, admitted, minReplicas)
 +}
 +
@@ -138,7 +141,7 @@ index 0000000..4886245
 +		}
 +		wgs, _, _ := unstructured.NestedSlice(latest.Object, "spec", "workerGroupSpecs")
 +		changed := false
-+		for i, wg := range wgs {
++		for _, wg := range wgs {
 +			wgMap, ok := wg.(map[string]interface{})
 +			if !ok {
 +				continue
@@ -149,20 +152,13 @@ index 0000000..4886245
 +			}
 +			groupName, _ := wgMap["groupName"].(string)
 +			minReplicas, _ := getInt64(wgMap["minReplicas"])
-+			target := workerGroupTarget(bound, admitted[strings.ToLower(groupName)], minReplicas)
-+			if maxReplicas, _ := getInt64(wgMap["maxReplicas"]); maxReplicas > target {
++			ceiling := maxReplicasCeiling(bound, admitted[strings.ToLower(groupName)], minReplicas)
++			if maxReplicas, _ := getInt64(wgMap["maxReplicas"]); maxReplicas > ceiling {
 +				logger.Info("clamping RayCluster maxReplicas to Kueue quota",
-+					"cluster", latest.GetName(), "group", groupName, "requestedMax", maxReplicas, "clamped", target)
-+				wgMap["maxReplicas"] = target
++					"cluster", latest.GetName(), "group", groupName, "requestedMax", maxReplicas, "clamped", ceiling)
++				wgMap["maxReplicas"] = ceiling
 +				changed = true
 +			}
-+			if replicas, _ := getInt64(wgMap["replicas"]); replicas > target {
-+				logger.Info("clamping RayCluster replicas to Kueue quota",
-+					"cluster", latest.GetName(), "group", groupName, "requestedReplicas", replicas, "clamped", target)
-+				wgMap["replicas"] = target
-+				changed = true
-+			}
-+			wgs[i] = wgMap
 +		}
 +		if !changed {
 +			return nil
@@ -202,7 +198,7 @@ index 0000000..4886245
 +			"type":               "ScaleGateClamped",
 +			"status":             "True",
 +			"reason":             "KueueQuotaCapped",
-+			"message":            "Worker replicas and maxReplicas clamped to available Kueue ClusterQueue quota",
++			"message":            "Worker maxReplicas clamped to available Kueue ClusterQueue quota",
 +			"lastTransitionTime": metav1.Now().UTC().Format("2006-01-02T15:04:05Z"),
 +		})
 +		_ = unstructured.SetNestedSlice(latest.Object, filteredConditions, "status", "conditions")
@@ -502,14 +498,15 @@ index 0000000..4886245
 +}
 diff --git a/ray-operator/controllers/ray/scalegate_controller_unit_test.go b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
 new file mode 100644
-index 0000000..545441d
+index 0000000..9a3beea
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,462 @@
 +package ray
 +
 +import (
 +	"context"
++	"reflect"
 +	"testing"
 +
 +	"k8s.io/apimachinery/pkg/api/meta"
@@ -521,12 +518,14 @@ index 0000000..545441d
 +	ctrl "sigs.k8s.io/controller-runtime"
 +	"sigs.k8s.io/controller-runtime/pkg/client"
 +	clientFake "sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 +
 +	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 +)
 +
 +// Tests for the ScaleGate quota bound: flavor and resource group combination, cohort borrowing, Kueue admission,
-+// and the minReplicas floor that keeps the clamped spec valid.
++// the minReplicas floor that keeps the clamped spec valid, and the rule that maxReplicas is the only field ScaleGate
++// writes.
 +
 +type sgFlavor struct {
 +	name      string
@@ -583,10 +582,11 @@ index 0000000..545441d
 +	rc := &unstructured.Unstructured{Object: map[string]interface{}{
 +		"spec": map[string]interface{}{
 +			"workerGroupSpecs": []interface{}{map[string]interface{}{
-+				"groupName":   "gpu-workers",
-+				"replicas":    replicas,
-+				"minReplicas": minReplicas,
-+				"maxReplicas": maxReplicas,
++				"groupName":     "gpu-workers",
++				"replicas":      replicas,
++				"minReplicas":   minReplicas,
++				"maxReplicas":   maxReplicas,
++				"scaleStrategy": map[string]interface{}{"workersToDelete": sgWorkersToDelete()},
 +				"template": map[string]interface{}{"spec": map[string]interface{}{"containers": []interface{}{
 +					map[string]interface{}{"name": "ray-worker", "resources": map[string]interface{}{
 +						"requests": map[string]interface{}{"cpu": "4", "nvidia.com/gpu": "1"},
@@ -621,7 +621,19 @@ index 0000000..545441d
 +	return wl
 +}
 +
++// sgWorkersToDelete returns the pods the Ray autoscaler asked the operator to delete from the test worker group.
++func sgWorkersToDelete() []interface{} {
++	return []interface{}{"gang-gpu-workers-aaaaa", "gang-gpu-workers-bbbbb"}
++}
++
 +func sgReconcile(t *testing.T, objs ...client.Object) (*unstructured.Unstructured, bool) {
++	t.Helper()
++	return sgReconcileWith(t, interceptor.Funcs{}, objs...)
++}
++
++// sgReconcileWith reconciles the RayCluster "gang" against a fake client that routes calls through funcs, and returns
++// the stored RayCluster and whether it carries the ScaleGateClamped condition.
++func sgReconcileWith(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) (*unstructured.Unstructured, bool) {
 +	t.Helper()
 +	mapper := meta.NewDefaultRESTMapper(nil)
 +	mapper.Add(rayClusterGVK, meta.RESTScopeNamespace)
@@ -639,6 +651,7 @@ index 0000000..545441d
 +		WithScheme(scheme).
 +		WithStatusSubresource(&rayv1.RayCluster{}).
 +		WithRESTMapper(mapper).
++		WithInterceptorFuncs(funcs).
 +		WithObjects(objs...).
 +		Build()
 +	r := &ScaleGateReconciler{Client: fakeClient}
@@ -659,10 +672,20 @@ index 0000000..545441d
 +	return got, clamped
 +}
 +
++func sgWorkerGroup(rc *unstructured.Unstructured) map[string]interface{} {
++	wgs, _, _ := unstructured.NestedSlice(rc.Object, "spec", "workerGroupSpecs")
++	return wgs[0].(map[string]interface{})
++}
++
++// sgWorkersToDeleteOf returns the workersToDelete list of the test worker group.
++func sgWorkersToDeleteOf(rc *unstructured.Unstructured) []interface{} {
++	list, _, _ := unstructured.NestedSlice(sgWorkerGroup(rc), "scaleStrategy", "workersToDelete")
++	return list
++}
++
 +func sgWorkerCounts(t *testing.T, rc *unstructured.Unstructured) (replicas, minReplicas, maxReplicas int64) {
 +	t.Helper()
-+	wgs, _, _ := unstructured.NestedSlice(rc.Object, "spec", "workerGroupSpecs")
-+	wg := wgs[0].(map[string]interface{})
++	wg := sgWorkerGroup(rc)
 +	replicas, _ = getInt64(wg["replicas"])
 +	minReplicas, _ = getInt64(wg["minReplicas"])
 +	maxReplicas, _ = getInt64(wg["maxReplicas"])
@@ -728,7 +751,8 @@ index 0000000..545441d
 +	}
 +}
 +
-+// A real borrowingLimit still bounds the group at nominal quota plus borrowingLimit.
++// A real borrowingLimit still bounds maxReplicas at nominal quota plus borrowingLimit, while replicas stays as the
++// Ray autoscaler wrote it: the operator caps the pods it creates at maxReplicas.
 +func TestScaleGateClampsToBorrowingLimit(t *testing.T) {
 +	queue := sgClusterQueue("team-queue", "shared", sgResourceGroups([]sgFlavor{
 +		{name: "spot", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "4", "4")}},
@@ -737,8 +761,8 @@ index 0000000..545441d
 +		{name: "spot", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "64")}},
 +	}))
 +	rc, clamped := sgReconcile(t, queue, lender, sgRayCluster("team-queue", 16, 1, 32))
-+	if replicas, minReplicas, maxReplicas := sgWorkerCounts(t, rc); replicas != 8 || minReplicas != 1 || maxReplicas != 8 {
-+		t.Errorf("worker group = replicas %d, min %d, max %d; want 8, 1, 8", replicas, minReplicas, maxReplicas)
++	if replicas, minReplicas, maxReplicas := sgWorkerCounts(t, rc); replicas != 16 || minReplicas != 1 || maxReplicas != 8 {
++		t.Errorf("worker group = replicas %d, min %d, max %d; want 16, 1, 8", replicas, minReplicas, maxReplicas)
 +	}
 +	if !clamped {
 +		t.Errorf("ScaleGateClamped condition missing after clamping")
@@ -746,6 +770,7 @@ index 0000000..545441d
 +}
 +
 +// Clamping stops at minReplicas, so the operator never sees a worker group whose minReplicas exceeds maxReplicas.
++// replicas is not raised or lowered to follow it.
 +func TestScaleGateNeverClampsBelowMinReplicas(t *testing.T) {
 +	queue := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{
 +		{name: "on-demand", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "4")}},
@@ -755,8 +780,136 @@ index 0000000..545441d
 +	if minReplicas > maxReplicas {
 +		t.Fatalf("minReplicas %d exceeds maxReplicas %d", minReplicas, maxReplicas)
 +	}
-+	if replicas != 6 || minReplicas != 6 || maxReplicas != 6 {
-+		t.Errorf("worker group = replicas %d, min %d, max %d; want 6, 6, 6", replicas, minReplicas, maxReplicas)
++	if replicas != 10 || minReplicas != 6 || maxReplicas != 6 {
++		t.Errorf("worker group = replicas %d, min %d, max %d; want 10, 6, 6", replicas, minReplicas, maxReplicas)
++	}
++}
++
++// sgWriteRecorder records a copy of every RayCluster the reconciler sends to the API server, by Update or by
++// status Update.
++type sgWriteRecorder struct {
++	written []*unstructured.Unstructured
++}
++
++func (w *sgWriteRecorder) record(obj client.Object) {
++	if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == rayClusterGVK {
++		w.written = append(w.written, u.DeepCopy())
++	}
++}
++
++func (w *sgWriteRecorder) funcs() interceptor.Funcs {
++	return interceptor.Funcs{
++		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
++			w.record(obj)
++			return c.Update(ctx, obj, opts...)
++		},
++		SubResourceUpdate: func(ctx context.Context, c client.Client, subResource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
++			w.record(obj)
++			return c.SubResource(subResource).Update(ctx, obj, opts...)
++		},
++	}
++}
++
++// ScaleGate writes only maxReplicas. On every path, each RayCluster it writes carries the replicas and
++// workersToDelete the Ray autoscaler wrote, and it writes nothing when maxReplicas needs no clamp.
++func TestScaleGateWritesOnlyMaxReplicas(t *testing.T) {
++	gpuQueue := func(gpus string) *unstructured.Unstructured {
++		return sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{
++			{name: "on-demand", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", gpus)}},
++		}))
++	}
++	tests := []struct {
++		name                               string
++		queue                              *unstructured.Unstructured
++		replicas, minReplicas, maxReplicas int64
++		admitted                           int64
++		wantMaxReplicas                    int64
++		wantClamped                        bool
++	}{
++		{name: "quota bound clamps maxReplicas below replicas", queue: gpuQueue("8"), replicas: 16, minReplicas: 1, maxReplicas: 32, wantMaxReplicas: 8, wantClamped: true},
++		{name: "minReplicas floor clamps maxReplicas below replicas", queue: gpuQueue("4"), replicas: 10, minReplicas: 6, maxReplicas: 10, wantMaxReplicas: 6, wantClamped: true},
++		{name: "admitted count floor clamps maxReplicas below replicas", queue: gpuQueue("2"), replicas: 60, minReplicas: 1, maxReplicas: 100, admitted: 50, wantMaxReplicas: 50, wantClamped: true},
++		{name: "replicas above the bound with maxReplicas within it is not a clamp", queue: gpuQueue("8"), replicas: 16, minReplicas: 1, maxReplicas: 8, wantMaxReplicas: 8},
++		{name: "quota above maxReplicas does not raise it", queue: gpuQueue("16"), replicas: 2, minReplicas: 1, maxReplicas: 4, wantMaxReplicas: 4},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			objs := []client.Object{tc.queue, sgRayCluster("team-queue", tc.replicas, tc.minReplicas, tc.maxReplicas)}
++			if tc.admitted > 0 {
++				objs = append(objs, sgAdmittedWorkload(tc.admitted))
++			}
++			recorder := &sgWriteRecorder{}
++			got, clamped := sgReconcileWith(t, recorder.funcs(), objs...)
++
++			if replicas, _, maxReplicas := sgWorkerCounts(t, got); replicas != tc.replicas || maxReplicas != tc.wantMaxReplicas {
++				t.Errorf("worker group = replicas %d, max %d; want %d, %d", replicas, maxReplicas, tc.replicas, tc.wantMaxReplicas)
++			}
++			if !reflect.DeepEqual(sgWorkersToDeleteOf(got), sgWorkersToDelete()) {
++				t.Errorf("workersToDelete = %v; want %v", sgWorkersToDeleteOf(got), sgWorkersToDelete())
++			}
++			if clamped != tc.wantClamped {
++				t.Errorf("ScaleGateClamped condition set = %v; want %v", clamped, tc.wantClamped)
++			}
++			if tc.wantClamped && len(recorder.written) == 0 {
++				t.Errorf("ScaleGate wrote nothing; want the clamped maxReplicas")
++			}
++			if !tc.wantClamped && len(recorder.written) != 0 {
++				t.Errorf("ScaleGate wrote %d RayCluster updates; want none", len(recorder.written))
++			}
++			for _, written := range recorder.written {
++				if replicas, _, _ := sgWorkerCounts(t, written); replicas != tc.replicas {
++					t.Errorf("ScaleGate wrote replicas %d; want %d, the value it read", replicas, tc.replicas)
++				}
++				if !reflect.DeepEqual(sgWorkersToDeleteOf(written), sgWorkersToDelete()) {
++					t.Errorf("ScaleGate wrote workersToDelete %v; want %v, the value it read", sgWorkersToDeleteOf(written), sgWorkersToDelete())
++				}
++			}
++		})
++	}
++}
++
++// When the Ray autoscaler writes between ScaleGate's read and its write, the write conflicts, and ScaleGate retries
++// on the new version and keeps what the autoscaler wrote.
++func TestScaleGateKeepsAutoscalerWriteOnConflict(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{
++		{name: "on-demand", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "8")}},
++	}))
++	autoscalerWrote := false
++	funcs := interceptor.Funcs{
++		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
++			if !autoscalerWrote {
++				autoscalerWrote = true
++				latest := &unstructured.Unstructured{}
++				latest.SetGroupVersionKind(rayClusterGVK)
++				if err := c.Get(ctx, client.ObjectKeyFromObject(obj), latest); err != nil {
++					return err
++				}
++				wgs, _, _ := unstructured.NestedSlice(latest.Object, "spec", "workerGroupSpecs")
++				wg := wgs[0].(map[string]interface{})
++				wg["replicas"] = int64(24)
++				wg["scaleStrategy"] = map[string]interface{}{"workersToDelete": []interface{}{"gang-gpu-workers-ccccc"}}
++				if err := unstructured.SetNestedSlice(latest.Object, wgs, "spec", "workerGroupSpecs"); err != nil {
++					return err
++				}
++				if err := c.Update(ctx, latest); err != nil {
++					return err
++				}
++			}
++			return c.Update(ctx, obj, opts...)
++		},
++	}
++	got, clamped := sgReconcileWith(t, funcs, queue, sgRayCluster("team-queue", 16, 1, 32))
++	if !autoscalerWrote {
++		t.Fatalf("the autoscaler write never happened, so the test checked nothing")
++	}
++	if replicas, _, maxReplicas := sgWorkerCounts(t, got); replicas != 24 || maxReplicas != 8 {
++		t.Errorf("worker group = replicas %d, max %d; want 24 (the autoscaler's write), 8", replicas, maxReplicas)
++	}
++	if want := []interface{}{"gang-gpu-workers-ccccc"}; !reflect.DeepEqual(sgWorkersToDeleteOf(got), want) {
++		t.Errorf("workersToDelete = %v; want %v (the autoscaler's write)", sgWorkersToDeleteOf(got), want)
++	}
++	if !clamped {
++		t.Errorf("ScaleGateClamped condition missing after clamping")
 +	}
 +}
 +

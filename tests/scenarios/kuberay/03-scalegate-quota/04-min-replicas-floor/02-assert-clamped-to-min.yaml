@@ -1,4 +1,5 @@
-# ScaleGate stops at minReplicas, so the worker group stays valid with minReplicas equal to maxReplicas.
+# ScaleGate stops at minReplicas, so the worker group stays valid with minReplicas equal to maxReplicas. It leaves
+# replicas at the 8 the user wrote, and the operator limits the group to maxReplicas.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -6,9 +7,10 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: gpu-workers
-      replicas: 6
+      replicas: 8
       minReplicas: 6
       maxReplicas: 6
 status:
+  desiredWorkerReplicas: 6
   (conditions[?type == 'ScaleGateClamped']):
     - status: "True"

@@ -5,9 +5,9 @@ metadata:
 spec:
   description: >
     Verifies that when a distributed RayCluster with heterogeneous worker groups (local CPU vs remote GPU)
-    attempts to scale both pools, ScaleGate selectively clamps maxReplicas and replicas only for the
-    constrained worker group whose resource quota is capped by Kueue, while allowing the unconstrained
-    worker group to expand freely.
+    attempts to scale both pools, ScaleGate selectively clamps maxReplicas only for the constrained
+    worker group whose resource quota is capped by Kueue, while allowing the unconstrained worker group
+    to expand freely. ScaleGate leaves replicas of both groups as the autoscaler wrote them.
   steps:
     - name: setup-multipool-queues
       try:

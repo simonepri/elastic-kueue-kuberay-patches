@@ -1,0 +1,18 @@
+# The autoscaler, not Kueue, raised replicas to 4, and a partial scale-up slice admits all 4 workers.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: autoscaled-cluster
+spec:
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 4
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: autoscaled-cluster
+status:
+  (admission.podSetAssignments[?name=='workers'].count | [0]): 4
+  (conditions[?type=='Finished'] | length(@)): 0

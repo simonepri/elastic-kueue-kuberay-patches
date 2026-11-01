@@ -1,0 +1,544 @@
+Backport of https://github.com/kubernetes-sigs/kueue/pull/16742 at commit
+b28eeae (open upstream): an elastic Workload scaled down below its minCount
+fails validation.
+
+With partial scale-up, Kueue sets a worker group's minCount to the count the
+job was created with. A later scale-down lowered count in place but kept
+minCount, which the API server rejects with "minCount should be less or equal
+to count". The scale-down now caps minCount at the new count, the Workload
+webhook accepts exactly that cap, and a Workload that has never held quota
+takes minCount from the job again, so its first admission stays
+all-or-nothing. The PR's KEP text and end-to-end test are not included.
+
+diff --git a/pkg/webhooks/workload_webhook.go b/pkg/webhooks/workload_webhook.go
+index 7caf243..3f90bf0 100644
+--- a/pkg/webhooks/workload_webhook.go
++++ b/pkg/webhooks/workload_webhook.go
+@@ -501,16 +501,19 @@ func scaledDownPodSetNames(wl *kueue.Workload) sets.Set[kueue.PodSetReference] {
+ 	return scaledDown
+ }
+ 
+-// validateImmutablePodSet helper to validate PodSet immutability on all fields but PodSet.Count.
++// validateImmutablePodSet validates immutability except count and accompanying minCount reductions during scale-down.
+ func validateImmutablePodSet(new, old kueue.PodSet, path *field.Path) field.ErrorList {
+ 	if features.Enabled(features.ElasticJobsViaWorkloadSlices) && new.Count < old.Count {
+ 		// Allow scale-down for elastic jobs.
++		if new.MinCount != nil && old.MinCount != nil && *new.MinCount == min(*old.MinCount, new.Count) {
++			new.MinCount = old.MinCount
++		}
+ 		new.Count = old.Count
+ 	}
+ 	return apivalidation.ValidateImmutableField(new, old, path)
+ }
+ 
+-// validateImmutablePodSets helper to validate PodSet lists for immutability on all fields but PodSet.Count.
++// validateImmutablePodSets validates each PodSet's immutability, allowing scale-down adjustments.
+ func validateImmutablePodSets(new, old []kueue.PodSet, path *field.Path) field.ErrorList {
+ 	if len(new) != len(old) {
+ 		return field.ErrorList{field.Invalid(path, new, apivalidation.FieldImmutableErrorMsg)}
+diff --git a/pkg/webhooks/workload_webhook_test.go b/pkg/webhooks/workload_webhook_test.go
+index 2a0048d..a4125e4 100644
+--- a/pkg/webhooks/workload_webhook_test.go
++++ b/pkg/webhooks/workload_webhook_test.go
+@@ -1709,6 +1709,116 @@ func TestValidateWorkloadUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestValidateWorkloadUpdateScaleDownMinCount(t *testing.T) {
++	testCases := map[string]struct {
++		oldMinCount        *int32
++		newCount           int32
++		newMinCount        *int32
++		disableElasticJobs bool
++		changeTemplate     bool
++		wantErr            bool
++	}{
++		"cap minimum at the new count": {
++			oldMinCount: new(int32(4)),
++			newCount:    1,
++			newMinCount: new(int32(1)),
++		},
++		"cap minimum at zero": {
++			oldMinCount: new(int32(4)),
++			newCount:    0,
++			newMinCount: new(int32(0)),
++		},
++		"preserve a minimum below the new count": {
++			oldMinCount: new(int32(2)),
++			newCount:    3,
++			newMinCount: new(int32(2)),
++		},
++		"preserve an unset minimum": {
++			newCount: 1,
++		},
++		"reject changing the minimum without scaling down": {
++			oldMinCount: new(int32(4)),
++			newCount:    4,
++			newMinCount: new(int32(1)),
++			wantErr:     true,
++		},
++		"reject changing the minimum while scaling up": {
++			oldMinCount: new(int32(4)),
++			newCount:    5,
++			newMinCount: new(int32(5)),
++			wantErr:     true,
++		},
++		"reject lowering the minimum below the new count": {
++			oldMinCount: new(int32(4)),
++			newCount:    2,
++			newMinCount: new(int32(1)),
++			wantErr:     true,
++		},
++		"reject lowering a minimum already below the new count": {
++			oldMinCount: new(int32(2)),
++			newCount:    3,
++			newMinCount: new(int32(1)),
++			wantErr:     true,
++		},
++		"reject increasing the minimum": {
++			oldMinCount: new(int32(1)),
++			newCount:    3,
++			newMinCount: new(int32(2)),
++			wantErr:     true,
++		},
++		"reject adding a minimum": {
++			newCount:    1,
++			newMinCount: new(int32(1)),
++			wantErr:     true,
++		},
++		"reject removing the minimum": {
++			oldMinCount: new(int32(4)),
++			newCount:    1,
++			wantErr:     true,
++		},
++		"reject changing the template during scale-down": {
++			oldMinCount:    new(int32(4)),
++			newCount:       1,
++			newMinCount:    new(int32(1)),
++			changeTemplate: true,
++			wantErr:        true,
++		},
++		"reject scale-down with elastic jobs disabled": {
++			oldMinCount:        new(int32(4)),
++			newCount:           1,
++			newMinCount:        new(int32(1)),
++			disableElasticJobs: true,
++			wantErr:            true,
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlices:                          !tc.disableElasticJobs,
++				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: !tc.disableElasticJobs,
++			})
++			before := utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
++				Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++				PodSets(*utiltestingapi.MakePodSet("workers", 4).Obj()).
++				ReserveQuotaAt(utiltestingapi.MakeAdmission("cluster-queue").
++					PodSets(kueue.PodSetAssignment{Name: "workers", Count: new(int32(4))}).Obj(), time.Now()).
++				Obj()
++			before.Spec.PodSets[0].MinCount = tc.oldMinCount
++			after := before.DeepCopy()
++			after.Spec.PodSets[0].Count = tc.newCount
++			after.Spec.PodSets[0].MinCount = tc.newMinCount
++			if tc.changeTemplate {
++				after.Spec.PodSets[0].Template.Annotations = map[string]string{"example.com/changed": "true"}
++			}
++
++			gotErr := ValidateWorkloadUpdate(after, before)
++			if (len(gotErr) > 0) != tc.wantErr {
++				t.Errorf("ValidateWorkloadUpdate() errors = %v, wantErr = %v", gotErr, tc.wantErr)
++			}
++		})
++	}
++}
++
+ func TestWorkloadWebhookDefault(t *testing.T) {
+ 	elasticWorkload := func() *kueue.Workload {
+ 		return utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+diff --git a/pkg/workload/podsetscounts.go b/pkg/workload/podsetscounts.go
+index 0da51ce..aa47274 100644
+--- a/pkg/workload/podsetscounts.go
++++ b/pkg/workload/podsetscounts.go
+@@ -102,7 +102,7 @@ func ExtractPodSetCountsFromWorkload(wl *kueue.Workload) PodSetsCounts {
+ 	return ExtractPodSetCounts(wl.Spec.PodSets)
+ }
+ 
+-// ApplyPodSetCounts updates the count values of a Workload's PodSets based on the provided counts.
++// ApplyPodSetCounts updates a Workload's PodSet counts and caps existing minimum counts at the new counts.
+ //
+ // This function only updates existing PodSets within the Workload. It ignores:
+ //   - PodSet names present in the counts map but not found in the Workload.
+@@ -112,8 +112,12 @@ func ExtractPodSetCountsFromWorkload(wl *kueue.Workload) PodSetsCounts {
+ // and calling it with a nil Workload will result in a panic.
+ func ApplyPodSetCounts(wl *kueue.Workload, counts PodSetsCounts) {
+ 	for i := range wl.Spec.PodSets {
+-		if count, found := counts[wl.Spec.PodSets[i].Name]; found {
+-			wl.Spec.PodSets[i].Count = count
++		ps := &wl.Spec.PodSets[i]
++		if count, found := counts[ps.Name]; found {
++			ps.Count = count
++			if ps.MinCount != nil && *ps.MinCount > count {
++				ps.MinCount = new(count)
++			}
+ 		}
+ 	}
+ }
+diff --git a/pkg/workload/podsetscounts_test.go b/pkg/workload/podsetscounts_test.go
+index 7a92711..c9b0ac5 100644
+--- a/pkg/workload/podsetscounts_test.go
++++ b/pkg/workload/podsetscounts_test.go
+@@ -366,6 +366,42 @@ func TestApplyPodSetCounts(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		"ApplyCountsWithMinCounts": {
++			args: args{
++				wl: &kueue.Workload{
++					Spec: kueue.WorkloadSpec{
++						PodSets: []kueue.PodSet{
++							{Name: "shrink-below-min", Count: 4, MinCount: new(int32(4))},
++							{Name: "shrink-above-min", Count: 4, MinCount: new(int32(2))},
++							{Name: "shrink-to-zero", Count: 4, MinCount: new(int32(4))},
++							{Name: "grow", Count: 4, MinCount: new(int32(2))},
++							{Name: "no-min", Count: 4},
++							{Name: "not-updated", Count: 4, MinCount: new(int32(4))},
++						},
++					},
++				},
++				counts: PodSetsCounts{
++					"shrink-below-min": 1,
++					"shrink-above-min": 3,
++					"shrink-to-zero":   0,
++					"grow":             6,
++					"no-min":           1,
++					"unknown":          1,
++				},
++			},
++			want: &kueue.Workload{
++				Spec: kueue.WorkloadSpec{
++					PodSets: []kueue.PodSet{
++						{Name: "shrink-below-min", Count: 1, MinCount: new(int32(1))},
++						{Name: "shrink-above-min", Count: 3, MinCount: new(int32(2))},
++						{Name: "shrink-to-zero", Count: 0, MinCount: new(int32(0))},
++						{Name: "grow", Count: 6, MinCount: new(int32(2))},
++						{Name: "no-min", Count: 1},
++						{Name: "not-updated", Count: 4, MinCount: new(int32(4))},
++					},
++				},
++			},
++		},
+ 	}
+ 	for name, tt := range tests {
+ 		t.Run(name, func(t *testing.T) {
+diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
+index 52f022d..209983e 100644
+--- a/pkg/workloadslicing/manager.go
++++ b/pkg/workloadslicing/manager.go
+@@ -55,6 +55,23 @@ func (r *Manager) EnsureWorkloadSlices(
+ 	jobObjectGVK schema.GroupVersionKind,
+ ) (*kueue.Workload, bool, error) {
+ 	jobPodSetsCounts := workload.ExtractPodSetCounts(jobPodSets)
++	applyPodSetCounts := func(wl *kueue.Workload) {
++		workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
++		// Only initial admission follows the job's current minimum. Replacements
++		// and readmissions retain their baseline, even after a zero-second admission.
++		if workload.HasQuotaReservation(wl) || workload.IsAdmitted(wl) ||
++			wl.Status.AccumulatedPastExecutionTimeSeconds != nil || ScaledUp(wl) {
++			return
++		}
++		for i := range wl.Spec.PodSets {
++			for _, jobPodSet := range jobPodSets {
++				if wl.Spec.PodSets[i].Name == jobPodSet.Name {
++					wl.Spec.PodSets[i].MinCount = jobPodSet.MinCount
++					break
++				}
++			}
++		}
++	}
+ 
+ 	workloads, err := FindNotFinishedWorkloads(ctx, r.Client, jobObject, jobObjectGVK)
+ 	if err != nil {
+@@ -110,7 +127,7 @@ func (r *Manager) EnsureWorkloadSlices(
+ 		// a. It hasn't been admitted (no quota reserved), or
+ 		// b. It's a scale-down event.
+ 		if !workload.HasQuotaReservation(wl) || ScaledDown(wlPodSetsCounts, jobPodSetsCounts) {
+-			workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
++			applyPodSetCounts(wl)
+ 			if err := r.Client.Update(ctx, wl); err != nil {
+ 				return nil, true, fmt.Errorf("failed to update workload's pod sets counts: %w", err)
+ 			}
+@@ -140,7 +157,7 @@ func (r *Manager) EnsureWorkloadSlices(
+ 		}
+ 
+ 		if !workload.HasQuotaReservation(selectedWorkload) || ScaledDown(selectedCounts, jobPodSetsCounts) {
+-			workload.ApplyPodSetCounts(selectedWorkload, jobPodSetsCounts)
++			applyPodSetCounts(selectedWorkload)
+ 			if err := r.Client.Update(ctx, selectedWorkload); err != nil {
+ 				return nil, true, fmt.Errorf("failed to update workload pod set counts: %w", err)
+ 			}
+diff --git a/pkg/workloadslicing/workloadslicing_test.go b/pkg/workloadslicing/workloadslicing_test.go
+index 2ac4dc7..d276e4c 100644
+--- a/pkg/workloadslicing/workloadslicing_test.go
++++ b/pkg/workloadslicing/workloadslicing_test.go
+@@ -48,6 +48,7 @@ import (
+ 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
+ 	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
+ 	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
+ 	"sigs.k8s.io/kueue/pkg/scheduler/preemption"
+ 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
+ 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
+@@ -1766,6 +1767,193 @@ func TestEnsureWorkloadSlices(t *testing.T) {
+ 	}
+ }
+ 
++func TestEnsureWorkloadSlicesScaleDownMinCount(t *testing.T) {
++	testCases := map[string]struct {
++		reserveQuota    bool
++		additionalSlice bool
++	}{
++		"one admitted slice": {
++			reserveQuota: true,
++		},
++		"one pending slice": {},
++		"multiple slices": {
++			reserveQuota:    true,
++			additionalSlice: true,
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			now := time.Now()
++			wl := utiltestingapi.MakeWorkload(testJobObject.Name+"-1", testJobObject.Namespace).
++				OwnerReference(testJobGVK, testJobObject.Name, string(testJobObject.UID)).
++				Creation(now).
++				PodSets(*utiltestingapi.MakePodSet("workers", 4).
++					SetMinimumCount(4).Request(corev1.ResourceCPU, "1").Obj())
++			if tc.reserveQuota {
++				wl.SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++			}
++			objects := []client.Object{wl.Obj()}
++			if tc.additionalSlice {
++				objects = append(objects, utiltestingapi.MakeWorkload(testJobObject.Name+"-old", testJobObject.Namespace).
++					OwnerReference(testJobGVK, testJobObject.Name, string(testJobObject.UID)).
++					Creation(now.Add(-time.Minute)).
++					PodSets(*utiltestingapi.MakePodSet("workers", 4).SetMinimumCount(4).Request(corev1.ResourceCPU, "1").Obj()).
++					Obj())
++			}
++			clnt := testWorkloadClientBuilder().WithObjects(objects...).Build()
++			wantPodSets := []kueue.PodSet{
++				*utiltestingapi.MakePodSet("workers", 1).SetMinimumCount(1).Request(corev1.ResourceCPU, "1").Obj(),
++			}
++			ctx, log := utiltesting.ContextWithLog(t)
++			manager := Manager{Client: clnt, Clock: testingclock.NewFakeClock(now)}
++			got, compatible, err := manager.EnsureWorkloadSlices(ctx, wantPodSets, testJobObject, testJobGVK)
++			if err != nil {
++				t.Fatalf("EnsureWorkloadSlices() error: %v", err)
++			}
++			if !compatible || got == nil || got.Name != wl.Obj().Name {
++				t.Fatalf("EnsureWorkloadSlices() workload = %v, compatible = %v", got, compatible)
++			}
++			if diff := cmp.Diff(wantPodSets, got.Spec.PodSets); diff != "" {
++				t.Errorf("EnsureWorkloadSlices() podSets (-want,+got):\n%s", diff)
++			}
++			var updated kueue.Workload
++			if err := clnt.Get(ctx, client.ObjectKeyFromObject(wl.Obj()), &updated); err != nil {
++				t.Fatalf("Failed to get workload: %v", err)
++			}
++			if diff := cmp.Diff(wantPodSets, updated.Spec.PodSets); diff != "" {
++				t.Errorf("Persisted workload podSets (-want,+got):\n%s", diff)
++			}
++			info := workload.NewInfo(log, &updated)
++			if len(info.TotalRequests) != 1 {
++				t.Fatalf("Expected one PodSet's resource usage, got %d", len(info.TotalRequests))
++			}
++			if got := info.TotalRequests[0].Count; got != 1 {
++				t.Errorf("Quota usage count = %d, want 1", got)
++			}
++			if got := info.TotalRequests[0].Requests.ResourceValue(corev1.ResourceCPU); !got.Equal(resources.NewAmount(1000)) {
++				t.Errorf("Quota CPU usage = %v millicores, want 1000", got)
++			}
++		})
++	}
++}
++
++func TestEnsureWorkloadSlicesPendingMinCount(t *testing.T) {
++	testCases := map[string]struct {
++		additionalSlice bool
++		replacement     bool
++		readmission     bool
++		staleAdmitted   bool
++		atomic          bool
++		wantMinCount    *int32
++	}{
++		"initial pending slice": {
++			wantMinCount: new(int32(5)),
++		},
++		"multiple initial pending slices": {
++			additionalSlice: true,
++			wantMinCount:    new(int32(5)),
++		},
++		"pending replacement": {
++			replacement:  true,
++			wantMinCount: new(int32(1)),
++		},
++		"multiple slices with pending replacement": {
++			additionalSlice: true,
++			replacement:     true,
++			wantMinCount:    new(int32(1)),
++		},
++		"evicted slice awaiting readmission": {
++			readmission:  true,
++			wantMinCount: new(int32(1)),
++		},
++		"quota released before admitted condition updates": {
++			staleAdmitted: true,
++			wantMinCount:  new(int32(1)),
++		},
++		"initial atomic slice": {
++			atomic: true,
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			now := time.Now()
++			head := utiltestingapi.MakePodSet("head", 1).Request(corev1.ResourceCPU, "1").Obj()
++			workers := utiltestingapi.MakePodSet("workers", 4).Request(corev1.ResourceCPU, "1").Obj()
++			if !tc.atomic {
++				workers.MinCount = new(int32(4))
++			}
++			wl := utiltestingapi.MakeWorkload(testJobObject.Name+"-1", testJobObject.Namespace).
++				OwnerReference(testJobGVK, testJobObject.Name, string(testJobObject.UID)).
++				Creation(now).
++				PodSets(*head, *workers)
++			old := wl.Clone().Name(testJobObject.Name + "-old").Creation(now.Add(-time.Minute))
++			if tc.replacement {
++				wl.Annotation(WorkloadSliceReplacementFor, string(workload.Key(old.Obj())))
++				old.SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++			}
++			if tc.readmission || tc.staleAdmitted {
++				wl.SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++				if tc.readmission {
++					workload.UnsetQuotaReservationWithCondition(wl.Obj(), "Pending", "Quota released", now)
++					wl.EvictedAt(now)
++				} else {
++					wl.Status.Admission = nil
++					wl.Condition(metav1.Condition{
++						Type:   kueue.WorkloadQuotaReserved,
++						Status: metav1.ConditionFalse,
++						Reason: "Pending",
++					})
++				}
++			}
++			objects := []client.Object{wl.Obj()}
++			if tc.additionalSlice {
++				objects = append(objects, old.Obj())
++			}
++			clnt := testWorkloadClientBuilder().WithObjects(objects...).Build()
++			ctx, _ := utiltesting.ContextWithLog(t)
++			manager := Manager{Client: clnt, Clock: testingclock.NewFakeClock(now)}
++			for _, count := range []int32{1, 5} {
++				if count == 5 && tc.additionalSlice && !tc.replacement {
++					if err := clnt.Create(ctx, old.Clone().Name(old.Obj().Name+"-2").ResourceVersion("").Obj()); err != nil {
++						t.Fatalf("Failed to create additional pending slice: %v", err)
++					}
++				}
++				jobWorkers := workers.DeepCopy()
++				jobWorkers.Count = count
++				if !tc.atomic {
++					jobWorkers.MinCount = new(count)
++				}
++				jobPodSets := []kueue.PodSet{*jobWorkers, *head}
++				got, compatible, err := manager.EnsureWorkloadSlices(ctx, jobPodSets, testJobObject, testJobGVK)
++				if err != nil {
++					t.Fatalf("EnsureWorkloadSlices() error: %v", err)
++				}
++				if !compatible || got == nil || got.Name != wl.Obj().Name {
++					t.Fatalf("EnsureWorkloadSlices() workload = %v, compatible = %v", got, compatible)
++				}
++				wantPodSets := []kueue.PodSet{*head, *jobWorkers.DeepCopy()}
++				if count == 5 {
++					wantPodSets[1].MinCount = tc.wantMinCount
++				}
++				if diff := cmp.Diff(wantPodSets, got.Spec.PodSets); diff != "" {
++					t.Errorf("EnsureWorkloadSlices() at count %d (-want,+got):\n%s", count, diff)
++				}
++				var updated kueue.Workload
++				if err := clnt.Get(ctx, client.ObjectKeyFromObject(wl.Obj()), &updated); err != nil {
++					t.Fatalf("Failed to get workload: %v", err)
++				}
++				if diff := cmp.Diff(wantPodSets, updated.Spec.PodSets); diff != "" {
++					t.Errorf("Persisted podSets at count %d (-want,+got):\n%s", count, diff)
++				}
++				wantPartialAdmission := count > ptr.Deref(wantPodSets[1].MinCount, count)
++				if got := workload.CanBePartiallyAdmitted(&updated); got != wantPartialAdmission {
++					t.Errorf("CanBePartiallyAdmitted() at count %d = %v, want %v", count, got, wantPartialAdmission)
++				}
++			}
++		})
++	}
++}
++
+ func TestNormalizeActiveSlices(t *testing.T) {
+ 	now := time.Now()
+ 	fakeClock := testingclock.NewFakeClock(now)
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_scaleup_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_scaleup_test.go
+index 5a69586..a9a73da 100644
+--- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_scaleup_test.go
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_scaleup_test.go
+@@ -246,6 +246,53 @@ var _ = ginkgo.Describe("RayCluster with partial replica scale-up for elastic jo
+ 		// order-based scenarios A-D, which need the order-based reducer and its give-back phase.
+ 	})
+ 
++	ginkgo.It("Should release quota when a partial scale-up RayCluster shrinks below its minimum", func() {
++		rayCluster := testingraycluster.MakeCluster("scale-down", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial).
++			Queue(localQueue.Name).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			FirstWorkerGroupReplicas(4, 1, 4).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, rayCluster)
++		initialSlice := &behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 1)[0]
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, initialSlice, workersGroupName, 4)
++		gomega.Expect(initialSlice.Spec.PodSets[workersPodSetIdx].MinCount).Should(gomega.Equal(new(int32(4))))
++		initialUID := initialSlice.UID
++		expectPodsUsage(5)
++
++		ginkgo.By("keeping another RayCluster pending because its three pods exceed the spare quota")
++		waitingCluster := testingraycluster.MakeCluster("waiting", ns.Name).
++			Queue(localQueue.Name).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			FirstWorkerGroupReplicas(2, 1, 2).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, waitingCluster)
++		workloads := behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 2)
++		waitingSlice := &workloads[0]
++		if waitingSlice.Name == initialSlice.Name {
++			waitingSlice = &workloads[1]
++		}
++		behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, waitingSlice)
++
++		ginkgo.By("scaling the admitted RayCluster from four workers to one")
++		scaleFirstWorkerGroup(rayCluster, 1)
++
++		ginkgo.By("updating the original admitted slice with a valid minimum")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(initialSlice), initialSlice)).Should(gomega.Succeed())
++			g.Expect(initialSlice.UID).Should(gomega.Equal(initialUID))
++			g.Expect(initialSlice.Spec.PodSets[workersPodSetIdx].Count).Should(gomega.Equal(int32(1)))
++			g.Expect(initialSlice.Spec.PodSets[workersPodSetIdx].MinCount).Should(gomega.Equal(new(int32(1))))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("admitting the waiting RayCluster without changing the queue's quota")
++		behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, initialSlice, waitingSlice)
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, waitingSlice, workersGroupName, 2)
++		expectPodsUsage(5)
++		behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 2)
++	})
++
+ 	ginkgo.It("Should give the spare capacity to the earlier worker group rather than spread it", func() {
+ 		// Two worker groups drawing on the same quota, so they compete. Both want two more
+ 		// workers and only two pods are spare, which forces a choice: the earlier group is the

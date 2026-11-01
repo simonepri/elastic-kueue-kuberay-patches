@@ -1,0 +1,28 @@
+# Queues whose CPU quota admits the head and at most three of the elastic RayCluster's workers.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: reapply-flavor
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: reapply-cluster-queue
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: reapply-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "1"
+            - name: "memory"
+              nominalQuota: "1Gi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: reapply-local-queue
+spec:
+  clusterQueue: reapply-cluster-queue

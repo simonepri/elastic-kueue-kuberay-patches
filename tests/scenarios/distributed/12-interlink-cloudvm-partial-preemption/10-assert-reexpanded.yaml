@@ -1,0 +1,22 @@
+# A Workload slice admits all 4 spot workers after the autoscaler's scale-up, through a
+# scale-up probe once the released quota is free again.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: hybrid-interlink-raycluster
+spec:
+  workerGroupSpecs:
+    - groupName: interlink-spot-workers
+      replicas: 4
+      maxReplicas: 4
+    - groupName: local-workers
+      replicas: 1
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: hybrid-interlink-raycluster
+status:
+  (admission.podSetAssignments[?name=='interlink-spot-workers'].count | [0]): 4
+  (conditions[?type=='Finished'] | length(@)): 0

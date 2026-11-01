@@ -2,6 +2,8 @@ apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
   name: 19-shared-kueue-fleet-fairness
+  labels:
+    partial-preemption: required
 spec:
   description: >
     Verifies the two-tier fleet queue architecture:
@@ -10,6 +12,14 @@ spec:
     When Cell 1 scales up and Cell 2 is idle, Cell 1 borrows spot quota beyond its nominal share.
     When Cell 2 arrives requesting its nominal share, Kueue triggers cohort reclaim, contracting
     Cell 1 and granting Cell 2 its fair share without split-capacity deadlocks or over-subscription.
+    Cell 1 keeps its replicas: Kueue deletes its spot worker Pods above the reclaim target, and
+    admits Cell 2 only once they are gone.
+  catch:
+    - script:
+        env:
+          - name: NS
+            value: ($namespace)
+        content: ../../dump-namespace.sh
   steps:
     - name: setup-queues-and-cohorts
       try:
@@ -31,8 +41,20 @@ spec:
       try:
         - apply:
             file: 03-cell2-spot-arrival.yaml
+        - script:
+            timeout: 90s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../assert-reclaimed-before-admission.sh cell1-raycluster-spot spot-workers 4 cell2-raycluster-spot
         - assert:
             file: 03-assert-fair-reclaim.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../assert-worker-pods.sh cell1-raycluster-spot spot-workers 4 2
     - name: prevent-overcapacity-burst
       try:
         - apply:

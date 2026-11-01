@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, release-please--branches--main ]
+    branches: [ main, release-please--branches--main, redesign/partial-preemption ]
   pull_request:
-    branches: [ main, release-please--branches--main ]
+    branches: [ main, release-please--branches--main, redesign/partial-preemption ]
 
 jobs:
   validate-patches:
@@ -171,9 +171,25 @@ jobs:
         run: mise run test:interlink
 
   integration-tests:
-    name: Chainsaw Integration Tests
+    name: Chainsaw Integration Tests (${{ matrix.leg }})
     needs: [validate-patches]
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The shipped gates with partial preemption off, so elastic victims are evicted whole.
+          - leg: partial preemption off
+            feature-gates: ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true
+            selector: partial-preemption!=required
+          # Every gate the readme lists for an elastic deployment, which turns partial preemption on.
+          - leg: partial preemption on
+            feature-gates: ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true
+            selector: ""
+    env:
+      KUEUE_FEATURE_GATES: ${{ matrix.feature-gates }}
+      CHAINSAW_SELECTOR: ${{ matrix.selector }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

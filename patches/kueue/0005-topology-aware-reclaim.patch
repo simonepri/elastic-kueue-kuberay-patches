@@ -598,10 +598,10 @@ index 558ed94..3d4afd7 100644
  }
  
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index e4f1814..56b0fe9 100644
+index 5a5071f..d3779d1 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
-@@ -76,6 +76,7 @@ type Preemptor struct {
+@@ -74,6 +74,7 @@ type Preemptor struct {
  	roleTracker            *roletracker.RoleTracker
  	customLabels           *metrics.CustomLabels
  	preemptionExpectations *expectations.Store
@@ -609,7 +609,7 @@ index e4f1814..56b0fe9 100644
  }
  
  // PreemptionStrategy represents a singular set of ordered potential preemption candidates.
-@@ -132,6 +133,10 @@ type preemptionCtx struct {
+@@ -130,6 +131,10 @@ type preemptionCtx struct {
  	assignment            flavorassigner.Assignment
  	frsNeedPreemption     sets.Set[resources.FlavorResource]
  	configurableEvaluator *configurable.PreemptionEvaluator
@@ -620,7 +620,7 @@ index e4f1814..56b0fe9 100644
  }
  
  func New(
-@@ -156,6 +161,7 @@ func New(
+@@ -154,6 +159,7 @@ func New(
  		roleTracker:            tracker,
  		customLabels:           customLabels,
  		preemptionExpectations: preemptionExpectations,
@@ -628,16 +628,16 @@ index e4f1814..56b0fe9 100644
  	}
  	return p
  }
-@@ -406,7 +412,7 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
+@@ -388,7 +394,7 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
  		var targets []*Target
  		for candidate := range strategy.candidates {
  			targets = append(targets, candidate)
 -			if workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
 +			if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
- 				if psName, currentCount, minCount, isElastic := getElasticInfo(candidate.WorkloadInfo); isElastic {
- 					totalUsage := candidate.WorkloadInfo.Usage()
- 					perPodQuota := make(resources.FlavorResourceQuantities)
-@@ -690,6 +696,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
+ 				targets = fillBackWorkloads(ctx, strategy.pCtx, targets, strategy.allowBorrowing)
+ 				if strategy.verify != nil {
+ 					if valid, reason := strategy.verify(targets); !valid {
+@@ -568,6 +574,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
  	return workloadQuotaFits(preemptionCtx, allowBorrowing) && workloadTopologyFits(ctx, preemptionCtx)
  }
  

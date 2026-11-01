@@ -1,0 +1,1109 @@
+Partial scale-up grants whole replicas of multi-host worker groups.
+
+KubeRay runs a multi-host worker group in whole replicas of numOfHosts pods and
+rounds replicas down, but partial admission grants any pod count between the
+baseline and the request. Kueue can charge 5 pods for a group whose replicas hold 2
+pods each, while KubeRay creates 2 replicas, 4 pods. A scale-up from 4 pods
+granted 5 counts as growth, so a slice is admitted at the size it replaces and
+recreated again and again. The ungater also picks gated pods by name, which
+starts one host of each of two replicas instead of one whole replica.
+
+With ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp on, the job reconciler
+writes kueue.x-k8s.io/podset-count-steps with step numOfHosts for each multi-host
+worker group of an elastic RayCluster, with PartialPreemption on or off. With
+PartialPreemption on it also writes the multi-host floor, minReplicas x
+numOfHosts. The scheduler's partial admission reduces step counts instead of pod
+counts, so a grant is a whole number of steps, the baseline rounds up to a step,
+and a scale-up must beat the baseline in whole steps. Steps of 1, a Workload
+without the annotation, and the gate off leave admission unchanged. For a PodSet
+with a step above 1 the ungater starts whole ray.io/worker-group-replica-name
+groups, completing a started group first, starting a new group only once all
+its pods exist, and never part of a group.
+
+diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
+index 756f485..a1eb815 100644
+--- a/pkg/controller/elasticjobs/elastic_job_ungater.go
++++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
+@@ -319,16 +319,21 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
+ 	}
+ 
+ 	log := ctrl.LoggerFrom(ctx)
++	steps := workload.PodSetCountSteps(wl)
+ 	var gated []*corev1.Pod
+ 	for ps, candidates := range gatedPerPodSet {
+ 		room := granted[ps] - ungatedPerPodSet[ps]
+ 		var toUngate []*corev1.Pod
+ 		if room > 0 {
+-			// Ungate the lowest-named pods first for deterministic behavior.
+-			slices.SortFunc(candidates, func(a, b *corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
+-			toUngate = candidates
+-			if int32(len(candidates)) > room {
+-				toUngate = candidates[:room]
++			if steps[ps] > 1 {
++				toUngate = podsToUngateInWholeGroups(candidates, pods, ps, steps[ps], room)
++			} else {
++				// Ungate the lowest-named pods first for deterministic behavior.
++				slices.SortFunc(candidates, func(a, b *corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
++				toUngate = candidates
++				if int32(len(candidates)) > room {
++					toUngate = candidates[:room]
++				}
+ 			}
+ 		}
+ 		log.V(4).Info("elastic ungating quota accounting for PodSet",
+diff --git a/pkg/controller/elasticjobs/ungate_whole_groups.go b/pkg/controller/elasticjobs/ungate_whole_groups.go
+new file mode 100644
+index 0000000..f683807
+--- /dev/null
++++ b/pkg/controller/elasticjobs/ungate_whole_groups.go
+@@ -0,0 +1,83 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Picks the gated pods of a PodSet that grows in steps so that only whole replica groups start.
++
++package elasticjobs
++
++import (
++	"slices"
++	"strings"
++
++	corev1 "k8s.io/api/core/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
++)
++
++// replicaGroupLabel names the pods of one replica of a multi-host Ray worker group.
++const replicaGroupLabel = "ray.io/worker-group-replica-name"
++
++// podsToUngateInWholeGroups returns up to room of the gated candidates of podSet, in whole
++// replica groups: a group is ungated only when all its gated pods fit, a group that
++// already has running pods is completed before a new one starts, and a group with nothing
++// running starts only once KubeRay has created all step pods of it. Groups go in name order.
++// A candidate without the group label is its own group. pods are all the live pods of the
++// slice, used to tell which groups have started.
++func podsToUngateInWholeGroups(candidates, pods []*corev1.Pod, podSet kueue.PodSetReference, step, room int32) []*corev1.Pod {
++	started := map[string]bool{}
++	for _, p := range pods {
++		if g := p.Labels[replicaGroupLabel]; g != "" && !utilpod.IsTerminated(p) &&
++			p.Labels[constants.PodSetLabel] == string(podSet) && !utilpod.HasGate(p, kueue.ElasticJobSchedulingGate) {
++			started[g] = true
++		}
++	}
++	groups := map[string][]*corev1.Pod{}
++	for _, p := range candidates {
++		key := p.Labels[replicaGroupLabel]
++		if key == "" {
++			key = "\x00" + p.Name
++		}
++		groups[key] = append(groups[key], p)
++	}
++	keys := make([]string, 0, len(groups))
++	for k := range groups {
++		keys = append(keys, k)
++	}
++	// Started groups first, then by name.
++	slices.SortFunc(keys, func(a, b string) int {
++		if started[a] != started[b] {
++			if started[a] {
++				return -1
++			}
++			return 1
++		}
++		return strings.Compare(a, b)
++	})
++	var out []*corev1.Pod
++	for _, k := range keys {
++		n := int32(len(groups[k]))
++		if !started[k] && !strings.HasPrefix(k, "\x00") && n != step {
++			continue
++		}
++		if n <= room {
++			out = append(out, groups[k]...)
++			room -= n
++		}
++	}
++	return out
++}
+diff --git a/pkg/controller/elasticjobs/ungate_whole_groups_test.go b/pkg/controller/elasticjobs/ungate_whole_groups_test.go
+new file mode 100644
+index 0000000..3aeeaa2
+--- /dev/null
++++ b/pkg/controller/elasticjobs/ungate_whole_groups_test.go
+@@ -0,0 +1,179 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package elasticjobs
++
++import (
++	"slices"
++	"testing"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++	testingclock "k8s.io/utils/clock/testing"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/util/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func replicaPod(name, group string, gated bool) *corev1.Pod {
++	p := makeElasticPodForPodSet(name, workersPodSet).Label(replicaGroupLabel, group)
++	if gated {
++		p = p.Gate(kueue.ElasticJobSchedulingGate)
++	}
++	return p.Obj()
++}
++
++// Pod names are random in KubeRay, so name order interleaves the replicas.
++func TestUngateWholeReplicaGroups(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	now := time.Now().Truncate(time.Second)
++
++	cases := map[string]struct {
++		step      string
++		granted   int32
++		pods      []*corev1.Pod
++		wantOpen  []string
++		wantGated []string
++	}{
++		"granted 6 with r1 and r2 running ungates r3 whole and keeps r4 whole gated": {
++			step:    "workers=2",
++			granted: 6,
++			pods: []*corev1.Pod{
++				replicaPod("p-1a", "r1", false), replicaPod("p-1b", "r1", false),
++				replicaPod("p-2a", "r2", false), replicaPod("p-2b", "r2", false),
++				replicaPod("p-a3", "r3", true), replicaPod("p-b4", "r4", true),
++				replicaPod("p-c3", "r3", true), replicaPod("p-d4", "r4", true),
++			},
++			wantOpen:  []string{"p-a3", "p-c3"},
++			wantGated: []string{"p-b4", "p-d4"},
++		},
++		"a half-started group is completed before a new one starts": {
++			step:    "workers=2",
++			granted: 4,
++			pods: []*corev1.Pod{
++				replicaPod("p-1a", "r1", false), replicaPod("p-1b", "r1", false),
++				replicaPod("p-2a", "r2", false), replicaPod("p-2b", "r2", true),
++				replicaPod("p-3a", "r3", true), replicaPod("p-3b", "r3", true),
++			},
++			wantOpen:  []string{"p-2b"},
++			wantGated: []string{"p-3a", "p-3b"},
++		},
++		"a group still missing pods is not started": {
++			step:    "workers=2",
++			granted: 4,
++			pods: []*corev1.Pod{
++				replicaPod("p-1a", "r1", false), replicaPod("p-1b", "r1", false),
++				replicaPod("p-2a", "r2", true), replicaPod("p-3a", "r3", true),
++			},
++			wantGated: []string{"p-2a", "p-3a"},
++		},
++		"a complete group starts while an incomplete one waits": {
++			step:    "workers=2",
++			granted: 4,
++			pods: []*corev1.Pod{
++				replicaPod("p-1a", "r1", false), replicaPod("p-1b", "r1", false),
++				replicaPod("p-2a", "r2", true), replicaPod("p-3a", "r3", true), replicaPod("p-3b", "r3", true),
++			},
++			wantOpen:  []string{"p-3a", "p-3b"},
++			wantGated: []string{"p-2a"},
++		},
++		"without a step pods go by name": {
++			granted: 5,
++			pods: []*corev1.Pod{
++				replicaPod("p-1a", "r1", false), replicaPod("p-1b", "r1", false),
++				replicaPod("p-2a", "r2", false), replicaPod("p-2b", "r2", false),
++				replicaPod("p-a3", "r3", true), replicaPod("p-b4", "r4", true),
++				replicaPod("p-c3", "r3", true), replicaPod("p-d4", "r4", true),
++			},
++			wantOpen:  []string{"p-a3"},
++			wantGated: []string{"p-b4", "p-c3", "p-d4"},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			ctx, _ := utiltesting.ContextWithLog(t)
++			wb := utiltestingapi.MakeWorkload("wl", "ns").
++				Finalizers(kueue.ResourceInUseFinalizerName).
++				Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++				ControllerReference(rayClusterGVK, "ray", "ray-uid").
++				PodSets(*utiltestingapi.MakePodSet(workersPodSet, 8).Request(corev1.ResourceCPU, "1").Obj()).
++				ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").
++					PodSets(utiltestingapi.MakePodSetAssignment(workersPodSet).
++						Assignment(corev1.ResourceCPU, "flavor", "6").Count(tc.granted).Obj()).Obj(), now).
++				AdmittedAt(true, now)
++			if tc.step != "" {
++				wb = wb.Annotation(constants.PodSetCountStepsAnnotation, tc.step)
++			}
++			wl := wb.Obj()
++
++			b := utiltesting.NewClientBuilder().
++				WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).
++				WithIndex(&kueue.Workload{}, coreindexer.OwnerReferenceIndexKey(rayClusterGVK), coreindexer.WorkloadOwnerIndexFunc(rayClusterGVK)).
++				WithIndex(&kueue.Workload{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexWorkloadSliceName).
++				WithStatusSubresource(wl)
++			for _, p := range tc.pods {
++				b = b.WithObjects(p)
++			}
++			c := b.Build()
++			if err := c.Create(ctx, wl); err != nil {
++				t.Fatal(err)
++			}
++			u := &elasticJobUngater{client: c, clock: testingclock.NewFakeClock(now), expectationsStore: expectations.NewStore(ControllerName)}
++			if _, err := u.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(wl)}); err != nil {
++				t.Fatal(err)
++			}
++
++			var open, gated []string
++			var list corev1.PodList
++			if err := c.List(ctx, &list); err != nil {
++				t.Fatal(err)
++			}
++			for _, p := range list.Items {
++				if testingpodHasGate(&p) {
++					gated = append(gated, p.Name)
++				} else {
++					open = append(open, p.Name)
++				}
++			}
++			slices.Sort(gated)
++			for _, w := range tc.wantOpen {
++				if !slices.Contains(open, w) {
++					t.Errorf("%s should be ungated; ungated: %v", w, open)
++				}
++			}
++			if !slices.Equal(gated, tc.wantGated) {
++				t.Errorf("gated = %v, want %v", gated, tc.wantGated)
++			}
++		})
++	}
++}
++
++func testingpodHasGate(p *corev1.Pod) bool {
++	for _, g := range p.Spec.SchedulingGates {
++		if g.Name == kueue.ElasticJobSchedulingGate {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/pkg/controller/jobframework/multi_host_steps.go b/pkg/controller/jobframework/multi_host_steps.go
+new file mode 100644
+index 0000000..8a595f6
+--- /dev/null
++++ b/pkg/controller/jobframework/multi_host_steps.go
+@@ -0,0 +1,43 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Gating of the floor and step annotations on partial scale-up, so the scheduler can grant
++// whole replicas of multi-host worker groups without PartialPreemption.
++
++package jobframework
++
++import (
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// reclaimFloorsEnabled reports whether the job reconciler writes floor and step annotations:
++// PartialPreemption writes both, partial scale-up writes the steps.
++func reclaimFloorsEnabled() bool {
++	return features.Enabled(features.PartialPreemption) ||
++		features.Enabled(features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp)
++}
++
++// scaleUpOnlySteps drops the steps equal to 1, which a missing entry already means, so
++// partial scale-up annotates only the PodSets it must round.
++func scaleUpOnlySteps(steps workload.PodSetsCounts) workload.PodSetsCounts {
++	for name, step := range steps {
++		if step <= 1 {
++			delete(steps, name)
++		}
++	}
++	return steps
++}
+diff --git a/pkg/controller/jobframework/reclaim_floors.go b/pkg/controller/jobframework/reclaim_floors.go
+index 00f067d..67367fe 100644
+--- a/pkg/controller/jobframework/reclaim_floors.go
++++ b/pkg/controller/jobframework/reclaim_floors.go
+@@ -39,25 +39,29 @@ type JobWithPodSetCountSteps interface {
+ }
+ 
+ // ReclaimFloors returns the floors and steps the job asks its Workload to carry. Both are
+-// empty unless PartialPreemption is on and the job uses workload slices. The floors are
++// empty unless the job uses workload slices. PartialPreemption writes both; partial
++// scale-up alone writes only the steps above 1 (see scaleUpOnlySteps). The floors are
+ // also empty unless the job takes the partial scale-up path: upstream creates no scale-up
+ // probe for other jobs, so a victim shrunk to its floor could never grow back.
+ func ReclaimFloors(job GenericJob) (floors, steps workload.PodSetsCounts) {
+-	if !features.Enabled(features.PartialPreemption) || !WorkloadSliceEnabled(job) {
++	if !reclaimFloorsEnabled() || !WorkloadSliceEnabled(job) {
+ 		return nil, nil
+ 	}
+-	if j, ok := job.(JobWithReclaimMinCounts); ok && ElasticPartialScaleUpEnabled(job) {
++	if j, ok := job.(JobWithReclaimMinCounts); ok && features.Enabled(features.PartialPreemption) && ElasticPartialScaleUpEnabled(job) {
+ 		floors = maps.Clone(j.ReclaimMinCounts())
+ 	}
+ 	if j, ok := job.(JobWithPodSetCountSteps); ok {
+ 		steps = maps.Clone(j.PodSetCountSteps())
++		if !features.Enabled(features.PartialPreemption) {
++			steps = scaleUpOnlySteps(steps)
++		}
+ 	}
+ 	return floors, steps
+ }
+ 
+ // applyReclaimFloors writes the job's floors and steps on a Workload built for it.
+ func applyReclaimFloors(job GenericJob, wl *kueue.Workload) {
+-	if !features.Enabled(features.PartialPreemption) {
++	if !reclaimFloorsEnabled() {
+ 		return
+ 	}
+ 	floors, steps := ReclaimFloors(job)
+@@ -66,9 +70,9 @@ func applyReclaimFloors(job GenericJob, wl *kueue.Workload) {
+ }
+ 
+ // reclaimFloorsOption makes EnsureWorkloadSlices keep the floors and steps of the job's
+-// Workload current. It is nil with PartialPreemption off, which leaves the Workload alone.
++// Workload current. It is nil with both gates off, which leaves the Workload alone.
+ func reclaimFloorsOption(job GenericJob) workloadslicing.EnsureOption {
+-	if !features.Enabled(features.PartialPreemption) {
++	if !reclaimFloorsEnabled() {
+ 		return nil
+ 	}
+ 	floors, steps := ReclaimFloors(job)
+diff --git a/pkg/controller/jobs/raycluster/common.go b/pkg/controller/jobs/raycluster/common.go
+index 8d6556f..0f0cecf 100644
+--- a/pkg/controller/jobs/raycluster/common.go
++++ b/pkg/controller/jobs/raycluster/common.go
+@@ -98,35 +98,30 @@ func effectiveWorkerCount(wgs *rayv1.WorkerGroupSpec) int32 {
+ }
+ 
+ // ReclaimMinCounts implements jobframework.JobWithReclaimMinCounts. Partial preemption may
+-// shrink a single-host worker group down to its minReplicas. A multi-host group has no
+-// floor, so it is only evicted whole.
++// shrink a worker group down to its minReplicas, which is minReplicas x numOfHosts pods for
++// a multi-host group.
+ func (j *RayCluster) ReclaimMinCounts() workload.PodSetsCounts {
+ 	floors := workload.PodSetsCounts{}
+ 	for i := range j.Spec.WorkerGroupSpecs {
+ 		wgs := &j.Spec.WorkerGroupSpecs[i]
+-		if !isSingleHost(wgs) {
+-			continue
+-		}
+-		floors[kueue.NewPodSetReference(wgs.GroupName)] = min(ptr.Deref(wgs.MinReplicas, 0), effectiveWorkerCount(wgs))
++		floors[kueue.NewPodSetReference(wgs.GroupName)] = min(ptr.Deref(wgs.MinReplicas, 0)*hostsPerReplica(wgs), effectiveWorkerCount(wgs))
+ 	}
+ 	return floors
+ }
+ 
+-// PodSetCountSteps implements jobframework.JobWithPodSetCountSteps. A pod of a single-host
+-// worker group is a whole replica, so the group changes by 1.
++// PodSetCountSteps implements jobframework.JobWithPodSetCountSteps. A replica is the unit
++// KubeRay creates and deletes, so a worker group changes by numOfHosts pods.
+ func (j *RayCluster) PodSetCountSteps() workload.PodSetsCounts {
+ 	steps := workload.PodSetsCounts{}
+ 	for i := range j.Spec.WorkerGroupSpecs {
+ 		wgs := &j.Spec.WorkerGroupSpecs[i]
+-		if isSingleHost(wgs) {
+-			steps[kueue.NewPodSetReference(wgs.GroupName)] = 1
+-		}
++		steps[kueue.NewPodSetReference(wgs.GroupName)] = hostsPerReplica(wgs)
+ 	}
+ 	return steps
+ }
+ 
+-func isSingleHost(wgs *rayv1.WorkerGroupSpec) bool {
+-	return max(wgs.NumOfHosts, 1) == 1
++func hostsPerReplica(wgs *rayv1.WorkerGroupSpec) int32 {
++	return max(wgs.NumOfHosts, 1)
+ }
+ 
+ // BuildPodSets builds PodSets from RayClusterSpec.
+diff --git a/pkg/controller/jobs/raycluster/reclaim_floors_test.go b/pkg/controller/jobs/raycluster/reclaim_floors_test.go
+index ec1aaae..82299c1 100644
+--- a/pkg/controller/jobs/raycluster/reclaim_floors_test.go
++++ b/pkg/controller/jobs/raycluster/reclaim_floors_test.go
+@@ -48,11 +48,11 @@ func elasticRayCluster() *testingrayutil.ClusterWrapper {
+ func TestRayClusterReclaimFloorsAndSteps(t *testing.T) {
+ 	rc := (*RayCluster)(elasticRayCluster().Obj())
+ 
+-	wantFloors := workload.PodSetsCounts{"small": 1, "zero": 0, "capped": 2}
++	wantFloors := workload.PodSetsCounts{"small": 1, "zero": 0, "tpu": 4, "capped": 2}
+ 	if diff := cmp.Diff(wantFloors, rc.ReclaimMinCounts()); diff != "" {
+ 		t.Errorf("ReclaimMinCounts() (-want,+got):\n%s", diff)
+ 	}
+-	wantSteps := workload.PodSetsCounts{"small": 1, "zero": 1, "capped": 1}
++	wantSteps := workload.PodSetsCounts{"small": 1, "zero": 1, "tpu": 4, "capped": 1}
+ 	if diff := cmp.Diff(wantSteps, rc.PodSetCountSteps()); diff != "" {
+ 		t.Errorf("PodSetCountSteps() (-want,+got):\n%s", diff)
+ 	}
+@@ -75,21 +75,39 @@ func TestConstructWorkloadReclaimFloors(t *testing.T) {
+ 			cluster:        elasticRayCluster(),
+ 			partialPreempt: true,
+ 			partialScaleUp: true,
+-			wantSteps:      "capped=1,small=1,zero=1",
++			wantSteps:      "capped=1,small=1,tpu=4,zero=1",
+ 		},
+ 		"gate on: partial strategy annotation without the scale-up gate gets no floor": {
+ 			cluster:        elasticRayCluster().SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial),
+ 			partialPreempt: true,
+-			wantSteps:      "capped=1,small=1,zero=1",
++			wantSteps:      "capped=1,small=1,tpu=4,zero=1",
+ 		},
+-		"gate on: elastic cluster with the partial strategy gets floors and steps of its single-host groups": {
++		"gate on: elastic cluster with the partial strategy gets floors and steps of every worker group": {
+ 			cluster:        elasticRayCluster().SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial),
+ 			partialPreempt: true,
+ 			partialScaleUp: true,
+-			wantFloors:     "capped=2,small=1,zero=0",
+-			wantSteps:      "capped=1,small=1,zero=1",
++			wantFloors:     "capped=2,small=1,tpu=4,zero=0",
++			wantSteps:      "capped=1,small=1,tpu=4,zero=1",
+ 			wantMinCounts:  map[kueue.PodSetReference]*int32{"small": new(int32(4)), "zero": new(int32(2)), "tpu": new(int32(12)), "capped": new(int32(3))},
+ 		},
++		"partial scale-up only: elastic cluster gets the steps of its multi-host groups and no floor": {
++			cluster:        elasticRayCluster().SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial),
++			partialScaleUp: true,
++			wantSteps:      "tpu=4",
++			wantMinCounts:  map[kueue.PodSetReference]*int32{"small": new(int32(4)), "zero": new(int32(2)), "tpu": new(int32(12)), "capped": new(int32(3))},
++		},
++		"partial scale-up only: single-host cluster gets no annotation": {
++			cluster: testingrayutil.MakeCluster("rc", "ns").UID("rc-uid").
++				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++				WithWorkerGroups(*testingrayutil.MakeWorkerGroup("small", 4).MinReplicas(1).Obj()),
++			partialScaleUp: true,
++		},
++		"partial scale-up only: non-elastic multi-host cluster gets no annotation": {
++			cluster: testingrayutil.MakeCluster("rc", "ns").UID("rc-uid").
++				WithWorkerGroups(*testingrayutil.MakeWorkerGroup("tpu", 3).MinReplicas(1).Obj()).
++				WithNumOfHosts("tpu", 4),
++			partialScaleUp: true,
++		},
+ 		"gate on: non-elastic cluster gets no annotation": {
+ 			cluster: testingrayutil.MakeCluster("rc", "ns").UID("rc-uid").
+ 				WithWorkerGroups(*testingrayutil.MakeWorkerGroup("small", 4).MinReplicas(1).Obj()),
+diff --git a/pkg/scheduler/flavorassigner/podset_reducer_steps.go b/pkg/scheduler/flavorassigner/podset_reducer_steps.go
+new file mode 100644
+index 0000000..aed9f3a
+--- /dev/null
++++ b/pkg/scheduler/flavorassigner/podset_reducer_steps.go
+@@ -0,0 +1,96 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// A PodSetReducer that grants counts in whole steps, such as the replicas of a multi-host worker group.
++
++package flavorassigner
++
++import (
++	"slices"
++
++	"k8s.io/utils/ptr"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// SteppedPodSetReducer is a PodSetReducer whose counts are multiples of each PodSet's step.
++// It reduces step counts and converts them to pods, so the baseline, the growth check and
++// the search all see the rounded counts. A PodSet's full count is always a candidate, even
++// when it is not a multiple of the step, and its baseline (MinCount) rounds up to the next
++// multiple.
++type SteppedPodSetReducer struct {
++	inner *PodSetReducer
++	// scales are the per-PodSet conversions, in the order of the PodSets.
++	scales []stepScale
++	names  []kueue.PodSetReference
++}
++
++// stepScale converts between a PodSet's step counts and its pod counts.
++type stepScale struct {
++	step, count int32
++}
++
++func (s stepScale) pods(steps int32) int32 {
++	return int32(min(int64(steps)*int64(s.step), int64(s.count)))
++}
++
++func (s stepScale) steps(pods int32) int32 {
++	return int32((int64(pods) + int64(s.step) - 1) / int64(s.step))
++}
++
++// NewSteppedPodSetReducer is NewOrderedPodSetReducer for PodSets that grow and shrink by
++// steps[name] pods, where a PodSet missing from steps, or with a step below 1, has step 1.
++// With every step 1 it behaves exactly as NewOrderedPodSetReducer.
++func NewSteppedPodSetReducer(podSets []kueue.PodSet, steps workload.PodSetsCounts, fits func(workload.PodSetsCounts) bool) *SteppedPodSetReducer {
++	r := &SteppedPodSetReducer{
++		scales: make([]stepScale, len(podSets)),
++		names:  make([]kueue.PodSetReference, len(podSets)),
++	}
++	unitPodSets := slices.Clone(podSets)
++	for i := range unitPodSets {
++		ps := &unitPodSets[i]
++		r.names[i] = ps.Name
++		r.scales[i] = stepScale{step: max(steps[ps.Name], 1), count: ps.Count}
++		if ps.MinCount != nil {
++			ps.MinCount = ptr.To(r.scales[i].steps(min(*ps.MinCount, ps.Count)))
++		}
++		ps.Count = r.scales[i].steps(ps.Count)
++	}
++	r.inner = NewOrderedPodSetReducer(unitPodSets, func(unitCounts workload.PodSetsCounts) bool {
++		return fits(r.toPods(unitCounts))
++	})
++	return r
++}
++
++// Reduce is PodSetReducer.Reduce; the counts it returns are pods.
++func (r *SteppedPodSetReducer) Reduce(mustGrow bool) (workload.PodSetsCounts, bool) {
++	unitCounts, found := r.inner.Reduce(mustGrow)
++	if !found {
++		return nil, false
++	}
++	return r.toPods(unitCounts), true
++}
++
++func (r *SteppedPodSetReducer) toPods(unitCounts workload.PodSetsCounts) workload.PodSetsCounts {
++	pods := make(workload.PodSetsCounts, len(unitCounts))
++	for i, name := range r.names {
++		if c, ok := unitCounts[name]; ok {
++			pods[name] = r.scales[i].pods(c)
++		}
++	}
++	return pods
++}
+diff --git a/pkg/scheduler/flavorassigner/podset_reducer_steps_test.go b/pkg/scheduler/flavorassigner/podset_reducer_steps_test.go
+new file mode 100644
+index 0000000..d182e02
+--- /dev/null
++++ b/pkg/scheduler/flavorassigner/podset_reducer_steps_test.go
+@@ -0,0 +1,138 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package flavorassigner
++
++import (
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++func TestSteppedPodSetReducer(t *testing.T) {
++	workers := func(count, minCount int32) []kueue.PodSet {
++		return []kueue.PodSet{*utiltestingapi.MakePodSet("workers", int(count)).SetMinimumCount(minCount).Obj()}
++	}
++	room := func(n int32) func(workload.PodSetsCounts) bool {
++		return func(c workload.PodSetsCounts) bool { return c["workers"] <= n }
++	}
++	cases := map[string]struct {
++		podSets   []kueue.PodSet
++		steps     workload.PodSetsCounts
++		fits      func(workload.PodSetsCounts) bool
++		mustGrow  bool
++		wantFound bool
++		want      workload.PodSetsCounts
++	}{
++		"room for 5 of 8 in steps of 2 grants 4": {
++			podSets: workers(8, 4), steps: workload.PodSetsCounts{"workers": 2}, fits: room(5),
++			wantFound: true, want: workload.PodSetsCounts{"workers": 4},
++		},
++		"room for 6 grants 6": {
++			podSets: workers(8, 4), steps: workload.PodSetsCounts{"workers": 2}, fits: room(6),
++			wantFound: true, want: workload.PodSetsCounts{"workers": 6},
++		},
++		"room for 5 does not grow a running baseline of 4": {
++			podSets: workers(8, 4), steps: workload.PodSetsCounts{"workers": 2}, fits: room(5), mustGrow: true,
++		},
++		"room for 6 grows a running baseline of 4": {
++			podSets: workers(8, 4), steps: workload.PodSetsCounts{"workers": 2}, fits: room(6), mustGrow: true,
++			wantFound: true, want: workload.PodSetsCounts{"workers": 6},
++		},
++		"room for 3 is below the baseline": {
++			podSets: workers(8, 4), steps: workload.PodSetsCounts{"workers": 2}, fits: room(3),
++		},
++		"room for the full count grants it": {
++			podSets: workers(8, 4), steps: workload.PodSetsCounts{"workers": 2}, fits: room(8), mustGrow: true,
++			wantFound: true, want: workload.PodSetsCounts{"workers": 8},
++		},
++		"a baseline off the step rounds up": {
++			podSets: workers(8, 3), steps: workload.PodSetsCounts{"workers": 2}, fits: room(5),
++			wantFound: true, want: workload.PodSetsCounts{"workers": 4},
++		},
++		"a full count off the step stays a candidate": {
++			podSets: workers(7, 4), steps: workload.PodSetsCounts{"workers": 2}, fits: room(7), mustGrow: true,
++			wantFound: true, want: workload.PodSetsCounts{"workers": 7},
++		},
++		"a partial grant of a full count off the step rounds down": {
++			podSets: workers(7, 4), steps: workload.PodSetsCounts{"workers": 2}, fits: room(6), mustGrow: true,
++			wantFound: true, want: workload.PodSetsCounts{"workers": 6},
++		},
++		"no steps behaves as step 1": {
++			podSets: workers(8, 4), fits: room(5), mustGrow: true,
++			wantFound: true, want: workload.PodSetsCounts{"workers": 5},
++		},
++		"a step below 1 behaves as step 1": {
++			podSets: workers(8, 4), steps: workload.PodSetsCounts{"workers": 0}, fits: room(5), mustGrow: true,
++			wantFound: true, want: workload.PodSetsCounts{"workers": 5},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			got, found := NewSteppedPodSetReducer(tc.podSets, tc.steps, tc.fits).Reduce(tc.mustGrow)
++			if found != tc.wantFound {
++				t.Fatalf("Reduce() found = %v, want %v (counts %v)", found, tc.wantFound, got)
++			}
++			if diff := cmp.Diff(tc.want, got); diff != "" {
++				t.Errorf("Reduce() counts (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++// TestSteppedPodSetReducerOnlyFitsMultiples pins that fits never sees a count that is not a
++// whole number of steps below the full count.
++func TestSteppedPodSetReducerOnlyFitsMultiples(t *testing.T) {
++	podSets := []kueue.PodSet{
++		*utiltestingapi.MakePodSet("a", 9).SetMinimumCount(3).Obj(),
++		*utiltestingapi.MakePodSet("b", 8).SetMinimumCount(4).Obj(),
++	}
++	fits := func(c workload.PodSetsCounts) bool {
++		if c["a"]%3 != 0 || c["b"]%2 != 0 {
++			t.Errorf("fits saw %v, not whole steps", c)
++		}
++		return c["a"]+c["b"] <= 13
++	}
++	got, found := NewSteppedPodSetReducer(podSets, workload.PodSetsCounts{"a": 3, "b": 2}, fits).Reduce(false)
++	if !found {
++		t.Fatal("Reduce() found nothing")
++	}
++	if got["a"]%3 != 0 || got["b"]%2 != 0 || got["a"]+got["b"] > 13 {
++		t.Errorf("Reduce() = %v", got)
++	}
++}
++
++// TestSteppedPodSetReducerStepOneMatchesOrdered pins that unit steps change nothing against the base reducer.
++func TestSteppedPodSetReducerStepOneMatchesOrdered(t *testing.T) {
++	podSets := []kueue.PodSet{
++		*utiltestingapi.MakePodSet("ps1", 6).SetMinimumCount(2).Obj(),
++		*utiltestingapi.MakePodSet("ps2", 5).SetMinimumCount(1).Obj(),
++	}
++	for limit := int32(2); limit <= 11; limit++ {
++		fits := func(c workload.PodSetsCounts) bool { return c["ps1"]+c["ps2"] <= limit }
++		for _, mustGrow := range []bool{false, true} {
++			want, wantFound := NewOrderedPodSetReducer(podSets, fits).Reduce(mustGrow)
++			got, found := NewSteppedPodSetReducer(podSets, nil, fits).Reduce(mustGrow)
++			if found != wantFound || cmp.Diff(want, got) != "" {
++				t.Errorf("limit %d mustGrow %v: got %v,%v want %v,%v", limit, mustGrow, got, found, want, wantFound)
++			}
++		}
++	}
++}
+diff --git a/pkg/scheduler/partial_scale_up_steps.go b/pkg/scheduler/partial_scale_up_steps.go
+new file mode 100644
+index 0000000..2112c46
+--- /dev/null
++++ b/pkg/scheduler/partial_scale_up_steps.go
+@@ -0,0 +1,34 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// The step sizes the scheduler's partial admission rounds a Workload's grants to.
++
++package scheduler
++
++import (
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// partialScaleUpSteps returns the step each PodSet of wl is granted in, read from its
++// kueue.x-k8s.io/podset-count-steps annotation, or nil when partial scale-up is off.
++func partialScaleUpSteps(wl *kueue.Workload) workload.PodSetsCounts {
++	if !features.Enabled(features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp) {
++		return nil
++	}
++	return workload.PodSetCountSteps(wl)
++}
+diff --git a/pkg/scheduler/partial_scale_up_steps_test.go b/pkg/scheduler/partial_scale_up_steps_test.go
+new file mode 100644
+index 0000000..fa93b37
+--- /dev/null
++++ b/pkg/scheduler/partial_scale_up_steps_test.go
+@@ -0,0 +1,50 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package scheduler
++
++import (
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++func TestPartialScaleUpSteps(t *testing.T) {
++	wl := utiltestingapi.MakeWorkload("wl", "ns").
++		PodSets(*utiltestingapi.MakePodSet("head", 1).Obj(), *utiltestingapi.MakePodSet("tpu", 8).Obj()).
++		Annotation(constants.PodSetCountStepsAnnotation, "tpu=2").
++		Obj()
++
++	t.Run("partial scale-up on reads the annotation", func(t *testing.T) {
++		features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++		features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp, true)
++		want := workload.PodSetsCounts{"head": 1, "tpu": 2}
++		if diff := cmp.Diff(want, partialScaleUpSteps(wl)); diff != "" {
++			t.Errorf("partialScaleUpSteps() (-want,+got):\n%s", diff)
++		}
++	})
++	t.Run("partial scale-up off ignores the annotation", func(t *testing.T) {
++		features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp, false)
++		if got := partialScaleUpSteps(wl); got != nil {
++			t.Errorf("partialScaleUpSteps() = %v, want nil", got)
++		}
++	})
++}
+diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
+index 33f8115..2fb96f1 100644
+--- a/pkg/scheduler/scheduler.go
++++ b/pkg/scheduler/scheduler.go
+@@ -1596,7 +1596,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+ 		// Only an admitted predecessor can already be running these PodSets. A predecessor
+ 		// that only holds quota may still be waiting for admission checks and needs the baseline back.
+ 		mustGrow := replaceableWorkloadSlice != nil && workload.IsAdmitted(replaceableWorkloadSlice.Obj)
+-		reducer := flavorassigner.NewOrderedPodSetReducer(effectiveReducerPodSets(wl.Obj.Spec.PodSets, replaceableWorkloadSlice, mustGrow), fitsFn)
++		reducer := flavorassigner.NewSteppedPodSetReducer(effectiveReducerPodSets(wl.Obj.Spec.PodSets, replaceableWorkloadSlice, mustGrow), partialScaleUpSteps(wl.Obj), fitsFn)
+ 		if _, found := reducer.Reduce(mustGrow); found {
+ 			assignmentPlan = *bestPartialPlan
+ 		}
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_multi_host_scaleup_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_multi_host_scaleup_test.go
+new file mode 100644
+index 0000000..3144d6b
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_multi_host_scaleup_test.go
+@@ -0,0 +1,178 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Partial scale-up of a multi-host worker group: grants come in whole replicas.
++
++package raycluster
++
++import (
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/component-base/featuregate"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++var _ = ginkgo.Describe("RayCluster partial scale-up of a multi-host worker group", ginkgo.Label("job:ray", "area:jobs"), func() {
++	var (
++		ns             *corev1.Namespace
++		resourceFlavor *kueue.ResourceFlavor
++		clusterQueue   *kueue.ClusterQueue
++		localQueue     *kueue.LocalQueue
++	)
++
++	setup := func(partialPreemption bool) {
++		ginkgo.BeforeEach(func() {
++			features.SetFeatureGatesDuringTest(ginkgo.GinkgoTB(), map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlices:                          true,
++				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++				features.PartialPreemption:                                     partialPreemption,
++			})
++			fwk.StartManager(ctx, cfg, managerAndSchedulerSetup())
++
++			ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "multi-host-")
++			resourceFlavor = utiltestingapi.MakeResourceFlavor("default").Obj()
++			behavioral.MustCreate(ctx, k8sClient, resourceFlavor)
++			// One head and four workers use 5 pods. The quota leaves room for 5 workers, not 6.
++			clusterQueue = utiltestingapi.MakeClusterQueue("default").
++				ResourceGroup(*utiltestingapi.MakeFlavorQuotas(resourceFlavor.Name).
++					Resource(corev1.ResourcePods, "6").
++					Resource(corev1.ResourceCPU, "100").
++					Obj()).
++				Obj()
++			behavioral.MustCreate(ctx, k8sClient, clusterQueue)
++			localQueue = utiltestingapi.MakeLocalQueue("default", ns.Name).ClusterQueue(clusterQueue.Name).Obj()
++			behavioral.MustCreate(ctx, k8sClient, localQueue)
++		})
++		ginkgo.AfterEach(func() {
++			gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, localQueue, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, resourceFlavor, true)
++			fwk.StopManager(ctx)
++		})
++	}
++
++	// multiHostCluster has one worker group of two hosts per replica, admitted at two replicas (four pods).
++	multiHostCluster := func() *rayv1.RayCluster {
++		return testingraycluster.MakeCluster("foo", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial).
++			Queue(localQueue.Name).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			FirstWorkerGroupReplicas(2, 1, 4).
++			WithNumOfHosts(workersGroupName, 2).
++			Obj()
++	}
++
++	scaleTo := func(rc *rayv1.RayCluster, replicas int32) {
++		ginkgo.GinkgoHelper()
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rc), rc)).To(gomega.Succeed())
++			rc.Spec.WorkerGroupSpecs[0].Replicas = new(replicas)
++			g.Expect(k8sClient.Update(ctx, rc)).To(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	}
++
++	setPodsQuota := func(quota string) {
++		ginkgo.GinkgoHelper()
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(clusterQueue), clusterQueue)).To(gomega.Succeed())
++			behavioral.SetResourceNominalQuota(clusterQueue, corev1.ResourcePods, quota)
++			g.Expect(k8sClient.Update(ctx, clusterQueue)).To(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	}
++
++	// Four pods granted, eight asked: room for five does not admit the slice at four again,
++	// and room for six admits it at six.
++	growsInWholeReplicas := func() {
++		rc := multiHostCluster()
++		behavioral.MustCreate(ctx, k8sClient, rc)
++		initial := &behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 1)[0]
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, initial, workersGroupName, 4)
++		gomega.Expect(initial.Annotations).To(gomega.HaveKeyWithValue(constants.PodSetCountStepsAnnotation, workersGroupName+"=2"))
++		if !features.Enabled(features.PartialPreemption) {
++			gomega.Expect(initial.Annotations).NotTo(gomega.HaveKey(constants.ReclaimMinCountsAnnotation))
++		}
++
++		ginkgo.By("asking for eight pods when room is left for five")
++		scaleTo(rc, 4)
++		slice := behavioral.ExpectNewWorkloadSlice(ctx, k8sClient, initial)
++		gomega.Expect(slice.Spec.PodSets[workersPodSetIdx].Count).To(gomega.Equal(int32(8)))
++		gomega.Expect(slice.Spec.PodSets[workersPodSetIdx].MinCount).To(gomega.Equal(new(int32(4))))
++		gomega.Expect(slice.Annotations).To(gomega.HaveKeyWithValue(constants.PodSetCountStepsAnnotation, workersGroupName+"=2"))
++
++		ginkgo.By("keeping the slice pending instead of admitting it at four pods again")
++		behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, slice)
++		gomega.Consistently(func(g gomega.Gomega) {
++			g.Expect(behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 2)).To(gomega.HaveLen(2))
++			got := &kueue.Workload{}
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(slice), got)).To(gomega.Succeed())
++			g.Expect(got.Status.Admission).To(gomega.BeNil())
++		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, initial, workersGroupName, 4)
++
++		ginkgo.By("granting six pods once room is left for six")
++		setPodsQuota("7")
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, slice, workersGroupName, 6)
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(initial))
++	}
++
++	ginkgo.When("PartialPreemption is off", func() {
++		setup(false)
++
++		ginkgo.It("Should grow in whole replicas and write the step without a floor", func() {
++			growsInWholeReplicas()
++		})
++	})
++
++	ginkgo.When("PartialPreemption is on", func() {
++		setup(true)
++
++		ginkgo.It("Should grow in whole replicas", func() {
++			growsInWholeReplicas()
++		})
++
++		ginkgo.It("Should write a floor of minReplicas times numOfHosts and refresh it", func() {
++			rc := multiHostCluster()
++			behavioral.MustCreate(ctx, k8sClient, rc)
++			wl := &behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 1)[0]
++			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.ReclaimMinCountsAnnotation, workersGroupName+"=2"))
++			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.PodSetCountStepsAnnotation, workersGroupName+"=2"))
++
++			ginkgo.By("raising minReplicas to 2")
++			gomega.Eventually(func(g gomega.Gomega) {
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rc), rc)).To(gomega.Succeed())
++				rc.Spec.WorkerGroupSpecs[0].MinReplicas = new(int32(2))
++				g.Expect(k8sClient.Update(ctx, rc)).To(gomega.Succeed())
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++			gomega.Eventually(func(g gomega.Gomega) {
++				got := &kueue.Workload{}
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).To(gomega.Succeed())
++				g.Expect(got.Annotations).To(gomega.HaveKeyWithValue(constants.ReclaimMinCountsAnnotation, workersGroupName+"=4"))
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		})
++	})
++})
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
+index 5077c37..6652cb0 100644
+--- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
+@@ -127,25 +127,13 @@ var _ = ginkgo.Describe("RayCluster reclaim floors", ginkgo.Label("job:ray", "ar
+ 			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+ 		})
+ 
+-		ginkgo.It("Should give a multi-host worker group no floor", func() {
++		ginkgo.It("Should give a multi-host worker group a floor and a step in whole replicas", func() {
+ 			rc := elasticCluster().WithNumOfHosts("workers-group-0", 2).Obj()
+ 			behavioral.MustCreate(ctx, k8sClient, rc)
+ 
+ 			wl := onlyWorkload()
+-			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.ReclaimMinCountsAnnotation))
+-			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.PodSetCountStepsAnnotation))
+-		})
+-
+-		ginkgo.It("Should give an elastic cluster without the partial scale-up strategy steps but no floor", func() {
+-			rc := testingraycluster.MakeCluster("foo", ns.Name).
+-				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+-				Queue(localQueue.Name).
+-				RequestWorkerGroup(corev1.ResourceCPU, "1").FirstWorkerGroupReplicas(4, 2, 8).Obj()
+-			behavioral.MustCreate(ctx, k8sClient, rc)
+-
+-			wl := onlyWorkload()
+-			gomega.Expect(wl.Annotations).NotTo(gomega.HaveKey(constants.ReclaimMinCountsAnnotation))
+-			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.PodSetCountStepsAnnotation, "workers-group-0=1"))
++			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.ReclaimMinCountsAnnotation, "workers-group-0=4"))
++			gomega.Expect(wl.Annotations).To(gomega.HaveKeyWithValue(constants.PodSetCountStepsAnnotation, "workers-group-0=2"))
+ 		})
+ 
+ 		ginkgo.It("Should give a non-elastic cluster no floor", func() {

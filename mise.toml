@@ -41,6 +41,10 @@ INTERLINK_IMAGE_TAG = "{{env.INTERLINK_UPSTREAM}}-p{{env.INTERLINK_PATCH_VERSION
 RAY_BASE_IMAGE = "rayproject/ray:{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}"
 RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}-p{{env.RAY_PATCH_VERSION}}"
 
+# Kueue feature gates for cluster:up. The default leaves PartialPreemption off; CI runs a second leg with
+# KUEUE_FEATURE_GATES set to the readme's full gate list, which turns partial preemption on.
+KUEUE_FEATURE_GATES = "{{ get_env(name='KUEUE_FEATURE_GATES', default='ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true') }}"
+
 [tasks."clone:kueue"]
 description = "Clone upstream Kueue at target version"
 run = """
@@ -234,24 +238,27 @@ docker run --rm -v "$PWD/tests/ray:/tests:ro" -v "$PWD/third_party/ray/python/ra
 """
 
 [tasks."test:kueue"]
-description = "Run unit tests of the packages the Karpenter AdmissionCheck, deployment queue, topology-aware reclaim, and elastic flavor change patches change, and the rollback compatibility tests"
+description = "Run the unit tests of every package the Kueue patches change or build on, with the race detector, so each upstream test that passes on vanilla Kueue must pass on the patched tree"
+depends = ["patch:kueue"]
+dir = "third_party/kueue"
+run = "go test -race -timeout 30m ./pkg/scheduler/... ./pkg/cache/... ./pkg/controller/... ./pkg/features/... ./pkg/webhooks/... ./pkg/workload/... ./pkg/workloadslicing/... ./pkg/util/equality/..."
+
+[tasks."test:kueue-integration"]
+description = "Run the patched Kueue topology-aware scheduling and RayCluster integration suites and the RayCluster webhook suite against envtest, which include the topology-aware cohort reclaim, elastic flavor placement and template re-apply specs"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
 run = """
 set -e
-go test ./pkg/controller/admissionchecks/karpenter/ ./pkg/cache/queue/ ./pkg/controller/jobs/deployment/ ./pkg/controller/elasticjobs/ ./pkg/scheduler/...
-go test ./pkg/controller/jobs/raycluster/ -run 'TestRollback'
-"""
-
-[tasks."test:kueue-integration"]
-description = "Run the patched Kueue topology-aware reclaim integration suite against envtest"
-depends = ["patch:kueue"]
-dir = "third_party/kueue"
-run = """
 make test-integration \
   INTEGRATION_TARGET=./test/integration/singlecluster/tas/... \
+  INTEGRATION_NPROCS=4
+make test-integration \
+  INTEGRATION_TARGET=./test/integration/singlecluster/controller/jobs/raycluster/... \
+  INTEGRATION_NPROCS=1
+make test-integration \
+  INTEGRATION_TARGET=./test/integration/singlecluster/webhook/jobs/... \
   INTEGRATION_NPROCS=1 \
-  'INTEGRATION_FILTERS=--focus="Topology-aware cohort reclaim"'
+  'INTEGRATION_FILTERS=--focus="RayCluster Webhook"'
 """
 
 [tasks."test:kuberay"]
@@ -409,8 +416,9 @@ subjects:
   namespace: default
 EOF
 
-# 6. Install Kueue manifests directly patched with sed (image, ko entrypoint), the ConcurrentAdmission feature gate
-#    the Karpenter AdmissionCheck requires, and the Karpenter RBAC
+# 6. Install Kueue manifests directly patched with sed (image, ko entrypoint), the feature gates in KUEUE_FEATURE_GATES
+#    (by default the ConcurrentAdmission gate the Karpenter AdmissionCheck requires and the FlavorChangeFromZero gate
+#    that patch 0006 completes), and the Karpenter RBAC
 echo "Installing Kueue manifests with patched image..."
 curl -sL "https://github.com/kubernetes-sigs/kueue/releases/download/$KUEUE_UPSTREAM/manifests.yaml" | \
   sed -e "s|registry.k8s.io/kueue/kueue:$KUEUE_UPSTREAM|$KUEUE_IMG|g" \
@@ -448,8 +456,16 @@ subjects:
   namespace: kueue-system
 EOF
 
+# Patch 0007 re-stamps the templates of an elastic RayCluster on every write, so its webhook must also see updates;
+# the release manifests register it for CREATE only.
+raycluster_webhook=$(kubectl get mutatingwebhookconfiguration kueue-mutating-webhook-configuration -o jsonpath='{.webhooks[*].name}' |
+  awk '{for (i = 1; i <= NF; i++) if ($i == "mraycluster.kb.io") print i - 1}')
+kubectl patch mutatingwebhookconfiguration kueue-mutating-webhook-configuration --type=json \
+  -p '[{"op":"add","path":"/webhooks/'"$raycluster_webhook"'/rules/0/operations/-","value":"UPDATE"}]'
+
+echo "Enabling Kueue feature gates: $KUEUE_FEATURE_GATES"
 kubectl patch deployment/kueue-controller-manager -n kueue-system --type=json \
-  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates=ConcurrentAdmission=true"}]'
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates='"$KUEUE_FEATURE_GATES"'"}]'
 kubectl set resources deployment/kueue-controller-manager -n kueue-system --limits=memory=2Gi --requests=memory=512Mi
 
 # 7. Wait for rollouts
@@ -573,5 +589,7 @@ description = "Tear down the local Kind cluster"
 run = "kind delete cluster --name $CLUSTER_NAME"
 
 [tasks.test]
-description = "Run full scenario test suite"
-run = "chainsaw test tests/scenarios/ --parallel 1 --assert-timeout 60s --cleanup-timeout 120s --force-termination-grace-period 0s"
+description = "Run the scenarios that pass with PartialPreemption off, or every scenario with CHAINSAW_SELECTOR set to an empty string"
+# CHAINSAW_SELECTOR is a label selector over the scenarios. Those labeled partial-preemption=required need the
+# PartialPreemption gate, so when it is unset only the others run; set it to "" to run every scenario.
+run = 'chainsaw test tests/scenarios/ --selector "${CHAINSAW_SELECTOR-partial-preemption!=required}" --parallel 1 --assert-timeout 60s --cleanup-timeout 120s --force-termination-grace-period 0s'

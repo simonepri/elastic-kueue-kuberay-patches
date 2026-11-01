@@ -9,7 +9,8 @@ victim with floors shrunk to them, evicts shrunk targets whole when the
 candidates run out without a fit, and grows them back in steps during
 fill-back, a PodSet the preemptor does not need back to its whole count, so
 the reclaim target leaves it out. Victims whose reclaim target is pending are offered right after the
-evicted ones; once the target is 5 minutes old they are ordered like any other
+evicted ones, with their other PodSets whole, which an escalation may still
+shrink to their floors; once the target is 5 minutes old they are ordered like any other
 candidate and evicted whole. A victim shrunk earlier in the same cycle is not
 offered again. A partial target is issued as a reclaim-target annotation,
 never raised, with the time it was last lowered and no preemption
@@ -210,10 +211,10 @@ index 6da3b27..3c1cc74 100644
  }
 diff --git a/pkg/scheduler/preemption/partial_preemption.go b/pkg/scheduler/preemption/partial_preemption.go
 new file mode 100644
-index 0000000..8243c60
+index 0000000..0b4aab8
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption.go
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,275 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -267,9 +268,10 @@ index 0000000..8243c60
 +}
 +
 +// reclaimBounds returns the bound of each PodSet of wl that partial preemption
-+// may shrink, or nil when wl may only be evicted whole. A workload whose reclaim
-+// target is pending keeps at most that target, and is offered at it; one whose
-+// target is older than policy.ReclaimTimeout is only evicted whole. Any other workload
++// may shrink, or nil when wl may only be evicted whole. A PodSet whose reclaim
++// target is pending keeps at most that target, and a workload with one is
++// offered at its targets with its other PodSets whole; a workload whose target
++// is older than policy.ReclaimTimeout is only evicted whole. Any other workload
 +// is offered at the floors of kueue.x-k8s.io/reclaim-min-counts, rounded up to
 +// their steps.
 +func reclaimBounds(wl *workload.Info, now time.Time) map[kueue.PodSetReference]reclaimBound {
@@ -292,18 +294,20 @@ index 0000000..8243c60
 +		if hasFloor {
 +			floor = (floor + step - 1) / step * step
 +		}
-+		if len(pending) > 0 {
-+			target, found := pending[ps.Name]
-+			if !found || target >= ps.Count {
-+				continue
-+			}
++		if target, found := pending[ps.Name]; found && target < ps.Count {
 +			if !hasFloor || floor > target {
 +				floor = target
 +			}
 +			bounds[ps.Name] = reclaimBound{floor: floor, ceiling: target, initial: target, step: step}
 +		} else if hasFloor && floor < ps.Count {
 +			ceiling := floor + (ps.Count-floor)/step*step
-+			bounds[ps.Name] = reclaimBound{floor: floor, ceiling: ceiling, initial: floor, step: step}
++			// A workload with a pending target is offered at that target, its
++			// other PodSets whole; they shrink only once it is escalated.
++			initial := floor
++			if len(pending) > 0 {
++				initial = ps.Count
++			}
++			bounds[ps.Name] = reclaimBound{floor: floor, ceiling: ceiling, initial: initial, step: step}
 +		}
 +	}
 +	if len(bounds) == 0 {
@@ -488,10 +492,10 @@ index 0000000..8243c60
 +}
 diff --git a/pkg/scheduler/preemption/partial_preemption_property_test.go b/pkg/scheduler/preemption/partial_preemption_property_test.go
 new file mode 100644
-index 0000000..a477f82
+index 0000000..83fb2de
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption_property_test.go
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,273 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -528,6 +532,7 @@ index 0000000..a477f82
 +	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
 +	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 +	"sigs.k8s.io/kueue/pkg/workload"
++	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
 +)
 +
 +const propertyCases = 1500
@@ -561,7 +566,9 @@ index 0000000..a477f82
 +				w.reclaimable = append(w.reclaimable, kueue.ReclaimablePod{Name: ps.name, Count: rc})
 +				charged = min(admitted, ps.count-rc)
 +			}
-+			if r.IntN(2) == 0 {
++			// A second PodSet of a victim with a pending target mostly has a
++			// floor, so the target leaves out a PodSet that may still shrink.
++			if r.IntN(2) == 0 || (pending != nil && r.IntN(4) != 0) {
 +				step := 1 + r.Int32N(3)
 +				if floors == nil {
 +					floors, steps = make(workload.PodSetsCounts), make(workload.PodSetsCounts)
@@ -569,7 +576,7 @@ index 0000000..a477f82
 +				floors[ps.name] = r.Int32N(ps.count+1) / step * step
 +				steps[ps.name] = step
 +			}
-+			if r.IntN(8) == 0 && charged > 1 {
++			if r.IntN(4) == 0 && charged > 1 {
 +				if pending == nil {
 +					pending = make(workload.PodSetsCounts)
 +				}
@@ -605,21 +612,24 @@ index 0000000..a477f82
 +}
 +
 +// fitsAfter reports whether the preemptor's quota fits once targets are
-+// removed, through both the seam's removal and its usage-only removal.
-+func fitsAfter(t *testing.T, run *ppRun, targets []*Target) bool {
++// removed, through both the seam's removal and its usage-only removal, and
++// whether it fits without borrowing.
++func fitsAfter(t *testing.T, run *ppRun, targets []*Target) (fits, fitsWithoutBorrowing bool) {
 +	t.Helper()
 +	cq := run.snapshot.ClusterQueue("incoming")
 +	usage := workload.Usage{Quota: workload.ResourceUsage{Assigned: run.assign.TotalRequestsFor(utiltesting.NewLogger(t), run.incoming)}}
++	pCtx := &preemptionCtx{preemptorCQ: cq, workloadUsage: usage}
 +	revert := policy.SimulateRemoval(run.snapshot, targets)
-+	removed := cq.Fits(usage) == schdcache.FitsCheckOk
++	fits = cq.Fits(usage) == schdcache.FitsCheckOk
++	fitsWithoutBorrowing = workloadQuotaFits(pCtx, false)
 +	revert()
 +	revert = policy.SimulateUsageRemoval(run.snapshot, targets)
 +	usageRemoved := cq.Fits(usage) == schdcache.FitsCheckOk
 +	revert()
-+	if removed != usageRemoved {
-+		t.Errorf("SimulateRemoval and SimulateUsageRemoval disagree: %t != %t", removed, usageRemoved)
++	if fits != usageRemoved {
++		t.Errorf("SimulateRemoval and SimulateUsageRemoval disagree: %t != %t", fits, usageRemoved)
 +	}
-+	return removed
++	return fits, fitsWithoutBorrowing
 +}
 +
 +func TestPartialPreemptionSearchProperties(t *testing.T) {
@@ -628,7 +638,7 @@ index 0000000..a477f82
 +		t.Run(mode.name, func(t *testing.T) {
 +			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
 +			r := rand.New(rand.NewPCG(20, 4))
-+			var found, shrunk int
++			var found, shrunk, inFlightMultiPodSet int
 +			for i := range propertyCases {
 +				sc := randomScenario(r)
 +				ok := t.Run(fmt.Sprint(i), func(t *testing.T) {
@@ -655,6 +665,11 @@ index 0000000..a477f82
 +						return
 +					}
 +					found++
++					for _, target := range targets {
++						if len(target.WorkloadInfo.TotalRequests) > 1 && len(workload.PendingReclaimTargetCounts(target.WorkloadInfo.Obj)) > 0 {
++							inFlightMultiPodSet++
++						}
++					}
 +					seen := make(map[workload.Reference]bool)
 +					for _, target := range targets {
 +						key := workload.Key(target.WorkloadInfo.Obj)
@@ -663,22 +678,23 @@ index 0000000..a477f82
 +						}
 +						seen[key] = true
 +					}
-+					if !fitsAfter(t, run, targets) {
++					fits, fitsWithoutBorrowing := fitsAfter(t, run, targets)
++					if !fits {
 +						t.Errorf("the preemptor does not fit after the targets %v", describeTargets(targets))
 +					}
 +					for i, target := range targets {
 +						bounds := reclaimBounds(target.WorkloadInfo, now)
 +						if target.Remaining == nil {
-+							if bounds == nil {
++							floors := annotatedFloors(target.WorkloadInfo, now)
++							if len(floors) == 0 {
 +								continue
-+							}
-+							floors := make(workload.PodSetsCounts)
-+							for name, b := range bounds {
-+								floors[name] = b.floor
 +							}
 +							alternative := append([]*Target(nil), targets...)
 +							alternative[i] = &Target{WorkloadInfo: target.WorkloadInfo, Remaining: policy.ShrunkTo(target.WorkloadInfo, floors)}
-+							if fitsAfter(t, run, alternative) {
++							// A strategy that does not let the preemptor borrow only
++							// needs the floors to suffice without borrowing.
++							altFits, altFitsWithoutBorrowing := fitsAfter(t, run, alternative)
++							if (fitsWithoutBorrowing && altFitsWithoutBorrowing) || (!fitsWithoutBorrowing && altFits) {
 +								t.Errorf("%s is evicted whole although its floors %v suffice: %v", target.WorkloadInfo.Obj.Name, floors, describeTargets(targets))
 +							}
 +							continue
@@ -697,7 +713,7 @@ index 0000000..a477f82
 +								// Grown back whole: the PodSet is not shrunk.
 +							case ps.Count > current || ps.Count < b.floor || ps.Count > b.ceiling:
 +								t.Errorf("%s/%s keeps %d of %d pods, outside [%d, %d]", target.WorkloadInfo.Obj.Name, ps.Name, ps.Count, current, b.floor, b.ceiling)
-+							case !workload.IsPartiallyPreempted(target.WorkloadInfo.Obj) && ps.Count%b.step != 0:
++							case !isPending(target.WorkloadInfo.Obj, ps.Name) && ps.Count%b.step != 0:
 +								t.Errorf("%s/%s keeps %d pods, not a multiple of the step %d", target.WorkloadInfo.Obj.Name, ps.Name, ps.Count, b.step)
 +							}
 +							if ps.Count < current {
@@ -714,16 +730,51 @@ index 0000000..a477f82
 +					break
 +				}
 +			}
-+			t.Logf("%d of %d random cohorts found targets, %d targets shrunk", found, propertyCases, shrunk)
++			t.Logf("%d of %d random cohorts found targets, %d targets shrunk, %d targets multi-PodSet victims with a pending target",
++				found, propertyCases, shrunk, inFlightMultiPodSet)
 +		})
 +	}
 +}
++
++// isPending reports whether the PodSet's reclaim target is pending, so the
++// counts it may keep end at that target rather than at a step.
++func isPending(wl *kueue.Workload, podSet kueue.PodSetReference) bool {
++	_, found := workload.PendingReclaimTargetCounts(wl)[podSet]
++	return found
++}
++
++// annotatedFloors returns, from the annotations alone, the fewest pods each
++// PodSet of wl may keep: its floor rounded up to its step, and no more than a
++// pending target. It is empty for a workload that may only be evicted whole.
++func annotatedFloors(wl *workload.Info, now time.Time) workload.PodSetsCounts {
++	if workloadevict.IsEvicted(wl.Obj) || policy.ReclaimTimedOut(wl.Obj, now) && len(workload.PendingReclaimTargetCounts(wl.Obj)) > 0 {
++		return nil
++	}
++	floors := workload.ReclaimMinCounts(wl.Obj)
++	steps := workload.PodSetCountSteps(wl.Obj)
++	pending := workload.PendingReclaimTargetCounts(wl.Obj)
++	kept := make(workload.PodSetsCounts)
++	for _, ps := range wl.TotalRequests {
++		count, found := ps.Count, false
++		if floor, ok := floors[ps.Name]; ok {
++			step := max(1, steps[ps.Name])
++			count, found = min(count, (floor+step-1)/step*step), true
++		}
++		if target, ok := pending[ps.Name]; ok {
++			count, found = min(count, target), true
++		}
++		if found && count < ps.Count {
++			kept[ps.Name] = count
++		}
++	}
++	return kept
++}
 diff --git a/pkg/scheduler/preemption/partial_preemption_test.go b/pkg/scheduler/preemption/partial_preemption_test.go
 new file mode 100644
-index 0000000..c630430
+index 0000000..dbc9110
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption_test.go
-@@ -0,0 +1,919 @@
+@@ -0,0 +1,927 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1137,6 +1188,14 @@ index 0000000..c630430
 +			}},
 +			want:    []string{"inflight:main=2"},
 +			wantOff: []string{"cheap"},
++		},
++		"shrinks the PodSets an in-flight target leaves out before evicting the victim whole": {
++			sc: ppScenario{incoming: 3, lender: 1, needCPU: 3, workloads: []ppWorkload{
++				{name: "victim", cq: "borrower", podSets: []ppPodSet{{name: "a", count: 2, cpu: 1}, {name: "b", count: 2, cpu: 1}},
++					floors: "a=0,b=0", pending: "b=1"},
++			}},
++			want:    []string{"victim:a=1,b=0"},
++			wantOff: []string{"victim"},
 +		},
 +		"escalates an in-flight victim to one whole target": {
 +			sc: ppScenario{incoming: 4, needCPU: 4, workloads: []ppWorkload{

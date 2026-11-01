@@ -1,0 +1,14 @@
+# The RayCluster runs with Kueue's PodSet label on its worker template.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: reapplied-cluster
+spec:
+  suspend: false
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 2
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/podset: workers

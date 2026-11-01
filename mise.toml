@@ -43,7 +43,7 @@ RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}-p{{e
 
 # Kueue feature gates for cluster:up. The default leaves PartialPreemption off; CI runs a second leg with
 # KUEUE_FEATURE_GATES set to the readme's full gate list, which turns partial preemption on.
-KUEUE_FEATURE_GATES = "{{ get_env(name='KUEUE_FEATURE_GATES', default='ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true') }}"
+KUEUE_FEATURE_GATES = "{{ get_env(name='KUEUE_FEATURE_GATES', default='ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true') }}"
 
 [tasks."clone:kueue"]
 description = "Clone upstream Kueue at target version"

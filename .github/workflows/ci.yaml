@@ -179,9 +179,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The default gates: partial preemption off, so elastic victims are evicted whole.
+          # The shipped gates with partial preemption off, so elastic victims are evicted whole.
           - leg: partial preemption off
-            feature-gates: ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true
+            feature-gates: ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true
             selector: partial-preemption!=required
           # Every gate the readme lists for an elastic deployment, which turns partial preemption on.
           - leg: partial preemption on

@@ -17,10 +17,11 @@ counts, so a grant is a whole number of steps, the baseline rounds up to a step,
 and a scale-up must beat the baseline in whole steps. Steps of 1, a Workload
 without the annotation, and the gate off leave admission unchanged. For a PodSet
 with a step above 1 the ungater starts whole ray.io/worker-group-replica-name
-groups, completing a started group first, and never part of a group.
+groups, completing a started group first, starting a new group only once all
+its pods exist, and never part of a group.
 
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index 756f485..c2aa70c 100644
+index 756f485..a1eb815 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -319,16 +319,21 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
@@ -39,7 +40,7 @@ index 756f485..c2aa70c 100644
 -			if int32(len(candidates)) > room {
 -				toUngate = candidates[:room]
 +			if steps[ps] > 1 {
-+				toUngate = podsToUngateInWholeGroups(candidates, pods, ps, room)
++				toUngate = podsToUngateInWholeGroups(candidates, pods, ps, steps[ps], room)
 +			} else {
 +				// Ungate the lowest-named pods first for deterministic behavior.
 +				slices.SortFunc(candidates, func(a, b *corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
@@ -52,10 +53,10 @@ index 756f485..c2aa70c 100644
  		log.V(4).Info("elastic ungating quota accounting for PodSet",
 diff --git a/pkg/controller/elasticjobs/ungate_whole_groups.go b/pkg/controller/elasticjobs/ungate_whole_groups.go
 new file mode 100644
-index 0000000..8f3e022
+index 0000000..f683807
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/ungate_whole_groups.go
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,83 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -91,11 +92,12 @@ index 0000000..8f3e022
 +const replicaGroupLabel = "ray.io/worker-group-replica-name"
 +
 +// podsToUngateInWholeGroups returns up to room of the gated candidates of podSet, in whole
-+// replica groups: a group is ungated only when all its gated pods fit, and a group that
-+// already has running pods is completed before a new one starts. Groups go in name order.
++// replica groups: a group is ungated only when all its gated pods fit, a group that
++// already has running pods is completed before a new one starts, and a group with nothing
++// running starts only once KubeRay has created all step pods of it. Groups go in name order.
 +// A candidate without the group label is its own group. pods are all the live pods of the
 +// slice, used to tell which groups have started.
-+func podsToUngateInWholeGroups(candidates, pods []*corev1.Pod, podSet kueue.PodSetReference, room int32) []*corev1.Pod {
++func podsToUngateInWholeGroups(candidates, pods []*corev1.Pod, podSet kueue.PodSetReference, step, room int32) []*corev1.Pod {
 +	started := map[string]bool{}
 +	for _, p := range pods {
 +		if g := p.Labels[replicaGroupLabel]; g != "" && !utilpod.IsTerminated(p) &&
@@ -127,7 +129,11 @@ index 0000000..8f3e022
 +	})
 +	var out []*corev1.Pod
 +	for _, k := range keys {
-+		if n := int32(len(groups[k])); n <= room {
++		n := int32(len(groups[k]))
++		if !started[k] && !strings.HasPrefix(k, "\x00") && n != step {
++			continue
++		}
++		if n <= room {
 +			out = append(out, groups[k]...)
 +			room -= n
 +		}
@@ -136,10 +142,10 @@ index 0000000..8f3e022
 +}
 diff --git a/pkg/controller/elasticjobs/ungate_whole_groups_test.go b/pkg/controller/elasticjobs/ungate_whole_groups_test.go
 new file mode 100644
-index 0000000..356e65c
+index 0000000..3aeeaa2
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/ungate_whole_groups_test.go
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,179 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -220,6 +226,25 @@ index 0000000..356e65c
 +			},
 +			wantOpen:  []string{"p-2b"},
 +			wantGated: []string{"p-3a", "p-3b"},
++		},
++		"a group still missing pods is not started": {
++			step:    "workers=2",
++			granted: 4,
++			pods: []*corev1.Pod{
++				replicaPod("p-1a", "r1", false), replicaPod("p-1b", "r1", false),
++				replicaPod("p-2a", "r2", true), replicaPod("p-3a", "r3", true),
++			},
++			wantGated: []string{"p-2a", "p-3a"},
++		},
++		"a complete group starts while an incomplete one waits": {
++			step:    "workers=2",
++			granted: 4,
++			pods: []*corev1.Pod{
++				replicaPod("p-1a", "r1", false), replicaPod("p-1b", "r1", false),
++				replicaPod("p-2a", "r2", true), replicaPod("p-3a", "r3", true), replicaPod("p-3b", "r3", true),
++			},
++			wantOpen:  []string{"p-3a", "p-3b"},
++			wantGated: []string{"p-2a"},
 +		},
 +		"without a step pods go by name": {
 +			granted: 5,

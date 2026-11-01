@@ -82,7 +82,7 @@ All are Workload annotations. Count lists use the format of [kubernetes-sigs/kue
 | `kueue.x-k8s.io/reclaim-target-counts` | count list: the pod count each shrunk PodSet goes down to | by R5 on a deep copy of the victim, as `min(existing, new)` per PodSet, without preemption expectations (see below); lowered by R3 on scale-down | by R3 once the Workload no longer holds quota, after clearing the `reclaimablePods` it set | `constants.ReclaimTargetCountsAnnotation` (`pkg/constants/partial_preemption.go`, R3) |
 | `kueue.x-k8s.io/reclaim-preemptor` | `<namespace>/<name>` of the preemptor Workload | by R5, together with the target | by R3, together with the target | `constants.ReclaimPreemptorAnnotation` (same file, R3) |
 | `kueue.x-k8s.io/reclaim-requested-at` | RFC 3339 time the target was first written; R5 evicts the victim whole once a pending target is older than its timeout | by R5, when it first sets the target | by R3, together with the target | `constants.ReclaimRequestedAtAnnotation` (same file, R3) |
-| `kueue.x-k8s.io/reclaim-min-counts` | count list: the fewest pods each PodSet may keep; a PodSet missing from it is only evicted whole | by R4 when it builds the Workload, and by R4 in the in-place update of `EnsureWorkloadSlices` when the job's floor changes | never; a new slice gets its own | `constants.ReclaimMinCountsAnnotation` (`pkg/constants/reclaim_floors.go`, R4) |
+| `kueue.x-k8s.io/reclaim-min-counts` | count list: the fewest pods each PodSet may keep; a PodSet missing from it is only evicted whole | by R4 when it builds the Workload, and by R4 on every active slice in `EnsureWorkloadSlices` when the job's floor changes, only for a job that takes the partial scale-up path (`ElasticPartialScaleUpEnabled`), since upstream creates no scale-up probe for other jobs and a shrunk victim could never grow back | never; a new slice gets its own | `constants.ReclaimMinCountsAnnotation` (`pkg/constants/reclaim_floors.go`, R4) |
 | `kueue.x-k8s.io/podset-count-steps` | count list: the pod count each PodSet shrinks and grows by; a missing PodSet has step 1 | as above; independent of the floor, so R8 writes it without one | never | `constants.PodSetCountStepsAnnotation` (same file, R4) |
 
 `kueue.x-k8s.io/reclaim-target-counts` is the only key [kubernetes-sigs/kueue#17484](https://github.com/kubernetes-sigs/kueue/pull/17484) defines. The floor follows the `reclaimMinCount` field that the [KEP-975 draft](https://github.com/kubernetes-sigs/kueue/pull/14589) proposes, so it can become that field when the KEP lands.
@@ -138,7 +138,7 @@ type JobWithPodSetCountSteps interface {
 }
 ```
 
-R4 writes the floors when `PartialPreemption` is on, and the steps when `PartialPreemption` is on; R8 also writes the steps when `ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp` is on.
+R4 writes the floors when `PartialPreemption` is on and the job has the partial scale-up strategy, so an elastic RayCluster without it has no floor and is evicted whole, and the steps when `PartialPreemption` is on, for every elastic RayCluster; R8 also writes the steps when `ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp` is on.
 
 ## Preemption seam
 

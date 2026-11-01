@@ -1,3 +1,5 @@
+# Partial preemption shrinks the cluster without touching replicas: its Workload carries the
+# reclaim target and releases the quota of the workers above it.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -5,4 +7,21 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: workers
-      replicas: 6
+      replicas: 8
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: elastic-reexpand-cluster
+  annotations:
+    kueue.x-k8s.io/reclaim-target-counts: workers=6
+status:
+  (reclaimablePods[?name=='workers'].count | [0]): 2
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reexpand-urgent-job
+status:
+  (startTime != null): true

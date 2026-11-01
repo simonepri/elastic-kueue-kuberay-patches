@@ -1,3 +1,5 @@
+# Once the urgent job is gone, a scale-up probe regrows the cluster to all 8 workers;
+# replicas never changed.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -6,3 +8,15 @@ spec:
   workerGroupSpecs:
     - groupName: workers
       replicas: 8
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: elastic-reexpand-cluster
+  annotations:
+    (contains(keys(@), 'kueue.x-k8s.io/workload-slice-replacement-for')): true
+    (contains(keys(@), 'kueue.x-k8s.io/reclaim-target-counts')): false
+status:
+  (admission.podSetAssignments[?name=='workers'].count | [0]): 8
+  (conditions[?type=='Finished'] | length(@)): 0

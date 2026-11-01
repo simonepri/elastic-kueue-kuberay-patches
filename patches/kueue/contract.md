@@ -211,7 +211,7 @@ PartialPreemption: {{Version: version.MustParse("0.20"), Default: false, PreRele
 PartialPreemption: {ElasticJobsViaWorkloadSlices, ReclaimablePods},
 ```
 
-With the gate off, R3 to R6 change nothing: no floor annotation is written, no target is set, and the reconciler, ungater, and scheduler follow upstream code paths.
+With the gate off, R3 to R6 change nothing: no floor annotation is written, no target is set, and the reconciler, ungater, and scheduler follow upstream code paths. The code that acts on a reclaim target (R3's stopper, ungater cap and release, in-place scale-down rule and clearing, and R6's regrowth and hold) follows the annotations rather than the gate, so a target written before the gate is turned off still completes and the cluster still regrows. R6 also starts a suspended job with the admitted slice its pending probe replaces with the gate off, since a Workload admitted by an earlier release keeps a `minCount` that lets it be readmitted below its count.
 
 ## Migration from p0.6.x
 

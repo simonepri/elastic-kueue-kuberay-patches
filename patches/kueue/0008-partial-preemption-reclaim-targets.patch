@@ -1672,7 +1672,7 @@ index 209983e..d2491ef 100644
  
 diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
 new file mode 100644
-index 0000000..d833155
+index 0000000..1b42c1d
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption.go
 @@ -0,0 +1,273 @@
@@ -1769,8 +1769,9 @@ index 0000000..d833155
 +// each PodSet in counts runs at most its count. It deletes whole groups, as
 +// groupOf maps each Pod to a group key; the group whose costliest Pod has the
 +// lowest controller.kubernetes.io/pod-deletion-cost goes first, then the group
-+// with the newest Pod. Terminating Pods count toward counts and are not deleted
-+// again. It returns whether any Pod was deleted.
++// with the newest Pod. Terminating Pods are neither deleted again nor counted, so
++// a call made while earlier deletions are still terminating deletes nothing more.
++// It returns whether any Pod was deleted.
 +func DeletePodGroupsAboveCounts(ctx context.Context, c client.Client, wl *kueue.Workload, counts workload.PodSetsCounts, groupOf func(*corev1.Pod) string) (bool, error) {
 +	running, err := runningPodsPerPodSet(ctx, c, wl)
 +	if err != nil {
@@ -1778,16 +1779,15 @@ index 0000000..d833155
 +	}
 +	var toDelete []*corev1.Pod
 +	for _, ps := range slices.Sorted(maps.Keys(counts)) {
-+		pods := running[ps]
-+		remaining := int32(len(pods))
++		// Terminating Pods are already on their way out, so only the others count
++		// toward the target here; PodsAboveCounts still waits for them to go.
++		live := slices.DeleteFunc(slices.Clone(running[ps]), func(p *corev1.Pod) bool { return p.DeletionTimestamp != nil })
++		remaining := int32(len(live))
 +		if remaining <= counts[ps] {
 +			continue
 +		}
 +		groupsByKey := make(map[string]*podGroup)
-+		for _, p := range pods {
-+			if p.DeletionTimestamp != nil {
-+				continue
-+			}
++		for _, p := range live {
 +			key := groupOf(p)
 +			g, found := groupsByKey[key]
 +			if !found {
@@ -1951,10 +1951,10 @@ index 0000000..d833155
 +}
 diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go
 new file mode 100644
-index 0000000..19aa509
+index 0000000..acb3491
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption_test.go
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,365 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2165,9 +2165,15 @@ index 0000000..19aa509
 +		return p.Name
 +	}
 +	testCases := map[string]struct {
-+		pods        []*corev1.Pod
-+		counts      workload.PodSetsCounts
++		pods   []*corev1.Pod
++		counts workload.PodSetsCounts
++		// repeat calls DeletePodGroupsAboveCounts again while the Pods it deleted
++		// are still terminating, held by a finalizer.
++		repeat      bool
 +		wantDeleted []string
++		// wantAbove is whether PodsAboveCounts still reports Pods above the counts
++		// after the call, because terminating Pods hold their resources until gone.
++		wantAbove   bool
 +		wantStopped bool
 +	}{
 +		"no pod is deleted at or below the target": {
@@ -2221,15 +2227,31 @@ index 0000000..19aa509
 +			wantDeleted: []string{"old-a", "old-b"},
 +			wantStopped: true,
 +		},
-+		"terminating pods count toward the target and are not deleted again": {
++		"terminating pods are neither deleted again nor counted toward the target": {
 +			pods: []*corev1.Pod{
 +				worker("a", 0).Obj(),
 +				worker("b", time.Second).Obj(),
 +				worker("c", 2*time.Second).Finalizer("test").DeletionTimestamp(now).Obj(),
 +			},
-+			counts:      workload.PodSetsCounts{"workers": 2},
-+			wantDeleted: []string{"b"},
++			counts:    workload.PodSetsCounts{"workers": 2},
++			wantAbove: true,
++		},
++		"a repeat call while the deleted pods terminate deletes nothing more": {
++			pods: []*corev1.Pod{
++				worker("w-0", 0).Finalizer("test").Obj(),
++				worker("w-1", 1*time.Second).Finalizer("test").Obj(),
++				worker("w-2", 2*time.Second).Finalizer("test").Obj(),
++				worker("w-3", 3*time.Second).Finalizer("test").Obj(),
++				worker("w-4", 4*time.Second).Finalizer("test").Obj(),
++				worker("w-5", 5*time.Second).Finalizer("test").Obj(),
++				worker("w-6", 6*time.Second).Finalizer("test").Obj(),
++				worker("w-7", 7*time.Second).Finalizer("test").Obj(),
++			},
++			counts:      workload.PodSetsCounts{"workers": 4},
++			repeat:      true,
++			wantDeleted: []string{"w-4", "w-5", "w-6", "w-7"},
 +			wantStopped: true,
++			wantAbove:   true,
 +		},
 +		"gated, terminated, and other PodSets' pods are kept": {
 +			pods: []*corev1.Pod{
@@ -2259,14 +2281,29 @@ index 0000000..19aa509
 +			if stopped != tc.wantStopped {
 +				t.Errorf("DeletePodGroupsAboveCounts() = %v, want %v", stopped, tc.wantStopped)
 +			}
++			if tc.repeat {
++				if above, err := PodsAboveCounts(ctx, clnt, wl, tc.counts); err != nil || !above {
++					t.Errorf("PodsAboveCounts() = %v, %v while the deleted pods terminate, want true", above, err)
++				}
++				stopped, err := DeletePodGroupsAboveCounts(ctx, clnt, wl, tc.counts, group)
++				if err != nil {
++					t.Fatalf("DeletePodGroupsAboveCounts() repeat error: %v", err)
++				}
++				if stopped {
++					t.Errorf("DeletePodGroupsAboveCounts() repeat = true, want false")
++				}
++			}
 +			var deleted []string
 +			for _, p := range tc.pods {
 +				var got corev1.Pod
 +				err := clnt.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: p.Name}, &got)
-+				if apierrors.IsNotFound(err) {
++				switch {
++				case apierrors.IsNotFound(err):
 +					deleted = append(deleted, p.Name)
-+				} else if err != nil {
++				case err != nil:
 +					t.Fatalf("Failed to get pod %s: %v", p.Name, err)
++				case got.DeletionTimestamp != nil && !slices.ContainsFunc(tc.pods, func(o *corev1.Pod) bool { return o.Name == p.Name && o.DeletionTimestamp != nil }):
++					deleted = append(deleted, p.Name)
 +				}
 +			}
 +			slices.Sort(deleted)
@@ -2277,8 +2314,8 @@ index 0000000..19aa509
 +			if err != nil {
 +				t.Fatalf("PodsAboveCounts() error: %v", err)
 +			}
-+			if above {
-+				t.Errorf("PodsAboveCounts() = true after the deletion")
++			if above != tc.wantAbove {
++				t.Errorf("PodsAboveCounts() = %v after the deletion, want %v", above, tc.wantAbove)
 +			}
 +		})
 +	}

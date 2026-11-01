@@ -1,0 +1,32 @@
+# The autoscaler scales the shrunk cluster down to 1 worker, below its admitted 4: the Workload takes the job's count,
+# its reclaim target drops to 1 and its reclaimable count to 0, so it is charged the 1 worker that runs.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: autoscaled-cluster
+spec:
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 1
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: autoscaled-cluster
+  annotations:
+    kueue.x-k8s.io/reclaim-target-counts: workers=1
+spec:
+  (podSets[?name=='workers'].count | [0]): 1
+status:
+  (admission.podSetAssignments[?name=='workers'].count | [0]): 4
+  (length(reclaimablePods[?name=='workers' && count > `0`] || `[]`)): 0
+  (conditions[?type=='Evicted' && status=='True'] | length(@)): 0
+---
+# 300m for the head and its autoscaler, 100m for the worker left, 200m for the preemptor.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: autoscaler-cluster-queue
+status:
+  (flavorsReservation[?name=='autoscaler-flavor'].resources[] | [?name=='cpu'].total | [0]): 600m

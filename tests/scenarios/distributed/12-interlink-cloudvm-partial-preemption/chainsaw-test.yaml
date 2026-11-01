@@ -2,18 +2,23 @@ apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
   name: 25-interlink-cloudvm-partial-preemption
+  labels:
+    partial-preemption: required
 spec:
-  # TODO(simonepri): remove the skip once patches 0008 (R3) to 0011 (R6) are stacked and the kind cluster turns on PartialPreemption
-  # and ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp, and give the shared RayCluster of scenario 10 the partial scale-up
-  # annotation, which R6 needs to regrow it; the last step already plays the autoscaler's regrowth that R6 admits,
-  # and has not run yet. The earlier steps still assert replicas and need R5's rewrite; see patches/kueue/contract.md.
-  skip: true
   description: >
     Verifies partial preemption of the hybrid Ray cluster of 10-interlink-cloudvm-virtual-kubelet:
     a higher-priority burst job shrinks the InterLink worker group with a 15s termination grace
     period, without double-counting quota or evicting the Ray head pod, and the group re-expands
-    to its target once the burst job is deleted. After a spot interruption contracts the group and
+    to its target once the burst job is deleted. Kueue never changes replicas: it deletes the worker
+    Pods above the reclaim target, admits the burst job only once they are gone, and a scale-up
+    probe ungates their replacements again. After a spot interruption contracts the group and
     an opportunistic job takes the released quota, the group re-expands once the notice is removed.
+  catch:
+    - script:
+        env:
+          - name: NS
+            value: ($namespace)
+        content: ../../dump-namespace.sh
   steps:
     - name: setup-interlink-and-queues
       try:
@@ -21,22 +26,65 @@ spec:
             file: ../10-interlink-cloudvm-virtual-kubelet/00-interlink-setup.yaml
     - name: submit-hybrid-raycluster-with-provisioning-latency
       try:
-        - apply:
-            file: ../10-interlink-cloudvm-virtual-kubelet/01-raycluster-hybrid.yaml
+        # The cluster of scenario 10 with the partial scale-up annotation, which floors and regrowth need.
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: >-
+              kubectl annotate --local -o yaml -f ../10-interlink-cloudvm-virtual-kubelet/01-raycluster-hybrid.yaml
+              kueue.x-k8s.io/elastic-job-scale-up-strategy=partial | kubectl -n "$NS" apply -f -
         - assert:
             file: ../10-interlink-cloudvm-virtual-kubelet/02-assert-hybrid-active.yaml
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: WAIT_SECONDS=110 ../../assert-worker-pods.sh hybrid-interlink-raycluster interlink-spot-workers 4 0
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../assert-worker-pods.sh hybrid-interlink-raycluster local-workers 1 0
+      # The script's RayCluster is not one chainsaw tracks, so delete it before the queues it holds quota in.
+      cleanup:
+        - delete:
+            ref:
+              apiVersion: ray.io/v1
+              kind: RayCluster
+              name: hybrid-interlink-raycluster
     - name: trigger-partial-preemption-with-termination-grace-latency
       try:
         - apply:
             file: 03-preemptor-burst-job.yaml
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: WAIT_SECONDS=110 ../../assert-reclaimed-before-admission.sh hybrid-interlink-raycluster interlink-spot-workers 2 high-priority-burst-job
         - assert:
             file: 04-assert-partial-preemption.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../assert-worker-pods.sh hybrid-interlink-raycluster interlink-spot-workers 2 2
     - name: restore-quota-and-verify-elastic-reexpansion
       try:
         - delete:
             file: 05-restore-capacity.yaml
         - assert:
             file: 06-assert-elastic-reexpanded.yaml
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: WAIT_SECONDS=110 ../../assert-worker-pods.sh hybrid-interlink-raycluster interlink-spot-workers 4 0
     - name: queue-opportunistic-workload-pending-quota
       try:
         - apply:
@@ -51,7 +99,14 @@ spec:
       try:
         - delete:
             file: 09-restore-capacity.yaml
-        - patch:
-            file: 11-autoscaler-regrow.yaml
+        # The Ray autoscaler, not Kueue, raises the spot worker group back to its target once the interruption
+        # notice is gone; the cluster runs no autoscaler, so the step writes replicas as the autoscaler would.
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: >-
+              kubectl -n "$NS" patch raycluster hybrid-interlink-raycluster --type=json
+              -p '[{"op":"replace","path":"/spec/workerGroupSpecs/0/replicas","value":4}]'
         - assert:
             file: 10-assert-reexpanded.yaml

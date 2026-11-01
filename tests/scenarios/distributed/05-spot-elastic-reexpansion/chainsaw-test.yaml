@@ -2,16 +2,22 @@ apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
   name: 15-spot-elastic-reexpansion
+  labels:
+    partial-preemption: required
 spec:
-  # TODO(simonepri): run again with patch 0010-partial-preemption-search (R5) and 0011-elastic-regrow-after-reclaim (R6), and assert the shrink and regrowth on pods while replicas stay unchanged;
-  # see the acceptance tests in patches/kueue/contract.md.
-  skip: true
   description: >
     Verifies self-healing multi-pool elasticity: when remote spot pool capacity is preempted
     by a higher-priority workload, Kueue partially preempts remote-workers down to minReplicas
     while preserving the Ray head and local-workers intact. When spot capacity is restored,
     the RayCluster automatically re-expands remote-workers back to target replicas cleanly
-    without restarting the Ray head.
+    without restarting the Ray head. Kueue never changes replicas: it deletes the spot worker
+    Pods above the reclaim target, and a scale-up probe ungates their replacements again.
+  catch:
+    - script:
+        env:
+          - name: NS
+            value: ($namespace)
+        content: ../../dump-namespace.sh
   steps:
     - name: setup-queues
       try:
@@ -29,15 +35,51 @@ spec:
                 name: spot-elastic-raycluster
               status:
                 desiredWorkerReplicas: 6
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../assert-worker-pods.sh spot-elastic-raycluster remote-workers 4 0
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../assert-worker-pods.sh spot-elastic-raycluster local-workers 2 0
     - name: simulate-spot-interruption
       try:
         - apply:
             file: 02-interruption.yaml
+        - script:
+            timeout: 90s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../assert-reclaimed-before-admission.sh spot-elastic-raycluster remote-workers 2 spot-interruption-preemptor
         - assert:
             file: 03-assert-contracted.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../assert-worker-pods.sh spot-elastic-raycluster remote-workers 2 2
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../assert-worker-pods.sh spot-elastic-raycluster local-workers 2 0
     - name: restore-spot-capacity
       try:
         - delete:
             file: 04-restore-capacity.yaml
         - assert:
             file: 05-assert-reexpanded.yaml
+        - script:
+            timeout: 90s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: WAIT_SECONDS=85 ../../assert-worker-pods.sh spot-elastic-raycluster remote-workers 4 0

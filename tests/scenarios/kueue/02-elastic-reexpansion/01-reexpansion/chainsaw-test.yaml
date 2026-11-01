@@ -2,15 +2,21 @@ apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
   name: 06-elastic-reexpansion
+  labels:
+    partial-preemption: required
 spec:
-  # TODO(simonepri): remove the skip once patches 0008 (R3), 0009 (R4) and 0010 (R5) are stacked under 0011 (R6) and the kind
-  # cluster turns on PartialPreemption and ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp; the assertions already
-  # follow the contract's R6 acceptance test, and have not run yet. See patches/kueue/contract.md.
-  skip: true
   description: >
     Verifies two-way elasticity: after yielding workers to a high-priority job,
     the RayCluster automatically re-expands to its original target replica count
-    once the high-priority job completes and releases its quota.
+    once the high-priority job completes and releases its quota. Kueue never changes
+    the cluster's replicas: the shrink deletes the worker Pods above the reclaim target,
+    and a scale-up probe ungates them again once the quota is free.
+  catch:
+    - script:
+        env:
+          - name: NS
+            value: ($namespace)
+        content: ../../../dump-namespace.sh
   steps:
     - name: setup-queues
       try:
@@ -22,14 +28,32 @@ spec:
             file: 01-raycluster.yaml
         - assert:
             file: 01-assert-ray-active.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../../assert-worker-pods.sh elastic-reexpand-cluster workers 8 0
     - name: submit-preemptor
       try:
         - apply:
             file: 02-urgent-job.yaml
+        - script:
+            timeout: 90s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../../assert-reclaimed-before-admission.sh elastic-reexpand-cluster workers 6 reexpand-urgent-job
     - name: assert-preempted-drain
       try:
         - assert:
             file: 03-assert-drained.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../../assert-worker-pods.sh elastic-reexpand-cluster workers 6 2
     - name: delete-preemptor-and-reexpand
       try:
         - delete:
@@ -39,3 +63,9 @@ spec:
               name: reexpand-urgent-job
         - assert:
             file: 04-assert-reexpanded.yaml
+        - script:
+            timeout: 90s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: WAIT_SECONDS=85 ../../../assert-worker-pods.sh elastic-reexpand-cluster workers 8 0

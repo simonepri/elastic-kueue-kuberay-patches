@@ -7,7 +7,8 @@ takes a victim out of the snapshot goes through one seam in
 pkg/scheduler/preemption/policy/partial.go. The classical strategy offers a
 victim with floors shrunk to them, evicts shrunk targets whole when the
 candidates run out without a fit, and grows them back in steps during
-fill-back. Victims whose reclaim target is pending are offered right after the
+fill-back, a PodSet the preemptor does not need back to its whole count, so
+the reclaim target leaves it out. Victims whose reclaim target is pending are offered right after the
 evicted ones; once the target is 5 minutes old they are ordered like any other
 candidate and evicted whole. A victim shrunk earlier in the same cycle is not
 offered again. A partial target is issued as a reclaim-target annotation,
@@ -209,10 +210,10 @@ index 6da3b27..3c1cc74 100644
  }
 diff --git a/pkg/scheduler/preemption/partial_preemption.go b/pkg/scheduler/preemption/partial_preemption.go
 new file mode 100644
-index 0000000..0952fc7
+index 0000000..8243c60
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption.go
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,272 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -258,7 +259,9 @@ index 0000000..0952fc7
 +)
 +
 +// reclaimBound is the range a PodSet of a partial target may keep: from floor
-+// up to ceiling pods, in steps of step. A target is offered at initial pods.
++// up to ceiling pods, in steps of step. A target is offered at initial pods. A
++// PodSet grown back to its whole count is not shrunk, so a reclaim target
++// leaves it out.
 +type reclaimBound struct {
 +	floor, ceiling, initial, step int32
 +}
@@ -299,7 +302,7 @@ index 0000000..0952fc7
 +			}
 +			bounds[ps.Name] = reclaimBound{floor: floor, ceiling: target, initial: target, step: step}
 +		} else if hasFloor && floor < ps.Count {
-+			ceiling := floor + (ps.Count-1-floor)/step*step
++			ceiling := floor + (ps.Count-floor)/step*step
 +			bounds[ps.Name] = reclaimBound{floor: floor, ceiling: ceiling, initial: floor, step: step}
 +		}
 +	}
@@ -362,8 +365,10 @@ index 0000000..0952fc7
 +
 +// growPartialTargets gives each target offered shrunk back as many pods as
 +// the preemptor still fits with, in steps up to its ceiling, in reverse
-+// order. A target that was escalated is shrunk to its floors again first, if
-+// the preemptor still fits.
++// order. A PodSet the preemptor does not need grows back to its whole count,
++// but the last PodSet keeps at least one step less when every other one is
++// whole, so a target always shrinks its workload. A target that was escalated
++// is shrunk to its floors again first, if the preemptor still fits.
 +func growPartialTargets(ctx context.Context, preemptionCtx *preemptionCtx, targets []*Target, partial []*Target, allowBorrowing bool) {
 +	snapshot := preemptionCtx.snapshot
 +	swap := func(from, to *workload.Info) {
@@ -396,14 +401,23 @@ index 0000000..0952fc7
 +				counts[ps.Name] = ps.Count
 +			}
 +		}
-+		for _, name := range slices.Sorted(maps.Keys(bounds)) {
++		whole := make(workload.PodSetsCounts, len(t.WorkloadInfo.TotalRequests))
++		for _, ps := range t.WorkloadInfo.TotalRequests {
++			whole[ps.Name] = ps.Count
++		}
++		names := slices.Sorted(maps.Keys(bounds))
++		for i, name := range names {
 +			b, current := bounds[name], counts[name]
++			ceiling := b.ceiling
++			if i == len(names)-1 && ceiling >= whole[name] && !slices.ContainsFunc(names[:i], func(n kueue.PodSetReference) bool { return counts[n] < whole[n] }) {
++				ceiling -= b.step
++			}
 +			grownBy := func(steps int) *workload.Info {
 +				grown := maps.Clone(counts)
 +				grown[name] = current + int32(steps)*b.step
 +				return policy.ShrunkTo(t.WorkloadInfo, grown)
 +			}
-+			steps := sort.Search(int((b.ceiling-current)/b.step), func(i int) bool {
++			steps := sort.Search(int(max(0, ceiling-current)/b.step), func(i int) bool {
 +				grown := grownBy(i + 1)
 +				swap(t.Remaining, grown)
 +				fits := workloadFits(ctx, preemptionCtx, allowBorrowing)
@@ -474,10 +488,10 @@ index 0000000..0952fc7
 +}
 diff --git a/pkg/scheduler/preemption/partial_preemption_property_test.go b/pkg/scheduler/preemption/partial_preemption_property_test.go
 new file mode 100644
-index 0000000..5856104
+index 0000000..a477f82
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption_property_test.go
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,226 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -670,6 +684,7 @@ index 0000000..5856104
 +							continue
 +						}
 +						shrunk++
++						shrinks := false
 +						for j, ps := range target.Remaining.TotalRequests {
 +							current := target.WorkloadInfo.TotalRequests[j].Count
 +							b, found := bounds[ps.Name]
@@ -678,11 +693,19 @@ index 0000000..5856104
 +								if ps.Count != current {
 +									t.Errorf("%s/%s shrank without a floor", target.WorkloadInfo.Obj.Name, ps.Name)
 +								}
-+							case ps.Count >= current || ps.Count < b.floor || ps.Count > b.ceiling:
++							case ps.Count == current:
++								// Grown back whole: the PodSet is not shrunk.
++							case ps.Count > current || ps.Count < b.floor || ps.Count > b.ceiling:
 +								t.Errorf("%s/%s keeps %d of %d pods, outside [%d, %d]", target.WorkloadInfo.Obj.Name, ps.Name, ps.Count, current, b.floor, b.ceiling)
 +							case !workload.IsPartiallyPreempted(target.WorkloadInfo.Obj) && ps.Count%b.step != 0:
 +								t.Errorf("%s/%s keeps %d pods, not a multiple of the step %d", target.WorkloadInfo.Obj.Name, ps.Name, ps.Count, b.step)
 +							}
++							if ps.Count < current {
++								shrinks = true
++							}
++						}
++						if !shrinks {
++							t.Errorf("%s is a partial target that shrinks no PodSet: %v", target.WorkloadInfo.Obj.Name, describeTargets(targets))
 +						}
 +					}
 +				})
@@ -697,10 +720,10 @@ index 0000000..5856104
 +}
 diff --git a/pkg/scheduler/preemption/partial_preemption_test.go b/pkg/scheduler/preemption/partial_preemption_test.go
 new file mode 100644
-index 0000000..bdf59ac
+index 0000000..c630430
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption_test.go
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,919 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1062,6 +1085,13 @@ index 0000000..bdf59ac
 +				elastic("elastic", "borrower", 1, 4, "main=1"),
 +			}},
 +			want:    []string{"elastic:main=1"},
++			wantOff: []string{"elastic"},
++		},
++		"grows a PodSet the preemptor does not need back to its whole count": {
++			sc: ppScenario{incoming: 1, lender: 3, needCPU: 1, workloads: []ppWorkload{
++				{name: "elastic", cq: "borrower", podSets: []ppPodSet{{name: "a", count: 2, cpu: 1}, {name: "b", count: 2, cpu: 1}}, floors: "a=0,b=0"},
++			}},
++			want:    []string{"elastic:b=1"},
 +			wantOff: []string{"elastic"},
 +		},
 +		"charges a multi-PodSet victim per PodSet": {

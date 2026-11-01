@@ -1,8 +1,24 @@
-apiVersion: ray.io/v1
-kind: RayCluster
+# Team A's cluster is admitted with all 6 workers, 2 of them on GPUs borrowed from team B's queue.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
 metadata:
-  name: borrowing-ray-cluster
-spec:
-  workerGroupSpecs:
-    - groupName: workers
-      replicas: 6
+  ownerReferences:
+    - name: borrowing-ray-cluster
+status:
+  (admission.podSetAssignments[?name=='workers'].count | [0]): 6
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: cohort-queue-a
+status:
+  flavorsReservation:
+    - name: cohort-flavor
+      resources:
+        - name: cpu
+          total: "14"
+        - name: memory
+          total: "28Gi"
+        - name: nvidia.com/gpu
+          borrowed: "2"
+          total: "6"

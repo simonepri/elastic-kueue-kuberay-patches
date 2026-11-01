@@ -1,3 +1,5 @@
+# Cell 1 keeps its replicas and its admission: the reclaim target of its 4 nominal workers returns the 2 borrowed
+# GPUs once the Pods above it are gone, so its queue charges only its nominal share.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -5,9 +7,19 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: spot-workers
-      replicas: 4
+      replicas: 6
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: cell1-raycluster-spot
+  annotations:
+    kueue.x-k8s.io/reclaim-target-counts: spot-workers=4
 status:
-  desiredWorkerReplicas: 4
+  (admission.podSetAssignments[?name=='spot-workers'].count | [0]): 6
+  (reclaimablePods[?name=='spot-workers'].count | [0]): 2
+  (conditions[?type=='Evicted' && status=='True'] | length(@)): 0
 ---
 apiVersion: ray.io/v1
 kind: RayCluster

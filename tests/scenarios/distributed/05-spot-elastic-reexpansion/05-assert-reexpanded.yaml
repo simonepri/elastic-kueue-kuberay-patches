@@ -1,3 +1,4 @@
+# Once the preemptor is gone, a scale-up probe admits all 4 spot workers again; replicas never changed.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -8,3 +9,16 @@ spec:
       replicas: 4
     - groupName: local-workers
       replicas: 2
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: spot-elastic-raycluster
+  annotations:
+    (contains(keys(@), 'kueue.x-k8s.io/workload-slice-replacement-for')): true
+    (contains(keys(@), 'kueue.x-k8s.io/reclaim-target-counts')): false
+status:
+  (admission.podSetAssignments[?name=='remote-workers'].count | [0]): 4
+  (admission.podSetAssignments[?name=='local-workers'].count | [0]): 2
+  (conditions[?type=='Finished'] | length(@)): 0

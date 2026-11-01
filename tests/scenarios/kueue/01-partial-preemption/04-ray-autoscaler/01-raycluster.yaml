@@ -1,0 +1,59 @@
+# An elastic RayCluster that the Ray in-tree autoscaler sizes between 1 and 4 workers. Each worker offers Ray one
+# logical CPU, so a request for 4 CPUs scales it to 4 workers; the head offers none.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: autoscaled-cluster
+  labels:
+    kueue.x-k8s.io/queue-name: autoscaler-local-queue
+    kueue.x-k8s.io/priority-class: pc-autoscaler-low
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+    kueue.x-k8s.io/elastic-job-scale-up-strategy: partial
+spec:
+  rayVersion: "2.38.0"
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    idleTimeoutSeconds: 10
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 512Mi
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "0"
+    template:
+      spec:
+        priorityClassName: pc-autoscaler-low
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.38.0
+            resources:
+              requests:
+                cpu: 200m
+                memory: 2Gi
+              limits:
+                memory: 2Gi
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 4
+      rayStartParams:
+        num-cpus: "1"
+      template:
+        spec:
+          priorityClassName: pc-autoscaler-low
+          terminationGracePeriodSeconds: 5
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 1Gi
+                limits:
+                  memory: 1Gi

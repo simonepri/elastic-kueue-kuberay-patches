@@ -1,3 +1,5 @@
+# Team A keeps its replicas and its admission; the reclaim target of 4 workers returns the 2 borrowed GPUs once the
+# Pods above it are gone, so team A's queue charges only its nominal quota.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -5,4 +7,32 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: workers
-      replicas: 4
+      replicas: 6
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: borrowing-ray-cluster
+  annotations:
+    kueue.x-k8s.io/reclaim-target-counts: workers=4
+status:
+  (admission.podSetAssignments[?name=='workers'].count | [0]): 6
+  (reclaimablePods[?name=='workers'].count | [0]): 2
+  (conditions[?type=='Evicted' && status=='True'] | length(@)): 0
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: cohort-queue-a
+status:
+  flavorsReservation:
+    - name: cohort-flavor
+      resources:
+        - name: cpu
+          total: "10"
+        - name: memory
+          total: "20Gi"
+        - name: nvidia.com/gpu
+          borrowed: "0"
+          total: "4"

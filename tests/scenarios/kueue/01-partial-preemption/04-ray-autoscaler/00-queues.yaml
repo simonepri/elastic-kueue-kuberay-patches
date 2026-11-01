@@ -1,0 +1,58 @@
+# One ClusterQueue whose CPU quota fits the Ray head (200m, plus 100m that Kueue charges the head for the autoscaler
+# sidecar) and four workers (100m each), and nothing more: the preemptor's two pods fit only once the autoscaled
+# cluster gives back two workers. Memory never binds.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pc-autoscaler-low
+value: 100
+globalDefault: false
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pc-autoscaler-high
+value: 1000
+globalDefault: false
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: pc-autoscaler-low
+value: 100
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: pc-autoscaler-high
+value: 1000
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: autoscaler-flavor
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: autoscaler-cluster-queue
+spec:
+  namespaceSelector: {}
+  preemption:
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: autoscaler-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "700m"
+            - name: "memory"
+              nominalQuota: "32Gi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: autoscaler-local-queue
+spec:
+  clusterQueue: autoscaler-cluster-queue

@@ -1,0 +1,26 @@
+# A higher-priority Job whose two pods need the CPU quota of two autoscaled workers; it ends on its own, which frees the quota.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: preemptor-short
+  labels:
+    kueue.x-k8s.io/queue-name: autoscaler-local-queue
+    kueue.x-k8s.io/priority-class: pc-autoscaler-high
+spec:
+  parallelism: 2
+  completions: 2
+  template:
+    spec:
+      terminationGracePeriodSeconds: 0
+      priorityClassName: pc-autoscaler-high
+      containers:
+        - name: work
+          image: busybox:latest
+          command: ["sleep", "90"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 1Gi
+            limits:
+              memory: 1Gi
+      restartPolicy: Never

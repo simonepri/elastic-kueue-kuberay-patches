@@ -5,6 +5,9 @@ metadata:
   labels:
     kueue.x-k8s.io/queue-name: lq-team-a
     kueue.x-k8s.io/priority-class: pc-cohort-low
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+    kueue.x-k8s.io/elastic-job-scale-up-strategy: partial
 spec:
   rayVersion: "2.38.0"
   headGroupSpec:

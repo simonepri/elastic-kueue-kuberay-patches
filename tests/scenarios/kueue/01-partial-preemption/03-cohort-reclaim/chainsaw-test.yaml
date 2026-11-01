@@ -2,15 +2,22 @@ apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
   name: 09-cohort-borrowing-reclaim
+  labels:
+    partial-preemption: required
 spec:
-  # TODO(simonepri): run again with patch 0010-partial-preemption-search (R5), and assert that the pods above the target are deleted and recreated gated while replicas stay unchanged;
-  # see the acceptance tests in patches/kueue/contract.md.
-  skip: true
   description: >
     Verifies multi-queue Cohort fair-share borrowing and collaborative reclaim:
     Team A borrows idle capacity up to borrowingLimit; when Team B arrives requesting
-    its nominal quota, Team A cooperatively relinquishes borrowed capacity back to 4 replicas
-    allowing Team B to start immediately without destroying Team A.
+    its nominal quota, Team A cooperatively relinquishes borrowed capacity back to 4 workers
+    allowing Team B to start immediately without destroying Team A. Team A keeps its replicas;
+    Kueue deletes the worker Pods above the reclaim target, KubeRay recreates them gated, and
+    Team B is admitted only after the deleted Pods are gone.
+  catch:
+    - script:
+        env:
+          - name: NS
+            value: ($namespace)
+        content: ../../../dump-namespace.sh
   steps:
     - name: setup-cohort-queues
       try:
@@ -22,13 +29,31 @@ spec:
             file: 01-borrowing-raycluster.yaml
         - assert:
             file: 01-assert-borrowing-allowed.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../../assert-worker-pods.sh borrowing-ray-cluster workers 6 0
     - name: submit-team-b-job
       try:
         - apply:
             file: 02-team-b-nominal-job.yaml
+        - script:
+            timeout: 90s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../../assert-reclaimed-before-admission.sh borrowing-ray-cluster workers 4 team-b-nominal-job
     - name: assert-reclaimed-and-admitted
       try:
         - assert:
             file: 03-assert-borrowed-reclaimed.yaml
         - assert:
             file: 04-assert-team-b-admitted.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ../../../assert-worker-pods.sh borrowing-ray-cluster workers 4 2

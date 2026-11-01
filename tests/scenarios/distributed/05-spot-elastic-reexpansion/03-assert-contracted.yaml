@@ -1,3 +1,5 @@
+# Partial preemption shrinks remote-workers to minReplicas without touching replicas: the Workload carries the reclaim
+# target and releases the quota of the 2 spot workers above it, while the head and local-workers are kept.
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
@@ -5,6 +7,26 @@ metadata:
 spec:
   workerGroupSpecs:
     - groupName: remote-workers
-      replicas: 2
+      replicas: 4
     - groupName: local-workers
       replicas: 2
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: spot-elastic-raycluster
+  annotations:
+    kueue.x-k8s.io/reclaim-target-counts: remote-workers=2
+status:
+  (admission.podSetAssignments[?name=='remote-workers'].count | [0]): 4
+  (reclaimablePods[?name=='remote-workers'].count | [0]): 2
+  (length(reclaimablePods[?name=='local-workers'] || `[]`)): 0
+  (conditions[?type=='Evicted' && status=='True'] | length(@)): 0
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spot-interruption-preemptor
+spec:
+  suspend: false

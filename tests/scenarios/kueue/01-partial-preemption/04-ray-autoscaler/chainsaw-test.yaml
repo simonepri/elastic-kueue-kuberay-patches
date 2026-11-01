@@ -1,0 +1,160 @@
+# Partial preemption of an elastic RayCluster that the Ray in-tree autoscaler sizes, the setup a production deployment runs.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 04-ray-autoscaler-partial-preemption
+  labels:
+    partial-preemption: required
+spec:
+  description: >
+    Verifies partial preemption of an elastic RayCluster with enableInTreeAutoscaling. The autoscaler
+    scales the cluster to 4 workers; a higher-priority Job then shrinks it to 2 by deleting whole
+    worker replicas while replicas stay at 4, is admitted only once their pods are gone, and the
+    autoscaler never undoes the shrink. When the Job ends, a scale-up probe regrows the cluster to 4.
+    A second Job shrinks it again, and the autoscaler then scales it down to 1 idle worker, below
+    its admitted count, which lowers the Workload's count and reclaim target without a rejected
+    write. Throughout, the pods that hold resources never exceed the quota.
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: start-autoscaled-cluster
+      try:
+        - apply:
+            file: 01-raycluster.yaml
+        - script:
+            timeout: 600s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./wait-head-ready.sh
+        - script:
+            timeout: 300s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./watch-quota.sh 'running_workers 1'
+      catch:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./dump-state.sh
+    - name: autoscaler-scales-up
+      try:
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./request-resources.sh 4
+        - script:
+            timeout: 300s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./watch-quota.sh 'replicas 4 && running_workers 4'
+        - assert:
+            file: 02-assert-scaled-up.yaml
+      catch:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./dump-state.sh
+    - name: preemptor-shrinks-autoscaled-cluster
+      try:
+        - apply:
+            file: 03-preemptor-short.yaml
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: WAIT_SECONDS=110 ../../../assert-reclaimed-before-admission.sh autoscaled-cluster workers 2 preemptor-short
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: WATCH_SECONDS=110 ./watch-quota.sh 'job_running preemptor-short && workers 2 2'
+        - assert:
+            file: 04-assert-shrunk.yaml
+        # The autoscaler still holds 4 CPUs, yet the shrink stays: replicas stay at 4 and the 2 recreated workers gated.
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./watch-quota.sh 'replicas 4 && workers 2 2' 30
+      catch:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./dump-state.sh
+    - name: regrow-once-the-preemptor-ends
+      try:
+        - script:
+            timeout: 300s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./watch-quota.sh 'job_complete preemptor-short && running_workers 4'
+        - assert:
+            file: 05-assert-regrown.yaml
+      catch:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./dump-state.sh
+    - name: autoscaler-scales-down-a-shrunk-cluster
+      try:
+        - apply:
+            file: 06-preemptor-long.yaml
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: WAIT_SECONDS=110 ../../../assert-reclaimed-before-admission.sh autoscaled-cluster workers 2 preemptor-long
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: WATCH_SECONDS=110 ./watch-quota.sh 'job_running preemptor-long && workers 2 2'
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./request-resources.sh 0
+        - script:
+            timeout: 300s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./watch-quota.sh 'replicas 1 && workers 1'
+        - assert:
+            file: 07-assert-scaled-down.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./watch-quota.sh 'replicas 1 && workers 1 && job_running preemptor-long' 20
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-no-rejected-writes.sh
+      catch:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./dump-state.sh

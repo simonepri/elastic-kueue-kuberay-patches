@@ -1,0 +1,30 @@
+# Once the preemptor ends, a scale-up probe admits all 4 workers again; replicas never changed, and the probe's slice
+# carries no reclaim target.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: autoscaled-cluster
+spec:
+  workerGroupSpecs:
+    - groupName: workers
+      replicas: 4
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  ownerReferences:
+    - name: autoscaled-cluster
+  annotations:
+    (contains(keys(@), 'kueue.x-k8s.io/workload-slice-replacement-for')): true
+    (contains(keys(@), 'kueue.x-k8s.io/reclaim-target-counts')): false
+status:
+  (admission.podSetAssignments[?name=='workers'].count | [0]): 4
+  (conditions[?type=='Finished'] | length(@)): 0
+---
+# 300m for the head and its autoscaler, and 400m for the 4 workers.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: autoscaler-cluster-queue
+status:
+  (flavorsReservation[?name=='autoscaler-flavor'].resources[] | [?name=='cpu'].total | [0]): 700m

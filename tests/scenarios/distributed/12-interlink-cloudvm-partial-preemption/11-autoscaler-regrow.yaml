@@ -1,0 +1,10 @@
+# The Ray autoscaler, not Kueue, raises the spot worker group back to its target once the
+# interruption notice is gone; envtest-free scenarios have no autoscaler, so the step writes it.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: hybrid-interlink-raycluster
+spec:
+  workerGroupSpecs:
+    - groupName: interlink-spot-workers
+      replicas: 4

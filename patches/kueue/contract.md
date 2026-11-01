@@ -38,6 +38,7 @@ Rules for every patch:
 - Put new types, constants, and helpers in new files the patch owns, such as `pkg/workload/partial_preemption.go`, and edit upstream files only at call sites.
 - Gate new behavior on `PartialPreemption` (R3, R4, R5, R6) or on the upstream gate the behavior belongs to (R2, R8), and keep R1 limited to elastic RayClusters.
 - R3 and R4 cover RayCluster only. Elastic RayJobs and RayServices get no floor, so preemption evicts them whole.
+- Elastic clusters without the `kueue.x-k8s.io/elastic-job-scale-up-strategy: partial` annotation are never shrunk: R4 writes them no floor, so preemption evicts them whole, because R6 regrows only through partial scale-up probes.
 - Add tests that fail without the patch, a readme row, and the changed packages to `mise run test:kueue` or `test:kueue-integration`.
 - When an upstream PR that a patch mirrors merges, rebase on the merged version and delete what it replaces.
 
@@ -72,6 +73,8 @@ Between the two writes the reclaimable count can exceed the new count. `podSetsC
 R3 reads the reclaim target annotations whatever the `PartialPreemption` gate says, as #17484 does: the ungater cap, the quota release, the re-derivation, the charge floor above, and the clearing on quota release keep working when the gate is turned off after a reclaim. Only the stopper and the in-place scale-down rule need the gate. When an eviction releases the quota, the job reconciler clears the reclaimable counts of the PodSets with a target in the same reconcile, and the Workload controller then clears the annotations. A target whose `kueue.x-k8s.io/reclaim-requested-at` is before the second the Workload's `QuotaReserved` condition last became true belongs to an earlier admission: R3 ignores it and the ungater clears it. If the Workload was admitted again before its reclaimable counts were cleared, it was admitted for that smaller charge, so the target still holds and keeps the pods at it until the quota is next released.
 
 Because a slice kept at its old spec count no longer matches the job's count, R6 compares the job's count with the reclaim target, not with the slice's spec count, when it decides whether to create a scale-up probe after the release.
+
+R6 holds a replacement slice back while its predecessor's target is pending, and while the preemptor in `kueue.x-k8s.io/reclaim-preemptor` is pending, but no longer than `ReclaimTimeout` after `kueue.x-k8s.io/reclaim-requested-at` and not once that preemptor has been evicted since the request, other than by deactivation, which shows it was admitted; deactivation marks even a workload that never held quota evicted. R5 records only the latest preemptor of a target, so an earlier preemptor still pending is not waited for; if a probe takes the released quota first, that preemptor needs another reclaim round.
 
 ## Annotation keys
 

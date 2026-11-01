@@ -3,8 +3,10 @@ kind: Test
 metadata:
   name: 25-interlink-cloudvm-partial-preemption
 spec:
-  # TODO(simonepri): run again with patch 0010-partial-preemption-search (R5) and 0011-elastic-regrow-after-reclaim (R6), and assert the shrink and regrowth on pods while replicas stay unchanged;
-  # see the acceptance tests in patches/kueue/contract.md.
+  # TODO(simonepri): remove the skip once patches 0008 (R3) to 0011 (R6) are stacked and the kind cluster turns on PartialPreemption
+  # and ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp, and give the shared RayCluster of scenario 10 the partial scale-up
+  # annotation, which R6 needs to regrow it; the last step already plays the autoscaler's regrowth that R6 admits,
+  # and has not run yet. The earlier steps still assert replicas and need R5's rewrite; see patches/kueue/contract.md.
   skip: true
   description: >
     Verifies partial preemption of the hybrid Ray cluster of 10-interlink-cloudvm-virtual-kubelet:
@@ -49,5 +51,7 @@ spec:
       try:
         - delete:
             file: 09-restore-capacity.yaml
+        - patch:
+            file: 11-autoscaler-regrow.yaml
         - assert:
             file: 10-assert-reexpanded.yaml

@@ -3,8 +3,9 @@ kind: Test
 metadata:
   name: 06-elastic-reexpansion
 spec:
-  # TODO(simonepri): run again with patch 0011-elastic-regrow-after-reclaim (R6), and assert regrowth through a scale-up probe while replicas stay unchanged;
-  # see the acceptance tests in patches/kueue/contract.md.
+  # TODO(simonepri): remove the skip once patches 0008 (R3), 0009 (R4) and 0010 (R5) are stacked under 0011 (R6) and the kind
+  # cluster turns on PartialPreemption and ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp; the assertions already
+  # follow the contract's R6 acceptance test, and have not run yet. See patches/kueue/contract.md.
   skip: true
   description: >
     Verifies two-way elasticity: after yielding workers to a high-priority job,

@@ -203,7 +203,7 @@ index 6509710..8d6556f 100644
  func BuildPodSets(rayClusterSpec *rayv1.RayClusterSpec, annotations map[string]string) ([]kueue.PodSet, error) {
  	podSets := make([]kueue.PodSet, 0)
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index d99d579..7953939 100644
+index 82eafab..4a85f00 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -81,6 +81,8 @@ type RayCluster rayv1.RayCluster
@@ -214,7 +214,7 @@ index d99d579..7953939 100644
 +var _ jobframework.JobWithPodSetCountSteps = (*RayCluster)(nil)
  
  func (j *RayCluster) CustomEquivalenceOptions(_ context.Context, _ client.Client, wl *kueue.Workload) []equality.ComparePodSetsOption {
- 	opts := MinCountMigrationOptions(wl)
+ 	opts := MinCountMigrationOptions(wl, &j.Spec)
 diff --git a/pkg/controller/jobs/raycluster/reclaim_floors_external_test.go b/pkg/controller/jobs/raycluster/reclaim_floors_external_test.go
 new file mode 100644
 index 0000000..ffec8d0

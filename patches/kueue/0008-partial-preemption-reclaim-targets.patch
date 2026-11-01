@@ -1052,7 +1052,7 @@ index 0000000..c4612f1
 +	}
 +}
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index 71d289b..d99d579 100644
+index 7724dad..82eafab 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -156,8 +156,8 @@ func (j *RayCluster) Finished(ctx context.Context) (message string, success, fin

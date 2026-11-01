@@ -221,7 +221,12 @@ Patch releases up to p0.6.x gave every Ray worker group `minCount = minReplicas`
 - **Elastic Workloads without the partial scale-up annotation** drop it at their next slice: `ConstructWorkload` copies a predecessor's `minCount` forward only when `ElasticPartialScaleUpEnabled(job)` (`prepareWorkloadSliceForScaleUp`), which R0's `TestMinCountMigrationSliceChain` pins. A cluster that never resizes keeps its Workload, and its `minCount`, until it resizes or is recreated.
 - **Elastic Workloads with the partial scale-up annotation** copy `min(minReplicas, count)` forward along the slice chain for as long as the chain lives. It is at most upstream's floor, so the only effect is that readmission may be partial down to `minReplicas`; recreating the cluster starts a clean chain. These clusters need `ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp` anyway.
 
-The [readme](../../readme.md#feature-gates) gives the exit condition for that gate and for R0.
+Those releases also shrank Workloads by rewriting their admission, and wrote `replicas` to follow it:
+
+- **Non-elastic clusters they shrank** stay at the shrunk `replicas` until they are recreated, since nothing in this stack writes `replicas`; their Workload stays charged for the shrunk admission, which matches what runs.
+- **Multi-host worker groups** were shrunk in pods while `replicas` was set to pods divided by `numOfHosts`, rounded down: 4 replicas of 2 hosts shrunk to 5 pods run 2 replicas, 4 pods, while 5 are charged. R0 keeps such a job matching its Workload while the Workload holds quota and the job's pod count is the admitted count rounded down to whole replicas (`equality.WithCountsInWholeSteps`, `TestMinCountMigrationMultiHostShrink`). The extra pod's quota stays charged until the quota is released or the cluster is recreated.
+
+The [readme](../../readme.md#feature-gates) gives the exit condition for that gate and for R0, and the [rollback](../../readme.md#rollback) steps.
 
 ## Acceptance tests
 

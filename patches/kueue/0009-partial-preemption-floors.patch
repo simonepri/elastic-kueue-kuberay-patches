@@ -131,10 +131,10 @@ index 0000000..00f067d
 +	return workloadslicing.WithReclaimFloors(floors, steps)
 +}
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index 9896b68..3b092d6 100644
+index 29edd3b..fbeb0f4 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -1226,7 +1226,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
+@@ -1234,7 +1234,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
  		// Workload slices allow modifications only to PodSet.Count.
  		// Any other changes will result in the slice being marked as incompatible,
  		// and the workload will fall back to being processed by the original ensureOneWorkload function.
@@ -143,7 +143,7 @@ index 9896b68..3b092d6 100644
  		if err != nil {
  			return nil, err
  		}
-@@ -2096,6 +2096,7 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
+@@ -2104,6 +2104,7 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
  	}
  
  	wl := NewWorkload(newWorkloadName(job, extra), object, podSets, labelKeysToCopy, annotationsToCopy)
@@ -203,7 +203,7 @@ index 6509710..8d6556f 100644
  func BuildPodSets(rayClusterSpec *rayv1.RayClusterSpec, annotations map[string]string) ([]kueue.PodSet, error) {
  	podSets := make([]kueue.PodSet, 0)
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index 71d289b..c555e3b 100644
+index d99d579..7953939 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -81,6 +81,8 @@ type RayCluster rayv1.RayCluster
@@ -400,44 +400,12 @@ index 0000000..ec1aaae
 +		})
 +	}
 +}
-diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
-index bcc4dd9..10b466a 100644
---- a/pkg/features/kube_features.go
-+++ b/pkg/features/kube_features.go
-@@ -45,6 +45,9 @@ const (
- 	// Enables partial scale up for elastic jobs.
- 	ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp featuregate.Feature = "ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp"
- 
-+	// Enables preemption to shrink elastic workloads to their reclaim floor before evicting them.
-+	PartialPreemption featuregate.Feature = "PartialPreemption"
-+
- 	// owner: @KunWuLuan
- 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/582-preempt-based-on-flavor-order
- 	//
-@@ -946,6 +949,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
- 	TASPartialSlices:                                    {TopologyAwareScheduling},
- 	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {ElasticJobsViaWorkloadSlices},
- 	SchedulerLibraryIntegration:                         {TopologyAwareScheduling},
-+	PartialPreemption:                                   {ElasticJobsViaWorkloadSlices, ReclaimablePods},
- }
- 
- // defaultVersionedFeatureGates consists of all known Kueue-specific feature keys.
-@@ -966,6 +970,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
- 	ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: {
- 		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
- 	},
-+	PartialPreemption: {
-+		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
-+	},
- 	FlavorFungibility: {
- 		{Version: version.MustParse("0.5"), Default: true, PreRelease: featuregate.Beta},
- 	},
 diff --git a/pkg/workload/reclaim_floors.go b/pkg/workload/reclaim_floors.go
 new file mode 100644
-index 0000000..df02f9e
+index 0000000..7985002
 --- /dev/null
 +++ b/pkg/workload/reclaim_floors.go
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,64 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -457,18 +425,13 @@ index 0000000..df02f9e
 +package workload
 +
 +import (
-+	"fmt"
-+	"slices"
-+	"strconv"
-+	"strings"
-+
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	"sigs.k8s.io/kueue/pkg/constants"
 +)
 +
 +// ReclaimMinCounts reads kueue.x-k8s.io/reclaim-min-counts. A malformed entry is ignored.
 +func ReclaimMinCounts(wl *kueue.Workload) PodSetsCounts {
-+	return parseFloorCounts(wl.Annotations[constants.ReclaimMinCountsAnnotation], 0)
++	return ParsePodSetCounts(wl.Annotations[constants.ReclaimMinCountsAnnotation])
 +}
 +
 +// SetReclaimMinCounts writes kueue.x-k8s.io/reclaim-min-counts, or removes it when counts is empty.
@@ -480,12 +443,12 @@ index 0000000..df02f9e
 +// is in the result; one the annotation leaves out, or lists with a malformed or non-positive
 +// step, has step 1.
 +func PodSetCountSteps(wl *kueue.Workload) PodSetsCounts {
-+	listed := parseFloorCounts(wl.Annotations[constants.PodSetCountStepsAnnotation], 1)
++	listed := ParsePodSetCounts(wl.Annotations[constants.PodSetCountStepsAnnotation])
 +	steps := make(PodSetsCounts, len(wl.Spec.PodSets))
 +	for i := range wl.Spec.PodSets {
 +		name := wl.Spec.PodSets[i].Name
 +		steps[name] = 1
-+		if step, ok := listed[name]; ok {
++		if step, ok := listed[name]; ok && step >= 1 {
 +			steps[name] = step
 +		}
 +	}
@@ -497,20 +460,6 @@ index 0000000..df02f9e
 +	setFloorCounts(wl, constants.PodSetCountStepsAnnotation, steps)
 +}
 +
-+// FormatFloorCounts renders counts as <podSet>=<count>[,<podSet>=<count>], PodSets sorted by name.
-+func FormatFloorCounts(counts PodSetsCounts) string {
-+	names := make([]string, 0, len(counts))
-+	for name := range counts {
-+		names = append(names, string(name))
-+	}
-+	slices.Sort(names)
-+	entries := make([]string, len(names))
-+	for i, name := range names {
-+		entries[i] = fmt.Sprintf("%s=%d", name, counts[kueue.PodSetReference(name)])
-+	}
-+	return strings.Join(entries, ",")
-+}
-+
 +func setFloorCounts(wl *kueue.Workload, key string, counts PodSetsCounts) {
 +	if len(counts) == 0 {
 +		delete(wl.Annotations, key)
@@ -519,32 +468,14 @@ index 0000000..df02f9e
 +	if wl.Annotations == nil {
 +		wl.Annotations = make(map[string]string, 1)
 +	}
-+	wl.Annotations[key] = FormatFloorCounts(counts)
-+}
-+
-+// parseFloorCounts parses a count list and ignores every entry that is malformed or whose
-+// count is below minCount.
-+func parseFloorCounts(value string, minCount int32) PodSetsCounts {
-+	counts := PodSetsCounts{}
-+	for entry := range strings.SplitSeq(value, ",") {
-+		name, countStr, found := strings.Cut(entry, "=")
-+		if !found || name == "" {
-+			continue
-+		}
-+		count, err := strconv.ParseInt(countStr, 10, 32)
-+		if err != nil || int32(count) < minCount {
-+			continue
-+		}
-+		counts[kueue.PodSetReference(name)] = int32(count)
-+	}
-+	return counts
++	wl.Annotations[key] = FormatPodSetCounts(counts)
 +}
 diff --git a/pkg/workload/reclaim_floors_test.go b/pkg/workload/reclaim_floors_test.go
 new file mode 100644
-index 0000000..648a89f
+index 0000000..50daafd
 --- /dev/null
 +++ b/pkg/workload/reclaim_floors_test.go
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,94 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -567,6 +498,7 @@ index 0000000..648a89f
 +	"testing"
 +
 +	"github.com/google/go-cmp/cmp"
++	"github.com/google/go-cmp/cmp/cmpopts"
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	"sigs.k8s.io/kueue/pkg/constants"
@@ -591,7 +523,7 @@ index 0000000..648a89f
 +		t.Run(name, func(t *testing.T) {
 +			wl := &kueue.Workload{}
 +			wl.Annotations = tc.annotations
-+			if diff := cmp.Diff(tc.want, ReclaimMinCounts(wl)); diff != "" {
++			if diff := cmp.Diff(tc.want, ReclaimMinCounts(wl), cmpopts.EquateEmpty()); diff != "" {
 +				t.Errorf("ReclaimMinCounts() (-want,+got):\n%s", diff)
 +			}
 +		})
@@ -639,7 +571,7 @@ index 0000000..648a89f
 +	}
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 209983e..fef6ebd 100644
+index d2491ef..2ff00f8 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -53,7 +53,9 @@ func (r *Manager) EnsureWorkloadSlices(
@@ -665,7 +597,7 @@ index 209983e..fef6ebd 100644
  	// An evicted slice can still own running Pods. Return it to the job
  	// reconciler until its reservation is released, unless an admitted
  	// replacement has already taken ownership of those Pods.
-@@ -168,3 +176,16 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -184,3 +192,16 @@ func (r *Manager) EnsureWorkloadSlices(
  		return nil, true, nil
  	}
  }
@@ -684,7 +616,7 @@ index 209983e..fef6ebd 100644
 +}
 diff --git a/pkg/workloadslicing/reclaim_floors.go b/pkg/workloadslicing/reclaim_floors.go
 new file mode 100644
-index 0000000..d61528f
+index 0000000..a3ce0fc
 --- /dev/null
 +++ b/pkg/workloadslicing/reclaim_floors.go
 @@ -0,0 +1,87 @@
@@ -767,7 +699,7 @@ index 0000000..d61528f
 +}
 +
 +func syncAnnotation(wl *kueue.Workload, key string, counts workload.PodSetsCounts, set func(*kueue.Workload, workload.PodSetsCounts)) bool {
-+	want := workload.FormatFloorCounts(counts)
++	want := workload.FormatPodSetCounts(counts)
 +	got, found := wl.Annotations[key]
 +	if got == want && found == (want != "") {
 +		return false

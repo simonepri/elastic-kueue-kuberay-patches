@@ -13,13 +13,62 @@ deferAdmissionCheckNodeSelectorsToPods, and the ElasticJobUngater adds those of
 the flavors the active slice assigns to each pod before it removes the gate.
 Only a PodSet whose template carries the elastic scheduling gate is deferred,
 because the ungater handles no other pods. The reconciler marks such a Workload
-with the kueue.x-k8s.io/flavor-placement-on-pods annotation and every later
-slice copies it, so the ungater keeps adding the placement after the gate is
+with the kueue.x-k8s.io/flavor-placement-on-pods annotation when it builds the
+Workload, so every copy, such as a ConcurrentAdmission variant, and every later
+slice carries it, so the ungater keeps adding the placement after the gate is
 turned off. A gated pod created before the active slice whose old template gave
 it a conflicting value is deleted once so its owner recreates it; any other
 conflicting pod stays gated and gets a Warning event on the Workload. The
 gate's default stays false.
 
+diff --git a/pkg/controller/concurrentadmission/controller_flavor_placement_test.go b/pkg/controller/concurrentadmission/controller_flavor_placement_test.go
+new file mode 100644
+index 0000000..c34b383
+--- /dev/null
++++ b/pkg/controller/concurrentadmission/controller_flavor_placement_test.go
+@@ -0,0 +1,42 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package concurrentadmission
++
++import (
++	"testing"
++
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// A cluster admitted through a variant has no other Workload for the ungater to read the
++// marker from, so the variant must carry the parent's.
++func TestGenerateVariantKeepsFlavorPlacementMarker(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero, false)
++	parent := utiltestingapi.MakeWorkload("parent", "ns").
++		Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Annotation(workloadslicing.FlavorPlacementOnPodsAnnotation, "true").
++		Obj()
++
++	variant := generateVariant(parent, "remote")
++
++	if !workloadslicing.FlavorPlacementOnPods(variant) {
++		t.Errorf("variant annotations %v do not keep the flavor placement marker", variant.Annotations)
++	}
++}
 diff --git a/pkg/controller/elasticjobs/elastic_flavor_placement.go b/pkg/controller/elasticjobs/elastic_flavor_placement.go
 new file mode 100644
 index 0000000..8a301e5
@@ -450,7 +499,7 @@ index 069957c..e9e47fc 100644
  					"pod", klog.KObj(p), "podSet", ps)
  				continue
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index 31ef492..32096fb 100644
+index 31ef492..9896b68 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
 @@ -1698,6 +1698,9 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
@@ -504,7 +553,7 @@ index 31ef492..32096fb 100644
  	for _, check := range wl.Status.AdmissionChecks {
  		for _, update := range check.PodSetUpdates {
  			podSetInfo := infoByName[update.Name]
-@@ -1887,6 +1896,84 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
+@@ -1887,6 +1896,100 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
  	return nil
  }
  
@@ -552,6 +601,22 @@ index 31ef492..32096fb 100644
 +	return deferred, nil
 +}
 +
++// markFlavorPlacementOnPods marks a Workload that will be started with the flavor placement
++// off its templates. It does so when the Workload is built, and not when the job starts, so
++// that every copy made from it, such as a ConcurrentAdmission variant, and every later slice
++// carries the marker.
++func markFlavorPlacementOnPods(wl *kueue.Workload) {
++	if !workloadslicing.FlavorPlacementOnPods(wl) {
++		return
++	}
++	for i := range wl.Spec.PodSets {
++		if ungatedByElasticJobUngater(wl, wl.Spec.PodSets[i].Name) {
++			metav1.SetMetaDataAnnotation(&wl.ObjectMeta, workloadslicing.FlavorPlacementOnPodsAnnotation, "true")
++			return
++		}
++	}
++}
++
 +// ungatedByElasticJobUngater reports whether the Pods of the PodSet start behind the
 +// elastic scheduling gate, which only the ElasticJobUngater removes.
 +func ungatedByElasticJobUngater(wl *kueue.Workload, name kueue.PodSetReference) bool {
@@ -589,7 +654,15 @@ index 31ef492..32096fb 100644
  // stopJob will suspend the job, and also restore node affinity, reset job status if needed.
  // Returns whether any operation was done to stop the job or an error.
  func (r *JobReconciler) stopJob(ctx context.Context, job GenericJob, wl *kueue.Workload, stopReason StopReason, eventMsg string) error {
-@@ -2088,6 +2175,9 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
+@@ -2067,6 +2170,7 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
+ 	// associated Job object. This is particularly useful in contexts such as the
+ 	// MultiKueue workload controller, where the Job may not be immediately available.
+ 	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)
++	markFlavorPlacementOnPods(wl)
+ 
+ 	// Lookup existing slice for a given job.
+ 	workloadSlices, err := workloadslicing.FindNotFinishedWorkloads(ctx, clnt, job.Object(), job.GVK())
+@@ -2088,6 +2192,9 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
  			originName = oldSlice.Name
  		}
  		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, kueue.WorkloadSliceNameAnnotation, originName)
@@ -601,10 +674,10 @@ index 31ef492..32096fb 100644
  		// Any other slices length is invalid. I.E, we expect to have at most 1 "current/old" workload slice.
 diff --git a/pkg/controller/jobframework/reconciler_flavor_placement_test.go b/pkg/controller/jobframework/reconciler_flavor_placement_test.go
 new file mode 100644
-index 0000000..74f9996
+index 0000000..d87f157
 --- /dev/null
 +++ b/pkg/controller/jobframework/reconciler_flavor_placement_test.go
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,193 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -762,6 +835,40 @@ index 0000000..74f9996
 +	if len(got[0].Template.Spec.Tolerations) != 0 || len(got[0].Template.Spec.NodeSelector) != 0 {
 +		t.Errorf("running PodSet carries flavor placement: nodeSelector=%v tolerations=%v",
 +			got[0].Template.Spec.NodeSelector, got[0].Template.Spec.Tolerations)
++	}
++}
++
++func TestMarkFlavorPlacementOnPods(t *testing.T) {
++	gate := corev1.PodSchedulingGate{Name: kueue.ElasticJobSchedulingGate}
++	build := func(gated bool) *kueue.Workload {
++		podSet := utiltestingapi.MakePodSet("workers", 1)
++		if gated {
++			podSet = podSet.SchedulingGates(gate)
++		}
++		return utiltestingapi.MakeWorkload("wl", "ns").
++			Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			PodSets(*podSet.Obj()).
++			Obj()
++	}
++	cases := map[string]struct {
++		gate  bool
++		gated bool
++		want  bool
++	}{
++		"mark a Workload with a gated PodSet when the gate is on": {gate: true, gated: true, want: true},
++		"leave a Workload without a gated PodSet alone":           {gate: true},
++		"leave a Workload alone with the gate off":                {gated: true},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero, tc.gate)
++			wl := build(tc.gated)
++			markFlavorPlacementOnPods(wl)
++			if got := wl.Annotations[workloadslicing.FlavorPlacementOnPodsAnnotation] == "true"; got != tc.want {
++				t.Errorf("marker = %v, want %v", got, tc.want)
++			}
++		})
 +	}
 +}
 diff --git a/pkg/workloadslicing/flavor_placement.go b/pkg/workloadslicing/flavor_placement.go

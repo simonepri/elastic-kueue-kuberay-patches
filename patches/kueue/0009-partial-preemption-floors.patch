@@ -6,8 +6,9 @@ annotations instead: kueue.x-k8s.io/reclaim-min-counts and
 kueue.x-k8s.io/podset-count-steps. With the PartialPreemption gate on, the job
 reconciler writes them when it builds the Workload of an elastic RayCluster:
 floor = minReplicas and step 1 for each single-host worker group.
-EnsureWorkloadSlices keeps them current on the slice it returns, in a
-metadata-only update that leaves spec, minCount and admission alone. Multi-host
+EnsureWorkloadSlices keeps them current on every active slice, capped at each
+slice's PodSet count, in a metadata-only update that leaves spec, minCount and
+admission alone. Multi-host
 groups, the head, non-elastic RayClusters, RayJobs and RayServices get no entry.
 With the gate off, nothing is written or updated.
 
@@ -630,10 +631,10 @@ index 0000000..648a89f
 +	}
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 209983e..4ea8056 100644
+index 209983e..fef6ebd 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
-@@ -53,10 +53,13 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -53,7 +53,9 @@ func (r *Manager) EnsureWorkloadSlices(
  	jobPodSets []kueue.PodSet,
  	jobObject client.Object,
  	jobObjectGVK schema.GroupVersionKind,
@@ -643,49 +644,42 @@ index 209983e..4ea8056 100644
  	jobPodSetsCounts := workload.ExtractPodSetCounts(jobPodSets)
  	applyPodSetCounts := func(wl *kueue.Workload) {
  		workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
-+		options.apply(wl)
- 		// Only initial admission follows the job's current minimum. Replacements
- 		// and readmissions retain their baseline, even after a zero-second admission.
- 		if workload.HasQuotaReservation(wl) || workload.IsAdmitted(wl) ||
-@@ -120,7 +123,7 @@ func (r *Manager) EnsureWorkloadSlices(
- 					}
- 				}
- 			}
--			return wl, true, nil
-+			return r.refreshFloors(ctx, wl, options)
- 		}
+@@ -78,6 +80,12 @@ func (r *Manager) EnsureWorkloadSlices(
+ 		return nil, true, fmt.Errorf("failed to find active workload slices: %w", err)
+ 	}
  
- 		// Allow updating the existing slice if:
-@@ -153,7 +156,7 @@ func (r *Manager) EnsureWorkloadSlices(
- 		}
- 
- 		if jobPodSetsCounts.EqualTo(selectedCounts) {
--			return selectedWorkload, true, nil
-+			return r.refreshFloors(ctx, selectedWorkload, options)
- 		}
- 
- 		if !workload.HasQuotaReservation(selectedWorkload) || ScaledDown(selectedCounts, jobPodSetsCounts) {
-@@ -168,3 +171,14 @@ func (r *Manager) EnsureWorkloadSlices(
++	// Partial preemption reads the floors of the admitted slice, which is not always the
++	// one this call returns, so every active slice gets the job's current floors.
++	if err := r.refreshFloors(ctx, workloads, options); err != nil {
++		return nil, true, err
++	}
++
+ 	// An evicted slice can still own running Pods. Return it to the job
+ 	// reconciler until its reservation is released, unless an admitted
+ 	// replacement has already taken ownership of those Pods.
+@@ -168,3 +176,16 @@ func (r *Manager) EnsureWorkloadSlices(
  		return nil, true, nil
  	}
  }
 +
-+// refreshFloors returns wl after it brings the reclaim floor and step annotations up to
-+// the job's, when the caller asked for that.
-+func (r *Manager) refreshFloors(ctx context.Context, wl *kueue.Workload, options ensureOptions) (*kueue.Workload, bool, error) {
-+	if options.apply(wl) {
-+		if err := r.Client.Update(ctx, wl); err != nil {
-+			return nil, true, fmt.Errorf("failed to update workload's reclaim floors: %w", err)
++// refreshFloors brings the reclaim floor and step annotations of every slice up to the
++// job's, when the caller asked for that. It writes metadata only.
++func (r *Manager) refreshFloors(ctx context.Context, active []kueue.Workload, options ensureOptions) error {
++	for i := range active {
++		if options.apply(&active[i]) {
++			if err := r.Client.Update(ctx, &active[i]); err != nil {
++				return fmt.Errorf("failed to update workload's reclaim floors: %w", err)
++			}
 +		}
 +	}
-+	return wl, true, nil
++	return nil
 +}
 diff --git a/pkg/workloadslicing/reclaim_floors.go b/pkg/workloadslicing/reclaim_floors.go
 new file mode 100644
-index 0000000..48e3c7d
+index 0000000..d61528f
 --- /dev/null
 +++ b/pkg/workloadslicing/reclaim_floors.go
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,87 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -745,8 +739,23 @@ index 0000000..48e3c7d
 +	if !o.refreshFloors {
 +		return false
 +	}
-+	changed := syncAnnotation(wl, constants.ReclaimMinCountsAnnotation, o.floors, workload.SetReclaimMinCounts)
++	changed := syncAnnotation(wl, constants.ReclaimMinCountsAnnotation, o.floorsFor(wl), workload.SetReclaimMinCounts)
 +	return syncAnnotation(wl, constants.PodSetCountStepsAnnotation, o.steps, workload.SetPodSetCountSteps) || changed
++}
++
++// floorsFor caps each floor at the PodSet's count in wl, since a slice smaller than the job,
++// such as an admitted slice under a pending scale-up, cannot keep more pods than it has.
++func (o *ensureOptions) floorsFor(wl *kueue.Workload) workload.PodSetsCounts {
++	floors := make(workload.PodSetsCounts, len(o.floors))
++	for name, floor := range o.floors {
++		floors[name] = floor
++	}
++	for i := range wl.Spec.PodSets {
++		if floor, ok := floors[wl.Spec.PodSets[i].Name]; ok {
++			floors[wl.Spec.PodSets[i].Name] = min(floor, wl.Spec.PodSets[i].Count)
++		}
++	}
++	return floors
 +}
 +
 +func syncAnnotation(wl *kueue.Workload, key string, counts workload.PodSetsCounts, set func(*kueue.Workload, workload.PodSetsCounts)) bool {
@@ -760,10 +769,10 @@ index 0000000..48e3c7d
 +}
 diff --git a/pkg/workloadslicing/reclaim_floors_test.go b/pkg/workloadslicing/reclaim_floors_test.go
 new file mode 100644
-index 0000000..ca808cb
+index 0000000..fbd070f
 --- /dev/null
 +++ b/pkg/workloadslicing/reclaim_floors_test.go
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,254 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -939,6 +948,84 @@ index 0000000..ca808cb
 +			}
 +		})
 +	}
++}
++
++func TestEnsureWorkloadSlicesReclaimFloorsOnEverySlice(t *testing.T) {
++	now := time.Now()
++	workers := func(count int) *kueue.PodSet {
++		return utiltestingapi.MakePodSet("workers", count).Request(corev1.ResourceCPU, "1").Obj()
++	}
++	owned := func(name string, created time.Time) *utiltestingapi.WorkloadWrapper {
++		return utiltestingapi.MakeWorkload(name, testJobObject.Namespace).
++			OwnerReference(testJobGVK, testJobObject.Name, string(testJobObject.UID)).
++			ResourceVersion("1").Creation(created)
++	}
++	admittedA := func() *utiltestingapi.WorkloadWrapper {
++		return owned(testJobObject.Name+"-a", now.Add(-time.Minute)).PodSets(*workers(4)).
++			Annotation(constants.ReclaimMinCountsAnnotation, "workers=2").
++			SimpleReserveQuota("default", "default", now).AdmittedAt(true, now)
++	}
++	pendingB := func() *utiltestingapi.WorkloadWrapper {
++		return owned(testJobObject.Name+"-b", now).PodSets(*workers(8)).
++			Annotation(constants.ReclaimMinCountsAnnotation, "workers=2").
++			Annotation(WorkloadSliceReplacementFor, string(workload.Key(admittedA().Obj())))
++	}
++	cases := map[string]struct {
++		objects   []*kueue.Workload
++		floors    int32
++		wantFloor map[string]string
++	}{
++		"an admitted slice under a pending replacement gets the new floor": {
++			objects:   []*kueue.Workload{admittedA().Obj(), pendingB().Obj()},
++			floors:    3,
++			wantFloor: map[string]string{"-a": "workers=3", "-b": "workers=3"},
++		},
++		"a floor above a slice's count is capped at that count": {
++			objects:   []*kueue.Workload{admittedA().Obj(), pendingB().Obj()},
++			floors:    6,
++			wantFloor: map[string]string{"-a": "workers=4", "-b": "workers=6"},
++		},
++		"a partially admitted slice that matches the job gets the new floor": {
++			objects: []*kueue.Workload{
++				owned(testJobObject.Name+"-a", now).PodSets(*workers(8)).
++					Annotation(constants.ReclaimMinCountsAnnotation, "workers=2").
++					ReserveQuotaAt(utiltestingapi.MakeAdmission("default").
++						PodSets(kueue.PodSetAssignment{Name: "workers", Count: new(int32(6))}).Obj(), now).
++					AdmittedAt(true, now).Obj(),
++			},
++			floors:    3,
++			wantFloor: map[string]string{"-a": "workers=3"},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			clnt := testWorkloadClientBuilder().WithObjects(toObjects(tc.objects)...).Build()
++			ctx, _ := utiltesting.ContextWithLog(t)
++			manager := Manager{Client: clnt, Clock: testingclock.NewFakeClock(now)}
++			_, _, err := manager.EnsureWorkloadSlices(ctx, []kueue.PodSet{*workers(8)}, testJobObject, testJobGVK,
++				WithReclaimFloors(workload.PodSetsCounts{"workers": tc.floors}, nil))
++			if err != nil {
++				t.Fatal(err)
++			}
++			for suffix, want := range tc.wantFloor {
++				var got kueue.Workload
++				if err := clnt.Get(ctx, client.ObjectKey{Namespace: testJobObject.Namespace, Name: testJobObject.Name + suffix}, &got); err != nil {
++					t.Fatal(err)
++				}
++				if v := got.Annotations[constants.ReclaimMinCountsAnnotation]; v != want {
++					t.Errorf("slice %s floors = %q, want %q", suffix, v, want)
++				}
++			}
++		})
++	}
++}
++
++func toObjects(wls []*kueue.Workload) []client.Object {
++	objs := make([]client.Object, len(wls))
++	for i, wl := range wls {
++		objs[i] = wl
++	}
++	return objs
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
 new file mode 100644

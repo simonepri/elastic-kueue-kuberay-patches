@@ -1,0 +1,146 @@
+Time out unplaceable KubeRay worker pods sooner than placed ones that are starting.
+
+The autoscaler moves an ALLOCATED instance to ALLOCATION_TIMEOUT once it stays
+ALLOCATED for RAY_AUTOSCALER_RECONCILE_ALLOCATE_STATUS_TIMEOUT_S (an hour by
+default), whether its pod can't be placed on any node or is placed and still
+pulling its image or waiting for its node to boot. With several worker groups
+ranked by priority, one timeout can't fit both: a short one drops pods that are
+about to start, and a long one waits on a group that has no capacity before
+trying the next one.
+
+KubeRayProvider now marks a worker pod that has no node and either keeps
+scheduling gates (such as a queue's admission gate) or is reported Unschedulable
+by the scheduler, and the reconciler times out such an ALLOCATED instance after
+RAY_AUTOSCALER_RECONCILE_UNSCHEDULABLE_TIMEOUT_S (two minutes by default, never
+longer than the allocate timeout). A pod bound to a node keeps the allocate
+timeout.
+
+Upstream status: not yet reported to ray-project/ray.
+
+diff --git a/python/ray/autoscaler/v2/instance_manager/cloud_providers/kuberay/cloud_provider.py b/python/ray/autoscaler/v2/instance_manager/cloud_providers/kuberay/cloud_provider.py
+index 7c4578e..f2c1851 100644
+--- a/python/ray/autoscaler/v2/instance_manager/cloud_providers/kuberay/cloud_provider.py
++++ b/python/ray/autoscaler/v2/instance_manager/cloud_providers/kuberay/cloud_provider.py
+@@ -635,8 +635,31 @@ class KubeRayProvider(ICloudInstanceProvider):
+             node_type=type,
+             node_kind=kind,
+             is_running=KubeRayProvider._is_running(pod),
++            is_unschedulable=KubeRayProvider._is_unschedulable(pod),
+         )
+ 
++    @staticmethod
++    def _is_unschedulable(pod) -> bool:
++        """Whether the pod can't be placed on a node yet.
++
++        A pod is unschedulable while it has no node and either still has
++        scheduling gates (e.g. it waits for a queue to admit it) or the scheduler
++        reported it as Unschedulable. A pod bound to a node is never unschedulable,
++        even while it pulls its image or its node is still starting.
++        """
++        if pod.get("spec", {}).get("nodeName"):
++            return False
++        if pod.get("spec", {}).get("schedulingGates"):
++            return True
++        for condition in pod.get("status", {}).get("conditions") or []:
++            if (
++                condition.get("type") == "PodScheduled"
++                and condition.get("status") == "False"
++                and condition.get("reason") == "Unschedulable"
++            ):
++                return True
++        return False
++
+     @staticmethod
+     def _is_running(pod) -> bool:
+         """Convert pod state to Ray NodeStatus
+diff --git a/python/ray/autoscaler/v2/instance_manager/config.py b/python/ray/autoscaler/v2/instance_manager/config.py
+index 180cbd0..a6be59b 100644
+--- a/python/ray/autoscaler/v2/instance_manager/config.py
++++ b/python/ray/autoscaler/v2/instance_manager/config.py
+@@ -89,6 +89,14 @@ class InstanceReconcileConfig:
+     allocate_status_timeout_s: int = env_integer(
+         "RAY_AUTOSCALER_RECONCILE_ALLOCATE_STATUS_TIMEOUT_S", 60 * 60
+     )
++    # The timeout for waiting for an ALLOCATED instance that the cloud provider
++    # can't place on a host to be RAY_RUNNING. It's shorter than
++    # allocate_status_timeout_s so that the autoscaler tries other node types
++    # soon when one has no capacity, while a placed instance that is still
++    # starting (e.g. pulling its image) keeps the longer timeout.
++    unschedulable_status_timeout_s: int = env_integer(
++        "RAY_AUTOSCALER_RECONCILE_UNSCHEDULABLE_TIMEOUT_S", 2 * 60
++    )
+     # The timeout for waiting for a RAY_INSTALLING instance to be RAY_RUNNING.
+     ray_install_status_timeout_s: int = env_integer(
+         "RAY_AUTOSCALER_RECONCILE_RAY_INSTALL_STATUS_TIMEOUT_S", 30 * 60
+diff --git a/python/ray/autoscaler/v2/instance_manager/node_provider.py b/python/ray/autoscaler/v2/instance_manager/node_provider.py
+index 61e870e..84741bc 100644
+--- a/python/ray/autoscaler/v2/instance_manager/node_provider.py
++++ b/python/ray/autoscaler/v2/instance_manager/node_provider.py
+@@ -64,6 +64,10 @@ class CloudInstance:
+     # to handle cloud instances w/o request ids.
+     # TODO: make this a required field.
+     request_id: Optional[str] = None
++    # If the cloud provider can't place the cloud instance on a host yet, e.g. a
++    # Kubernetes pod that is gated or unschedulable. Such an instance is timed out
++    # after unschedulable_status_timeout_s rather than allocate_status_timeout_s.
++    is_unschedulable: bool = False
+ 
+ 
+ class CloudInstanceProviderError(Exception):
+diff --git a/python/ray/autoscaler/v2/instance_manager/reconciler.py b/python/ray/autoscaler/v2/instance_manager/reconciler.py
+index ad42f66..69b86b5 100644
+--- a/python/ray/autoscaler/v2/instance_manager/reconciler.py
++++ b/python/ray/autoscaler/v2/instance_manager/reconciler.py
+@@ -302,6 +302,7 @@ class Reconciler:
+             instance_manager=instance_manager,
+             reconcile_config=autoscaling_config.get_instance_reconcile_config(),
+             _logger=_logger or logger,
++            non_terminated_cloud_instances=non_terminated_cloud_instances,
+         )
+ 
+         Reconciler._scale_cluster(
+@@ -983,6 +984,9 @@ class Reconciler:
+         instance_manager: InstanceManager,
+         reconcile_config: InstanceReconcileConfig,
+         _logger: logging.Logger,
++        non_terminated_cloud_instances: Optional[
++            Dict[CloudInstanceId, CloudInstance]
++        ] = None,
+     ):
+         """
+         Handle stuck instances with timeouts.
+@@ -1011,9 +1015,13 @@ class Reconciler:
+             instance_manager: The instance manager to reconcile.
+             reconcile_config: The instance reconcile config.
+             _logger: The logger to log the warning messages. It's used for testing.
++            non_terminated_cloud_instances: The non-terminated cloud instances from
++                the cloud provider. An ALLOCATED instance whose cloud instance is
++                unschedulable times out after unschedulable_status_timeout_s.
+ 
+         """
+         instances, version = Reconciler._get_im_instances(instance_manager)
++        non_terminated_cloud_instances = non_terminated_cloud_instances or {}
+ 
+         instances_by_status = defaultdict(list)
+         for instance in instances:
+@@ -1039,9 +1047,19 @@ class Reconciler:
+             assert (
+                 instance.cloud_instance_id
+             ), "cloud instance id should be set on ALLOCATED instance"
++            # An instance the cloud provider can't place is unlikely to start
++            # soon, so give up on it sooner to let other node types be tried.
++            timeout_s = reconcile_config.allocate_status_timeout_s
++            cloud_instance = non_terminated_cloud_instances.get(
++                instance.cloud_instance_id
++            )
++            if cloud_instance and cloud_instance.is_unschedulable:
++                timeout_s = min(
++                    timeout_s, reconcile_config.unschedulable_status_timeout_s
++                )
+             update = Reconciler._handle_stuck_instance(
+                 instance,
+-                reconcile_config.allocate_status_timeout_s,
++                timeout_s,
+                 new_status=IMInstance.ALLOCATION_TIMEOUT,
+                 cloud_instance_id=instance.cloud_instance_id,
+                 instance_type=instance.instance_type,

@@ -1,0 +1,27 @@
+# High-priority workload claiming flavor-a from the cohort-mate queue.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flavor-a-reclaim-job
+  labels:
+    kueue.x-k8s.io/queue-name: lq-cohort-mate
+    kueue.x-k8s.io/priority-class: pc-flavor-split-high
+spec:
+  parallelism: 8
+  completions: 8
+  template:
+    spec:
+      terminationGracePeriodSeconds: 0
+      priorityClassName: pc-flavor-split-high
+      containers:
+        - name: train
+          image: busybox:latest
+          command: ["sleep", "5"]
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+      restartPolicy: Never

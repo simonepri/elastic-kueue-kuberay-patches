@@ -1,0 +1,115 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 01-flavor-split-podsets
+  labels:
+    flavor-split: required
+spec:
+  description: >
+    Verifies flavor-split PodSets for an elastic RayCluster worker group:
+    Setup: ClusterQueue with flavor-a (quota 8) then flavor-b (quota 8), plus a cohort-mate queue at higher priority.
+    1. Overflow: scale 0 to 12. Expect entries workers=8 on flavor-a and workers--2=4 on flavor-b,
+       all pods Running with the right nodeSelectors and entry labels, and one active Workload.
+    2. Reclaim: higher-priority workload claims flavor-a. Only the 8 flavor-a pods are removed;
+       the 4 flavor-b pods keep running; the RayCluster is not suspended.
+    3. LIFO shrink: from 12 to 10 reduces workers--2 to 2 and leaves workers at 8.
+    4. Merge-back: shrink to 8 drops workers--2 from the next slice.
+    5. Job finish: the Workload and all pods finish cleanly.
+  catch:
+    - script:
+        env:
+          - name: NS
+            value: ($namespace)
+        content: ../../../dump-namespace.sh
+    - script:
+        env:
+          - name: NS
+            value: ($namespace)
+        content: kubectl delete pods --all -n "$NS" --force --grace-period=0 2>/dev/null || true
+  steps:
+    - name: setup-queues-and-cluster
+      try:
+        - apply:
+            file: 00-queues.yaml
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./setup-nodes.sh
+        - apply:
+            file: 01-raycluster.yaml
+      cleanup:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: |
+              kubectl delete pods --all -n "$NS" --force --grace-period=0 2>/dev/null || true
+              kubectl delete node node-flavor-a node-flavor-b --ignore-not-found 2>/dev/null || true
+    - name: 01-overflow-scale-0-to-12
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./scale.sh 12
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-overflow.sh
+    - name: 02-reclaim-flavor-a
+      try:
+        - apply:
+            file: 02-high-priority-job.yaml
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-reclaim.sh
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./clean-reclaim.sh
+    - name: 03-lifo-shrink-12-to-10
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./scale.sh 10
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-lifo-shrink.sh
+    - name: 04-merge-back-shrink-to-8
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./scale.sh 8
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-merge-back.sh
+    - name: 05-job-finish
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./finish-job.sh
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-job-finish.sh

@@ -1,0 +1,57 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: elastic-rayjob
+  labels:
+    kueue.x-k8s.io/queue-name: reclaim-nodes-lq
+    kueue.x-k8s.io/priority-class: priority-low
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+    kueue.x-k8s.io/elastic-job-scale-up-strategy: "partial"
+    kueue.x-k8s.io/reclaim-min-counts: workers=4
+spec:
+  entrypoint: "python -c 'import time; time.sleep(3600)'"
+  shutdownAfterJobFinishes: true
+  rayClusterSpec:
+    rayVersion: "2.38.0"
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+      template:
+        spec:
+          priorityClassName: priority-low
+          containers:
+            - name: ray-head
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+    workerGroupSpecs:
+      - groupName: workers
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 8
+        rayStartParams: {}
+        template:
+          spec:
+            priorityClassName: priority-low
+            nodeSelector:
+              fake-gpu-node: "true"
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: kubernetes.io/hostname
+                whenUnsatisfiable: DoNotSchedule
+                labelSelector:
+                  matchLabels:
+                    ray.io/group: workers
+            containers:
+              - name: ray-worker
+                image: rayproject/ray:2.38.0
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "256Mi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    nvidia.com/gpu: "1"

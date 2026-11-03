@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: preemptor-job
+  labels:
+    kueue.x-k8s.io/queue-name: reclaim-nodes-lq
+    kueue.x-k8s.io/priority-class: priority-high
+spec:
+  parallelism: 1
+  completions: 1
+  template:
+    spec:
+      priorityClassName: priority-high
+      nodeSelector:
+        fake-gpu-node: "true"
+      containers:
+        - name: preemptor
+          image: busybox:latest
+          command: ["sleep", "120"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+              nvidia.com/gpu: "4"
+            limits:
+              nvidia.com/gpu: "4"
+      restartPolicy: Never

@@ -76,6 +76,18 @@ index 0000000..0b3061c
 +	// were first set.
 +	ReclaimRequestedAtAnnotation = "kueue.x-k8s.io/reclaim-requested-at"
 +)
+diff --git a/pkg/controller/admissionchecks/karpenter/controller_test.go b/pkg/controller/admissionchecks/karpenter/controller_test.go
+index 057a627..cf64444 100644
+--- a/pkg/controller/admissionchecks/karpenter/controller_test.go
++++ b/pkg/controller/admissionchecks/karpenter/controller_test.go
+@@ -125,7 +125,6 @@ func newFixture(t *testing.T, wl *kueue.Workload, acAnnotations map[string]stri
+ 	objs := append(baseObjects(acAnnotations), extra...)
+ 	objs = append(objs, wl)
+ 	c := utiltesting.NewClientBuilder().WithObjects(objs...).WithStatusSubresource(wl).
+-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string { return []string{o.(*corev1.Pod).Spec.NodeName} }).
+ 		Build()
+ 	clk := testingclock.NewFakeClock(reservedAt.Add(time.Second))
+ 	return &fixture{
 diff --git a/pkg/controller/core/indexer/indexer.go b/pkg/controller/core/indexer/indexer.go
 index 1c69baa..dc9416d 100644
 --- a/pkg/controller/core/indexer/indexer.go

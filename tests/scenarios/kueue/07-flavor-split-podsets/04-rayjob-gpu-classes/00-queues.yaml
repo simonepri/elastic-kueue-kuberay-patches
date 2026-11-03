@@ -68,7 +68,7 @@ spec:
             - name: "memory"
               nominalQuota: "256Gi"
             - name: "nvidia.com/gpu"
-              nominalQuota: "8"
+              nominalQuota: "6"
         - name: spot-gpu
           resources:
             - name: "cpu"

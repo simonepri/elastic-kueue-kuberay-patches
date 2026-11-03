@@ -1,0 +1,46 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 05-reclaim-whole-nodes
+  labels:
+    partial-preemption: required
+spec:
+  description: >
+    Verifies that when partial preemption stops elastic worker pods above a reclaim target,
+    it frees whole nodes first to avoid GPU capacity fragmentation.
+    Two nodes each advertise 4 GPUs. An elastic RayJob runs 8 single-GPU workers (4 on node-a, 4 on node-b).
+    A high-priority preemptor job requests 4 GPUs on a single node.
+    The partial-preemption stopper empties one entire node (deleting all 4 workers from that node)
+    rather than splitting deletions across both nodes, allowing the 4-GPU preemptor pod to be scheduled
+    and become Running.
+  catch:
+    - script:
+        env:
+          - name: NS
+            value: ($namespace)
+        content: ../../../dump-namespace.sh
+  steps:
+    - name: setup-nodes-and-queues
+      try:
+        - apply:
+            file: 00-nodes-and-queues.yaml
+    - name: run-elastic-rayjob-across-nodes
+      try:
+        - apply:
+            file: 01-rayjob.yaml
+        - script:
+            timeout: 90s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-distribution.sh
+    - name: submit-preemptor-and-verify-whole-node-freed
+      try:
+        - apply:
+            file: 02-preemptor.yaml
+        - script:
+            timeout: 90s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-emptied-and-preemptor-running.sh

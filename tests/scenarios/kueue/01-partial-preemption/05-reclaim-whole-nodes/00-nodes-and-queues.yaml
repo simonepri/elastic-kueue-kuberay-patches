@@ -1,0 +1,116 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: priority-low
+value: 100
+globalDefault: false
+description: "Low priority elastic ray workloads"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: priority-high
+value: 1000
+globalDefault: false
+description: "High priority preemptor workloads"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: priority-low
+value: 100
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: priority-high
+value: 1000
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: fake-gpu-node-a
+  labels:
+    fake-gpu-node: "true"
+    kubernetes.io/hostname: fake-gpu-node-a
+status:
+  capacity:
+    cpu: "32"
+    memory: "128Gi"
+    nvidia.com/gpu: "4"
+  allocatable:
+    cpu: "32"
+    memory: "128Gi"
+    nvidia.com/gpu: "4"
+  conditions:
+    - type: Ready
+      status: "True"
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: fake-gpu-node-b
+  labels:
+    fake-gpu-node: "true"
+    kubernetes.io/hostname: fake-gpu-node-b
+status:
+  capacity:
+    cpu: "32"
+    memory: "128Gi"
+    nvidia.com/gpu: "4"
+  allocatable:
+    cpu: "32"
+    memory: "128Gi"
+    nvidia.com/gpu: "4"
+  conditions:
+    - type: Ready
+      status: "True"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: default-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: fake-gpu-flavor
+spec:
+  nodeLabels:
+    fake-gpu-node: "true"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: reclaim-nodes-cq
+spec:
+  namespaceSelector: {}
+  preemption:
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "32"
+            - name: "memory"
+              nominalQuota: "128Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "0"
+        - name: fake-gpu-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "64"
+            - name: "memory"
+              nominalQuota: "256Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "8"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: reclaim-nodes-lq
+spec:
+  clusterQueue: reclaim-nodes-cq

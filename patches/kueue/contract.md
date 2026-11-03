@@ -111,7 +111,7 @@ type JobWithPartialStop interface {
 }
 ```
 
-RayCluster implements it by deleting running pods above the target in whole `ray.io/worker-group-replica-name` groups, lowest `controller.kubernetes.io/pod-deletion-cost` first, then newest. R3 also adds, in `pkg/workload/partial_preemption.go`, `ParsePodSetCounts(string) PodSetsCounts`, `FormatPodSetCounts(PodSetsCounts) string`, `ReclaimTargetCounts`, `SetReclaimTargetCounts`, `PendingReclaimTargetCounts`, `IsPartiallyPreempted`, and `ReclaimablePodsForTargets`, with #17484's semantics.
+RayCluster implements it by deleting running pods above the target in whole `ray.io/worker-group-replica-name` groups: unscheduled pods are deleted first, then whole nodes' worth of pods are deleted (preferring nodes where this pod set holds the most pods to maximize contiguous freed capacity, breaking ties by fewer other GPUs or other pods requested on the node, then node name for determinism), using partial nodes in lowest `controller.kubernetes.io/pod-deletion-cost` first, then newest order only for any remaining count. R3 also adds, in `pkg/workload/partial_preemption.go`, `ParsePodSetCounts(string) PodSetsCounts`, `FormatPodSetCounts(PodSetsCounts) string`, `ReclaimTargetCounts`, `SetReclaimTargetCounts`, `PendingReclaimTargetCounts`, `IsPartiallyPreempted`, and `ReclaimablePodsForTargets`, with #17484's semantics.
 
 R4 adds separate readers and writers for floors and steps, in `pkg/workload/reclaim_floors.go`:
 

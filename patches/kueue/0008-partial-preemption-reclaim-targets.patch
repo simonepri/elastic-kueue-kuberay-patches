@@ -1672,10 +1672,10 @@ index 209983e..d2491ef 100644
  
 diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
 new file mode 100644
-index 0000000..1b42c1d
+index 0000000..8818749
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption.go
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,435 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1765,13 +1765,187 @@ index 0000000..1b42c1d
 +	return cost
 +}
 +
++// comparePodGroups orders pod groups by deletion cost ascending, then newest first.
++func comparePodGroups(a, b *podGroup) int {
++	if a.deletionCost != b.deletionCost {
++		return cmp.Compare(a.deletionCost, b.deletionCost)
++	}
++	if newerPod(a.newest, b.newest) {
++		return -1
++	}
++	if newerPod(b.newest, a.newest) {
++		return 1
++	}
++	return 0
++}
++
++type nodeReclaimUsage struct {
++	name      string
++	podCount  int32
++	otherPods int
++	otherGPUs int64
++}
++
++func compareNodes(a, b *nodeReclaimUsage) int {
++	if a.podCount != b.podCount {
++		return cmp.Compare(b.podCount, a.podCount) // prefer node holding most pods
++	}
++	if a.otherGPUs != b.otherGPUs {
++		return cmp.Compare(a.otherGPUs, b.otherGPUs) // prefer fewer other GPUs
++	}
++	if a.otherPods != b.otherPods {
++		return cmp.Compare(a.otherPods, b.otherPods) // prefer fewer other pods
++	}
++	return strings.Compare(a.name, b.name)
++}
++
++func computeNodeUsages(allPods []corev1.Pod) map[string]*nodeReclaimUsage {
++	usages := make(map[string]*nodeReclaimUsage)
++	for i := range allPods {
++		p := &allPods[i]
++		if p.Spec.NodeName == "" || utilpod.IsTerminated(p) {
++			continue
++		}
++		u, ok := usages[p.Spec.NodeName]
++		if !ok {
++			u = &nodeReclaimUsage{name: p.Spec.NodeName}
++			usages[p.Spec.NodeName] = u
++		}
++		u.otherPods++
++		for _, c := range p.Spec.Containers {
++			if q, ok := c.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")]; ok {
++				u.otherGPUs += q.Value()
++			}
++		}
++	}
++	return usages
++}
++
++func podsToReclaim(groups []*podGroup, needed int32, allPods []corev1.Pod) []*corev1.Pod {
++	var toDelete []*corev1.Pod
++
++	// 1. Separate unscheduled and scheduled groups. Unscheduled groups are deleted first.
++	var unscheduled []*podGroup
++	var scheduled []*podGroup
++	for _, g := range groups {
++		hasScheduled := false
++		for _, p := range g.pods {
++			if p.Spec.NodeName != "" {
++				hasScheduled = true
++				break
++			}
++		}
++		if hasScheduled {
++			scheduled = append(scheduled, g)
++		} else {
++			unscheduled = append(unscheduled, g)
++		}
++	}
++
++	slices.SortFunc(unscheduled, comparePodGroups)
++	for _, g := range unscheduled {
++		if needed <= 0 {
++			break
++		}
++		toDelete = append(toDelete, g.pods...)
++		needed -= int32(len(g.pods))
++	}
++
++	if needed <= 0 || len(scheduled) == 0 {
++		return toDelete
++	}
++
++	// 2. Group scheduled replica groups by node.
++	nodeUsages := computeNodeUsages(allPods)
++	nodeGroups := make(map[string][]*podGroup)
++	for _, g := range scheduled {
++		nodeName := g.pods[0].Spec.NodeName
++		nodeGroups[nodeName] = append(nodeGroups[nodeName], g)
++	}
++
++	for nodeName, grps := range nodeGroups {
++		u, ok := nodeUsages[nodeName]
++		if !ok {
++			u = &nodeReclaimUsage{name: nodeName}
++			nodeUsages[nodeName] = u
++		}
++		for _, g := range grps {
++			u.podCount += int32(len(g.pods))
++			u.otherPods -= len(g.pods)
++			for _, p := range g.pods {
++				for _, c := range p.Spec.Containers {
++					if q, ok := c.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")]; ok {
++						u.otherGPUs -= q.Value()
++					}
++				}
++			}
++		}
++	}
++
++	for needed > 0 && len(nodeGroups) > 0 {
++		var wholeCandidates []*nodeReclaimUsage
++		for nodeName := range nodeGroups {
++			u := nodeUsages[nodeName]
++			if u.podCount > 0 && u.podCount <= needed {
++				wholeCandidates = append(wholeCandidates, u)
++			}
++		}
++
++		if len(wholeCandidates) > 0 {
++			slices.SortFunc(wholeCandidates, compareNodes)
++			chosen := wholeCandidates[0]
++			for _, g := range nodeGroups[chosen.name] {
++				toDelete = append(toDelete, g.pods...)
++				needed -= int32(len(g.pods))
++			}
++			delete(nodeGroups, chosen.name)
++			chosen.podCount = 0
++			continue
++		}
++
++		var activeNodes []*nodeReclaimUsage
++		for nodeName := range nodeGroups {
++			u := nodeUsages[nodeName]
++			if u.podCount > 0 {
++				activeNodes = append(activeNodes, u)
++			}
++		}
++		if len(activeNodes) == 0 {
++			break
++		}
++		slices.SortFunc(activeNodes, compareNodes)
++		chosen := activeNodes[0]
++		grps := nodeGroups[chosen.name]
++		slices.SortFunc(grps, comparePodGroups)
++		var remainingGrps []*podGroup
++		for _, g := range grps {
++			if needed <= 0 {
++				remainingGrps = append(remainingGrps, g)
++			} else {
++				toDelete = append(toDelete, g.pods...)
++				needed -= int32(len(g.pods))
++				chosen.podCount -= int32(len(g.pods))
++			}
++		}
++		if len(remainingGrps) == 0 {
++			delete(nodeGroups, chosen.name)
++		} else {
++			nodeGroups[chosen.name] = remainingGrps
++		}
++	}
++
++	return toDelete
++}
++
 +// DeletePodGroupsAboveCounts deletes running Pods of the workload slice until
-+// each PodSet in counts runs at most its count. It deletes whole groups, as
-+// groupOf maps each Pod to a group key; the group whose costliest Pod has the
-+// lowest controller.kubernetes.io/pod-deletion-cost goes first, then the group
-+// with the newest Pod. Terminating Pods are neither deleted again nor counted, so
-+// a call made while earlier deletions are still terminating deletes nothing more.
-+// It returns whether any Pod was deleted.
++// each PodSet in counts runs at most its count. When deleting pods, unscheduled
++// pods are deleted first, then whole nodes' worth of pods are deleted (preferring
++// nodes where this pod set holds the most pods, breaking ties by fewer other GPUs
++// or other pods on the node, then node name). Any remaining pods are deleted from
++// a partial node in deletion cost / age order. Multi-host replica groups are kept
++// whole. Terminating Pods are neither deleted again nor counted, so a call made
++// while earlier deletions are still terminating deletes nothing more. It returns
++// whether any Pod was deleted.
 +func DeletePodGroupsAboveCounts(ctx context.Context, c client.Client, wl *kueue.Workload, counts workload.PodSetsCounts, groupOf func(*corev1.Pod) string) (bool, error) {
 +	running, err := runningPodsPerPodSet(ctx, c, wl)
 +	if err != nil {
@@ -1801,25 +1975,13 @@ index 0000000..1b42c1d
 +			}
 +		}
 +		groups := slices.Collect(maps.Values(groupsByKey))
-+		slices.SortFunc(groups, func(a, b *podGroup) int {
-+			if a.deletionCost != b.deletionCost {
-+				return cmp.Compare(a.deletionCost, b.deletionCost)
++		var allPods corev1.PodList
++		if slices.ContainsFunc(live, func(p *corev1.Pod) bool { return p.Spec.NodeName != "" }) {
++			if err := c.List(ctx, &allPods); err != nil {
++				return false, err
 +			}
-+			if newerPod(a.newest, b.newest) {
-+				return -1
-+			}
-+			if newerPod(b.newest, a.newest) {
-+				return 1
-+			}
-+			return 0
-+		})
-+		for _, g := range groups {
-+			if remaining <= counts[ps] {
-+				break
-+			}
-+			toDelete = append(toDelete, g.pods...)
-+			remaining -= int32(len(g.pods))
 +		}
++		toDelete = append(toDelete, podsToReclaim(groups, remaining-counts[ps], allPods.Items)...)
 +	}
 +	log := ctrl.LoggerFrom(ctx)
 +	err = parallelize.Until(ctx, len(toDelete), func(i int) error {
@@ -1954,7 +2116,7 @@ new file mode 100644
 index 0000000..acb3491
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption_test.go
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,640 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1975,6 +2137,7 @@ index 0000000..acb3491
 +
 +import (
 +	"context"
++	"fmt"
 +	"errors"
 +	"slices"
 +	"testing"
@@ -2165,8 +2328,9 @@ index 0000000..acb3491
 +		return p.Name
 +	}
 +	testCases := map[string]struct {
-+		pods   []*corev1.Pod
-+		counts workload.PodSetsCounts
++		pods        []*corev1.Pod
++		otherPods   []*corev1.Pod
++		counts      workload.PodSetsCounts
 +		// repeat calls DeletePodGroupsAboveCounts again while the Pods it deleted
 +		// are still terminating, held by a finalizer.
 +		repeat      bool
@@ -2176,6 +2340,276 @@ index 0000000..acb3491
 +		wantAbove   bool
 +		wantStopped bool
 +	}{
++		"16 pods 8+8 on two nodes, delete 8 empties one node": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			for i := range 8 {
++				name := fmt.Sprintf("w-a-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-a").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			for i := range 8 {
++				pods = append(pods, worker(fmt.Sprintf("w-b-%d", i), time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 8},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"8+5 on two nodes, delete 5 empties the 5-pod node": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			for i := range 8 {
++				pods = append(pods, worker(fmt.Sprintf("w-a-%d", i), time.Duration(i)*time.Second).NodeName("node-a").Obj())
++			}
++			for i := range 5 {
++				name := fmt.Sprintf("w-b-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-b").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 8},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"8+5 on two nodes, delete 8 empties the 8-pod node to maximize contiguous freed capacity": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			for i := range 8 {
++				name := fmt.Sprintf("w-a-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-a").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			for i := range 5 {
++				pods = append(pods, worker(fmt.Sprintf("w-b-%d", i), time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 5},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"uneven sets with other tenants pods on a node prefer node with fewer other GPUs/pods": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			for i := range 8 {
++				pods = append(pods, worker(fmt.Sprintf("w-a-%d", i), time.Duration(i)*time.Second).NodeName("node-a").Obj())
++			}
++			for i := range 8 {
++				name := fmt.Sprintf("w-b-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-b").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			other := testingpod.MakePod("other-tenant", "ns").
++				NodeName("node-a").
++				Request(corev1.ResourceName("nvidia.com/gpu"), "1").
++				Obj()
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++			}{
++				pods:        pods,
++				otherPods:   []*corev1.Pod{other},
++				counts:      workload.PodSetsCounts{"workers": 8},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"multi-host groups are kept whole when emptying whole nodes": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			// 2 groups of 2 pods on node-a
++			for g := 1; g <= 2; g++ {
++				for h := 0; h < 2; h++ {
++					name := fmt.Sprintf("g%d-%d", g, h)
++					pods = append(pods, worker(name, time.Duration(g)*time.Second).Label("group", fmt.Sprintf("g%d", g)).NodeName("node-a").Obj())
++					wantDeleted = append(wantDeleted, name)
++				}
++			}
++			// 2 groups of 2 pods on node-b
++			for g := 3; g <= 4; g++ {
++				for h := 0; h < 2; h++ {
++					name := fmt.Sprintf("g%d-%d", g, h)
++					pods = append(pods, worker(name, time.Duration(g)*time.Second).Label("group", fmt.Sprintf("g%d", g)).NodeName("node-b").Obj())
++				}
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 4},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"multi-host groups are kept whole when deleting from a partial node": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			// 2 groups of 2 pods on node-a
++			for g := 1; g <= 2; g++ {
++				for h := 0; h < 2; h++ {
++					pods = append(pods, worker(fmt.Sprintf("g%d-%d", g, h), time.Duration(g)*time.Second).Label("group", fmt.Sprintf("g%d", g)).NodeName("node-a").Obj())
++				}
++			}
++			// 2 groups of 2 pods on node-b
++			for g := 3; g <= 4; g++ {
++				for h := 0; h < 2; h++ {
++					pods = append(pods, worker(fmt.Sprintf("g%d-%d", g, h), time.Duration(g)*time.Second).Label("group", fmt.Sprintf("g%d", g)).NodeName("node-b").Obj())
++				}
++			}
++			// Node-a chosen for partial; g2 is newer than g1, so g2 is deleted whole (g2-0, g2-1)
++			wantDeleted := []string{"g2-0", "g2-1"}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 6},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"unscheduled pods are deleted before scheduled whole nodes": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			// 2 unscheduled pods
++			for i := range 2 {
++				name := fmt.Sprintf("u-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			// 8 pods on node-a
++			for i := range 8 {
++				name := fmt.Sprintf("w-a-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-a").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			// 8 pods on node-b
++			for i := range 8 {
++				pods = append(pods, worker(fmt.Sprintf("w-b-%d", i), time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 8},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
 +		"no pod is deleted at or below the target": {
 +			pods: []*corev1.Pod{
 +				worker("a", 0).Obj(),
@@ -2266,9 +2700,12 @@ index 0000000..acb3491
 +	for name, tc := range testCases {
 +		t.Run(name, func(t *testing.T) {
 +			ctx, _ := utiltesting.ContextWithLog(t)
-+			objs := make([]client.Object, len(tc.pods))
++			objs := make([]client.Object, len(tc.pods)+len(tc.otherPods))
 +			for i := range tc.pods {
 +				objs[i] = tc.pods[i]
++			}
++			for i := range tc.otherPods {
++				objs[len(tc.pods)+i] = tc.otherPods[i]
 +			}
 +			clnt := utiltesting.NewClientBuilder().
 +				WithObjects(objs...).

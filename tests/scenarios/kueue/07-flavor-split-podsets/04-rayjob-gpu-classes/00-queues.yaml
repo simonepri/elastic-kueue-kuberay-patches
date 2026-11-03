@@ -1,0 +1,94 @@
+# Single resource group covering cpu, memory, and nvidia.com/gpu with a reserved GPU flavor first (gpu-class: h200),
+# then spot GPU (gpu-class: l4), and on-demand CPU.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: pc-flavor-split
+value: 100
+globalDefault: false
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: pc-flavor-split
+value: 100
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: reserved-gpu
+spec:
+  nodeLabels:
+    instance-type: reserved-gpu
+    gpu-class: h200
+    karpenter.sh/capacity-type: reserved
+    instance-gpu-memory: "40000"
+  nodeTaints:
+    - key: nvidia.com/gpu
+      value: present
+      effect: NoSchedule
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: spot-gpu
+spec:
+  nodeLabels:
+    instance-type: spot-gpu
+    gpu-class: l4
+    karpenter.sh/capacity-type: spot
+    instance-gpu-memory: "40000"
+  nodeTaints:
+    - key: nvidia.com/gpu
+      value: present
+      effect: NoSchedule
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: on-demand
+spec:
+  nodeLabels:
+    instance-type: on-demand
+    karpenter.sh/capacity-type: on-demand
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: flavor-split-team
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: reserved-gpu
+          resources:
+            - name: "cpu"
+              nominalQuota: "64"
+            - name: "memory"
+              nominalQuota: "256Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "8"
+        - name: spot-gpu
+          resources:
+            - name: "cpu"
+              nominalQuota: "64"
+            - name: "memory"
+              nominalQuota: "256Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "16"
+        - name: on-demand
+          resources:
+            - name: "cpu"
+              nominalQuota: "64"
+            - name: "memory"
+              nominalQuota: "256Gi"
+            - name: "nvidia.com/gpu"
+              nominalQuota: "0"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: lq-flavor-split
+spec:
+  clusterQueue: flavor-split-team

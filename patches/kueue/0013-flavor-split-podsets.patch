@@ -1,29 +1,50 @@
-Let one elastic PodSet span flavors through split PodSets of the same Workload.
-
-A Workload PodSet has one flavor per resource, and a scale-up slice keeps each
-PodSet on the flavor of the slice it replaces while it has pods. An elastic
-worker group whose growth does not fit on that flavor stays pending even when
-the next flavor in the ClusterQueue has room, and a second Workload for the
-overflow would break the one-Workload-per-job rule of KEP-77.
-
-With ElasticJobsViaWorkloadSlicesFlavorSplit on, the flavor assigner notes in a
-refused replacement slice's message when a PodSet's growth would fit on a flavor
-that the sticky-flavor check skipped. Once the scheduler has refused a pending
-scale-up probe with that note, the job reconciler keeps each PodSet's
-newest entry at what the replaced slice runs and moves the growth to a split
-entry, <podSet>--<n>, marked with the template annotation
-kueue.x-k8s.io/flavor-split-of. The new entry is absent from the replaced slice,
-so the flavor assigner gives it the first flavor that fits. Where Kueue matches
-job PodSets with slice PodSets, the job's counts are mapped onto the entries:
-growth goes to the newest entry, a shrink of an admitted slice follows the pods
-the job's controller deleted, and newest entries shrink first among pods not
-started yet. New slices carry the entries and drop those at 0. The
-ElasticJobUngater starts each gated pod in an entry with room, writing the entry
-in the pod's kueue.x-k8s.io/podset label with the entry's flavor placement.
-Split entries get floor 0 and their PodSet's step, so partial preemption of one
-flavor stops only that flavor's pods. The job gets the PodSet info of its own
-PodSets only. Everything but the split itself follows the entries, not the gate.
-
+diff --git a/charts/kueue/templates/webhook/manifests.yaml b/charts/kueue/templates/webhook/manifests.yaml
+index a7815cf..a5093a5 100644
+--- a/charts/kueue/templates/webhook/manifests.yaml
++++ b/charts/kueue/templates/webhook/manifests.yaml
+@@ -429,6 +429,7 @@ webhooks:
+           - v1
+         operations:
+           - CREATE
++          - UPDATE
+         resources:
+           - rayjobs
+     sideEffects: None
+diff --git a/config/components/webhook/manifests.yaml b/config/components/webhook/manifests.yaml
+index 3861674..9a349b8 100644
+--- a/config/components/webhook/manifests.yaml
++++ b/config/components/webhook/manifests.yaml
+@@ -251,6 +251,7 @@ webhooks:
+     - v1
+     operations:
+     - CREATE
++    - UPDATE
+     resources:
+     - rayjobs
+   sideEffects: None
+diff --git a/pkg/controller/elasticjobs/elastic_flavor_placement.go b/pkg/controller/elasticjobs/elastic_flavor_placement.go
+index 8a301e5..482d46e 100644
+--- a/pkg/controller/elasticjobs/elastic_flavor_placement.go
++++ b/pkg/controller/elasticjobs/elastic_flavor_placement.go
+@@ -52,7 +52,7 @@ func (r *elasticJobUngater) admissionUpdate(ctx context.Context, wl *kueue.Workl
+ // deferFlavorPlacementToPods in the job framework), because a PodSet that had no
+ // Pods may move to another flavor, and only the Pods can follow it.
+ func addFlavorPlacement(ctx context.Context, c client.Client, wl *kueue.Workload, podSetName kueue.PodSetReference, update *podAdmissionUpdate) error {
+-	if !workloadslicing.FlavorPlacementOnPods(wl) || wl.Status.Admission == nil {
++	if wl.Status.Admission == nil {
+ 		return nil
+ 	}
+ 	psIdx := slices.IndexFunc(wl.Spec.PodSets, func(ps kueue.PodSet) bool { return ps.Name == podSetName })
+@@ -60,6 +60,9 @@ func addFlavorPlacement(ctx context.Context, c client.Client, wl *kueue.Workload
+ 	if psIdx == -1 || psaIdx == -1 {
+ 		return nil
+ 	}
++	if !workloadslicing.FlavorPlacementOnPods(wl) && !workloadslicing.IsSplitEntry(&wl.Spec.PodSets[psIdx]) {
++		return nil
++	}
+ 	info, err := podset.FromAssignment(ctx, c, &wl.Status.Admission.PodSetAssignments[psaIdx], &wl.Spec.PodSets[psIdx])
+ 	if err != nil {
+ 		return fmt.Errorf("reading the ResourceFlavors of PodSet %q: %w", podSetName, err)
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
 index a1eb815..630e308 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
@@ -246,10 +267,10 @@ index 0000000..e0dec0d
 +}
 diff --git a/pkg/controller/elasticjobs/ungate_split_entries_test.go b/pkg/controller/elasticjobs/ungate_split_entries_test.go
 new file mode 100644
-index 0000000..5c11513
+index 0000000..bbacca8
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/ungate_split_entries_test.go
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,168 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -359,6 +380,18 @@ index 0000000..5c11513
 +			pods:     []*corev1.Pod{running("a", workersPodSet), running("b", split), gated("c", workersPodSet)},
 +			wantPods: []corev1.Pod{*running("a", workersPodSet), *running("b", split), onReserved("c")},
 +		},
++		"split entry gets flavor placement when flavor placement on pods is false and base pods keep template selector": {
++			workload: func() *kueue.Workload {
++				w := wl(1, 1)
++				delete(w.Annotations, workloadslicing.FlavorPlacementOnPodsAnnotation)
++				return w
++			}(),
++			pods: []*corev1.Pod{
++				makeElasticPodForPodSet("a", workersPodSet).NodeSelector("example.com/pool", "reserved").Gate(kueue.ElasticJobSchedulingGate).CreationTimestamp(now).Obj(),
++				gated("b", workersPodSet),
++			},
++			wantPods: []corev1.Pod{onReserved("a"), onSpot("b")},
++		},
 +	}
 +	for name, tc := range cases {
 +		t.Run(name, func(t *testing.T) {
@@ -408,10 +441,10 @@ index 0000000..5c11513
 +}
 diff --git a/pkg/controller/jobframework/flavor_split.go b/pkg/controller/jobframework/flavor_split.go
 new file mode 100644
-index 0000000..88eced7
+index 0000000..be57e5b
 --- /dev/null
 +++ b/pkg/controller/jobframework/flavor_split.go
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,178 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -436,23 +469,142 @@ index 0000000..88eced7
 +import (
 +	"context"
 +
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/klog/v2"
++	ctrl "sigs.k8s.io/controller-runtime"
 +	"sigs.k8s.io/controller-runtime/pkg/client"
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
 +	"sigs.k8s.io/kueue/pkg/podset"
++	"sigs.k8s.io/kueue/pkg/util/slices"
 +	"sigs.k8s.io/kueue/pkg/workloadslicing"
 +)
 +
-+// carrySplitEntries returns the PodSets of a new slice for the job: its own PodSets, plus the
-+// split entries of the active slice the new one replaces (see workloadslicing.CarrySplitEntries).
-+// It follows the split entries rather than ElasticJobsViaWorkloadSlicesFlavorSplit, so the pods
-+// of an entry created before the gate was turned off keep a PodSet that charges them.
++// carrySplitEntries returns the PodSets of a new slice for the job: its own PodSets with their
++// clean templates (cleaned by stripInjectedAdmission), plus the split entries of that active
++// slice (see workloadslicing.CarrySplitEntries).
 +func carrySplitEntries(ctx context.Context, c client.Client, job GenericJob, podSets []kueue.PodSet) ([]kueue.PodSet, error) {
 +	prev, err := workloadslicing.FindLatestActiveWorkload(ctx, c, job.Object(), job.GVK())
 +	if err != nil {
 +		return nil, err
 +	}
 +	return workloadslicing.CarrySplitEntries(podSets, prev), nil
++}
++
++// stripInjectedAdmission strips from the probe's templates exactly the nodeSelector,
++// tolerations, labels, and annotations that Kueue's predecessor admission injected
++// (podset.FromAssignment + deferFlavorPlacementToPods), preserving any user edits to the job templates.
++func stripInjectedAdmission(ctx context.Context, c client.Client, job GenericJob, podSets []kueue.PodSet) error {
++	prev, err := workloadslicing.FindLatestActiveWorkload(ctx, c, job.Object(), job.GVK())
++	if err != nil || prev == nil || prev.Status.Admission == nil {
++		return err
++	}
++	prevPodSets := make(map[kueue.PodSetReference]*kueue.PodSet, len(prev.Spec.PodSets))
++	for i := range prev.Spec.PodSets {
++		prevPodSets[prev.Spec.PodSets[i].Name] = &prev.Spec.PodSets[i]
++	}
++	prevPSAs := make(map[kueue.PodSetReference]*kueue.PodSetAssignment, len(prev.Status.Admission.PodSetAssignments))
++	for i := range prev.Status.Admission.PodSetAssignments {
++		prevPSAs[prev.Status.Admission.PodSetAssignments[i].Name] = &prev.Status.Admission.PodSetAssignments[i]
++	}
++
++	for i := range podSets {
++		psName := podSets[i].Name
++		psa, found := prevPSAs[psName]
++		ps := prevPodSets[psName]
++		if !found || ps == nil {
++			continue
++		}
++		info, err := podset.FromAssignment(ctx, c, psa, ps)
++		if err != nil {
++			if !apierrors.IsNotFound(err) {
++				return err
++			}
++			ctrl.LoggerFrom(ctx).V(2).Info("Predecessor ResourceFlavor not found; skipping admission info strip for podset", "workload", klog.KObj(prev), "podSet", psName, "error", err)
++			info = podset.PodSetInfo{
++				Name:         psa.Name,
++				NodeSelector: make(map[string]string),
++				Labels:       make(map[string]string),
++				Annotations:  make(map[string]string),
++			}
++		}
++		if workloadslicing.IsElasticWorkload(prev) {
++			info.Annotations[kueue.WorkloadSliceNameAnnotation] = workloadslicing.SliceName(prev)
++		}
++		info.Labels[constants.PodSetLabel] = string(psa.Name)
++
++		infos := []podset.PodSetInfo{info}
++		if _, err := deferFlavorPlacementToPods(ctx, c, prev, infos); err != nil && !apierrors.IsNotFound(err) {
++			return err
++		}
++		info = infos[0]
++
++		template := &podSets[i].Template
++		for k, v := range info.NodeSelector {
++			if template.Spec.NodeSelector != nil && template.Spec.NodeSelector[k] == v {
++				// Strip only when the predecessor Workload's spec.podSets original template lacked this key
++				if ps.Template.Spec.NodeSelector == nil || ps.Template.Spec.NodeSelector[k] != v {
++					delete(template.Spec.NodeSelector, k)
++				}
++			}
++		}
++		if len(template.Spec.NodeSelector) == 0 {
++			template.Spec.NodeSelector = nil
++		}
++
++		if len(template.Spec.Tolerations) > 0 && len(info.Tolerations) > 0 {
++			template.Spec.Tolerations = slices.Pick(template.Spec.Tolerations, func(t *corev1.Toleration) bool {
++				// If the predecessor Workload's original template already had this toleration, keep it (user-set).
++				for j := range ps.Template.Spec.Tolerations {
++					if ps.Template.Spec.Tolerations[j].MatchToleration(t) {
++						return true
++					}
++				}
++				// Otherwise, if it matches an injected toleration, strip it.
++				for j := range info.Tolerations {
++					if info.Tolerations[j].MatchToleration(t) {
++						return false
++					}
++				}
++				return true
++			})
++			if len(template.Spec.Tolerations) == 0 {
++				template.Spec.Tolerations = nil
++			}
++		}
++
++		for k, v := range info.Labels {
++			if template.Labels != nil && template.Labels[k] == v {
++				// Strip only when the predecessor Workload's spec.podSets original template lacked it
++				if ps.Template.Labels == nil || ps.Template.Labels[k] != v {
++					delete(template.Labels, k)
++				}
++			}
++		}
++		if len(template.Labels) == 0 {
++			template.Labels = nil
++		}
++
++		for k, v := range info.Annotations {
++			if template.Annotations != nil && template.Annotations[k] == v {
++				// Strip only when the predecessor Workload's spec.podSets original template lacked it
++				if ps.Template.Annotations == nil || ps.Template.Annotations[k] != v {
++					delete(template.Annotations, k)
++				}
++			}
++		}
++		if template.Annotations != nil {
++			if ps.Template.Annotations == nil || ps.Template.Annotations[kueue.WorkloadAnnotation] != template.Annotations[kueue.WorkloadAnnotation] {
++				delete(template.Annotations, kueue.WorkloadAnnotation)
++			}
++			if len(template.Annotations) == 0 {
++				template.Annotations = nil
++			}
++		}
++	}
++	return nil
 +}
 +
 +// withoutSplitEntries drops the info of wl's split entries, which are listed after the job's
@@ -473,10 +625,10 @@ index 0000000..88eced7
 +}
 diff --git a/pkg/controller/jobframework/flavor_split_external_test.go b/pkg/controller/jobframework/flavor_split_external_test.go
 new file mode 100644
-index 0000000..e9242e3
+index 0000000..f4e4f47
 --- /dev/null
 +++ b/pkg/controller/jobframework/flavor_split_external_test.go
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,284 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -506,6 +658,7 @@ index 0000000..e9242e3
 +	"go.uber.org/mock/gomock"
 +	batchv1 "k8s.io/api/batch/v1"
 +	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 +	"sigs.k8s.io/controller-runtime/pkg/client"
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -549,8 +702,14 @@ index 0000000..e9242e3
 +	mgj.EXPECT().Object().Return(job).AnyTimes()
 +	mgj.EXPECT().GVK().Return(gvk).AnyTimes()
 +	mgj.EXPECT().PodSets(gomock.Any(), gomock.Any()).Return([]kueue.PodSet{*utiltestingapi.MakePodSet("workers", 14).Obj()}, nil).AnyTimes()
++	reservedFlavor := utiltestingapi.MakeResourceFlavor("reserved").
++		NodeLabel("gpu-class", "h200").
++		NodeLabel("capacity-type", "reserved").
++		Toleration(corev1.Toleration{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists}).
++		Obj()
++
 +	cl := utiltesting.NewClientBuilder().
-+		WithObjects([]client.Object{&corev1.Namespace{Name: "ns"}, job, predecessor}...).
++		WithObjects([]client.Object{&corev1.Namespace{Name: "ns"}, job, predecessor, reservedFlavor}...).
 +		WithIndex(&kueue.Workload{}, indexer.OwnerReferenceIndexKey(gvk), indexer.WorkloadOwnerIndexFunc(gvk)).
 +		Build()
 +
@@ -576,6 +735,182 @@ index 0000000..e9242e3
 +	}
 +	if diff := cmp.Diff([]kueue.PodSetReference{"head", "workers"}, names); diff != "" {
 +		t.Errorf("GetPodSetsInfoFromWorkload() (-want,+got):\n%s", diff)
++	}
++}
++
++func TestConstructWorkloadDerivesTemplatesFromPredecessor(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	gvk := batchv1.SchemeGroupVersion.WithKind("Job")
++	now := time.Now()
++	job := testingjob.MakeJob("job", "ns").
++		SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Queue("lq").
++		UID("job-uid").
++		Obj()
++
++	// Predecessor workload has the original user-defined template (ungated predecessor, admitted
++	// before the scheduling gate existed). It explicitly includes user-set toleration for nvidia.com/gpu
++	// (matching the flavor's own toleration) and user nodeSelectors, labels, and annotations.
++	origTemplate := corev1.PodTemplateSpec{
++		ObjectMeta: metav1.ObjectMeta{
++			Labels:      map[string]string{"user.label/foo": "bar"},
++			Annotations: map[string]string{"user.annotation/foo": "bar"},
++		},
++		Spec: corev1.PodSpec{
++			NodeSelector: map[string]string{
++				"instance-gpu-memory": "20000",
++				"custom-user-label":   "keep-me",
++			},
++			Tolerations: []corev1.Toleration{
++				{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
++			},
++		},
++	}
++	predecessor := utiltestingapi.MakeWorkload("slice", "ns").
++		PodSets(kueue.PodSet{
++			Name:     "workers",
++			Count:    8,
++			Template: origTemplate,
++		}).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment("workers").Count(8).Assignment(corev1.ResourceCPU, "reserved", "1").Obj(),
++		).Obj(), now).
++		ControllerReference(gvk, "job", "job-uid").
++		Obj()
++
++	// The live job template was mutated by RunWithPodSetsInfo when admitting the reserved flavor
++	// on an UNGATED predecessor, injecting gpu-class: h200, capacity-type: reserved, podset label,
++	// and workload annotation. Additionally, the user edited the live template to add a custom annotation
++	// and container.
++	injectedTemplate := corev1.PodTemplateSpec{
++		ObjectMeta: metav1.ObjectMeta{
++			Labels: map[string]string{
++				"user.label/foo":        "bar",
++				"kueue.x-k8s.io/podset": "workers",
++			},
++			Annotations: map[string]string{
++				"user.annotation/foo":     "bar",
++				"user.custom/annotation":  "preserved",
++				"kueue.x-k8s.io/workload": "slice",
++			},
++		},
++		Spec: corev1.PodSpec{
++			Containers: []corev1.Container{{Name: "user-added-worker", Env: []corev1.EnvVar{}}},
++			NodeSelector: map[string]string{
++				"instance-gpu-memory": "20000",
++				"custom-user-label":   "keep-me",
++				"gpu-class":           "h200",
++				"capacity-type":       "reserved",
++			},
++			Tolerations: []corev1.Toleration{
++				{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
++			},
++		},
++	}
++
++	wantTemplate := corev1.PodTemplateSpec{
++		ObjectMeta: metav1.ObjectMeta{
++			Labels: map[string]string{
++				"user.label/foo": "bar",
++			},
++			Annotations: map[string]string{
++				"user.annotation/foo":    "bar",
++				"user.custom/annotation": "preserved",
++			},
++		},
++		Spec: corev1.PodSpec{
++			Containers: []corev1.Container{{Name: "user-added-worker", Env: []corev1.EnvVar{}}},
++			NodeSelector: map[string]string{
++				"instance-gpu-memory": "20000",
++				"custom-user-label":   "keep-me",
++			},
++			Tolerations: []corev1.Toleration{
++				{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
++			},
++		},
++	}
++
++	ctx, _ := utiltesting.ContextWithLog(t)
++	mgj := mocks.NewMockGenericJob(gomock.NewController(t))
++	mgj.EXPECT().Object().Return(job).AnyTimes()
++	mgj.EXPECT().GVK().Return(gvk).AnyTimes()
++	// JobPodSets returns podSets constructed from the live job injected template, with new count 16.
++	mgj.EXPECT().PodSets(gomock.Any(), gomock.Any()).Return([]kueue.PodSet{
++		{
++			Name:     "workers",
++			Count:    16,
++			Template: injectedTemplate,
++		},
++	}, nil).AnyTimes()
++	reservedFlavor := utiltestingapi.MakeResourceFlavor("reserved").
++		NodeLabel("gpu-class", "h200").
++		NodeLabel("capacity-type", "reserved").
++		Toleration(corev1.Toleration{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}).
++		Obj()
++
++	cl := utiltesting.NewClientBuilder().
++		WithObjects([]client.Object{&corev1.Namespace{Name: "ns"}, job, predecessor, reservedFlavor}...).
++		WithIndex(&kueue.Workload{}, indexer.OwnerReferenceIndexKey(gvk), indexer.WorkloadOwnerIndexFunc(gvk)).
++		Build()
++
++	wl, err := ConstructWorkload(ctx, cl, mgj, nil, nil)
++	if err != nil {
++		t.Fatalf("ConstructWorkload() error: %v", err)
++	}
++
++	// The constructed workload for the scale-up probe must NOT inherit the injected flavor nodeSelector
++	// or labels/annotations, but MUST preserve user-defined tolerations (even matching the flavor),
++	// user nodeSelectors, and live user edits.
++	gotTemplate := wl.Spec.PodSets[0].Template
++	if diff := cmp.Diff(wantTemplate, gotTemplate); diff != "" {
++		t.Errorf("ConstructWorkload() template (-want,+got):\n%s", diff)
++	}
++}
++
++func TestConstructWorkloadPredecessorFlavorNotFound(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	gvk := batchv1.SchemeGroupVersion.WithKind("Job")
++	now := time.Now()
++	job := testingjob.MakeJob("job", "ns").
++		SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Queue("lq").
++		UID("job-uid").
++		Obj()
++
++	predecessor := utiltestingapi.MakeWorkload("slice", "ns").
++		PodSets(kueue.PodSet{
++			Name:  "workers",
++			Count: 8,
++		}).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment("workers").Count(8).Assignment(corev1.ResourceCPU, "missing-flavor", "1").Obj(),
++		).Obj(), now).
++		ControllerReference(gvk, "job", "job-uid").
++		Obj()
++
++	ctx, _ := utiltesting.ContextWithLog(t)
++	mgj := mocks.NewMockGenericJob(gomock.NewController(t))
++	mgj.EXPECT().Object().Return(job).AnyTimes()
++	mgj.EXPECT().GVK().Return(gvk).AnyTimes()
++	mgj.EXPECT().PodSets(gomock.Any(), gomock.Any()).Return([]kueue.PodSet{
++		{
++			Name:  "workers",
++			Count: 16,
++		},
++	}, nil).AnyTimes()
++
++	// Flavor "missing-flavor" is deliberately omitted from client objects.
++	cl := utiltesting.NewClientBuilder().
++		WithObjects([]client.Object{&corev1.Namespace{Name: "ns"}, job, predecessor}...).
++		WithIndex(&kueue.Workload{}, indexer.OwnerReferenceIndexKey(gvk), indexer.WorkloadOwnerIndexFunc(gvk)).
++		Build()
++
++	wl, err := ConstructWorkload(ctx, cl, mgj, nil, nil)
++	if err != nil {
++		t.Fatalf("ConstructWorkload() unexpected error when flavor is missing: %v", err)
++	}
++	if wl == nil {
++		t.Fatal("ConstructWorkload() returned nil workload")
 +	}
 +}
 diff --git a/pkg/controller/jobframework/flavor_split_test.go b/pkg/controller/jobframework/flavor_split_test.go
@@ -665,14 +1000,17 @@ index 67367fe..a6799f1 100644
  	workload.SetPodSetCountSteps(wl, steps)
  }
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index edce889..343a0d3 100644
+index edce889..49d849e 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -2095,6 +2095,11 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
+@@ -2095,6 +2095,14 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
  	if err != nil {
  		return nil, err
  	}
 +	if WorkloadSliceEnabled(job) {
++		if err = stripInjectedAdmission(ctx, c, job, podSets); err != nil {
++			return nil, err
++		}
 +		if podSets, err = carrySplitEntries(ctx, c, job, podSets); err != nil {
 +			return nil, err
 +		}
@@ -680,7 +1018,7 @@ index edce889..343a0d3 100644
  	extra := ""
  	if ElasticPartialScaleUpEnabled(job) {
  		extra, err = prepareWorkloadSliceForScaleUp(ctx, c, job, podSets)
-@@ -2347,7 +2352,7 @@ func getPodSetsInfoFromStatus(ctx context.Context, c client.Client, w *kueue.Wor
+@@ -2347,7 +2355,7 @@ func getPodSetsInfoFromStatus(ctx context.Context, c client.Client, w *kueue.Wor
  		}
  		podSetsInfo[i] = info
  	}
@@ -689,7 +1027,7 @@ index edce889..343a0d3 100644
  }
  
  // podSetAssignmentsInSpecOrder reorders the admission, which lists the members
-@@ -2583,7 +2588,7 @@ func GetPodSetsInfoFromWorkload(wl *kueue.Workload) []podset.PodSetInfo {
+@@ -2583,7 +2591,7 @@ func GetPodSetsInfoFromWorkload(wl *kueue.Workload) []podset.PodSetInfo {
  		return nil
  	}
  
@@ -698,6 +1036,243 @@ index edce889..343a0d3 100644
  }
  
  type ReconcilerSetup func(*builder.Builder, client.Client) *builder.Builder
+diff --git a/pkg/controller/jobs/raycluster/elastic_template_restamp.go b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
+index ca9470d..14e15c0 100644
+--- a/pkg/controller/jobs/raycluster/elastic_template_restamp.go
++++ b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
+@@ -22,6 +22,7 @@ import (
+ 
+ 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+ 	corev1 "k8s.io/api/core/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+ 	"sigs.k8s.io/kueue/pkg/constants"
+@@ -76,14 +77,14 @@ func (w *RayClusterWebhook) restampElasticTemplates(ctx context.Context, obj *ra
+ 		templates[kueue.NewPodSetReference(wgs.GroupName)] = &wgs.Template
+ 	}
+ 	for podSet, template := range templates {
+-		stampPodSet(template, podSet, sliceName)
++		StampPodSet(template, podSet, sliceName)
+ 		// The name of the slice that started the cluster stays: changing it would change the
+ 		// template of a running cluster, and with upgradeStrategy Recreate KubeRay deletes every
+ 		// Pod when the template changes. It only fills a gap that a re-apply left.
+-		if _, found := template.Annotations[kueue.WorkloadAnnotation]; !found && podsScheduledTracking() {
++		if _, found := template.Annotations[kueue.WorkloadAnnotation]; !found && PodsScheduledTracking() {
+ 			template.Annotations[kueue.WorkloadAnnotation] = active.Name
+ 		}
+-		if err := w.stampAdmission(ctx, active, podSet, template); err != nil {
++		if err := StampAdmission(ctx, w.client, active, podSet, template); err != nil {
+ 			return err
+ 		}
+ 	}
+@@ -92,7 +93,7 @@ func (w *RayClusterWebhook) restampElasticTemplates(ctx context.Context, obj *ra
+ 
+ // podsScheduledTracking reports whether the job reconciler stamps the Workload annotation
+ // on the templates, as getPodSetsInfoFromStatus does.
+-func podsScheduledTracking() bool {
++func PodsScheduledTracking() bool {
+ 	return features.Enabled(features.WaitForPodsReadyUnscheduledTimeout) ||
+ 		features.Enabled(features.TopologyAwareScheduling) ||
+ 		features.Enabled(features.SchedulerLibraryIntegration)
+@@ -103,7 +104,7 @@ func podsScheduledTracking() bool {
+ // assignment, which keep its Pods from running outside their domains, and, unless the ungater
+ // owns the placement of the chain (workloadslicing.FlavorPlacementOnPods), the flavors' node
+ // labels and tolerations. It keeps a value the template already sets.
+-func (w *RayClusterWebhook) stampAdmission(ctx context.Context, active *kueue.Workload, podSetName kueue.PodSetReference, template *corev1.PodTemplateSpec) error {
++func StampAdmission(ctx context.Context, c client.Client, active *kueue.Workload, podSetName kueue.PodSetReference, template *corev1.PodTemplateSpec) error {
+ 	if active.Status.Admission == nil {
+ 		return nil
+ 	}
+@@ -112,7 +113,7 @@ func (w *RayClusterWebhook) stampAdmission(ctx context.Context, active *kueue.Wo
+ 	if psIdx == -1 || psaIdx == -1 {
+ 		return nil
+ 	}
+-	info, err := podset.FromAssignment(ctx, w.client, &active.Status.Admission.PodSetAssignments[psaIdx], &active.Spec.PodSets[psIdx])
++	info, err := podset.FromAssignment(ctx, c, &active.Status.Admission.PodSetAssignments[psaIdx], &active.Spec.PodSets[psIdx])
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -145,7 +146,7 @@ func (w *RayClusterWebhook) stampAdmission(ctx context.Context, active *kueue.Wo
+ 	return nil
+ }
+ 
+-func stampPodSet(template *corev1.PodTemplateSpec, podSet kueue.PodSetReference, sliceName string) {
++func StampPodSet(template *corev1.PodTemplateSpec, podSet kueue.PodSetReference, sliceName string) {
+ 	if template.Labels == nil {
+ 		template.Labels = make(map[string]string, 1)
+ 	}
+diff --git a/pkg/controller/jobs/raycluster/min_count_migration_test.go b/pkg/controller/jobs/raycluster/min_count_migration_test.go
+index 1bf5900..d7469c9 100644
+--- a/pkg/controller/jobs/raycluster/min_count_migration_test.go
++++ b/pkg/controller/jobs/raycluster/min_count_migration_test.go
+@@ -216,8 +216,8 @@ func TestMinCountMigrationMultiHostShrink(t *testing.T) {
+ 		wantEquivalent bool
+ 	}{
+ 		"replicas at the admitted count rounded down": {replicas: 2, wantEquivalent: true},
+-		"fewer replicas":                              {replicas: 1},
+-		"more replicas":                               {replicas: 3},
++		"fewer replicas": {replicas: 1},
++		"more replicas":  {replicas: 3},
+ 	}
+ 	for name, tc := range cases {
+ 		t.Run(name, func(t *testing.T) {
+diff --git a/pkg/controller/jobs/rayjob/rayjob_webhook.go b/pkg/controller/jobs/rayjob/rayjob_webhook.go
+index f288243..6dc8b45 100644
+--- a/pkg/controller/jobs/rayjob/rayjob_webhook.go
++++ b/pkg/controller/jobs/rayjob/rayjob_webhook.go
+@@ -20,6 +20,8 @@ import (
+ 	"context"
+ 
+ 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	admissionv1 "k8s.io/api/admission/v1"
++	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/util/validation/field"
+@@ -27,12 +29,15 @@ import (
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+ 
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+ 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
+ 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
+ 	"sigs.k8s.io/kueue/pkg/features"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
+ 	"sigs.k8s.io/kueue/pkg/util/webhook"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
+ )
+ 
+ var (
+@@ -74,7 +79,7 @@ func SetupRayJobWebhook(mgr ctrl.Manager, opts ...jobframework.Option) error {
+ 		Complete()
+ }
+ 
+-// +kubebuilder:webhook:path=/mutate-ray-io-v1-rayjob,mutating=true,failurePolicy=fail,sideEffects=None,groups=ray.io,resources=rayjobs,verbs=create,versions=v1,name=mrayjob.kb.io,admissionReviewVersions=v1
++// +kubebuilder:webhook:path=/mutate-ray-io-v1-rayjob,mutating=true,failurePolicy=fail,sideEffects=None,groups=ray.io,resources=rayjobs,verbs=create;update,versions=v1,name=mrayjob.kb.io,admissionReviewVersions=v1
+ 
+ var _ admission.Defaulter[*rayv1.RayJob] = &RayJobWebhook{}
+ 
+@@ -83,6 +88,9 @@ func (w *RayJobWebhook) Default(ctx context.Context, obj *rayv1.RayJob) error {
+ 	job := fromObject(obj)
+ 	log := ctrl.LoggerFrom(ctx).WithName("rayjob-webhook")
+ 	log.V(5).Info("Applying defaults")
++	if req, err := admission.RequestFromContext(ctx); err == nil && req.Operation == admissionv1.Update {
++		return w.restampElasticTemplates(ctx, obj)
++	}
+ 	if err := w.integrationManager.ApplyDefaultLocalQueue(ctx, w.client, job.Object(), w.queues.DefaultLocalQueueExist, w.managedJobsNamespaceSelector); err != nil {
+ 		return err
+ 	}
+@@ -93,6 +101,59 @@ func (w *RayJobWebhook) Default(ctx context.Context, obj *rayv1.RayJob) error {
+ 		return err
+ 	}
+ 	jobframework.ApplyDefaultForManagedBy(job, w.queues, w.cache, log)
++
++	if isAnElasticJob(obj) && job.Spec.RayClusterSpec != nil {
++		utilpod.GateTemplate(&job.Spec.RayClusterSpec.HeadGroupSpec.Template, kueue.ElasticJobSchedulingGate)
++		for index := range job.Spec.RayClusterSpec.WorkerGroupSpecs {
++			wgs := &job.Spec.RayClusterSpec.WorkerGroupSpecs[index]
++			utilpod.GateTemplate(&wgs.Template, kueue.ElasticJobSchedulingGate)
++		}
++	}
++	return nil
++}
++
++// returns whether the RayJob is an elastic job or not
++func isAnElasticJob(job *rayv1.RayJob) bool {
++	return features.Enabled(features.ElasticJobsViaWorkloadSlices) && workloadslicing.Enabled(job.GetObjectMeta())
++}
++
++func (w *RayJobWebhook) restampElasticTemplates(ctx context.Context, obj *rayv1.RayJob) error {
++	if !isAnElasticJob(obj) || obj.Spec.RayClusterSpec == nil {
++		return nil
++	}
++	job := fromObject(obj)
++	clusterSpec := job.Spec.RayClusterSpec
++	utilpod.GateTemplate(&clusterSpec.HeadGroupSpec.Template, kueue.ElasticJobSchedulingGate)
++	for i := range clusterSpec.WorkerGroupSpecs {
++		utilpod.GateTemplate(&clusterSpec.WorkerGroupSpecs[i].Template, kueue.ElasticJobSchedulingGate)
++	}
++	if job.IsSuspended() {
++		return nil
++	}
++	active, err := workloadslicing.FindLatestActiveWorkload(ctx, w.client, job.Object(), job.GVK())
++	if err != nil {
++		return err
++	}
++	if active == nil || !workloadslicing.IsElasticWorkload(active) {
++		return nil
++	}
++	sliceName := workloadslicing.SliceName(active)
++	templates := map[kueue.PodSetReference]*corev1.PodTemplateSpec{
++		kueue.NewPodSetReference(headGroupPodSetName): &clusterSpec.HeadGroupSpec.Template,
++	}
++	for i := range clusterSpec.WorkerGroupSpecs {
++		wgs := &clusterSpec.WorkerGroupSpecs[i]
++		templates[kueue.NewPodSetReference(wgs.GroupName)] = &wgs.Template
++	}
++	for podSet, template := range templates {
++		raycluster.StampPodSet(template, podSet, sliceName)
++		if _, found := template.Annotations[kueue.WorkloadAnnotation]; !found && raycluster.PodsScheduledTracking() {
++			template.Annotations[kueue.WorkloadAnnotation] = active.Name
++		}
++		if err := raycluster.StampAdmission(ctx, w.client, active, podSet, template); err != nil {
++			return err
++		}
++	}
+ 	return nil
+ }
+ 
+diff --git a/pkg/controller/jobs/rayjob/rayjob_webhook_test.go b/pkg/controller/jobs/rayjob/rayjob_webhook_test.go
+index ddcfa19..f411b29 100644
+--- a/pkg/controller/jobs/rayjob/rayjob_webhook_test.go
++++ b/pkg/controller/jobs/rayjob/rayjob_webhook_test.go
+@@ -18,6 +18,7 @@ package rayjob
+ 
+ import (
+ 	"fmt"
++	"slices"
+ 	"testing"
+ 	"time"
+ 
+@@ -920,3 +921,35 @@ func TestValidateUpdate(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestDefaultElasticJob(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	ctx, _ := utiltesting.ContextWithLog(t)
++	builder := utiltesting.NewClientBuilder()
++	cli := builder.Build()
++	cqCache := schdcache.New(cli)
++	queueManager := qcache.NewManagerForUnitTests(cli, cqCache)
++	wh := &RayJobWebhook{
++		client: cli,
++		queues: queueManager,
++		cache:  cqCache,
++	}
++
++	job := testingrayutil.MakeJob("elastic-job", "ns").
++		Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Obj()
++
++	if err := wh.Default(ctx, job); err != nil {
++		t.Fatalf("unexpected Default() error: %v", err)
++	}
++
++	gate := corev1.PodSchedulingGate{Name: kueue.ElasticJobSchedulingGate}
++	if !slices.Contains(job.Spec.RayClusterSpec.HeadGroupSpec.Template.Spec.SchedulingGates, gate) {
++		t.Errorf("head template missing %s scheduling gate", kueue.ElasticJobSchedulingGate)
++	}
++	for i, wgs := range job.Spec.RayClusterSpec.WorkerGroupSpecs {
++		if !slices.Contains(wgs.Template.Spec.SchedulingGates, gate) {
++			t.Errorf("worker group %d template missing %s scheduling gate", i, kueue.ElasticJobSchedulingGate)
++		}
++	}
++}
 diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
 index 644b856..366b609 100644
 --- a/pkg/features/kube_features.go

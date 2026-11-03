@@ -135,10 +135,10 @@ index 0000000..24ea21d
 +	}
 +}
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
-index 7f8fe2e..fd88323 100644
+index 7f8fe2e..e3fe746 100644
 --- a/pkg/scheduler/flavorassigner/flavor_split.go
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
-@@ -14,48 +14,253 @@ See the License for the specific language governing permissions and
+@@ -14,48 +14,256 @@ See the License for the specific language governing permissions and
  limitations under the License.
  */
  
@@ -232,6 +232,9 @@ index 7f8fe2e..fd88323 100644
 +		return nil
 +	}
 +	step := workload.PodSetCountSteps(a.wl.Obj)[ps.Name]
++	if ps.Count%step != 0 || running%step != 0 {
++		return nil
++	}
 +	floor := max(running, workload.ReclaimMinCounts(a.wl.Obj)[ps.Name])
 +	var groups []*resourcegroups.ResourceGroup
 +	for name, amount := range ips.podSet.Requests.Iter() {
@@ -717,7 +720,7 @@ index 2fb96f1..2f6eff7 100644
  		// the counts Reduce returns.
  		var bestPartialPlan *assignment.Plan
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
-index 8d9a02e..892c813 100644
+index 8d9a02e..7a8ed44 100644
 --- a/pkg/workloadslicing/flavor_split.go
 +++ b/pkg/workloadslicing/flavor_split.go
 @@ -304,6 +304,11 @@ func splitTriedProbe(probe, replaced *kueue.Workload) bool {
@@ -732,7 +735,7 @@ index 8d9a02e..892c813 100644
  	running := AfterReclaimBaseline(replaced)
  	steps := workload.PodSetCountSteps(probe)
  	groups := splitGroups(probe.Spec.PodSets)
-@@ -361,3 +366,51 @@ func SplitGrowth(probe, replaced *kueue.Workload, partial bool) bool {
+@@ -361,3 +366,60 @@ func SplitGrowth(probe, replaced *kueue.Workload, partial bool) bool {
  	}
  	return changed
  }
@@ -757,6 +760,15 @@ index 8d9a02e..892c813 100644
 +	base := SplitBase(&probe.Spec.PodSets[idx])
 +	floor := workload.ReclaimMinCounts(probe)
 +	steps := workload.PodSetCountSteps(probe)
++	step := steps[split.PodSet]
++	if split.Fills[0].Count < floor[split.PodSet] {
++		return false
++	}
++	for _, fill := range split.Fills {
++		if fill.Count%step != 0 {
++			return false
++		}
++	}
 +	original := probe.Spec.PodSets[idx].DeepCopy()
 +	probe.Spec.PodSets[idx].Count = split.Fills[0].Count
 +	if probe.Spec.PodSets[idx].MinCount != nil && *probe.Spec.PodSets[idx].MinCount > split.Fills[0].Count {
@@ -786,10 +798,10 @@ index 8d9a02e..892c813 100644
 +}
 diff --git a/pkg/workloadslicing/greedy_split_test.go b/pkg/workloadslicing/greedy_split_test.go
 new file mode 100644
-index 0000000..850cf17
+index 0000000..58d7c26
 --- /dev/null
 +++ b/pkg/workloadslicing/greedy_split_test.go
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,74 @@
 +// Verifies that the reconciler materializes count proposals into split entries of the same Workload.
 +
 +/*
@@ -839,6 +851,29 @@ index 0000000..850cf17
 +		if got := workload.PodSetCountSteps(probe)["workers--2"]; got != 2 {
 +			t.Fatalf("step=%d", got)
 +		}
++	}
++}
++
++// Floors and steps are annotations, so refreshing them need not change spec generation.
++func TestRejectGreedyProposalAfterPolicyRefresh(t *testing.T) {
++	for _, policy := range []string{"floor", "step"} {
++		t.Run(policy, func(t *testing.T) {
++			probe := api.MakeWorkload("probe", "default").PodSets(*api.MakePodSet("workers", 24).Obj()).Obj()
++			workload.SetPodSetCountSteps(probe, workload.PodSetsCounts{"workers": 2})
++			proposal := flavorassigner.GreedySplit{PodSet: "workers", Fills: []flavorassigner.FlavorFill{{Flavor: "a", Count: 14}, {Flavor: "b", Count: 10}}}
++			if policy == "floor" {
++				workload.SetReclaimMinCounts(probe, workload.PodSetsCounts{"workers": 16})
++			} else {
++				workload.SetPodSetCountSteps(probe, workload.PodSetsCounts{"workers": 4})
++			}
++			before := probe.DeepCopy()
++			if applyGreedySplit(probe, proposal, true) {
++				t.Fatal("accepted proposal from the old policy")
++			}
++			if !reflect.DeepEqual(probe, before) {
++				t.Fatal("rejected proposal mutated probe")
++			}
++		})
 +	}
 +}
 diff --git a/test/integration/singlecluster/scheduler/greedy_split_test.go b/test/integration/singlecluster/scheduler/greedy_split_test.go

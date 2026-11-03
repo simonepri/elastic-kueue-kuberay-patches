@@ -33,18 +33,6 @@ metadata:
   labels:
     fake-gpu-node: "true"
     kubernetes.io/hostname: fake-gpu-node-a
-status:
-  capacity:
-    cpu: "32"
-    memory: "128Gi"
-    nvidia.com/gpu: "4"
-  allocatable:
-    cpu: "32"
-    memory: "128Gi"
-    nvidia.com/gpu: "4"
-  conditions:
-    - type: Ready
-      status: "True"
 ---
 apiVersion: v1
 kind: Node
@@ -53,18 +41,6 @@ metadata:
   labels:
     fake-gpu-node: "true"
     kubernetes.io/hostname: fake-gpu-node-b
-status:
-  capacity:
-    cpu: "32"
-    memory: "128Gi"
-    nvidia.com/gpu: "4"
-  allocatable:
-    cpu: "32"
-    memory: "128Gi"
-    nvidia.com/gpu: "4"
-  conditions:
-    - type: Ready
-      status: "True"
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor

@@ -24,6 +24,8 @@ spec:
       try:
         - apply:
             file: 00-nodes-and-queues.yaml
+        - script:
+            content: ./setup-nodes.sh
     - name: run-elastic-rayjob-across-nodes
       try:
         - apply:

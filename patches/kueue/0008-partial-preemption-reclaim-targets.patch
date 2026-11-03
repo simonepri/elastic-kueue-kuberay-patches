@@ -1113,10 +1113,10 @@ index 7724dad..82eafab 100644
  	}
  	// RayClusters are commonly used as devboxes, where users may already be
 diff --git a/pkg/controller/tas/indexer/indexer.go b/pkg/controller/tas/indexer/indexer.go
-index 804aadf..61a23e5 100644
+index 804aadf..fcb030e 100644
 --- a/pkg/controller/tas/indexer/indexer.go
 +++ b/pkg/controller/tas/indexer/indexer.go
-@@ -19,6 +19,7 @@ package indexer
+@@ -19,12 +19,14 @@ package indexer
  import (
  	"context"
  	"fmt"
@@ -1124,12 +1124,32 @@ index 804aadf..61a23e5 100644
  	"strconv"
  
  	corev1 "k8s.io/api/core/v1"
-@@ -119,7 +120,7 @@ func SetupIndexes(ctx context.Context, indexer client.FieldIndexer) error {
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
+ 	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
+ 	"sigs.k8s.io/kueue/pkg/workload"
+ 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
+@@ -75,11 +77,7 @@ func indexPodNodeSelectorHostname(o client.Object) []string {
+ }
+ 
+ func indexPodNodeName(o client.Object) []string {
+-	pod, ok := o.(*corev1.Pod)
+-	if !ok {
+-		return nil
+-	}
+-	return []string{pod.Spec.NodeName}
++	return coreindexer.IndexPodNodeName(o)
+ }
+ 
+ func indexNodeHostname(o client.Object) []string {
+@@ -119,7 +117,7 @@ func SetupIndexes(ctx context.Context, indexer client.FieldIndexer) error {
  	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeSelectorHostnameKey, indexPodNodeSelectorHostname); err != nil {
  		return fmt.Errorf("setting index pod node selector hostname: %w", err)
  	}
 -	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameKey, indexPodNodeName); err != nil {
-+	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameKey, indexPodNodeName); err != nil && !strings.Contains(err.Error(), "indexer conflict") {
++	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameKey, coreindexer.IndexPodNodeName); err != nil && !strings.Contains(err.Error(), "indexer conflict") {
  		return fmt.Errorf("setting index on %s for Pod: %w", PodNodeNameKey, err)
  	}
  	if err := indexer.IndexField(ctx, &corev1.Node{}, NodeHostnameKey, indexNodeHostname); err != nil {
@@ -1168,6 +1188,40 @@ index bcc4dd9..644b856 100644
  	FlavorFungibility: {
  		{Version: version.MustParse("0.5"), Default: true, PreRelease: featuregate.Beta},
  	},
+diff --git a/pkg/util/testing/client.go b/pkg/util/testing/client.go
+index d8562a4..1708336 100644
+--- a/pkg/util/testing/client.go
++++ b/pkg/util/testing/client.go
+@@ -22,6 +22,7 @@ import (
+ 	"fmt"
+ 	"sync"
+ 
++	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/types"
+@@ -50,6 +51,7 @@ func NewClientBuilder(addToSchemes ...func(s *runtime.Scheme) error) *fake.Clien
+ 	}
+ 
+ 	return fake.NewClientBuilder().WithScheme(scheme).
++		WithIndex(&corev1.Pod{}, indexer.PodNodeNameKey, indexer.IndexPodNodeName).
+ 		WithIndex(&kueue.LocalQueue{}, indexer.QueueClusterQueueKey, indexer.IndexQueueClusterQueue).
+ 		WithIndex(&kueue.Workload{}, indexer.WorkloadQueueKey, indexer.IndexWorkloadQueue).
+ 		WithIndex(&kueue.Workload{}, indexer.WorkloadClusterQueueKey, indexer.IndexWorkloadClusterQueue).
+@@ -64,7 +66,12 @@ type builderIndexer struct {
+ 	*fake.ClientBuilder
+ }
+ 
+-func (b *builderIndexer) IndexField(_ context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
++func (b *builderIndexer) IndexField(_ context.Context, obj client.Object, field string, extractValue client.IndexerFunc) (err error) {
++	defer func() {
++		if r := recover(); r != nil {
++			err = fmt.Errorf("%v", r)
++		}
++	}()
+ 	b.ClientBuilder = b.WithIndex(obj, field, extractValue)
+ 	return nil
+ }
 diff --git a/pkg/workload/partial_preemption.go b/pkg/workload/partial_preemption.go
 new file mode 100644
 index 0000000..1d2db83
@@ -1741,7 +1795,7 @@ diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/par
 new file mode 100644
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption.go
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,527 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1782,6 +1836,7 @@ new file mode 100644
 +	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 +	utilresource "sigs.k8s.io/kueue/pkg/util/resource"
 +	"sigs.k8s.io/kueue/pkg/workload"
++	indexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
 +)
 +
 +// runningPodsPerPodSet returns the Pods of the workload slice that hold their
@@ -2131,21 +2186,7 @@ new file mode 100644
 +			slices.Sort(nodeNames)
 +			for _, nodeName := range nodeNames {
 +				var list corev1.PodList
-+				err := c.List(ctx, &list, client.MatchingFields{"spec.nodeName": nodeName})
-+				if err != nil {
-+					if strings.Contains(err.Error(), "does not exist") {
-+						// Index not registered on this client; fallback to cluster list
-+						var allPods corev1.PodList
-+						if err := c.List(ctx, &allPods); err != nil {
-+							return false, err
-+						}
-+						for _, p := range allPods.Items {
-+							if candidateNodes.Has(p.Spec.NodeName) {
-+								candidatePods = append(candidatePods, p)
-+							}
-+						}
-+						break
-+					}
++				if err := c.List(ctx, &list, client.MatchingFields{indexer.PodNodeNameKey: nodeName}); err != nil {
 +					return false, err
 +				}
 +				candidatePods = append(candidatePods, list.Items...)
@@ -2286,7 +2327,7 @@ diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicin
 new file mode 100644
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption_test.go
-@@ -0,0 +1,721 @@
+@@ -0,0 +1,720 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2307,8 +2348,8 @@ new file mode 100644
 +
 +import (
 +	"context"
-+	"fmt"
 +	"errors"
++	"fmt"
 +	"slices"
 +	"testing"
 +	"time"
@@ -2499,9 +2540,9 @@ new file mode 100644
 +		return p.Name
 +	}
 +	testCases := map[string]struct {
-+		pods        []*corev1.Pod
-+		otherPods   []*corev1.Pod
-+		counts      workload.PodSetsCounts
++		pods      []*corev1.Pod
++		otherPods []*corev1.Pod
++		counts    workload.PodSetsCounts
 +		// repeat calls DeletePodGroupsAboveCounts again while the Pods it deleted
 +		// are still terminating, held by a finalizer.
 +		repeat      bool
@@ -2614,10 +2655,10 @@ new file mode 100644
 +				pods        []*corev1.Pod
 +				otherPods   []*corev1.Pod
 +				counts      workload.PodSetsCounts
-+			repeat      bool
-+			wantDeleted []string
-+			wantAbove   bool
-+			wantStopped bool
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
 +			}{
 +				pods:        pods,
 +				counts:      workload.PodSetsCounts{"workers": 8},
@@ -2649,10 +2690,10 @@ new file mode 100644
 +				pods        []*corev1.Pod
 +				otherPods   []*corev1.Pod
 +				counts      workload.PodSetsCounts
-+			repeat      bool
-+			wantDeleted []string
-+			wantAbove   bool
-+			wantStopped bool
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
 +			}{
 +				pods:        pods,
 +				counts:      workload.PodSetsCounts{"workers": 8},
@@ -2684,10 +2725,10 @@ new file mode 100644
 +				pods        []*corev1.Pod
 +				otherPods   []*corev1.Pod
 +				counts      workload.PodSetsCounts
-+			repeat      bool
-+			wantDeleted []string
-+			wantAbove   bool
-+			wantStopped bool
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
 +			}{
 +				pods:        pods,
 +				counts:      workload.PodSetsCounts{"workers": 5},
@@ -2723,10 +2764,10 @@ new file mode 100644
 +				pods        []*corev1.Pod
 +				otherPods   []*corev1.Pod
 +				counts      workload.PodSetsCounts
-+			repeat      bool
-+			wantDeleted []string
-+			wantAbove   bool
-+			wantStopped bool
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
 +			}{
 +				pods:        pods,
 +				otherPods:   []*corev1.Pod{other},
@@ -2766,10 +2807,10 @@ new file mode 100644
 +				pods        []*corev1.Pod
 +				otherPods   []*corev1.Pod
 +				counts      workload.PodSetsCounts
-+			repeat      bool
-+			wantDeleted []string
-+			wantAbove   bool
-+			wantStopped bool
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
 +			}{
 +				pods:        pods,
 +				counts:      workload.PodSetsCounts{"workers": 4},
@@ -2806,10 +2847,10 @@ new file mode 100644
 +				pods        []*corev1.Pod
 +				otherPods   []*corev1.Pod
 +				counts      workload.PodSetsCounts
-+			repeat      bool
-+			wantDeleted []string
-+			wantAbove   bool
-+			wantStopped bool
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
 +			}{
 +				pods:        pods,
 +				counts:      workload.PodSetsCounts{"workers": 6},
@@ -2849,10 +2890,10 @@ new file mode 100644
 +				pods        []*corev1.Pod
 +				otherPods   []*corev1.Pod
 +				counts      workload.PodSetsCounts
-+			repeat      bool
-+			wantDeleted []string
-+			wantAbove   bool
-+			wantStopped bool
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
 +			}{
 +				pods:        pods,
 +				counts:      workload.PodSetsCounts{"workers": 8},
@@ -2960,7 +3001,6 @@ new file mode 100644
 +			clnt := utiltesting.NewClientBuilder().
 +				WithObjects(objs...).
 +				WithIndex(&corev1.Pod{}, indexer.WorkloadSliceNameKey, indexer.IndexPodWorkloadSliceName).
-+				WithIndex(&corev1.Pod{}, indexer.PodNodeNameKey, indexer.IndexPodNodeName).
 +				Build()
 +			stopped, err := DeletePodGroupsAboveCounts(ctx, clnt, wl, tc.counts, group)
 +			if err != nil {

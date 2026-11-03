@@ -1,0 +1,33 @@
+# A higher-priority job takes four GPUs from the RayJob's first flavor, leaving its worker floor of two.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flavor-split-preemptor
+  labels:
+    kueue.x-k8s.io/queue-name: lq-flavor-split
+    kueue.x-k8s.io/priority-class: pc-flavor-split-preemptor
+spec:
+  parallelism: 4
+  completions: 4
+  template:
+    spec:
+      nodeSelector:
+        instance-type: reserved-gpu
+        gpu-class: h200
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: train
+          image: busybox:latest
+          command: ["sleep", "600"]
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+      restartPolicy: Never

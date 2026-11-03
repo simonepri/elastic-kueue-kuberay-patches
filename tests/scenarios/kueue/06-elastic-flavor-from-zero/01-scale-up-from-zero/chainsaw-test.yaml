@@ -1,4 +1,4 @@
-# Scales an elastic RayCluster's worker group up from zero and checks that Kueue moves it to the flavor that fits every worker.
+# Checks flavor placement after an elastic RayCluster scales from zero, with greedy splitting enabled or disabled.
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
@@ -7,9 +7,9 @@ spec:
   description: >
     Verifies that an elastic RayCluster admitted with no workers is not pinned to the flavor
     Kueue assigned to the empty worker group. When the worker group scales to six workers and
-    only three fit in that flavor, the scale-up slice is admitted with all six in the next
-    flavor instead of three in the first, and Kueue adds that flavor's node label and
-    toleration to each worker before ungating it, never to the worker template.
+    only three fit in that flavor, the flavor-split gate fills three there and three in the
+    next flavor. With that gate off all six move to the next flavor. Each worker receives
+    its entry's placement before ungating; the worker template keeps no flavor placement.
   steps:
     - name: setup-queues
       try:
@@ -36,8 +36,6 @@ spec:
             content: >-
               kubectl -n "$NS" patch raycluster from-zero-cluster --type=json
               -p '[{"op":"replace","path":"/spec/workerGroupSpecs/0/replicas","value":6}]'
-        - assert:
-            file: 02-assert-moved.yaml
         - script:
             timeout: 120s
             env:

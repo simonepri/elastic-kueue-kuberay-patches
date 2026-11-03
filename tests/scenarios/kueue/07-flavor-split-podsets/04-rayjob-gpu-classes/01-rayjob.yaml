@@ -1,6 +1,6 @@
 # Elastic RayJob with CPU head (affinity karpenter.sh/capacity-type In [reserved, on-demand])
 # and GPU workers (affinity instance-gpu-memory Gt 20000, 1 GPU, toleration for nvidia.com/gpu).
-# The worker template does NOT have a gpu-class nodeSelector so it can span flavors with distinct gpu-class labels.
+# Workers use atomic scale-up and no gpu-class selector, so splitting requires neither partial admission nor a shared flavor label.
 apiVersion: ray.io/v1
 kind: RayJob
 metadata:
@@ -10,7 +10,6 @@ metadata:
     kueue.x-k8s.io/priority-class: pc-flavor-split
   annotations:
     kueue.x-k8s.io/elastic-job: "true"
-    kueue.x-k8s.io/elastic-job-scale-up-strategy: partial
 spec:
   entrypoint: "python -c 'import time; time.sleep(3600)'"
   shutdownAfterJobFinishes: true

@@ -376,10 +376,10 @@ index 00a7420..741e44f 100644
  )
  
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
-index 7f8fe2e..f6944f9 100644
+index 7f8fe2e..25d76f0 100644
 --- a/pkg/scheduler/flavorassigner/flavor_split.go
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
-@@ -14,48 +14,260 @@ See the License for the specific language governing permissions and
+@@ -14,48 +14,267 @@ See the License for the specific language governing permissions and
  limitations under the License.
  */
  
@@ -485,10 +485,7 @@ index 7f8fe2e..f6944f9 100644
 +	for name, amount := range ips.podSet.Requests.Iter() {
 +		if amount.Sign() > 0 && a.cq.RGByResource(name) == nil && !IgnoreUndeclaredResources(a.quotaCheckStrategy) {
 +			return nil
- 		}
--		for _, psID := range psIDs {
--			if replaced := podSetResourcesByName(a.replaceWorkloadSlice.TotalRequests, a.wl.Obj.Spec.PodSets[psID].Name); replaced != nil && replaced.Requests != nil {
--				val = val.Sub(replaced.Requests.ResourceValue(rName))
++		}
 +	}
 +	for i := range a.cq.ResourceGroups {
 +		rg := &a.cq.ResourceGroups[i]
@@ -497,10 +494,8 @@ index 7f8fe2e..f6944f9 100644
 +			if amount.Sign() > 0 && rg.CoveredResources.Has(name) {
 +				requested = true
 +				break
- 			}
- 		}
--		if val.Sign() > 0 {
--			grows = true
++			}
++		}
 +		if requested {
 +			groups = append(groups, rg)
 +		}
@@ -518,12 +513,7 @@ index 7f8fe2e..f6944f9 100644
 +		}
 +		if len(plans[i]) > len(plans[primary]) {
 +			primary = i
- 		}
--		fr := resources.FlavorResource{Flavor: fName, Resource: rName}
--		mode, _, _ := a.fitsResourceQuota(ctx, fr, assignmentUsage[fr], val, a.cq.QuotaFor(fr))
--		fits = mode == fit
--	})
--	return fits && grows
++		}
 +		var end int32
 +		for _, fill := range plans[i] {
 +			end += fill.Count
@@ -559,7 +549,10 @@ index 7f8fe2e..f6944f9 100644
 +					fill.Flavors[name] = flavor
 +				}
 +			}
-+		}
+ 		}
+-		for _, psID := range psIDs {
+-			if replaced := podSetResourcesByName(a.replaceWorkloadSlice.TotalRequests, a.wl.Obj.Spec.PodSets[psID].Name); replaced != nil && replaced.Requests != nil {
+-				val = val.Sub(replaced.Requests.ResourceValue(rName))
 +		split.Fills = append(split.Fills, fill)
 +	}
 +	return split
@@ -613,6 +606,13 @@ index 7f8fe2e..f6944f9 100644
 +		}
 +		fits := func(count int32) bool {
 +			scaled := ips.podSet.ScaledTo(count)
++			if rg.CoveredResources.Has(corev1.ResourcePods) {
++				if scaled.Requests == nil {
++					scaled.Requests = resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourcePods: int64(count)})
++				} else {
++					scaled.Requests.Set(corev1.ResourcePods, resources.NewAmount(int64(count)))
++				}
++			}
 +			for name, val := range scaled.Requests.Iter() {
 +				if !rg.CoveredResources.Has(name) {
 +					continue
@@ -631,7 +631,7 @@ index 7f8fe2e..f6944f9 100644
 +				if val.Sign() > 0 && features.Enabled(features.FlavorFungibility) && shouldTryNextFlavor(granularMode{fit, borrowingLevel(borrow)}, a.cq.FlavorFungibility) {
 +					return false
 +				}
-+			}
+ 			}
 +			return true
 +		}
 +		low, high := int32(0), (remaining-baseline)/step
@@ -646,10 +646,17 @@ index 7f8fe2e..f6944f9 100644
 +		count := baseline + low*step
 +		if first && count < floor {
 +			return nil
-+		}
+ 		}
+-		if val.Sign() > 0 {
+-			grows = true
 +		if count == 0 {
 +			continue
-+		}
+ 		}
+-		fr := resources.FlavorResource{Flavor: fName, Resource: rName}
+-		mode, _, _ := a.fitsResourceQuota(ctx, fr, assignmentUsage[fr], val, a.cq.QuotaFor(fr))
+-		fits = mode == fit
+-	})
+-	return fits && grows
 +		if !fits(count) {
 +			return nil
 +		}
@@ -709,7 +716,7 @@ index 5189e31..165df38 100644
  
  	assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, workload.NewInfo(log, replaced),
 diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
-index 59e6970..0e4d023 100644
+index 59e6970..cd401d5 100644
 --- a/pkg/scheduler/flavorassigner/flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/flavorassigner.go
 @@ -18,6 +18,7 @@ package flavorassigner
@@ -720,7 +727,15 @@ index 59e6970..0e4d023 100644
  	"fmt"
  	"maps"
  	"math"
-@@ -415,6 +416,19 @@ func (a *FlavorAssigner) AssignFlavors(
+@@ -336,6 +337,7 @@ func (a *FlavorAssigner) AssignFlavors(
+ 	for i, podSet := range requests {
+ 		if a.cq.RGByResource(corev1.ResourcePods) != nil {
+ 			if podSet.Requests != nil {
++				podSet.Requests = podSet.Requests.Clone()
+ 				podSet.Requests.Set(corev1.ResourcePods, resources.NewAmount(int64(podSet.Count)))
+ 			} else {
+ 				podSet.Requests = resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourcePods: int64(podSet.Count)})
+@@ -415,6 +417,19 @@ func (a *FlavorAssigner) AssignFlavors(
  			}
  		}
  
@@ -740,7 +755,7 @@ index 59e6970..0e4d023 100644
  		requests := resources.NewRequests()
  		psIDs := make([]int, len(podSets))
  		for idx, podset := range podSets {
-@@ -900,9 +914,7 @@ func (a *FlavorAssigner) findFlavorForPodSets(
+@@ -900,9 +915,7 @@ func (a *FlavorAssigner) findFlavorForPodSets(
  						// Flavor mismatch. Skip further checks for this resource.
  						representativeMode = worstGranularMode()
  						msg := fmt.Sprintf("could not assign %s flavor since the original workload is assigned: %s", fName, originalFlavor)
@@ -753,10 +768,10 @@ index 59e6970..0e4d023 100644
  						flavorNoFitReason = mostSevereReason(flavorNoFitReason, kueue.WorkloadQuotaReservedReasonNoMatchingFlavor)
 diff --git a/pkg/scheduler/flavorassigner/greedy_split_test.go b/pkg/scheduler/flavorassigner/greedy_split_test.go
 new file mode 100644
-index 0000000..c743cfc
+index 0000000..a0084f7
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/greedy_split_test.go
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,318 @@
 +// Tests ordered flavor fill proposals and verifies that assignment leaves its input untouched.
 +
 +/*
@@ -1021,6 +1036,58 @@ index 0000000..c743cfc
 +	}
 +	if onA != 10 || onB != 14 {
 +		t.Fatalf("admitted A=%d B=%d", onA, onB)
++	}
++}
++
++func TestGreedySyntheticPodQuota(t *testing.T) {
++	features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: true, features.ElasticJobsViaWorkloadSlicesFlavorSplit: true})
++	ctx, log := utiltesting.ContextWithLog(t)
++	cq := api.MakeClusterQueue("cq").ResourceGroup(
++		*api.MakeFlavorQuotas("a").Resource(corev1.ResourcePods, "7").Resource(corev1.ResourceCPU, "100").Obj(),
++		*api.MakeFlavorQuotas("b").Resource(corev1.ResourcePods, "32").Resource(corev1.ResourceCPU, "100").Obj()).Obj()
++	cache := schdcache.New(utiltesting.NewFakeClient())
++	flavors := map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor{"a": api.MakeResourceFlavor("a").Obj(), "b": api.MakeResourceFlavor("b").Obj()}
++	for _, f := range flavors {
++		cache.AddOrUpdateResourceFlavor(log, f)
++	}
++	if err := cache.AddClusterQueue(ctx, cq); err != nil {
++		t.Fatal(err)
++	}
++	snapshot, err := cache.Snapshot(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	probe := api.MakeWorkload("probe", "ns").Annotation(constants.ElasticJobAnnotation, "true").PodSets(
++		*api.MakePodSet("head", 1).Request(corev1.ResourceCPU, "1").Obj(),
++		*api.MakePodSet("workers", 10).Request(corev1.ResourceCPU, "1").Obj()).Obj()
++	assign := func() Assignment {
++		info := workload.NewInfo(log, probe)
++		result := New(info, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, nil, configapi.QuotaCheckBlockUndeclared, resources.NewResourceFormatter(), 0).AssignFlavors(ctx, log, nil)
++		for _, ps := range info.TotalRequests {
++			if ps.Requests.ResourceValue(corev1.ResourcePods).Sign() != 0 {
++				t.Fatal("synthetic pods mutated the shared workload info")
++			}
++		}
++		return result
++	}
++	first := assign()
++	split, ok := ParseGreedySplit(first.Message())
++	if !ok || !reflect.DeepEqual(split.Fills, []FlavorFill{{Flavor: "a", Count: 6}, {Flavor: "b", Count: 4}}) {
++		t.Fatalf("proposal=%s", first.Message())
++	}
++	probe.Spec.PodSets[1].Count = 6
++	entry := *probe.Spec.PodSets[1].DeepCopy()
++	entry.Name = "workers--2"
++	entry.Count = 4
++	probe.Spec.PodSets = append(probe.Spec.PodSets, entry)
++	final := assign()
++	if final.RepresentativeMode() != Fit || len(final.PodSets) != 3 {
++		t.Fatalf("materialized plan failed fit: %s", final.Message())
++	}
++	for i, want := range []kueue.ResourceFlavorReference{"a", "a", "b"} {
++		if final.PodSets[i].Flavors[corev1.ResourcePods].Name != want {
++			t.Fatalf("entry %d assigned to %v", i, final.PodSets[i].Flavors)
++		}
 +	}
 +}
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go

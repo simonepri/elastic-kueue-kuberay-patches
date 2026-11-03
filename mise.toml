@@ -244,7 +244,7 @@ dir = "third_party/kueue"
 run = "go test -race -timeout 30m ./pkg/scheduler/... ./pkg/cache/... ./pkg/controller/... ./pkg/features/... ./pkg/webhooks/... ./pkg/workload/... ./pkg/workloadslicing/... ./pkg/util/equality/..."
 
 [tasks."test:kueue-integration"]
-description = "Run the patched Kueue scheduler flavor-fill ownership, topology-aware scheduling and RayCluster integration suites and the RayCluster webhook suite against envtest, which include the topology-aware cohort reclaim, elastic flavor placement and template re-apply specs"
+description = "Run the patched Kueue scheduler flavor-fill ownership, topology-aware scheduling, RayJob and RayCluster integration suites and the RayCluster webhook suite against envtest, which include the topology-aware cohort reclaim, elastic flavor placement and template re-apply specs"
 depends = ["patch:kueue"]
 dir = "third_party/kueue"
 run = """
@@ -256,6 +256,9 @@ make test-integration \
 make test-integration \
   INTEGRATION_TARGET=./test/integration/singlecluster/tas/... \
   INTEGRATION_NPROCS=4
+make test-integration \
+  INTEGRATION_TARGET=./test/integration/singlecluster/controller/jobs/rayjob/... \
+  INTEGRATION_NPROCS=1
 make test-integration \
   INTEGRATION_TARGET=./test/integration/singlecluster/controller/jobs/raycluster/... \
   INTEGRATION_NPROCS=1

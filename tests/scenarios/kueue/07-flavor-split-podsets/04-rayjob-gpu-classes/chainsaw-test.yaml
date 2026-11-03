@@ -16,8 +16,9 @@ spec:
     1. Head is admitted on on-demand (reserved-gpu and spot-gpu have untolerated GPU taints).
     2. Workers scale directly from 0 to 10: workers x6 on reserved-gpu and workers--2 x4 on spot-gpu.
        Each entry's pods carry its distinct gpu-class selector.
-    3. Scale-down to 4 removes the newest entry's pods and two base-entry pods.
-    4. Regrowth to 6 drops the empty split entry and merges back.
+    3. With partial preemption enabled, opt in to reclaim, keep two workers on A and regrow four in a new B entry.
+       The existing B workers and head survive; the RayJob stays unsuspended.
+    4. Scale down, then regrow to 6 to drop empty split entries and merge back.
     5. Finish: deleting the RayJob finishes its Workloads and removes its pods.
   catch:
     - script:
@@ -65,42 +66,14 @@ spec:
               - name: NS
                 value: ($namespace)
             content: ./assert-head.sh on-demand
-    - name: scale-down-and-merge-back
+    - name: reclaim-regrow-shrink-and-merge-back
       try:
         - script:
+            timeout: 400s
             env:
               - name: NS
                 value: ($namespace)
-            content: ./scale.sh 4 workers--2=4 workers=2
-        - script:
-            timeout: 100s
-            env:
-              - name: NS
-                value: ($namespace)
-            content: ./assert-entries.sh workers=4@reserved-gpu workers--2=0
-        - script:
-            timeout: 100s
-            env:
-              - name: NS
-                value: ($namespace)
-            content: ./assert-head.sh on-demand
-        - script:
-            env:
-              - name: NS
-                value: ($namespace)
-            content: ./scale.sh 6
-        - script:
-            timeout: 100s
-            env:
-              - name: NS
-                value: ($namespace)
-            content: ./assert-entries.sh workers=6@reserved-gpu
-        - script:
-            timeout: 100s
-            env:
-              - name: NS
-                value: ($namespace)
-            content: ./assert-head.sh on-demand
+            content: ./reclaim-and-shrink.sh
     - name: finish
       try:
         - delete:

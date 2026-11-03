@@ -469,6 +469,12 @@ raycluster_webhook=$(kubectl get mutatingwebhookconfiguration kueue-mutating-web
   awk '{for (i = 1; i <= NF; i++) if ($i == "mraycluster.kb.io") print i - 1}')
 kubectl patch mutatingwebhookconfiguration kueue-mutating-webhook-configuration --type=json \
   -p '[{"op":"add","path":"/webhooks/'"$raycluster_webhook"'/rules/0/operations/-","value":"UPDATE"}]'
+rayjob_webhook=$(kubectl get mutatingwebhookconfiguration kueue-mutating-webhook-configuration -o jsonpath='{.webhooks[*].name}' |
+  awk '{for (i = 1; i <= NF; i++) if ($i == "mrayjob.kb.io") print i - 1}')
+if [ -n "$rayjob_webhook" ]; then
+  kubectl patch mutatingwebhookconfiguration kueue-mutating-webhook-configuration --type=json \
+    -p '[{"op":"add","path":"/webhooks/'"$rayjob_webhook"'/rules/0/operations/-","value":"UPDATE"}]'
+fi
 
 echo "Enabling Kueue feature gates: $KUEUE_FEATURE_GATES"
 kubectl patch deployment/kueue-controller-manager -n kueue-system --type=json \

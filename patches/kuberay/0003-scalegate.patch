@@ -1,9 +1,9 @@
 diff --git a/ray-operator/controllers/ray/scalegate_controller.go b/ray-operator/controllers/ray/scalegate_controller.go
 new file mode 100644
-index 0000000..fc19a87
+index 0000000..0bb3587
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller.go
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,534 @@
 +package ray
 +
 +import (
@@ -436,8 +436,9 @@ index 0000000..fc19a87
 +	return quota, nil
 +}
 +
-+// admittedWorkerCounts returns, by lowercased pod set name, the pod counts Kueue admitted for the Workload of the
-+// RayCluster or of the RayJob that owns it; the map is empty when that Workload is not admitted.
++// admittedWorkerCounts returns, by lowercased base pod set name, the pod counts Kueue admitted for the Workload of the
++// RayCluster or of the RayJob that owns it; the map is empty when that Workload is not admitted. If a worker group's
++// pod set is split into multiple entries (<group>, <group>--2, ...), the counts are summed.
 +func (r *ScaleGateReconciler) admittedWorkerCounts(ctx context.Context, rc *unstructured.Unstructured) (map[string]int64, error) {
 +	owners := map[types.UID]bool{rc.GetUID(): true}
 +	for _, ref := range rc.GetOwnerReferences() {
@@ -464,28 +465,69 @@ index 0000000..fc19a87
 +			continue
 +		}
 +		specCounts := map[string]int64{}
++		podSetBases := map[string]string{}
++		podSetNames := map[string]bool{}
 +		podSets, _, _ := unstructured.NestedSlice(wl.Object, "spec", "podSets")
 +		for _, ps := range podSets {
 +			if psMap, ok := ps.(map[string]interface{}); ok {
 +				name, _ := psMap["name"].(string)
-+				specCounts[strings.ToLower(name)], _ = getInt64(psMap["count"])
++				lowerName := strings.ToLower(name)
++				specCounts[lowerName], _ = getInt64(psMap["count"])
++				podSetNames[lowerName] = true
++				if base, found, _ := unstructured.NestedString(psMap, "template", "metadata", "annotations", "kueue.x-k8s.io/flavor-split-of"); found && base != "" {
++					podSetBases[lowerName] = strings.ToLower(base)
++				}
 +			}
 +		}
++		wlCounts := map[string]int64{}
 +		for _, a := range assignments {
 +			aMap, ok := a.(map[string]interface{})
 +			if !ok {
 +				continue
 +			}
 +			name, _ := aMap["name"].(string)
-+			name = strings.ToLower(name)
++			lowerName := strings.ToLower(name)
++			base := resolvePodSetBase(lowerName, podSetBases, podSetNames)
 +			count, ok := getInt64(aMap["count"])
 +			if !ok {
-+				count = specCounts[name]
++				count = specCounts[lowerName]
 +			}
-+			counts[name] = max(counts[name], count)
++			wlCounts[base] += count
++		}
++		for base, count := range wlCounts {
++			counts[base] = max(counts[base], count)
 +		}
 +	}
 +	return counts, nil
++}
++
++// resolvePodSetBase resolves the base pod set name of a potentially split pod set entry.
++// The kueue.x-k8s.io/flavor-split-of annotation on the Workload's PodSet template is authoritative.
++// If only the name is available, a trailing --<digits> is stripped only when the stripped name
++// is another PodSet in the same Workload.
++func resolvePodSetBase(name string, podSetBases map[string]string, podSetNames map[string]bool) string {
++	if base, ok := podSetBases[name]; ok && base != "" {
++		return base
++	}
++	if idx := strings.LastIndex(name, "--"); idx != -1 {
++		suffix := name[idx+2:]
++		if len(suffix) > 0 && isAllDigits(suffix) {
++			candidate := name[:idx]
++			if podSetNames[candidate] {
++				return candidate
++			}
++		}
++	}
++	return name
++}
++
++func isAllDigits(s string) bool {
++	for _, r := range s {
++		if r < '0' || r > '9' {
++			return false
++		}
++	}
++	return true
 +}
 +
 +func (r *ScaleGateReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -498,10 +540,10 @@ index 0000000..fc19a87
 +}
 diff --git a/ray-operator/controllers/ray/scalegate_controller_unit_test.go b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
 new file mode 100644
-index 0000000..9a3beea
+index 0000000..a6d02b3
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,632 @@
 +package ray
 +
 +import (
@@ -962,6 +1004,176 @@ index 0000000..9a3beea
 +				t.Errorf("maxWorkers = %d, %v; want %d, %v", got, bound, tc.want, tc.wantBound)
 +			}
 +		})
++	}
++}
++
++// admittedWorkerCounts sums split pod set entries (<group>, <group>--2, ...) belonging to the same worker group.
++func TestScaleGateAdmittedWorkerCounts(t *testing.T) {
++	rc := sgRayCluster("team-queue", 16, 1, 32)
++	tests := []struct {
++		name        string
++		podSets     []map[string]interface{}
++		assignments []map[string]interface{}
++		wantCounts  map[string]int64
++	}{
++		{
++			name: "no suffix",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++			},
++			wantCounts: map[string]int64{"head": 1, "gpu-workers": 8},
++		},
++		{
++			name: "two entries 8+4 giving 12",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++				{
++					"name":  "gpu-workers--2",
++					"count": int64(4),
++					"template": map[string]interface{}{
++						"metadata": map[string]interface{}{
++							"annotations": map[string]interface{}{
++								"kueue.x-k8s.io/flavor-split-of": "gpu-workers",
++							},
++						},
++					},
++				},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++				{"name": "gpu-workers--2", "count": int64(4)},
++			},
++			wantCounts: map[string]int64{"head": 1, "gpu-workers": 12},
++		},
++		{
++			name: "two entries 8+4 giving 12 without annotation fallback to name",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++				{"name": "gpu-workers--2", "count": int64(4)},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++				{"name": "gpu-workers--2", "count": int64(4)},
++			},
++			wantCounts: map[string]int64{"head": 1, "gpu-workers": 12},
++		},
++		{
++			name: "an entry at 0",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(0)},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(0)},
++			},
++			wantCounts: map[string]int64{"head": 1, "gpu-workers": 0},
++		},
++		{
++			name: "trailing digits when base is not a podset in workload",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "standalone--2", "count": int64(5)},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "standalone--2", "count": int64(5)},
++			},
++			wantCounts: map[string]int64{"head": 1, "standalone--2": 5},
++		},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			podSets := make([]interface{}, len(tc.podSets))
++			for i, ps := range tc.podSets {
++				entry := map[string]interface{}{"name": ps["name"], "count": ps["count"]}
++				if tmpl, ok := ps["template"]; ok {
++					entry["template"] = tmpl
++				}
++				podSets[i] = entry
++			}
++			podSetAssignments := make([]interface{}, len(tc.assignments))
++			for i, a := range tc.assignments {
++				podSetAssignments[i] = map[string]interface{}{"name": a["name"], "count": a["count"]}
++			}
++			wl := sgKueueObject("Workload", "raycluster-gang", "default", map[string]interface{}{
++				"podSets": podSets,
++			})
++			wl.Object["status"] = map[string]interface{}{"admission": map[string]interface{}{
++				"clusterQueue":      "team-queue",
++				"podSetAssignments": podSetAssignments,
++			}}
++			wl.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "ray.io/v1", Kind: "RayCluster", Name: "gang", UID: "raycluster-uid"}})
++
++			mapper := meta.NewDefaultRESTMapper(nil)
++			mapper.Add(rayClusterGVK, meta.RESTScopeNamespace)
++			mapper.Add(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"}, meta.RESTScopeNamespace)
++			scheme := runtime.NewScheme()
++			if err := rayv1.AddToScheme(scheme); err != nil {
++				t.Fatalf("AddToScheme: %v", err)
++			}
++			fakeClient := clientFake.NewClientBuilder().
++				WithScheme(scheme).
++				WithRESTMapper(mapper).
++				WithObjects(rc, wl).
++				Build()
++			r := &ScaleGateReconciler{Client: fakeClient}
++
++			got, err := r.admittedWorkerCounts(context.Background(), rc)
++			if err != nil {
++				t.Fatalf("admittedWorkerCounts: %v", err)
++			}
++			if !reflect.DeepEqual(got, tc.wantCounts) {
++				t.Errorf("admittedWorkerCounts = %v; want %v", got, tc.wantCounts)
++			}
++		})
++	}
++}
++
++// Kueue admitting split pod sets for 8+4=12 workers bounds maxReplicas at 12 instead of quota 2.
++func TestScaleGateNeverClampsBelowAdmittedCountSplitPodSets(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "shared", sgResourceGroups([]sgFlavor{
++		{name: "reserved", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "2")}},
++	}))
++	rc := sgRayCluster("team-queue", 16, 1, 32)
++	wl := sgKueueObject("Workload", "raycluster-gang", "default", map[string]interface{}{
++		"podSets": []interface{}{
++			map[string]interface{}{"name": "head", "count": int64(1)},
++			map[string]interface{}{"name": "gpu-workers", "count": int64(8)},
++			map[string]interface{}{
++				"name":  "gpu-workers--2",
++				"count": int64(4),
++				"template": map[string]interface{}{
++					"metadata": map[string]interface{}{
++						"annotations": map[string]interface{}{
++							"kueue.x-k8s.io/flavor-split-of": "gpu-workers",
++						},
++					},
++				},
++			},
++		},
++	})
++	wl.Object["status"] = map[string]interface{}{"admission": map[string]interface{}{
++		"clusterQueue": "team-queue",
++		"podSetAssignments": []interface{}{
++			map[string]interface{}{"name": "head", "count": int64(1)},
++			map[string]interface{}{"name": "gpu-workers", "count": int64(8)},
++			map[string]interface{}{"name": "gpu-workers--2", "count": int64(4)},
++		},
++	}}
++	wl.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "ray.io/v1", Kind: "RayCluster", Name: "gang", UID: "raycluster-uid"}})
++	got, _ := sgReconcile(t, queue, rc, wl)
++	if replicas, _, maxReplicas := sgWorkerCounts(t, got); replicas != 16 || maxReplicas != 12 {
++		t.Errorf("worker group = replicas %d, max %d; want 16, 12 (the admitted count from 8+4)", replicas, maxReplicas)
 +	}
 +}
 diff --git a/ray-operator/main.go b/ray-operator/main.go

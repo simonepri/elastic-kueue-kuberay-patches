@@ -1038,7 +1038,7 @@ index 2fb96f1..2f6eff7 100644
  		// the counts Reduce returns.
  		var bestPartialPlan *assignment.Plan
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
-index 8d9a02e..b8239d4 100644
+index 8d9a02e..b47081f 100644
 --- a/pkg/workloadslicing/flavor_split.go
 +++ b/pkg/workloadslicing/flavor_split.go
 @@ -287,8 +287,8 @@ func ExpandToSplitEntries(podSets []kueue.PodSet, floors, steps workload.PodSets
@@ -1067,7 +1067,7 @@ index 8d9a02e..b8239d4 100644
  	running := AfterReclaimBaseline(replaced)
  	steps := workload.PodSetCountSteps(probe)
  	groups := splitGroups(probe.Spec.PodSets)
-@@ -361,3 +369,61 @@ func SplitGrowth(probe, replaced *kueue.Workload, partial bool) bool {
+@@ -361,3 +369,88 @@ func SplitGrowth(probe, replaced *kueue.Workload, partial bool) bool {
  	}
  	return changed
  }
@@ -1107,6 +1107,7 @@ index 8d9a02e..b8239d4 100644
 +	if probe.Spec.PodSets[idx].MinCount != nil && *probe.Spec.PodSets[idx].MinCount > split.Fills[0].Count {
 +		probe.Spec.PodSets[idx].MinCount = ptr.To(split.Fills[0].Count)
 +	}
++	remainingMin := ptr.Deref(original.MinCount, 0) - ptr.Deref(probe.Spec.PodSets[idx].MinCount, 0)
 +	for _, fill := range split.Fills[1:] {
 +		name, ok := nextSplitName(probe.Spec.PodSets, base)
 +		if !ok {
@@ -1114,7 +1115,12 @@ index 8d9a02e..b8239d4 100644
 +		}
 +		entry := newSplitEntry(original, name, fill.Count)
 +		entry.Template.Annotations[FlavorSplitOfAnnotation] = string(base)
-+		if partial {
++		if replaced == nil {
++			if original.MinCount != nil {
++				entry.MinCount = ptr.To(min(remainingMin, fill.Count))
++				remainingMin -= *entry.MinCount
++			}
++		} else if partial {
 +			entry.MinCount = ptr.To(steps[original.Name])
 +		}
 +		probe.Spec.PodSets = append(probe.Spec.PodSets, entry)
@@ -1129,12 +1135,33 @@ index 8d9a02e..b8239d4 100644
 +	workload.SetPodSetCountSteps(probe, steps)
 +	return true
 +}
++
++// refreshInitialSplitMinCounts distributes the job's initial admission minimum across
++// its entries. Resizing a pending first slice must not set a base minimum above its count.
++func refreshInitialSplitMinCounts(wl *kueue.Workload, jobPodSets []kueue.PodSet) {
++	minimums := make(workload.PodSetsCounts)
++	for _, ps := range jobPodSets {
++		if ps.MinCount != nil {
++			minimums[ps.Name] = *ps.MinCount
++		}
++	}
++	for i := range wl.Spec.PodSets {
++		ps := &wl.Spec.PodSets[i]
++		base := SplitBase(ps)
++		if minimum, found := minimums[base]; found {
++			ps.MinCount = ptr.To(min(minimum, ps.Count))
++			minimums[base] -= *ps.MinCount
++		} else {
++			ps.MinCount = nil
++		}
++	}
++}
 diff --git a/pkg/workloadslicing/greedy_split_test.go b/pkg/workloadslicing/greedy_split_test.go
 new file mode 100644
-index 0000000..90c2a25
+index 0000000..cce7800
 --- /dev/null
 +++ b/pkg/workloadslicing/greedy_split_test.go
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,142 @@
 +// Verifies that the reconciler materializes count proposals into split entries of the same Workload.
 +
 +/*
@@ -1157,12 +1184,14 @@ index 0000000..90c2a25
 +
 +import (
 +	"encoding/json"
++	"fmt"
 +	batchv1 "k8s.io/api/batch/v1"
 +	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 +	"k8s.io/component-base/featuregate"
++	"k8s.io/utils/ptr"
 +	"reflect"
-+	"sigs.k8s.io/controller-runtime/pkg/client"
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
 +	"sigs.k8s.io/kueue/pkg/features"
 +	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
 +	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
@@ -1229,29 +1258,78 @@ index 0000000..90c2a25
 +}
 +
 +func TestInitialNonzeroSliceSplitsThroughManager(t *testing.T) {
-+	features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlicesFlavorSplit: true, features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: true})
-+	ctx, _ := utiltesting.ContextWithLog(t)
-+	probe := api.MakeWorkload("first", "ns").Annotation(EnabledAnnotationKey, EnabledAnnotationValue).Annotation(FlavorPlacementOnPodsAnnotation, "true").PodSets(*api.MakePodSet("workers", 24).Obj()).Obj()
-+	payload, _ := json.Marshal(flavorassigner.GreedySplit{PodSet: "workers", Fills: []flavorassigner.FlavorFill{{Flavor: "a", Count: 15}, {Flavor: "b", Count: 9}}})
-+	probe.Status.Conditions = []metav1.Condition{{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse, Message: flavorassigner.GrowthFitsOtherFlavorReason + "; greedy fill: " + string(payload)}}
-+	c := utiltesting.NewClientBuilder().WithObjects(probe).WithStatusSubresource(probe).Build()
-+	manager := Manager{Client: c}
-+	if err := manager.splitRefusedProbe(ctx, &batchv1.Job{}, nil, probe); err != nil {
-+		t.Fatal(err)
-+	}
-+	fresh := &kueue.Workload{}
-+	if err := c.Get(ctx, client.ObjectKeyFromObject(probe), fresh); err != nil {
-+		t.Fatal(err)
-+	}
-+	if got := workload.ExtractPodSetCountsFromWorkload(fresh); !reflect.DeepEqual(got, workload.PodSetsCounts{"workers": 15, "workers--2": 9}) {
-+		t.Fatalf("counts=%v", got)
++	for _, partial := range []bool{false, true} {
++		t.Run(fmt.Sprint(partial), func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlicesFlavorSplit: true, features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: true})
++			ctx, _ := utiltesting.ContextWithLog(t)
++			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns", UID: "job-uid"}}
++			ps := api.MakePodSet("workers", 24).Obj()
++			if partial {
++				ps.MinCount = ptr.To[int32](24)
++			}
++			probe := api.MakeWorkload("first", "ns").OwnerReference(testJobGVK, job.Name, string(job.UID)).Annotation(EnabledAnnotationKey, EnabledAnnotationValue).Annotation(FlavorPlacementOnPodsAnnotation, "true").PodSets(*ps).Obj()
++			payload, _ := json.Marshal(flavorassigner.GreedySplit{PodSet: "workers", Fills: []flavorassigner.FlavorFill{{Flavor: "a", Count: 15}, {Flavor: "b", Count: 9}}})
++			probe.Status.Conditions = []metav1.Condition{{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse, Message: flavorassigner.GrowthFitsOtherFlavorReason + "; greedy fill: " + string(payload)}}
++			c := utiltesting.NewClientBuilder().WithObjects(probe).WithStatusSubresource(probe).WithIndex(&kueue.Workload{}, coreindexer.OwnerReferenceIndexKey(testJobGVK), coreindexer.WorkloadOwnerIndexFunc(testJobGVK)).Build()
++			manager := Manager{Client: c}
++			got, compatible, err := manager.EnsureWorkloadSlices(ctx, []kueue.PodSet{*ps}, job, testJobGVK)
++			if err != nil || !compatible || got == nil {
++				t.Fatalf("compatible=%v err=%v", compatible, err)
++			}
++			if counts := workload.ExtractPodSetCountsFromWorkload(got); !reflect.DeepEqual(counts, workload.PodSetsCounts{"workers": 15, "workers--2": 9}) {
++				t.Fatalf("counts=%v", counts)
++			}
++			for _, entry := range got.Spec.PodSets {
++				if partial && (entry.MinCount == nil || *entry.MinCount != entry.Count) {
++					t.Fatalf("initial minimum=%v count=%d", entry.MinCount, entry.Count)
++				}
++			}
++			// The first slice still has no quota when the desired count changes.
++			ps.Count = 26
++			if partial {
++				ps.MinCount = ptr.To[int32](26)
++			}
++			got, compatible, err = manager.EnsureWorkloadSlices(ctx, []kueue.PodSet{*ps}, job, testJobGVK)
++			if err != nil || !compatible || got == nil {
++				t.Fatalf("resize: compatible=%v err=%v", compatible, err)
++			}
++			if counts := workload.ExtractPodSetCountsFromWorkload(got); !reflect.DeepEqual(counts, workload.PodSetsCounts{"workers": 15, "workers--2": 11}) {
++				t.Fatalf("resized counts=%v", counts)
++			}
++			for _, entry := range got.Spec.PodSets {
++				if partial && (entry.MinCount == nil || *entry.MinCount != entry.Count) {
++					t.Fatalf("resized minimum=%v count=%d", entry.MinCount, entry.Count)
++				}
++			}
++		})
 +	}
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 66dce78..e657b74 100644
+index 66dce78..212093b 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
-@@ -240,7 +240,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
+@@ -69,6 +69,10 @@ func (r *Manager) EnsureWorkloadSlices(
+ 			wl.Status.AccumulatedPastExecutionTimeSeconds != nil || ScaledUp(wl) {
+ 			return
+ 		}
++		if HasSplitEntries(wl.Spec.PodSets) {
++			refreshInitialSplitMinCounts(wl, jobPodSets)
++			return
++		}
+ 		for i := range wl.Spec.PodSets {
+ 			for _, jobPodSet := range jobPodSets {
+ 				if wl.Spec.PodSets[i].Name == jobPodSet.Name {
+@@ -146,6 +150,9 @@ func (r *Manager) EnsureWorkloadSlices(
+ 					}
+ 				}
+ 			}
++			if err := r.splitRefusedProbe(ctx, jobObject, workloads, wl); err != nil {
++				return nil, true, err
++			}
+ 			return wl, true, nil
+ 		}
+ 
+@@ -240,7 +247,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
  		return nil
  	}
  	replaced := admittedPredecessor(workloads, probe)
@@ -1260,7 +1338,7 @@ index 66dce78..e657b74 100644
  		return nil
  	}
  	// The scheduler writes the probe's status while the reconciler decides, so a conflict
-@@ -254,7 +254,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
+@@ -254,7 +261,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
  			return nil
  		}
  		ctrl.LoggerFrom(ctx).V(2).Info("Splitting the growth of a refused workload slice into PodSets that may take another flavor",
@@ -1269,6 +1347,81 @@ index 66dce78..e657b74 100644
  		if err := r.Client.Update(ctx, split); err != nil {
  			if apierrors.IsConflict(err) {
  				if getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(probe), probe); getErr != nil {
+diff --git a/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
+new file mode 100644
+index 0000000..9991aac
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
+@@ -0,0 +1,69 @@
++// Verifies that a first nonzero RayJob slice consumes a greedy proposal and reaches admission through the job reconciler.
++
++package rayjob
++
++import (
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/component-base/featuregate"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	api "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingrayjob "sigs.k8s.io/kueue/pkg/util/testingjobs/rayjob"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++var _ = ginkgo.Describe("RayJob initial greedy flavor fill", func() {
++	ginkgo.DescribeTable("admits a first nonzero slice with ordered entries", func(partial bool) {
++		features.SetFeatureGatesDuringTest(ginkgo.GinkgoTB(), map[featuregate.Feature]bool{
++			features.ElasticJobsViaWorkloadSlices:                          true,
++			features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++			features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero:      true,
++			features.ElasticJobsViaWorkloadSlicesFlavorSplit:               true,
++		})
++		fwk.StartManager(ctx, cfg, managerAndSchedulerSetup())
++		ginkgo.DeferCleanup(func() { fwk.StopManager(ctx) })
++		ns := behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "rayjob-initial-fill-")
++		a := api.MakeResourceFlavor("initial-a").Obj()
++		b := api.MakeResourceFlavor("initial-b").Obj()
++		cq := api.MakeClusterQueue("initial-fill").ResourceGroup(
++			*api.MakeFlavorQuotas(a.Name).Resource(corev1.ResourcePods, "7").Resource(corev1.ResourceCPU, "100").Obj(),
++			*api.MakeFlavorQuotas(b.Name).Resource(corev1.ResourcePods, "32").Resource(corev1.ResourceCPU, "100").Obj()).Obj()
++		ginkgo.DeferCleanup(func() {
++			gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, cq, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, a, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, b, true)
++		})
++		for _, obj := range []client.Object{a, b, cq, api.MakeLocalQueue("queue", ns.Name).ClusterQueue(cq.Name).Obj()} {
++			behavioral.MustCreate(ctx, k8sClient, obj)
++		}
++		job := testingrayjob.MakeJob("initial", ns.Name).Annotation(workloadslicing.EnabledAnnotationKey, "true").Queue("queue").WithSubmissionMode(rayv1.InteractiveMode).RequestWorkerGroup(corev1.ResourceCPU, "1").Obj()
++		job.Spec.RayClusterSpec.WorkerGroupSpecs[0].Replicas = new(int32(10))
++		job.Spec.RayClusterSpec.WorkerGroupSpecs[0].MaxReplicas = new(int32(20))
++		if partial {
++			job.Annotations[constants.ElasticJobScaleUpStrategyAnnotationKey] = constants.ElasticJobScaleUpStrategyPartial
++		}
++		behavioral.MustCreate(ctx, k8sClient, job)
++		setInitStatus(job.Name, ns.Name)
++		check := func(g gomega.Gomega) {
++			var list kueue.WorkloadList
++			g.Expect(k8sClient.List(ctx, &list, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			g.Expect(list.Items).To(gomega.HaveLen(1))
++			wl := &list.Items[0]
++			g.Expect(workload.IsAdmitted(wl)).To(gomega.BeTrue())
++			g.Expect(workload.ExtractPodSetCountsFromWorkload(wl)).To(gomega.Equal(workload.PodSetsCounts{"head": 1, "workers-group-0": 6, "workers-group-0--2": 4}))
++			g.Expect(wl.Status.Admission.PodSetAssignments).To(gomega.HaveLen(3))
++			g.Expect(wl.Status.Admission.PodSetAssignments[1].Flavors[corev1.ResourcePods]).To(gomega.Equal(kueue.ResourceFlavorReference(a.Name)))
++			g.Expect(wl.Status.Admission.PodSetAssignments[2].Flavors[corev1.ResourcePods]).To(gomega.Equal(kueue.ResourceFlavorReference(b.Name)))
++		}
++		gomega.Eventually(check, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		gomega.Consistently(check, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
++	}, ginkgo.Entry("atomic", false), ginkgo.Entry("partial strategy preserves initial minimum", true))
++})
 diff --git a/test/integration/singlecluster/scheduler/greedy_split_test.go b/test/integration/singlecluster/scheduler/greedy_split_test.go
 new file mode 100644
 index 0000000..6d2e18f

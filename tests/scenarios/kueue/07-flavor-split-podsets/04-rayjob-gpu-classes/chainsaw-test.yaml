@@ -20,6 +20,7 @@ spec:
        The existing B workers and head survive; the RayJob stays unsuspended.
     4. Scale down, then regrow to 6 to drop empty split entries and merge back.
     5. Finish: deleting the RayJob finishes its Workloads and removes its pods.
+    6. A fresh RayJob starting at 10 workers fills 6 on A and 4 on B in its first slice.
   catch:
     - script:
         env:
@@ -87,3 +88,19 @@ spec:
               - name: NS
                 value: ($namespace)
             content: ./assert-job-finish.sh
+    - name: first-nonzero-slice
+      try:
+        - script:
+            timeout: 240s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: |
+              set -eu
+              kubectl -n "$NS" create --dry-run=client -f 01-rayjob.yaml -o json |
+                jq '.spec.rayClusterSpec.workerGroupSpecs[0].replicas = 10' |
+                kubectl -n "$NS" apply -f -
+              ./assert-entries.sh workers=6@reserved-gpu workers--2=4@spot-gpu
+              ./assert-head.sh on-demand
+              kubectl -n "$NS" delete rayjob flavor-split-job --wait=true
+              ./assert-job-finish.sh

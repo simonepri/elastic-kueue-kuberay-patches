@@ -1,0 +1,71 @@
+# Elastic RayJob with CPU head (affinity karpenter.sh/capacity-type In [reserved, on-demand])
+# and GPU workers (affinity instance-gpu-memory Gt 20000, 1 GPU, toleration for nvidia.com/gpu).
+# The worker template does NOT have a gpu-class nodeSelector so it can span flavors with distinct gpu-class labels.
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: flavor-split-job
+  labels:
+    kueue.x-k8s.io/queue-name: lq-flavor-split
+    kueue.x-k8s.io/priority-class: pc-flavor-split
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+    kueue.x-k8s.io/elastic-job-scale-up-strategy: partial
+spec:
+  entrypoint: "python -c 'import time; time.sleep(3600)'"
+  shutdownAfterJobFinishes: true
+  rayClusterSpec:
+    rayVersion: "2.38.0"
+    enableInTreeAutoscaling: true
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+      template:
+        spec:
+          priorityClassName: pc-flavor-split
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: karpenter.sh/capacity-type
+                        operator: In
+                        values: ["reserved", "on-demand"]
+          containers:
+            - name: ray-head
+              image: rayproject/ray:2.38.0
+              resources:
+                requests:
+                  cpu: "200m"
+                  memory: "512Mi"
+    workerGroupSpecs:
+      - groupName: workers
+        replicas: 0
+        minReplicas: 0
+        maxReplicas: 16
+        rayStartParams: {}
+        template:
+          spec:
+            priorityClassName: pc-flavor-split
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            affinity:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: instance-gpu-memory
+                          operator: Gt
+                          values: ["20000"]
+            containers:
+              - name: ray-worker
+                image: rayproject/ray:2.38.0
+                resources:
+                  requests:
+                    cpu: "200m"
+                    memory: "512Mi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    nvidia.com/gpu: "1"

@@ -1,0 +1,114 @@
+# Verifies greedy flavor fill in ClusterQueue order for an elastic RayJob with a CPU head and GPU workers sharing one ClusterQueue resource group across distinct gpu-class flavors.
+# Head requires node affinity karpenter.sh/capacity-type In [reserved, on-demand], CPU only (no GPU toleration).
+# Workers requires node affinity instance-gpu-memory Gt 20000, 1 GPU, tolerates nvidia.com/gpu, without a gpu-class selector.
+# The queue has reserved-gpu (6 GPUs, tainted nvidia.com/gpu, gpu-class: h200), spot-gpu (16 GPUs, tainted nvidia.com/gpu, gpu-class: l4), and on-demand (CPU only).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 07-flavor-split-rayjob-greedy-fill
+  labels:
+    partial-preemption: required
+spec:
+  description: >
+    Verifies greedy flavor fill in flavor order (ElasticJobsViaWorkloadSlicesFlavorSplit) when an elastic RayJob has a CPU-only
+    head pod set and GPU worker group scaling 0 -> 10 across flavors with distinct gpu-class labels.
+    1. Head is admitted on on-demand (reserved-gpu and spot-gpu have untolerated GPU taints).
+    2. Workers scale 0 -> 10: greedy fill admits workers x6 on reserved-gpu (gpu-class: h200) and workers--2 x4 on spot-gpu (gpu-class: l4).
+    3. Scale-down to 4 workers: workers--2 shrinks to 0 (LIFO shrink) and workers keeps 4 on reserved-gpu.
+    4. Scale to 6 workers: workers--2 is dropped and merges back, running workers x6 on reserved-gpu.
+    5. Finish: deleting the RayJob finishes its Workloads and removes its pods.
+  catch:
+    - script:
+        env:
+          - name: NS
+            value: ($namespace)
+        content: ../../../dump-namespace.sh
+  steps:
+    - name: setup-queues
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-rayjob
+      try:
+        - apply:
+            file: 01-rayjob.yaml
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-entries.sh workers=0
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-head.sh on-demand
+    - name: greedy-scale-up-0-to-10
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./scale.sh 10
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-entries.sh workers=6@reserved-gpu workers--2=4@spot-gpu
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-head.sh on-demand
+    - name: scale-down-and-merge-back
+      try:
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./scale.sh 4 workers--2=4 workers=2
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-entries.sh workers=4@reserved-gpu workers--2=0
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-head.sh on-demand
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./scale.sh 6
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-entries.sh workers=6@reserved-gpu
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-head.sh on-demand
+    - name: finish
+      try:
+        - delete:
+            ref:
+              apiVersion: ray.io/v1
+              kind: RayJob
+              name: flavor-split-job
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-job-finish.sh

@@ -1311,10 +1311,10 @@ index 644b856..366b609 100644
  		{Version: version.MustParse("0.14"), Default: true, PreRelease: featuregate.Beta},
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
 new file mode 100644
-index 0000000..7f8fe2e
+index 0000000..089222b
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,407 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1338,12 +1338,358 @@ index 0000000..7f8fe2e
 +
 +import (
 +	"context"
++	"fmt"
++	"math"
++	"slices"
 +
++	"github.com/go-logr/logr"
 +	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/validation"
++	"k8s.io/utils/ptr"
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	resourcegroups "sigs.k8s.io/kueue/pkg/util/resourcegroups"
++	"sigs.k8s.io/kueue/pkg/features"
 +	"sigs.k8s.io/kueue/pkg/resources"
++	"sigs.k8s.io/kueue/pkg/workload"
 +)
++
++// FlavorSplitOfAnnotation, on the template of a Workload PodSet, marks the PodSet as a split
++// entry of the job PodSet it names.
++const FlavorSplitOfAnnotation = "kueue.x-k8s.io/flavor-split-of"
++
++// maxWorkloadPodSets is the most PodSets the Workload API accepts.
++const maxWorkloadPodSets = 8
++
++// SplitBase returns the job PodSet whose pods ps runs: the one a split entry names, or ps itself.
++func SplitBase(ps *kueue.PodSet) kueue.PodSetReference {
++	if base := ps.Template.Annotations[FlavorSplitOfAnnotation]; base != "" {
++		return kueue.PodSetReference(base)
++	}
++	return ps.Name
++}
++
++// IsSplitEntry reports whether ps is a split entry of another PodSet.
++func IsSplitEntry(ps *kueue.PodSet) bool {
++	return ps.Template.Annotations[FlavorSplitOfAnnotation] != ""
++}
++
++// placesByTopology reports whether the topology request constrains where the pods go, which a split
++// entry cannot honor for pods spread over several entries.
++func placesByTopology(tr *kueue.PodSetTopologyRequest) bool {
++	return tr != nil && (tr.Required != nil || tr.Preferred != nil || ptr.Deref(tr.Unconstrained, false) ||
++		tr.PodSetGroupName != nil || tr.PodSetSliceRequiredTopology != nil)
++}
++
++// nextSplitName returns the first "<base>--<n>" name, from n = 2, that no PodSet uses, and false
++// when it would be longer than a PodSet name may be.
++func nextSplitName(podSets []kueue.PodSet, base kueue.PodSetReference) (kueue.PodSetReference, bool) {
++	for n := 2; ; n++ {
++		name := kueue.PodSetReference(fmt.Sprintf("%s--%d", base, n))
++		if len(name) > validation.DNS1123LabelMaxLength {
++			return "", false
++		}
++		if !slices.ContainsFunc(podSets, func(ps kueue.PodSet) bool { return ps.Name == name }) {
++			return name, true
++		}
++	}
++}
++
++// newSplitEntry returns a split entry of base named name, with base's template.
++func newSplitEntry(base *kueue.PodSet, name kueue.PodSetReference, count int32) kueue.PodSet {
++	entry := *base.DeepCopy()
++	entry.Name = name
++	entry.Count = count
++	entry.MinCount = nil
++	if !placesByTopology(entry.TopologyRequest) {
++		entry.TopologyRequest = nil
++	}
++	metav1.SetMetaDataAnnotation(&entry.Template.ObjectMeta, FlavorSplitOfAnnotation, string(SplitBase(base)))
++	return entry
++}
++
++func isElasticWorkerPodSet(wl *kueue.Workload, replaceSlice *workload.Info, ps *kueue.PodSet) bool {
++	if ps == nil || wl == nil {
++		return false
++	}
++	base := SplitBase(ps)
++	if base == "head" || ps.Name == "head" || ps.Name == "submitter" {
++		return false
++	}
++	if placesByTopology(ps.TopologyRequest) {
++		return false
++	}
++	hasMinCount := false
++	basePSIdx := slices.IndexFunc(wl.Spec.PodSets, func(p kueue.PodSet) bool { return p.Name == base })
++	if basePSIdx >= 0 && wl.Spec.PodSets[basePSIdx].MinCount != nil {
++		hasMinCount = true
++	}
++	floors := workload.ReclaimMinCounts(wl)
++	_, hasFloor := floors[base]
++	if !hasMinCount && !hasFloor && replaceSlice != nil && replaceSlice.Obj != nil {
++		if oldIdx := slices.IndexFunc(replaceSlice.Obj.Spec.PodSets, func(p kueue.PodSet) bool { return p.Name == base }); oldIdx >= 0 && replaceSlice.Obj.Spec.PodSets[oldIdx].MinCount != nil {
++			hasMinCount = true
++		}
++		oldFloors := workload.ReclaimMinCounts(replaceSlice.Obj)
++		if _, ok := oldFloors[base]; ok {
++			hasFloor = true
++		}
++	}
++	return hasMinCount || hasFloor
++}
++
++func (a *FlavorAssigner) isElasticWorkload() bool {
++	if a.wl == nil || a.wl.Obj == nil || a.wl.Obj.Annotations == nil {
++		return false
++	}
++	if a.wl.Obj.Annotations["kueue.x-k8s.io/flavor-placement-on-pods"] != "true" {
++		return false
++	}
++	if a.replaceWorkloadSlice != nil {
++		return a.replaceWorkloadSlice.Obj != nil && a.replaceWorkloadSlice.Obj.Annotations != nil &&
++			a.replaceWorkloadSlice.Obj.Annotations["kueue.x-k8s.io/flavor-placement-on-pods"] == "true"
++	}
++	return true
++}
++
++func (a *FlavorAssigner) resourceGroupForPodSet(psIdx int) *resourcegroups.ResourceGroup {
++	if psIdx < 0 || psIdx >= len(a.wl.TotalRequests) {
++		return nil
++	}
++	psr := &a.wl.TotalRequests[psIdx]
++	if psr.Requests == nil {
++		return nil
++	}
++	const gpuResource = corev1.ResourceName("nvidia.com/gpu")
++	if psr.Requests.ResourceValue(gpuResource).Sign() > 0 {
++		if rg := a.cq.RGByResource(gpuResource); rg != nil {
++			return rg
++		}
++	}
++	for resName, val := range psr.Requests.Iter() {
++		if val.Sign() <= 0 {
++			continue
++		}
++		if rg := a.cq.RGByResource(resName); rg != nil {
++			return rg
++		}
++	}
++	return nil
++}
++
++func (a *FlavorAssigner) maxPodsForFlavor(
++	log logr.Logger,
++	psIdx int,
++	ps *kueue.PodSet,
++	rg *resourcegroups.ResourceGroup,
++	fName kueue.ResourceFlavorReference,
++	currentFlavor kueue.ResourceFlavorReference,
++	runningCount int32,
++) int32 {
++	if status := a.checkFlavorForPodSets(log, fName, []int{psIdx}, []*kueue.PodSet{ps}, rg); !status.IsFit() {
++		return 0
++	}
++	psr := &a.wl.TotalRequests[psIdx]
++	if psr.Requests == nil || psr.Count <= 0 {
++		return 0
++	}
++	maxPods := int32(math.MaxInt32)
++	checked := false
++
++	for resName, val := range psr.Requests.Iter() {
++		if val.Sign() <= 0 {
++			continue
++		}
++		var perPod resources.Amount
++		if psr.PerPodRequests != nil {
++			perPod = psr.PerPodRequests.ResourceValue(resName)
++		} else {
++			perPod = val.QuoInt64(int64(psr.Count))
++		}
++		if perPod.Sign() <= 0 {
++			continue
++		}
++		fr := resources.FlavorResource{Flavor: fName, Resource: resName}
++		avail := a.cq.Available(fr)
++		if avail.Sign() <= 0 {
++			if fName == currentFlavor {
++				maxPods = min(maxPods, runningCount)
++				checked = true
++				continue
++			}
++			return 0
++		}
++		addVal, _ := avail.Quo(perPod).Int64()
++		addPods := int32(addVal)
++		if fName == currentFlavor {
++			maxPods = min(maxPods, runningCount+addPods)
++		} else {
++			maxPods = min(maxPods, addPods)
++		}
++		checked = true
++	}
++	if !checked || maxPods == math.MaxInt32 {
++		return 0
++	}
++	return max(0, maxPods)
++}
++
++func (a *FlavorAssigner) tryGreedySplit(ctx context.Context, log logr.Logger) bool {
++	if !features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorSplit) || a.wl == nil || a.wl.Obj == nil {
++		return false
++	}
++	if !a.isElasticWorkload() {
++		return false
++	}
++	if len(a.wl.Obj.Spec.PodSets) >= maxWorkloadPodSets {
++		return false
++	}
++
++	floors := workload.ReclaimMinCounts(a.wl.Obj)
++	steps := workload.PodSetCountSteps(a.wl.Obj)
++	changed := false
++
++	initialLen := len(a.wl.Obj.Spec.PodSets)
++	for i := 0; i < initialLen; i++ {
++		if len(a.wl.Obj.Spec.PodSets) >= maxWorkloadPodSets {
++			break
++		}
++		ps := &a.wl.Obj.Spec.PodSets[i]
++		if !isElasticWorkerPodSet(a.wl.Obj, a.replaceWorkloadSlice, ps) || ps.Count <= 0 {
++			continue
++		}
++		base := SplitBase(ps)
++		psIdx := slices.IndexFunc(a.wl.TotalRequests, func(r workload.PodSetResources) bool {
++			return r.Name == ps.Name
++		})
++		if psIdx < 0 {
++			continue
++		}
++
++		var runningCount int32
++		var currentFlavor kueue.ResourceFlavorReference
++		if a.replaceWorkloadSlice != nil {
++			if oldPS := podSetResourcesByName(a.replaceWorkloadSlice.TotalRequests, ps.Name); oldPS != nil && oldPS.Count > 0 {
++				runningCount = oldPS.Count
++				for _, f := range oldPS.Flavors {
++					currentFlavor = f
++					break
++				}
++			}
++		}
++
++		if ps.Count <= runningCount {
++			continue
++		}
++
++		rg := a.resourceGroupForPodSet(psIdx)
++		if rg == nil || len(rg.Flavors) < 2 {
++			continue
++		}
++
++		var flavorOrder []kueue.ResourceFlavorReference
++		if currentFlavor != "" {
++			flavorOrder = append(flavorOrder, currentFlavor)
++			idx := slices.Index(rg.Flavors, currentFlavor)
++			if idx >= 0 {
++				flavorOrder = append(flavorOrder, rg.Flavors[idx+1:]...)
++			} else {
++				flavorOrder = append(flavorOrder, rg.Flavors...)
++			}
++		} else {
++			flavorOrder = append(flavorOrder, rg.Flavors...)
++		}
++
++		type flavorGrant struct {
++			flavor kueue.ResourceFlavorReference
++			count  int32
++		}
++		var grants []flavorGrant
++		remaining := ps.Count
++
++		for _, fName := range flavorOrder {
++			if remaining <= 0 {
++				break
++			}
++			maxOnF := a.maxPodsForFlavor(log, psIdx, ps, rg, fName, currentFlavor, runningCount)
++			if maxOnF <= 0 {
++				continue
++			}
++			canTake := min(remaining, maxOnF)
++
++			if fName == currentFlavor || (currentFlavor == "" && len(grants) == 0) {
++				if floor, ok := floors[base]; ok && canTake < floor {
++					canTake = 0
++				}
++			}
++			if step, ok := steps[base]; ok && step > 1 {
++				if fName == currentFlavor {
++					growth := canTake - runningCount
++					if growth > 0 {
++						growth = (growth / step) * step
++						canTake = runningCount + growth
++					} else {
++						canTake = runningCount
++					}
++				} else {
++					canTake = (canTake / step) * step
++				}
++			}
++			if canTake <= 0 {
++				continue
++			}
++			if fName == currentFlavor && canTake <= runningCount {
++				grants = append(grants, flavorGrant{flavor: fName, count: runningCount})
++				remaining -= runningCount
++				continue
++			}
++			grants = append(grants, flavorGrant{flavor: fName, count: canTake})
++			remaining -= canTake
++		}
++
++		if remaining == 0 && len(grants) > 1 && len(a.wl.Obj.Spec.PodSets)-1+len(grants) <= maxWorkloadPodSets {
++			ps.Count = grants[0].count
++			if ps.MinCount != nil && *ps.MinCount > ps.Count {
++				ps.MinCount = ptr.To(ps.Count)
++			}
++			basePodSet := ps.DeepCopy()
++			if baseIdx := slices.IndexFunc(a.wl.Obj.Spec.PodSets, func(p kueue.PodSet) bool { return p.Name == base }); baseIdx >= 0 {
++				basePodSet = a.wl.Obj.Spec.PodSets[baseIdx].DeepCopy()
++			}
++			for _, g := range grants[1:] {
++				name, ok := nextSplitName(a.wl.Obj.Spec.PodSets, base)
++				if !ok {
++					break
++				}
++				entry := newSplitEntry(basePodSet, name, g.count)
++				a.wl.Obj.Spec.PodSets = append(a.wl.Obj.Spec.PodSets, entry)
++				if _, ok := floors[base]; ok {
++					floors[name] = 0
++				}
++				if step, ok := steps[base]; ok {
++					steps[name] = step
++				}
++			}
++			changed = true
++		}
++	}
++
++	if changed {
++		if len(floors) > 0 {
++			workload.SetReclaimMinCounts(a.wl.Obj, floors)
++		}
++		if len(steps) > 0 {
++			workload.SetPodSetCountSteps(a.wl.Obj, steps)
++		}
++		origCQ := a.wl.ClusterQueue
++		a.wl.Update(log, a.wl.Obj)
++		if origCQ != "" && a.wl.ClusterQueue == "" {
++			a.wl.ClusterQueue = origCQ
++		}
++	}
++	return changed
++}
 +
 +// GrowthFitsOtherFlavorReason ends the message the flavor assigner gives a flavor it skips because
 +// the replaced slice keeps the PodSet on another flavor, when the PodSet's growth over the replaced
@@ -1378,10 +1724,10 @@ index 0000000..7f8fe2e
 +}
 diff --git a/pkg/scheduler/flavorassigner/flavor_split_test.go b/pkg/scheduler/flavorassigner/flavor_split_test.go
 new file mode 100644
-index 0000000..5189e31
+index 0000000..2bb155e
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/flavor_split_test.go
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,481 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1660,11 +2006,225 @@ index 0000000..5189e31
 +		t.Errorf("PodSet[0] cpu flavor = %v, want on-demand", f)
 +	}
 +}
++
++
++func TestGreedyFlavorFill(t *testing.T) {
++	features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++		features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero:        true,
++		features.ElasticJobsViaWorkloadSlicesFlavorSplit:                 true,
++		features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++	})
++	ctx, log := utiltesting.ContextWithLog(t)
++	now := time.Now()
++
++	flavors := map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor{
++		"flavor-a": utiltestingapi.MakeResourceFlavor("flavor-a").
++			NodeLabel("instance-type", "flavor-a").
++			Taint(corev1.Taint{Key: "nvidia.com/gpu", Effect: corev1.TaintEffectNoSchedule}).Obj(),
++		"flavor-b": utiltestingapi.MakeResourceFlavor("flavor-b").
++			NodeLabel("instance-type", "flavor-b").
++			Taint(corev1.Taint{Key: "nvidia.com/gpu", Effect: corev1.TaintEffectNoSchedule}).Obj(),
++	}
++
++	makeWorkers := func(count int) kueue.PodSet {
++		ps := utiltestingapi.MakePodSet("workers", count).
++			Request("nvidia.com/gpu", "1").
++			Toleration(corev1.Toleration{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists}).Obj()
++		ps.MinCount = new(int32)
++		return *ps
++	}
++
++	t.Run("0->24 with 15 free on flavor A (expect 15 on A, 9 on B)", func(t *testing.T) {
++		cq := utiltestingapi.MakeClusterQueue("cq").
++			ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas("flavor-a").Resource("nvidia.com/gpu", "15").Obj(),
++				*utiltestingapi.MakeFlavorQuotas("flavor-b").Resource("nvidia.com/gpu", "20").Obj(),
++			).Obj()
++
++		cache := schdcache.New(utiltesting.NewFakeClient())
++		for _, f := range flavors {
++			cache.AddOrUpdateResourceFlavor(log, f)
++		}
++		if err := cache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++		snapshot, err := cache.Snapshot(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		probe := workload.NewInfo(log, utiltestingapi.MakeWorkload("probe", "default").
++			Annotation("kueue.x-k8s.io/flavor-placement-on-pods", "true").
++			PodSets(makeWorkers(24)).Obj())
++
++		assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, nil,
++			configapi.QuotaCheckBlockUndeclared, resources.NewResourceFormatter(), 0)
++		assignment := assigner.AssignFlavors(ctx, log, nil)
++		if mode := assignment.RepresentativeMode(); mode != Fit {
++			t.Fatalf("AssignFlavors() mode = %s, want Fit", mode)
++		}
++		if len(assignment.PodSets) != 2 {
++			t.Fatalf("AssignFlavors() got %d podsets, want 2", len(assignment.PodSets))
++		}
++		if assignment.PodSets[0].Name != "workers" || assignment.PodSets[0].Count != 15 || assignment.PodSets[0].Flavors["nvidia.com/gpu"].Name != "flavor-a" {
++			t.Errorf("PodSet[0] got %s count %d flavor %v, want workers 15 on flavor-a",
++				assignment.PodSets[0].Name, assignment.PodSets[0].Count, assignment.PodSets[0].Flavors["nvidia.com/gpu"])
++		}
++		if assignment.PodSets[1].Name != "workers--2" || assignment.PodSets[1].Count != 9 || assignment.PodSets[1].Flavors["nvidia.com/gpu"].Name != "flavor-b" {
++			t.Errorf("PodSet[1] got %s count %d flavor %v, want workers--2 9 on flavor-b",
++				assignment.PodSets[1].Name, assignment.PodSets[1].Count, assignment.PodSets[1].Flavors["nvidia.com/gpu"])
++		}
++	})
++
++	t.Run("growth 8->24 with 7 free on A (expect A 15, B 9)", func(t *testing.T) {
++		cq := utiltestingapi.MakeClusterQueue("cq").
++			ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas("flavor-a").Resource("nvidia.com/gpu", "15").Obj(),
++				*utiltestingapi.MakeFlavorQuotas("flavor-b").Resource("nvidia.com/gpu", "20").Obj(),
++			).Obj()
++
++		replaced := utiltestingapi.MakeWorkload("slice", "default").
++			Annotation("kueue.x-k8s.io/flavor-placement-on-pods", "true").
++			PodSets(makeWorkers(8)).
++			ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++				utiltestingapi.MakePodSetAssignment("workers").Count(8).Assignment("nvidia.com/gpu", "flavor-a", "8").Obj()).Obj(), now).
++			Obj()
++
++		cache := schdcache.New(utiltesting.NewFakeClient())
++		for _, f := range flavors {
++			cache.AddOrUpdateResourceFlavor(log, f)
++		}
++		if err := cache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++		if !cache.AddOrUpdateWorkload(ctx, log, replaced) {
++			t.Fatal("Could not add the replaced slice to the cache")
++		}
++		snapshot, err := cache.Snapshot(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		probe := workload.NewInfo(log, utiltestingapi.MakeWorkload("probe", "default").
++			Annotation("kueue.x-k8s.io/flavor-placement-on-pods", "true").
++			PodSets(makeWorkers(24)).Obj())
++
++		assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, workload.NewInfo(log, replaced),
++			configapi.QuotaCheckBlockUndeclared, resources.NewResourceFormatter(), 0)
++		assignment := assigner.AssignFlavors(ctx, log, nil)
++		if mode := assignment.RepresentativeMode(); mode != Fit {
++			t.Fatalf("AssignFlavors() mode = %s, want Fit", mode)
++		}
++		if len(assignment.PodSets) != 2 {
++			t.Fatalf("AssignFlavors() got %d podsets, want 2", len(assignment.PodSets))
++		}
++		if assignment.PodSets[0].Name != "workers" || assignment.PodSets[0].Count != 15 || assignment.PodSets[0].Flavors["nvidia.com/gpu"].Name != "flavor-a" {
++			t.Errorf("PodSet[0] got %s count %d flavor %v, want workers 15 on flavor-a",
++				assignment.PodSets[0].Name, assignment.PodSets[0].Count, assignment.PodSets[0].Flavors["nvidia.com/gpu"])
++		}
++		if assignment.PodSets[1].Name != "workers--2" || assignment.PodSets[1].Count != 9 || assignment.PodSets[1].Flavors["nvidia.com/gpu"].Name != "flavor-b" {
++			t.Errorf("PodSet[1] got %s count %d flavor %v, want workers--2 9 on flavor-b",
++				assignment.PodSets[1].Name, assignment.PodSets[1].Count, assignment.PodSets[1].Flavors["nvidia.com/gpu"])
++		}
++	})
++
++	t.Run("steps of 2 with 15 free (expect 14 on A)", func(t *testing.T) {
++		cq := utiltestingapi.MakeClusterQueue("cq").
++			ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas("flavor-a").Resource("nvidia.com/gpu", "15").Obj(),
++				*utiltestingapi.MakeFlavorQuotas("flavor-b").Resource("nvidia.com/gpu", "20").Obj(),
++			).Obj()
++
++		cache := schdcache.New(utiltesting.NewFakeClient())
++		for _, f := range flavors {
++			cache.AddOrUpdateResourceFlavor(log, f)
++		}
++		if err := cache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++		snapshot, err := cache.Snapshot(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		probe := workload.NewInfo(log, utiltestingapi.MakeWorkload("probe", "default").
++			Annotation("kueue.x-k8s.io/flavor-placement-on-pods", "true").
++			Annotation("kueue.x-k8s.io/podset-count-steps", "workers=2").
++			PodSets(makeWorkers(24)).Obj())
++
++		assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, nil,
++			configapi.QuotaCheckBlockUndeclared, resources.NewResourceFormatter(), 0)
++		assignment := assigner.AssignFlavors(ctx, log, nil)
++		if mode := assignment.RepresentativeMode(); mode != Fit {
++			t.Fatalf("AssignFlavors() mode = %s, want Fit", mode)
++		}
++		if len(assignment.PodSets) != 2 {
++			t.Fatalf("AssignFlavors() got %d podsets, want 2", len(assignment.PodSets))
++		}
++		if assignment.PodSets[0].Name != "workers" || assignment.PodSets[0].Count != 14 || assignment.PodSets[0].Flavors["nvidia.com/gpu"].Name != "flavor-a" {
++			t.Errorf("PodSet[0] got %s count %d flavor %v, want workers 14 on flavor-a",
++				assignment.PodSets[0].Name, assignment.PodSets[0].Count, assignment.PodSets[0].Flavors["nvidia.com/gpu"])
++		}
++		if assignment.PodSets[1].Name != "workers--2" || assignment.PodSets[1].Count != 10 || assignment.PodSets[1].Flavors["nvidia.com/gpu"].Name != "flavor-b" {
++			t.Errorf("PodSet[1] got %s count %d flavor %v, want workers--2 10 on flavor-b",
++				assignment.PodSets[1].Name, assignment.PodSets[1].Count, assignment.PodSets[1].Flavors["nvidia.com/gpu"])
++		}
++	})
++
++	t.Run("nothing free on A (expect all on B, as today)", func(t *testing.T) {
++		cq := utiltestingapi.MakeClusterQueue("cq").
++			ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas("flavor-a").Resource("nvidia.com/gpu", "0").Obj(),
++				*utiltestingapi.MakeFlavorQuotas("flavor-b").Resource("nvidia.com/gpu", "24").Obj(),
++			).Obj()
++
++		cache := schdcache.New(utiltesting.NewFakeClient())
++		for _, f := range flavors {
++			cache.AddOrUpdateResourceFlavor(log, f)
++		}
++		if err := cache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++		snapshot, err := cache.Snapshot(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		probe := workload.NewInfo(log, utiltestingapi.MakeWorkload("probe", "default").
++			Annotation("kueue.x-k8s.io/flavor-placement-on-pods", "true").
++			PodSets(makeWorkers(24)).Obj())
++
++		assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, nil,
++			configapi.QuotaCheckBlockUndeclared, resources.NewResourceFormatter(), 0)
++		assignment := assigner.AssignFlavors(ctx, log, nil)
++		if mode := assignment.RepresentativeMode(); mode != Fit {
++			t.Fatalf("AssignFlavors() mode = %s, want Fit", mode)
++		}
++		if len(assignment.PodSets) != 1 {
++			t.Fatalf("AssignFlavors() got %d podsets, want 1", len(assignment.PodSets))
++		}
++		if assignment.PodSets[0].Name != "workers" || assignment.PodSets[0].Count != 24 || assignment.PodSets[0].Flavors["nvidia.com/gpu"].Name != "flavor-b" {
++			t.Errorf("PodSet[0] got %s count %d flavor %v, want workers 24 on flavor-b",
++				assignment.PodSets[0].Name, assignment.PodSets[0].Count, assignment.PodSets[0].Flavors["nvidia.com/gpu"])
++		}
++	})
++}
 diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
-index def383f..59e6970 100644
+index def383f..f38d66a 100644
 --- a/pkg/scheduler/flavorassigner/flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/flavorassigner.go
-@@ -373,6 +373,17 @@ func (a *FlavorAssigner) AssignFlavors(
+@@ -293,6 +293,10 @@ func (a *FlavorAssigner) AssignFlavors(
+ 	log logr.Logger,
+ 	counts workload.PodSetsCounts,
+ ) Assignment {
++	if features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorSplit) && counts == nil && a.isElasticWorkload() {
++		a.tryGreedySplit(ctx, log)
++	}
++
+ 	// Second-pass requests follow admission order, while flavor scan state follows
+ 	// spec order. Use the request's spec index for the lookups below.
+ 	specIndexes := podset.SpecIndexes(a.wl.Obj.Spec.PodSets, a.wl.TotalRequests,
+@@ -373,6 +377,17 @@ func (a *FlavorAssigner) AssignFlavors(
  			}
  		}
  
@@ -1682,7 +2242,7 @@ index def383f..59e6970 100644
  		psIdx := specIndexes[i]
  		groupKey := tas.GroupKeyForPodSet(&a.wl.Obj.Spec.PodSets[psIdx])
  
-@@ -889,6 +900,9 @@ func (a *FlavorAssigner) findFlavorForPodSets(
+@@ -889,6 +904,9 @@ func (a *FlavorAssigner) findFlavorForPodSets(
  						// Flavor mismatch. Skip further checks for this resource.
  						representativeMode = worstGranularMode()
  						msg := fmt.Sprintf("could not assign %s flavor since the original workload is assigned: %s", fName, originalFlavor)
@@ -1798,6 +2358,49 @@ index 0000000..590423c
 +		t.Errorf("GetTargets() (-want,+got):\n%s", diff)
 +	}
 +}
+diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
+index 2fb96f1..c062413 100644
+--- a/pkg/scheduler/scheduler.go
++++ b/pkg/scheduler/scheduler.go
+@@ -32,6 +32,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/client-go/tools/events"
++	"k8s.io/client-go/util/retry"
+ 	"k8s.io/klog/v2"
+ 	"k8s.io/utils/clock"
+ 	ctrl "sigs.k8s.io/controller-runtime"
+@@ -1092,6 +1093,30 @@ func (s *Scheduler) patchWorkloadAdmission(
+ 	cq *schdcache.ClusterQueueSnapshot,
+ 	admission *kueue.Admission,
+ ) error {
++	if features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorSplit) && workloadslicing.HasSplitEntries(wl.Spec.PodSets) && s.client != nil {
++		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
++			var live kueue.Workload
++			if getErr := s.client.Get(ctx, client.ObjectKeyFromObject(wl), &live); getErr != nil {
++				return getErr
++			}
++			live.Spec.PodSets = slices.Clone(wl.Spec.PodSets)
++			if live.Annotations == nil {
++				live.Annotations = make(map[string]string)
++			}
++			for k, v := range wl.Annotations {
++				live.Annotations[k] = v
++			}
++			if updateErr := s.client.Update(ctx, &live); updateErr != nil {
++				return updateErr
++			}
++			wl.ResourceVersion = live.ResourceVersion
++			wl.Generation = live.Generation
++			return nil
++		})
++		if err != nil {
++			return err
++		}
++	}
+ 	replacedNodeName := workload.FirstUnhealthyNodeName(wl)
+ 	patchOptions := []workloadpatching.PatchStatusOption{
+ 		workloadpatching.WithRetryOnConflict(),
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
 new file mode 100644
 index 0000000..8d9a02e

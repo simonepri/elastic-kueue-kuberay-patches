@@ -840,10 +840,10 @@ index 0000000..590423c
 +}
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
 new file mode 100644
-index 0000000..a10cec2
+index 0000000..72f6acc
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split.go
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,344 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1029,8 +1029,20 @@ index 0000000..a10cec2
 +	entry.Name = name
 +	entry.Count = count
 +	entry.MinCount = nil
++	if !placesByTopology(entry.TopologyRequest) {
++		// Only the pod index labels, which describe the job PodSet's pods as a whole.
++		entry.TopologyRequest = nil
++	}
 +	metav1.SetMetaDataAnnotation(&entry.Template.ObjectMeta, FlavorSplitOfAnnotation, string(base.Name))
 +	return entry
++}
++
++// placesByTopology reports whether the topology request constrains where the pods go, which a split
++// entry cannot honor for pods spread over several entries. A request that only names the pod index
++// labels, as the RayCluster integration writes for every worker group, does not.
++func placesByTopology(tr *kueue.PodSetTopologyRequest) bool {
++	return tr != nil && (tr.Required != nil || tr.Preferred != nil || ptr.Deref(tr.Unconstrained, false) ||
++		tr.PodSetGroupName != nil || tr.PodSetSliceRequiredTopology != nil)
 +}
 +
 +// nextSplitName returns the first "<base>--<n>" name, from n = 2, that no PodSet uses, and false
@@ -1145,7 +1157,7 @@ index 0000000..a10cec2
 +		idxs := groups[base]
 +		newest := &probe.Spec.PodSets[idxs[len(idxs)-1]]
 +		have, found := running[newest.Name]
-+		if !found || have == 0 || newest.Count <= have || newest.TopologyRequest != nil || steps[base] > 1 {
++		if !found || have == 0 || newest.Count <= have || placesByTopology(newest.TopologyRequest) || steps[base] > 1 {
 +			continue
 +		}
 +		name, ok := nextSplitName(probe.Spec.PodSets, base)
@@ -1178,10 +1190,10 @@ index 0000000..a10cec2
 +}
 diff --git a/pkg/workloadslicing/flavor_split_test.go b/pkg/workloadslicing/flavor_split_test.go
 new file mode 100644
-index 0000000..ac13f51
+index 0000000..fef3c29
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split_test.go
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,532 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1461,6 +1473,12 @@ index 0000000..ac13f51
 +				PodSets(*utiltestingapi.MakePodSet("workers", 12).RequiredTopologyRequest("rack").Request(corev1.ResourceCPU, "1").Obj()).Obj(),
 +			replaced: admitted(plainPodSet("workers", 8)),
 +			want:     workload.PodSetsCounts{"workers": 12},
++		},
++		"a PodSet whose topology request only names pod index labels is split": {
++			probe: utiltestingapi.MakeWorkload("probe", "ns").
++				PodSets(*utiltestingapi.MakePodSet("workers", 12).PodIndexLabel(ptr.To("ray.io/worker-group-replica-index")).Request(corev1.ResourceCPU, "1").Obj()).Obj(),
++			replaced: admitted(plainPodSet("workers", 8)),
++			want:     workload.PodSetsCounts{"workers": 8, "workers--2": 4},
 +		},
 +		"a Workload with the most PodSets the API allows is not split": {
 +			probe: func() *kueue.Workload {

@@ -1,15 +1,17 @@
 diff --git a/ray-operator/controllers/ray/scalegate_controller.go b/ray-operator/controllers/ray/scalegate_controller.go
 new file mode 100644
-index 0000000..0bb3587
+index 0000000..751c638
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller.go
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,554 @@
 +package ray
 +
 +import (
 +	"context"
 +	"fmt"
 +	"math"
++	"os"
++	"strconv"
 +	"strings"
 +
 +	"k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +31,11 @@ index 0000000..0bb3587
 +// unlimitedQuota marks a quota that this ClusterQueue alone does not bound.
 +const unlimitedQuota = int64(math.MaxInt64)
 +
++// flavorSplitEnv names the operator environment variable that, set to true, makes ScaleGate bound a worker group by
++// the sum of its flavors in a resource group rather than the largest one. Set it when Kueue runs with the
++// ElasticJobsViaWorkloadSlicesFlavorSplit gate, which lets one worker group span flavors through split pod sets.
++const flavorSplitEnv = "SCALEGATE_FLAVOR_SPLIT"
++
 +// kueueVersions lists the Kueue API versions ScaleGate reads, newest first.
 +var kueueVersions = []string{"v1beta2", "v1beta1"}
 +
@@ -39,6 +46,8 @@ index 0000000..0bb3587
 +type ScaleGateReconciler struct {
 +	client.Client
 +	Scheme *runtime.Scheme
++	// FlavorSplit sums the flavors of a resource group in the bound, as Kueue may split a worker group across them.
++	FlavorSplit bool
 +}
 +
 +// flavorQuota maps each resource a flavor offers to the most of it one ClusterQueue can use on that flavor.
@@ -58,8 +67,9 @@ index 0000000..0bb3587
 +// maxWorkers returns how many workers needing unit fit in the quota, and false when the quota does not bound them.
 +// Resource groups hold different resources, so every group a worker needs must fit it: the bound is the minimum
 +// over groups. Kueue may place the worker on any flavor of a group, so a group fits as many workers as its
-+// largest flavor: the bound within a group is the maximum over flavors.
-+func (q clusterQueueQuota) maxWorkers(unit map[string]int64) (int64, bool) {
++// largest flavor: the bound within a group is the maximum over flavors. With flavorSplit, Kueue may run one worker
++// group on several flavors of a group at once, so the bound within a group is the sum over flavors.
++func (q clusterQueueQuota) maxWorkers(unit map[string]int64, flavorSplit bool) (int64, bool) {
 +	bound := unlimitedQuota
 +	for _, group := range q.groups {
 +		var needed []string
@@ -84,7 +94,14 @@ index 0000000..0bb3587
 +					fit = min(fit, limit/unit[res])
 +				}
 +			}
-+			best = max(best, fit)
++			switch {
++			case !flavorSplit:
++				best = max(best, fit)
++			case fit == unlimitedQuota || best == unlimitedQuota:
++				best = unlimitedQuota
++			default:
++				best += fit
++			}
 +		}
 +		bound = min(bound, best)
 +	}
@@ -146,7 +163,7 @@ index 0000000..0bb3587
 +			if !ok {
 +				continue
 +			}
-+			bound, ok := quota.maxWorkers(extractWorkerUnitResources(wgMap))
++			bound, ok := quota.maxWorkers(extractWorkerUnitResources(wgMap), r.FlavorSplit)
 +			if !ok {
 +				continue
 +			}
@@ -531,6 +548,9 @@ index 0000000..0bb3587
 +}
 +
 +func (r *ScaleGateReconciler) SetupWithManager(mgr ctrl.Manager) error {
++	if enabled, err := strconv.ParseBool(os.Getenv(flavorSplitEnv)); err == nil && enabled {
++		r.FlavorSplit = true
++	}
 +	rc := &unstructured.Unstructured{}
 +	rc.SetGroupVersionKind(rayClusterGVK)
 +	return ctrl.NewControllerManagedBy(mgr).
@@ -540,10 +560,10 @@ index 0000000..0bb3587
 +}
 diff --git a/ray-operator/controllers/ray/scalegate_controller_unit_test.go b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
 new file mode 100644
-index 0000000..a6d02b3
+index 0000000..7653185
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
-@@ -0,0 +1,632 @@
+@@ -0,0 +1,659 @@
 +package ray
 +
 +import (
@@ -999,7 +1019,34 @@ index 0000000..a6d02b3
 +	}
 +	for _, tc := range tests {
 +		t.Run(tc.name, func(t *testing.T) {
-+			got, bound := tc.quota.maxWorkers(unit)
++			got, bound := tc.quota.maxWorkers(unit, false)
++			if bound != tc.wantBound || (bound && got != tc.want) {
++				t.Errorf("maxWorkers = %d, %v; want %d, %v", got, bound, tc.want, tc.wantBound)
++			}
++		})
++	}
++}
++
++// With Kueue's flavor split, a worker group may run on every flavor of a resource group at once.
++func TestClusterQueueQuotaMaxWorkersFlavorSplit(t *testing.T) {
++	unit := map[string]int64{"nvidia.com/gpu": 1}
++	group := func(flavors ...flavorQuota) clusterQueueQuota {
++		return clusterQueueQuota{groups: []resourceGroupQuota{{covered: map[string]bool{"nvidia.com/gpu": true}, flavors: flavors}}}
++	}
++	tests := []struct {
++		name        string
++		quota       clusterQueueQuota
++		flavorSplit bool
++		want        int64
++		wantBound   bool
++	}{
++		{name: "the largest flavor without the split", quota: group(flavorQuota{"nvidia.com/gpu": 8}, flavorQuota{"nvidia.com/gpu": 4}), want: 8, wantBound: true},
++		{name: "the sum of the flavors with the split", quota: group(flavorQuota{"nvidia.com/gpu": 8}, flavorQuota{"nvidia.com/gpu": 4}), flavorSplit: true, want: 12, wantBound: true},
++		{name: "an unbounded flavor leaves the group unbounded", quota: group(flavorQuota{"nvidia.com/gpu": 8}, flavorQuota{"nvidia.com/gpu": unlimitedQuota}), flavorSplit: true, wantBound: false},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			got, bound := tc.quota.maxWorkers(unit, tc.flavorSplit)
 +			if bound != tc.wantBound || (bound && got != tc.want) {
 +				t.Errorf("maxWorkers = %d, %v; want %d, %v", got, bound, tc.want, tc.wantBound)
 +			}

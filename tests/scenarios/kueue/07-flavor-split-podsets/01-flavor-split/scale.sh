@@ -18,7 +18,7 @@ for arg in "$@"; do
   fi
   delete="$delete $names"
 done
-list=$(printf '%s\n' $delete | jq -R . | jq -cs .)
+list=$(printf '%s\n' $delete | jq -R 'select(. != "")' | jq -cs .)
 kubectl -n "$NS" patch raycluster "$cluster" --type=json -p "[
   {\"op\":\"replace\",\"path\":\"/spec/workerGroupSpecs/0/replicas\",\"value\":$replicas},
   {\"op\":\"add\",\"path\":\"/spec/workerGroupSpecs/0/scaleStrategy\",\"value\":{\"workersToDelete\":$list}}]"

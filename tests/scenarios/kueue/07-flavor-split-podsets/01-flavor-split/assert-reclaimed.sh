@@ -6,10 +6,10 @@ cluster=flavor-split-cluster
 state() {
   pods=$(kubectl -n "$NS" get pods -l "ray.io/cluster=$cluster,ray.io/group=workers" -o json)
   ungated() {
-    echo "$pods" | jq --arg e "$1" '[.items[] | select(.metadata.labels["kueue.x-k8s.io/podset"] == $e
+    printf "%s" "$pods" | jq --arg e "$1" '[.items[] | select(.metadata.labels["kueue.x-k8s.io/podset"] == $e
       and (.spec.schedulingGates // []) == [] and .metadata.deletionTimestamp == null)] | length'
   }
-  gated=$(echo "$pods" | jq '[.items[] | select((.spec.schedulingGates // []) != [])] | length')
+  gated=$(printf "%s" "$pods" | jq '[.items[] | select((.spec.schedulingGates // []) != [])] | length')
   suspended=$(kubectl -n "$NS" get raycluster "$cluster" -o jsonpath='{.spec.suspend}')
   lender=$(kubectl -n "$NS" get workloads -o json | jq -r '[.items[] | select(any(.metadata.ownerReferences[]?; .name == "flavor-split-lender-job"))
     | select(.status.admission != null)] | length')

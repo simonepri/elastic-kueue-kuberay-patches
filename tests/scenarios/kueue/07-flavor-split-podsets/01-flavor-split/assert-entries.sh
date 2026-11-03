@@ -9,13 +9,13 @@ want=$(printf '%s\n' "$@" | sort | tr '\n' ' ')
 state() {
   wl=$(kubectl -n "$NS" get workloads -o json | jq -c '[.items[] | select(any(.metadata.ownerReferences[]?; .name == "'"$cluster"'"))
     | select(.status.admission != null and all(.status.conditions[]?; .type != "Finished" or .status != "True"))]')
-  if [ "$(echo "$wl" | jq length)" -ne 1 ]; then
-    echo "admitted=$(echo "$wl" | jq length)"
+  if [ "$(printf "%s" "$wl" | jq length)" -ne 1 ]; then
+    echo "admitted=$(printf "%s" "$wl" | jq length)"
     return
   fi
   pods=$(kubectl -n "$NS" get pods -l "ray.io/cluster=$cluster,ray.io/group=workers" -o json | jq -c '[.items[]
     | select((.spec.schedulingGates // []) == [] and .metadata.deletionTimestamp == null)]')
-  echo "$wl" | jq -r --argjson pods "$pods" '.[0] as $w | $w.spec.podSets[] | select(.name != "head") | .name as $n
+  printf "%s" "$wl" | jq -r --argjson pods "$pods" '.[0] as $w | $w.spec.podSets[] | select(.name != "head") | .name as $n
     | ($w.status.admission.podSetAssignments[] | select(.name == $n) | .flavors["nvidia.com/gpu"]) as $f
     | ([$pods[] | select(.metadata.labels["kueue.x-k8s.io/podset"] == $n and .spec.nodeSelector["instance-type"] == $f)] | length) as $running
     | if .count == 0 and $running == 0 then "\($n)=0" elif $running == .count then "\($n)=\(.count)@\($f)" else "\($n)=\(.count)@\($f)/running=\($running)" end' | sort | tr '\n' ' '

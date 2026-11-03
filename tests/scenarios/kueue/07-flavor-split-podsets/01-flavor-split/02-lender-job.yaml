@@ -1,0 +1,25 @@
+# The lender's job asks for all 8 GPUs of flavor-a, which the team borrows.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flavor-split-lender-job
+  labels:
+    kueue.x-k8s.io/queue-name: lq-flavor-split-lender
+spec:
+  parallelism: 8
+  completions: 8
+  template:
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: train
+          image: busybox:latest
+          command: ["sleep", "60"]
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+      restartPolicy: Never

@@ -372,6 +372,11 @@ kubectl apply --server-side --force-conflicts -f https://raw.githubusercontent.c
 
 # 5. Install KubeRay operator directly with patched image, ko entrypoint, and RBAC
 echo "Installing KubeRay operator with patched image..."
+# The ScaleGate bounds a worker group by the sum of its flavors when Kueue may split it across them.
+case ",$KUEUE_FEATURE_GATES," in
+  *,ElasticJobsViaWorkloadSlicesFlavorSplit=true,*) scalegate_flavor_split=true ;;
+  *) scalegate_flavor_split=false ;;
+esac
 helm repo add kuberay https://ray-project.github.io/kuberay-helm/ || true
 helm repo update
 helm template kuberay-operator kuberay/kuberay-operator \
@@ -381,6 +386,8 @@ helm template kuberay-operator kuberay/kuberay-operator \
   --set leaderElectionEnabled=false \
   --set env[0].name=KUBERAY_SPOT_INTERRUPTION_NOTICES \
   --set-string env[0].value=true \
+  --set env[1].name=SCALEGATE_FLAVOR_SPLIT \
+  --set-string env[1].value="$scalegate_flavor_split" \
   --set resources.limits.cpu=2 \
   --set resources.limits.memory=2Gi \
   --set resources.requests.cpu=500m \

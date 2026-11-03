@@ -1,0 +1,2143 @@
+Let one elastic PodSet span flavors through split PodSets of the same Workload.
+
+A Workload PodSet has one flavor per resource, and a scale-up slice keeps each
+PodSet on the flavor of the slice it replaces while it has pods. An elastic
+worker group whose growth does not fit on that flavor stays pending even when
+the next flavor in the ClusterQueue has room, and a second Workload for the
+overflow would break the one-Workload-per-job rule of KEP-77.
+
+With ElasticJobsViaWorkloadSlicesFlavorSplit on, the flavor assigner notes in a
+refused replacement slice's message when a PodSet's growth would fit on a flavor
+that the sticky-flavor check skipped. Once the scheduler has refused a pending
+scale-up probe with that note, the job reconciler keeps each PodSet's
+newest entry at what the replaced slice runs and moves the growth to a split
+entry, <podSet>--<n>, marked with the template annotation
+kueue.x-k8s.io/flavor-split-of. The new entry is absent from the replaced slice,
+so the flavor assigner gives it the first flavor that fits. Where Kueue matches
+job PodSets with slice PodSets, the job's counts are mapped onto the entries:
+growth goes to the newest entry, a shrink of an admitted slice follows the pods
+the job's controller deleted, and newest entries shrink first among pods not
+started yet. New slices carry the entries and drop those at 0. The
+ElasticJobUngater starts each gated pod in an entry with room, writing the entry
+in the pod's kueue.x-k8s.io/podset label with the entry's flavor placement.
+Split entries get floor 0 and their PodSet's step, so partial preemption of one
+flavor stops only that flavor's pods. The job gets the PodSet info of its own
+PodSets only. Everything but the split itself follows the entries, not the gate.
+
+diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
+index a1eb815..630e308 100644
+--- a/pkg/controller/elasticjobs/elastic_job_ungater.go
++++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
+@@ -141,7 +141,7 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
+ 		return reconcile.Result{}, err
+ 	}
+ 
+-	pods, err := r.podsToUngate(ctx, active)
++	pods, entries, err := r.podsToUngate(ctx, active)
+ 	if err != nil {
+ 		return reconcile.Result{}, err
+ 	}
+@@ -161,11 +161,18 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
+ 		var ungated bool
+ 		e := utilclient.Patch(ctx, r.client, pod, func() (bool, error) {
+ 			podSetName := kueue.PodSetReference(pod.Labels[constants.PodSetLabel])
++			relabeled := false
++			if entry, found := entries[pod.Name]; found && entry != podSetName {
++				// The pod starts in a split entry of its PodSet and stays in it for life.
++				pod.Labels[constants.PodSetLabel] = string(entry)
++				podSetName, relabeled = entry, true
++			}
+ 			update, err := r.admissionUpdate(ctx, active, podSetName)
+ 			if err != nil {
+ 				return false, err
+ 			}
+ 			changed, err := refreshPodAdmission(pod, update)
++			changed = changed || relabeled
+ 			if err != nil {
+ 				return false, err
+ 			}
+@@ -268,7 +275,7 @@ func refreshPodAdmission(pod *corev1.Pod, update podAdmissionUpdate) (bool, erro
+ 	return changed, nil
+ }
+ 
+-func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload) ([]*corev1.Pod, error) {
++func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload) ([]*corev1.Pod, map[string]kueue.PodSetReference, error) {
+ 	// All pods in the slice chain share the same WorkloadSliceNameAnnotation,
+ 	// so the index lookup returns every pod created on behalf of this job.
+ 	// Although those pods may still carry an older slice's name in their
+@@ -278,7 +285,7 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
+ 	sliceName := workloadslicing.SliceName(wl)
+ 	pods, err := workloadslicing.ListPodsForWorkloadSlice(ctx, r.client, wl.Namespace, sliceName)
+ 	if err != nil {
+-		return nil, fmt.Errorf("listing pods for workload slice: %w", err)
++		return nil, nil, fmt.Errorf("listing pods for workload slice: %w", err)
+ 	}
+ 
+ 	granted := workload.ExtractGrantedPodSetCounts(wl)
+@@ -297,13 +304,13 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
+ 				var err error
+ 				update, err = r.admissionUpdate(ctx, wl, ps)
+ 				if err != nil {
+-					return nil, err
++					return nil, nil, err
+ 				}
+ 				admissionUpdates[ps] = update
+ 			}
+ 			if !podAdmissionCompatible(p, update) {
+ 				if recycled, err := r.recycleStalePod(ctx, wl, p, ps, update); err != nil {
+-					return nil, err
++					return nil, nil, err
+ 				} else if recycled {
+ 					continue
+ 				}
+@@ -321,7 +328,11 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
+ 	log := ctrl.LoggerFrom(ctx)
+ 	steps := workload.PodSetCountSteps(wl)
+ 	var gated []*corev1.Pod
++	groups := splitGroupsOf(wl)
+ 	for ps, candidates := range gatedPerPodSet {
++		if _, split := groups.entryOf[ps]; split {
++			continue
++		}
+ 		room := granted[ps] - ungatedPerPodSet[ps]
+ 		var toUngate []*corev1.Pod
+ 		if room > 0 {
+@@ -345,7 +356,16 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
+ 		)
+ 		gated = append(gated, toUngate...)
+ 	}
+-	return gated, nil
++	entries, err := r.ungateSplitGroups(ctx, wl, groups, gatedPerPodSet, ungatedPerPodSet, granted, admissionUpdates)
++	if err != nil {
++		return nil, nil, err
++	}
++	for _, p := range pods {
++		if _, found := entries[p.Name]; found {
++			gated = append(gated, p)
++		}
++	}
++	return gated, entries, nil
+ }
+ 
+ // Workload predicates
+diff --git a/pkg/controller/elasticjobs/ungate_split_entries.go b/pkg/controller/elasticjobs/ungate_split_entries.go
+new file mode 100644
+index 0000000..e0dec0d
+--- /dev/null
++++ b/pkg/controller/elasticjobs/ungate_split_entries.go
+@@ -0,0 +1,118 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Picks the gated pods of a PodSet with flavor-split entries and the entry each one starts in.
++
++package elasticjobs
++
++import (
++	"context"
++	"maps"
++	"slices"
++	"strings"
++
++	corev1 "k8s.io/api/core/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// splitGroups lists the entries of each PodSet of a Workload that has split entries.
++type splitGroups struct {
++	// entries holds, for each PodSet with split entries, its own entry and then its split
++	// entries, in spec order.
++	entries map[kueue.PodSetReference][]kueue.PodSetReference
++	// entryOf maps every entry in entries to its PodSet.
++	entryOf map[kueue.PodSetReference]kueue.PodSetReference
++}
++
++func splitGroupsOf(wl *kueue.Workload) splitGroups {
++	g := splitGroups{
++		entries: map[kueue.PodSetReference][]kueue.PodSetReference{},
++		entryOf: map[kueue.PodSetReference]kueue.PodSetReference{},
++	}
++	for i := range wl.Spec.PodSets {
++		if ps := &wl.Spec.PodSets[i]; workloadslicing.IsSplitEntry(ps) {
++			base := workloadslicing.SplitBase(ps)
++			if len(g.entries[base]) == 0 {
++				g.entries[base] = []kueue.PodSetReference{base}
++				g.entryOf[base] = base
++			}
++			g.entries[base] = append(g.entries[base], ps.Name)
++			g.entryOf[ps.Name] = base
++		}
++	}
++	return g
++}
++
++// ungateSplitGroups picks, for each PodSet with split entries, the gated pods to start and the
++// entry each starts in. The job's controller creates every pod of the PodSet with its own name
++// in the kueue.x-k8s.io/podset label, so its gated pods are shared by its entries: the PodSet's
++// own entry takes them first, then each split entry in order, each up to its granted count less
++// the pods already running in it, the lowest-named pods first. A pod goes to a split entry only
++// if it can take the entry's placement. The ungater then writes the entry in the pod's label,
++// which the pod keeps, so its running pods are counted, and stopped by partial preemption, in
++// that entry only.
++func (r *elasticJobUngater) ungateSplitGroups(
++	ctx context.Context,
++	wl *kueue.Workload,
++	groups splitGroups,
++	gated map[kueue.PodSetReference][]*corev1.Pod,
++	running, granted workload.PodSetsCounts,
++	updates map[kueue.PodSetReference]podAdmissionUpdate,
++) (map[string]kueue.PodSetReference, error) {
++	assigned := map[string]kueue.PodSetReference{}
++	byName := func(a, b *corev1.Pod) int { return strings.Compare(a.Name, b.Name) }
++	for _, base := range slices.Sorted(maps.Keys(groups.entries)) {
++		shared := slices.SortedFunc(slices.Values(gated[base]), byName)
++		for _, entry := range groups.entries[base] {
++			room := granted[entry] - running[entry]
++			if room <= 0 {
++				continue
++			}
++			update, found := updates[entry]
++			if !found {
++				var err error
++				if update, err = r.admissionUpdate(ctx, wl, entry); err != nil {
++					return nil, err
++				}
++				updates[entry] = update
++			}
++			// A gated pod that already has the entry's label goes first.
++			if entry != base {
++				for _, p := range slices.SortedFunc(slices.Values(gated[entry]), byName) {
++					if room == 0 {
++						break
++					}
++					assigned[p.Name] = entry
++					room--
++				}
++			}
++			rest := shared[:0:0]
++			for _, p := range shared {
++				if room > 0 && podAdmissionCompatible(p, update) {
++					assigned[p.Name] = entry
++					room--
++					continue
++				}
++				rest = append(rest, p)
++			}
++			shared = rest
++		}
++	}
++	return assigned, nil
++}
+diff --git a/pkg/controller/elasticjobs/ungate_split_entries_test.go b/pkg/controller/elasticjobs/ungate_split_entries_test.go
+new file mode 100644
+index 0000000..5c11513
+--- /dev/null
++++ b/pkg/controller/elasticjobs/ungate_split_entries_test.go
+@@ -0,0 +1,156 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package elasticjobs
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	gocmp "github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	testingclock "k8s.io/utils/clock/testing"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/util/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func TestUngateSplitEntries(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	spotToleration := corev1.Toleration{Key: "example.com/spot", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}
++	flavors := []client.Object{
++		utiltestingapi.MakeResourceFlavor("reserved").NodeLabel("example.com/pool", "reserved").Obj(),
++		utiltestingapi.MakeResourceFlavor("spot").NodeLabel("example.com/pool", "spot").Toleration(spotToleration).Obj(),
++	}
++	const split kueue.PodSetReference = "workers--2"
++	// wl runs workers on "reserved" with reserved pods granted, and the split entry on "spot"
++	// with spot pods granted.
++	wl := func(reserved, spot int32) *kueue.Workload {
++		w := utiltestingapi.MakeWorkload("wl", "ns").
++			Finalizers(kueue.ResourceInUseFinalizerName).
++			Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Annotation(workloadslicing.FlavorPlacementOnPodsAnnotation, "true").
++			ControllerReference(rayClusterGVK, "ray", "ray-uid").
++			PodSets(
++				*utiltestingapi.MakePodSet(workersPodSet, int(reserved)).Request(corev1.ResourceCPU, "1").Obj(),
++				*utiltestingapi.MakePodSet(split, int(spot)).
++					Annotations(map[string]string{workloadslicing.FlavorSplitOfAnnotation: string(workersPodSet)}).
++					Request(corev1.ResourceCPU, "1").Obj(),
++			).
++			ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++				utiltestingapi.MakePodSetAssignment(workersPodSet).Count(reserved).Assignment(corev1.ResourceCPU, "reserved", "1").Obj(),
++				utiltestingapi.MakePodSetAssignment(split).Count(spot).Assignment(corev1.ResourceCPU, "spot", "1").Obj(),
++			).Obj(), now).
++			AdmittedAt(true, now).
++			Obj()
++		w.CreationTimestamp = metav1.NewTime(now)
++		return w
++	}
++	gated := func(name string, podSet kueue.PodSetReference) *corev1.Pod {
++		return makeElasticPodForPodSet(name, podSet).Gate(kueue.ElasticJobSchedulingGate).CreationTimestamp(now).Obj()
++	}
++	running := func(name string, podSet kueue.PodSetReference) *corev1.Pod {
++		return makeElasticPodForPodSet(name, podSet).CreationTimestamp(now).Obj()
++	}
++	onReserved := func(name string) corev1.Pod {
++		return *makeElasticPodForPodSet(name, workersPodSet).NodeSelector("example.com/pool", "reserved").CreationTimestamp(now).Obj()
++	}
++	onSpot := func(name string) corev1.Pod {
++		p := makeElasticPodForPodSet(name, split).NodeSelector("example.com/pool", "spot").CreationTimestamp(now).Obj()
++		p.Spec.Tolerations = []corev1.Toleration{spotToleration}
++		return *p
++	}
++	cases := map[string]struct {
++		workload *kueue.Workload
++		pods     []*corev1.Pod
++		wantPods []corev1.Pod
++	}{
++		"the PodSet's own entry fills first, then the split entry takes the rest on its flavor": {
++			workload: wl(1, 2),
++			pods:     []*corev1.Pod{gated("a", workersPodSet), gated("b", workersPodSet), gated("c", workersPodSet)},
++			wantPods: []corev1.Pod{onReserved("a"), onSpot("b"), onSpot("c")},
++		},
++		"running pods keep their entry and count toward it": {
++			workload: wl(1, 2),
++			pods:     []*corev1.Pod{running("a", workersPodSet), running("b", split), gated("c", workersPodSet), gated("d", workersPodSet)},
++			wantPods: []corev1.Pod{
++				*running("a", workersPodSet), *running("b", split), onSpot("c"),
++				*gated("d", workersPodSet),
++			},
++		},
++		"a replacement pod of a stopped split pod starts in the entry with room": {
++			workload: wl(2, 1),
++			pods:     []*corev1.Pod{running("a", workersPodSet), running("b", split), gated("c", workersPodSet)},
++			wantPods: []corev1.Pod{*running("a", workersPodSet), *running("b", split), onReserved("c")},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++			ctx, _ := utiltesting.ContextWithLog(t)
++			objs := append([]client.Object{}, flavors...)
++			for _, p := range tc.pods {
++				objs = append(objs, p)
++			}
++			kClient := utiltesting.NewClientBuilder().
++				WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).
++				WithIndex(&kueue.Workload{}, coreindexer.OwnerReferenceIndexKey(rayClusterGVK), coreindexer.WorkloadOwnerIndexFunc(rayClusterGVK)).
++				WithIndex(&kueue.Workload{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexWorkloadSliceName).
++				WithInterceptorFuncs(interceptor.Funcs{
++					Patch: func(ctx context.Context, clnt client.WithWatch, obj client.Object, _ client.Patch, _ ...client.PatchOption) error {
++						return clnt.Update(ctx, obj)
++					},
++				}).
++				WithObjects(objs...).
++				WithStatusSubresource(tc.workload).
++				Build()
++			if err := kClient.Create(ctx, tc.workload); err != nil {
++				t.Fatalf("Could not create workload: %v", err)
++			}
++			ungater := &elasticJobUngater{
++				client:            kClient,
++				clock:             testingclock.NewFakeClock(now),
++				expectationsStore: expectations.NewStore(ControllerName),
++			}
++			if _, err := ungater.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(tc.workload)}); err != nil {
++				t.Fatalf("Reconcile returned error: %v", err)
++			}
++			var gotPods corev1.PodList
++			if err := kClient.List(ctx, &gotPods); err != nil {
++				t.Fatalf("Could not list pods: %v", err)
++			}
++			if diff := gocmp.Diff(tc.wantPods, gotPods.Items, podCmpOpts...); diff != "" {
++				t.Errorf("Pods after reconcile (-want,+got):\n%s", diff)
++			}
++			for _, p := range gotPods.Items {
++				if p.Labels[constants.PodSetLabel] == "" {
++					t.Errorf("Pod %s lost its PodSet label", p.Name)
++				}
++			}
++		})
++	}
++}
+diff --git a/pkg/controller/jobframework/flavor_split.go b/pkg/controller/jobframework/flavor_split.go
+new file mode 100644
+index 0000000..88eced7
+--- /dev/null
++++ b/pkg/controller/jobframework/flavor_split.go
+@@ -0,0 +1,59 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// The job reconciler's side of flavor-split PodSets: new slices keep the split entries of
++// the slice they replace, and the job's templates get the info of its own PodSets only.
++
++package jobframework
++
++import (
++	"context"
++
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/podset"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// carrySplitEntries returns the PodSets of a new slice for the job: its own PodSets, plus the
++// split entries of the active slice the new one replaces (see workloadslicing.CarrySplitEntries).
++// It follows the split entries rather than ElasticJobsViaWorkloadSlicesFlavorSplit, so the pods
++// of an entry created before the gate was turned off keep a PodSet that charges them.
++func carrySplitEntries(ctx context.Context, c client.Client, job GenericJob, podSets []kueue.PodSet) ([]kueue.PodSet, error) {
++	prev, err := workloadslicing.FindLatestActiveWorkload(ctx, c, job.Object(), job.GVK())
++	if err != nil {
++		return nil, err
++	}
++	return workloadslicing.CarrySplitEntries(podSets, prev), nil
++}
++
++// withoutSplitEntries drops the info of wl's split entries, which are listed after the job's
++// own PodSets, so the job gets one info per PodSet of its own, in order. The pods of a split
++// entry are created from its job PodSet's template; the ElasticJobUngater gives them the entry
++// and its flavor.
++func withoutSplitEntries(wl *kueue.Workload, infos []podset.PodSetInfo) []podset.PodSetInfo {
++	if !workloadslicing.HasSplitEntries(wl.Spec.PodSets) {
++		return infos
++	}
++	kept := make([]podset.PodSetInfo, 0, len(infos))
++	for i := range infos {
++		if !workloadslicing.IsSplitEntry(&wl.Spec.PodSets[i]) {
++			kept = append(kept, infos[i])
++		}
++	}
++	return kept
++}
+diff --git a/pkg/controller/jobframework/flavor_split_external_test.go b/pkg/controller/jobframework/flavor_split_external_test.go
+new file mode 100644
+index 0000000..e9242e3
+--- /dev/null
++++ b/pkg/controller/jobframework/flavor_split_external_test.go
+@@ -0,0 +1,101 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests for flavor-split PodSets in the job reconciler: a new slice keeps its predecessor's
++// split entries, and the job gets the info of its own PodSets only.
++
++package jobframework_test
++
++import (
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	"go.uber.org/mock/gomock"
++	batchv1 "k8s.io/api/batch/v1"
++	corev1 "k8s.io/api/core/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	mocks "sigs.k8s.io/kueue/internal/mocks/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	. "sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func splitEntry(name string, count int32) kueue.PodSet {
++	return *utiltestingapi.MakePodSet(kueue.PodSetReference(name), int(count)).
++		Annotations(map[string]string{workloadslicing.FlavorSplitOfAnnotation: "workers"}).Obj()
++}
++
++func TestConstructWorkloadCarriesSplitEntries(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	gvk := batchv1.SchemeGroupVersion.WithKind("Job")
++	now := time.Now()
++	job := testingjob.MakeJob("job", "ns").
++		SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Queue("lq").
++		UID("job-uid").
++		Obj()
++	predecessor := utiltestingapi.MakeWorkload("slice", "ns").
++		PodSets(*utiltestingapi.MakePodSet("workers", 8).Obj(), splitEntry("workers--2", 4), splitEntry("workers--3", 0)).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment("workers").Count(8).Assignment(corev1.ResourceCPU, "reserved", "1").Obj(),
++			utiltestingapi.MakePodSetAssignment("workers--2").Count(4).Assignment(corev1.ResourceCPU, "spot", "1").Obj(),
++			utiltestingapi.MakePodSetAssignment("workers--3").Count(0).Assignment(corev1.ResourceCPU, "spot", "1").Obj(),
++		).Obj(), now).
++		ControllerReference(gvk, "job", "job-uid").
++		Obj()
++
++	ctx, _ := utiltesting.ContextWithLog(t)
++	mgj := mocks.NewMockGenericJob(gomock.NewController(t))
++	mgj.EXPECT().Object().Return(job).AnyTimes()
++	mgj.EXPECT().GVK().Return(gvk).AnyTimes()
++	mgj.EXPECT().PodSets(gomock.Any(), gomock.Any()).Return([]kueue.PodSet{*utiltestingapi.MakePodSet("workers", 14).Obj()}, nil).AnyTimes()
++	cl := utiltesting.NewClientBuilder().
++		WithObjects([]client.Object{&corev1.Namespace{Name: "ns"}, job, predecessor}...).
++		WithIndex(&kueue.Workload{}, indexer.OwnerReferenceIndexKey(gvk), indexer.WorkloadOwnerIndexFunc(gvk)).
++		Build()
++
++	wl, err := ConstructWorkload(ctx, cl, mgj, nil, nil)
++	if err != nil {
++		t.Fatalf("ConstructWorkload() error: %v", err)
++	}
++	// The running entries keep their counts, the growth goes to the newest one, and the
++	// entry at 0 is dropped.
++	if diff := cmp.Diff(workload.PodSetsCounts{"workers": 8, "workers--2": 6}, workload.ExtractPodSetCountsFromWorkload(wl)); diff != "" {
++		t.Errorf("ConstructWorkload() counts (-want,+got):\n%s", diff)
++	}
++}
++
++func TestGetPodSetsInfoFromWorkloadSkipsSplitEntries(t *testing.T) {
++	wl := utiltestingapi.MakeWorkload("slice", "ns").
++		PodSets(*utiltestingapi.MakePodSet("head", 1).Obj(), *utiltestingapi.MakePodSet("workers", 8).Obj(), splitEntry("workers--2", 4)).
++		Obj()
++	infos := GetPodSetsInfoFromWorkload(wl)
++	var names []kueue.PodSetReference
++	for _, info := range infos {
++		names = append(names, info.Name)
++	}
++	if diff := cmp.Diff([]kueue.PodSetReference{"head", "workers"}, names); diff != "" {
++		t.Errorf("GetPodSetsInfoFromWorkload() (-want,+got):\n%s", diff)
++	}
++}
+diff --git a/pkg/controller/jobframework/flavor_split_test.go b/pkg/controller/jobframework/flavor_split_test.go
+new file mode 100644
+index 0000000..a1b7165
+--- /dev/null
++++ b/pkg/controller/jobframework/flavor_split_test.go
+@@ -0,0 +1,68 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package jobframework
++
++import (
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++
++	"sigs.k8s.io/kueue/pkg/constants"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// A job started with a split admission, as after a readmission, gets one info per PodSet of
++// its own, in order, so integrations that apply the infos by position still line up.
++func TestGetPodSetsInfoFromStatusSkipsSplitEntries(t *testing.T) {
++	ctx, _ := utiltesting.ContextWithLog(t)
++	now := time.Now()
++	cl := utiltesting.NewClientBuilder().WithObjects(
++		utiltestingapi.MakeResourceFlavor("reserved").Obj(),
++		utiltestingapi.MakeResourceFlavor("spot").Obj(),
++	).Build()
++	wl := utiltestingapi.MakeWorkload("slice", "ns").
++		PodSets(
++			*utiltestingapi.MakePodSet("head", 1).Obj(),
++			*utiltestingapi.MakePodSet("workers", 8).Obj(),
++			*utiltestingapi.MakePodSet("workers--2", 4).Annotations(map[string]string{workloadslicing.FlavorSplitOfAnnotation: "workers"}).Obj(),
++		).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment("head").Assignment(corev1.ResourceCPU, "reserved", "1").Obj(),
++			utiltestingapi.MakePodSetAssignment("workers").Count(8).Assignment(corev1.ResourceCPU, "reserved", "1").Obj(),
++			utiltestingapi.MakePodSetAssignment("workers--2").Count(4).Assignment(corev1.ResourceCPU, "spot", "1").Obj(),
++		).Obj(), now).
++		Obj()
++	infos, err := getPodSetsInfoFromStatus(ctx, cl, wl, false)
++	if err != nil {
++		t.Fatalf("getPodSetsInfoFromStatus() error: %v", err)
++	}
++	var names, labels []string
++	for _, info := range infos {
++		names = append(names, string(info.Name))
++		labels = append(labels, info.Labels[constants.PodSetLabel])
++	}
++	if diff := cmp.Diff([]string{"head", "workers"}, names); diff != "" {
++		t.Errorf("getPodSetsInfoFromStatus() names (-want,+got):\n%s", diff)
++	}
++	if diff := cmp.Diff([]string{"head", "workers"}, labels); diff != "" {
++		t.Errorf("getPodSetsInfoFromStatus() PodSet labels (-want,+got):\n%s", diff)
++	}
++}
+diff --git a/pkg/controller/jobframework/reclaim_floors.go b/pkg/controller/jobframework/reclaim_floors.go
+index 67367fe..a6799f1 100644
+--- a/pkg/controller/jobframework/reclaim_floors.go
++++ b/pkg/controller/jobframework/reclaim_floors.go
+@@ -65,6 +65,7 @@ func applyReclaimFloors(job GenericJob, wl *kueue.Workload) {
+ 		return
+ 	}
+ 	floors, steps := ReclaimFloors(job)
++	floors, steps = workloadslicing.ExpandToSplitEntries(wl.Spec.PodSets, floors, steps)
+ 	workload.SetReclaimMinCounts(wl, floors)
+ 	workload.SetPodSetCountSteps(wl, steps)
+ }
+diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
+index edce889..343a0d3 100644
+--- a/pkg/controller/jobframework/reconciler.go
++++ b/pkg/controller/jobframework/reconciler.go
+@@ -2095,6 +2095,11 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if WorkloadSliceEnabled(job) {
++		if podSets, err = carrySplitEntries(ctx, c, job, podSets); err != nil {
++			return nil, err
++		}
++	}
+ 	extra := ""
+ 	if ElasticPartialScaleUpEnabled(job) {
+ 		extra, err = prepareWorkloadSliceForScaleUp(ctx, c, job, podSets)
+@@ -2347,7 +2352,7 @@ func getPodSetsInfoFromStatus(ctx context.Context, c client.Client, w *kueue.Wor
+ 		}
+ 		podSetsInfo[i] = info
+ 	}
+-	return podSetsInfo, nil
++	return withoutSplitEntries(w, podSetsInfo), nil
+ }
+ 
+ // podSetAssignmentsInSpecOrder reorders the admission, which lists the members
+@@ -2583,7 +2588,7 @@ func GetPodSetsInfoFromWorkload(wl *kueue.Workload) []podset.PodSetInfo {
+ 		return nil
+ 	}
+ 
+-	return slices.Map(wl.Spec.PodSets, podset.FromPodSet)
++	return withoutSplitEntries(wl, slices.Map(wl.Spec.PodSets, podset.FromPodSet))
+ }
+ 
+ type ReconcilerSetup func(*builder.Builder, client.Client) *builder.Builder
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index 644b856..366b609 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -200,6 +200,13 @@ const (
+ 	// while it was empty.
+ 	ElasticJobsViaWorkloadSlicesFlavorChangeFromZero featuregate.Feature = "ElasticJobsViaWorkloadSlicesFlavorChangeFromZero"
+ 
++	// owner: @simonepri
++	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/77-dynamically-sized-jobs
++	//
++	// Lets the pods an elastic job adds to a PodSet run on another flavor when they do not
++	// fit on the flavor of its running pods, through a split PodSet in the same Workload.
++	ElasticJobsViaWorkloadSlicesFlavorSplit featuregate.Feature = "ElasticJobsViaWorkloadSlicesFlavorSplit"
++
+ 	// owner: @pbundyra
+ 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/2724-topology-aware-scheduling
+ 	//
+@@ -937,6 +944,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
+ 	TASRecomputeAssignmentWithinSchedulingCycle:         {TopologyAwareScheduling},
+ 	ElasticJobsViaWorkloadSlicesWithTAS:                 {ElasticJobsViaWorkloadSlices, TopologyAwareScheduling},
+ 	ElasticJobsViaWorkloadSlicesFlavorChangeFromZero:    {ElasticJobsViaWorkloadSlices},
++	ElasticJobsViaWorkloadSlicesFlavorSplit:             {ElasticJobsViaWorkloadSlicesFlavorChangeFromZero},
+ 	MultiKueueRayInTreeAutoscaling:                      {MultiKueue, ElasticJobsViaWorkloadSlices, SkipChildJobSuspension},
+ 	KueueDRAIntegrationExtendedResource:                 {KueueDRAIntegration},
+ 	KueueDRAIntegrationPartitionableDevices:             {KueueDRAIntegration},
+@@ -1047,6 +1055,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+ 	ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: {
+ 		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
+ 	},
++	ElasticJobsViaWorkloadSlicesFlavorSplit: {
++		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
++	},
+ 	TASFailedNodeReplacementFailFast: {
+ 		{Version: version.MustParse("0.13"), Default: false, PreRelease: featuregate.Alpha},
+ 		{Version: version.MustParse("0.14"), Default: true, PreRelease: featuregate.Beta},
+diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
+new file mode 100644
+index 0000000..7f8fe2e
+--- /dev/null
++++ b/pkg/scheduler/flavorassigner/flavor_split.go
+@@ -0,0 +1,61 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tells the job reconciler when the growth of a replacement slice would fit on a flavor that the
++// PodSet's running pods keep it off, so it can split that growth into its own PodSet.
++
++package flavorassigner
++
++import (
++	"context"
++
++	corev1 "k8s.io/api/core/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/resources"
++)
++
++// GrowthFitsOtherFlavorReason ends the message the flavor assigner gives a flavor it skips because
++// the replaced slice keeps the PodSet on another flavor, when the PodSet's growth over the replaced
++// slice would fit on the skipped flavor without preemption. With
++// ElasticJobsViaWorkloadSlicesFlavorSplit, the job reconciler splits the growth of a refused slice
++// only when its message contains it (see workloadslicing.SplitGrowth), so a slice that no other
++// flavor would take keeps its PodSets.
++const GrowthFitsOtherFlavorReason = "its growth fits this flavor"
++
++// growthFits reports whether the growth of the PodSets psIDs over the slice that the workload
++// replaces fits on the flavor fName without preemption, for every resource in requests. PodSets
++// that do not grow report false, since only growth can move to a split PodSet.
++func (a *FlavorAssigner) growthFits(ctx context.Context, fName kueue.ResourceFlavorReference, psIDs []int, requests resources.Requests, assignmentUsage resources.FlavorResourceQuantities) bool {
++	fits, grows := true, false
++	requests.ForEach(func(rName corev1.ResourceName, val resources.Amount) {
++		if !fits {
++			return
++		}
++		for _, psID := range psIDs {
++			if replaced := podSetResourcesByName(a.replaceWorkloadSlice.TotalRequests, a.wl.Obj.Spec.PodSets[psID].Name); replaced != nil && replaced.Requests != nil {
++				val = val.Sub(replaced.Requests.ResourceValue(rName))
++			}
++		}
++		if val.Sign() > 0 {
++			grows = true
++		}
++		fr := resources.FlavorResource{Flavor: fName, Resource: rName}
++		mode, _, _ := a.fitsResourceQuota(ctx, fr, assignmentUsage[fr], val, a.cq.QuotaFor(fr))
++		fits = mode == fit
++	})
++	return fits && grows
++}
+diff --git a/pkg/scheduler/flavorassigner/flavor_split_test.go b/pkg/scheduler/flavorassigner/flavor_split_test.go
+new file mode 100644
+index 0000000..e925df0
+--- /dev/null
++++ b/pkg/scheduler/flavorassigner/flavor_split_test.go
+@@ -0,0 +1,102 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package flavorassigner
++
++import (
++	"strings"
++	"testing"
++	"time"
++
++	"k8s.io/component-base/featuregate"
++
++	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// A replacement slice refused because its PodSet's running pods keep it on a full flavor says so,
++// and says whether its growth would fit on the flavor it skipped, which is what lets the job
++// reconciler split the growth into its own PodSet.
++func TestGrowthFitsOtherFlavorReason(t *testing.T) {
++	cases := map[string]struct {
++		gate       bool
++		secondGPUs string
++		wantMarker bool
++	}{
++		"the growth fits the second flavor":           {gate: true, secondGPUs: "4", wantMarker: true},
++		"the growth does not fit the second flavor":   {gate: true, secondGPUs: "2"},
++		"the gate off leaves the message as upstream": {secondGPUs: "4"},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: tc.gate,
++				features.ElasticJobsViaWorkloadSlicesFlavorSplit:          tc.gate,
++			})
++			ctx, log := utiltesting.ContextWithLog(t)
++			now := time.Now()
++			cq := utiltestingapi.MakeClusterQueue("cq").
++				ResourceGroup(
++					*utiltestingapi.MakeFlavorQuotas("first").Resource("nvidia.com/gpu", "8").Obj(),
++					*utiltestingapi.MakeFlavorQuotas("second").Resource("nvidia.com/gpu", tc.secondGPUs).Obj(),
++				).Obj()
++			replaced := utiltestingapi.MakeWorkload("slice", "default").
++				PodSets(*utiltestingapi.MakePodSet("workers", 8).Request("nvidia.com/gpu", "1").Obj()).
++				ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++					utiltestingapi.MakePodSetAssignment("workers").Count(8).Assignment("nvidia.com/gpu", "first", "8").Obj()).Obj(), now).
++				Obj()
++			cache := schdcache.New(utiltesting.NewFakeClient())
++			flavors := map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor{
++				"first":  utiltestingapi.MakeResourceFlavor("first").Obj(),
++				"second": utiltestingapi.MakeResourceFlavor("second").Obj(),
++			}
++			for _, f := range flavors {
++				cache.AddOrUpdateResourceFlavor(log, f)
++			}
++			if err := cache.AddClusterQueue(ctx, cq); err != nil {
++				t.Fatal(err)
++			}
++			if !cache.AddOrUpdateWorkload(ctx, log, replaced) {
++				t.Fatal("Could not add the replaced slice to the cache")
++			}
++			snapshot, err := cache.Snapshot(ctx)
++			if err != nil {
++				t.Fatal(err)
++			}
++			probe := workload.NewInfo(log, utiltestingapi.MakeWorkload("probe", "default").
++				PodSets(*utiltestingapi.MakePodSet("workers", 12).Request("nvidia.com/gpu", "1").Obj()).Obj())
++			assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, workload.NewInfo(log, replaced),
++				configapi.QuotaCheckBlockUndeclared, resources.NewResourceFormatter(), 0)
++			assignment := assigner.AssignFlavors(ctx, log, nil)
++			if mode := assignment.RepresentativeMode(); mode == Fit {
++				t.Fatalf("AssignFlavors() mode = %s, want the probe refused", mode)
++			}
++			msg := assignment.Message()
++			if !strings.Contains(msg, "since the original workload is assigned: first") {
++				t.Errorf("AssignFlavors() message %q does not name the replaced slice's flavor", msg)
++			}
++			if got := strings.Contains(msg, GrowthFitsOtherFlavorReason); got != tc.wantMarker {
++				t.Errorf("AssignFlavors() message %q has the growth marker = %v, want %v", msg, got, tc.wantMarker)
++			}
++		})
++	}
++}
+diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
+index def383f..568186b 100644
+--- a/pkg/scheduler/flavorassigner/flavorassigner.go
++++ b/pkg/scheduler/flavorassigner/flavorassigner.go
+@@ -889,6 +889,9 @@ func (a *FlavorAssigner) findFlavorForPodSets(
+ 						// Flavor mismatch. Skip further checks for this resource.
+ 						representativeMode = worstGranularMode()
+ 						msg := fmt.Sprintf("could not assign %s flavor since the original workload is assigned: %s", fName, originalFlavor)
++						if features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorSplit) && a.growthFits(ctx, fName, psIDs, requests, assignmentUsage) {
++							msg += "; " + GrowthFitsOtherFlavorReason
++						}
+ 						status.reasons = append(status.reasons, msg)
+ 						flavorQuotaReasons = append(flavorQuotaReasons, msg)
+ 						flavorNoFitReason = mostSevereReason(flavorNoFitReason, kueue.WorkloadQuotaReservedReasonNoMatchingFlavor)
+diff --git a/pkg/scheduler/preemption/flavor_split_test.go b/pkg/scheduler/preemption/flavor_split_test.go
+new file mode 100644
+index 0000000..590423c
+--- /dev/null
++++ b/pkg/scheduler/preemption/flavor_split_test.go
+@@ -0,0 +1,100 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package preemption
++
++import (
++	"testing"
++	"time"
++
++	gocmp "github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	clocktesting "k8s.io/utils/clock/testing"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// A worker group split across two flavors is shrunk only in the entry on the flavor the
++// preemptor needs: its entry on the other flavor is grown back whole.
++func TestPartialPreemptionShrinksOnlyTheSplitEntryOnTheNeededFlavor(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++	now := time.Now().Truncate(time.Second)
++	ctx, log := utiltesting.ContextWithLog(t)
++	victim := utiltestingapi.MakeWorkload("victim", "default").
++		Annotation(constants.ReclaimMinCountsAnnotation, "workers=2,workers--2=0").
++		PodSets(
++			*utiltestingapi.MakePodSet("workers", 4).Request(corev1.ResourceCPU, "1").Obj(),
++			*utiltestingapi.MakePodSet("workers--2", 4).
++				Annotations(map[string]string{"kueue.x-k8s.io/flavor-split-of": "workers"}).
++				Request(corev1.ResourceCPU, "1").Obj(),
++		).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("borrower").PodSets(
++			utiltestingapi.MakePodSetAssignment("workers").Count(4).Assignment(corev1.ResourceCPU, "reserved", "4").Obj(),
++			utiltestingapi.MakePodSetAssignment("workers--2").Count(4).Assignment(corev1.ResourceCPU, "spot", "4").Obj(),
++		).Obj(), now.Add(-time.Hour)).
++		AdmittedAt(true, now.Add(-time.Hour)).
++		Obj()
++	cl := utiltesting.NewClientBuilder().WithLists(&kueue.WorkloadList{Items: []kueue.Workload{*victim}}).
++		WithStatusSubresource(&kueue.Workload{}).Build()
++	cache := schdcache.New(cl)
++	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("reserved").Obj())
++	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("spot").Obj())
++	for _, cq := range []*kueue.ClusterQueue{
++		utiltestingapi.MakeClusterQueue("incoming").Cohort("shared").
++			ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas("reserved").Resource(corev1.ResourceCPU, "0").Obj(),
++				*utiltestingapi.MakeFlavorQuotas("spot").Resource(corev1.ResourceCPU, "4").Obj(),
++			).
++			Preemption(kueue.ClusterQueuePreemption{ReclaimWithinCohort: kueue.PreemptionPolicyAny, WithinClusterQueue: kueue.PreemptionPolicyNever}).Obj(),
++		utiltestingapi.MakeClusterQueue("borrower").Cohort("shared").
++			ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas("reserved").Resource(corev1.ResourceCPU, "4").Obj(),
++				*utiltestingapi.MakeFlavorQuotas("spot").Resource(corev1.ResourceCPU, "0").Obj(),
++			).Obj(),
++	} {
++		if err := cache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := cache.AddOrUpdateWorkload(ctx, log, victim); !err {
++		t.Fatal("Could not add the victim to the cache")
++	}
++	snapshot, err := cache.Snapshot(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	incoming := workload.NewInfo(log, utiltestingapi.MakeWorkload("preemptor", "default").
++		PodSets(*utiltestingapi.MakePodSet("main", 2).Request(corev1.ResourceCPU, "1").Obj()).Obj())
++	incoming.ClusterQueue = "incoming"
++	assignment := flavorassigner.Assignment{PodSets: []flavorassigner.PodSetAssignment{{
++		Name: "main", Count: 2, Requests: corev1.ResourceList{corev1.ResourceCPU: *resource.NewQuantity(2, resource.DecimalSI)},
++		Flavors: flavorassigner.ResourceAssignment{corev1.ResourceCPU: {Name: "spot", Mode: flavorassigner.Preempt}},
++	}}}
++	preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, nil, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
++	targets, _ := preemptor.GetTargets(ctx, *incoming, snapshot, assignment)
++	if diff := gocmp.Diff([]string{"victim:workers--2=2"}, describeTargets(targets)); diff != "" {
++		t.Errorf("GetTargets() (-want,+got):\n%s", diff)
++	}
++}
+diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
+new file mode 100644
+index 0000000..8d9a02e
+--- /dev/null
++++ b/pkg/workloadslicing/flavor_split.go
+@@ -0,0 +1,363 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Flavor-split PodSets: the pods an elastic job adds to a PodSet that do not fit on the flavor
++// of its running pods become a split entry of the same Workload, which the scheduler places
++// on the next flavor. This file maps job counts to entries and builds the entries.
++
++package workloadslicing
++
++import (
++	"context"
++	"fmt"
++	"maps"
++	"slices"
++	"strings"
++
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/validation"
++	"k8s.io/utils/ptr"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
++)
++
++// FlavorSplitOfAnnotation, on the template of a Workload PodSet, marks the PodSet as a split
++// entry of the job PodSet it names. A split entry runs some of that PodSet's pods, possibly on
++// another flavor; its name is the job PodSet's name with a "--<n>" suffix.
++const FlavorSplitOfAnnotation = "kueue.x-k8s.io/flavor-split-of"
++
++// maxWorkloadPodSets is the most PodSets the Workload API accepts.
++const maxWorkloadPodSets = 8
++
++// SplitBase returns the job PodSet whose pods ps runs: the one a split entry names, or ps itself.
++func SplitBase(ps *kueue.PodSet) kueue.PodSetReference {
++	if base := ps.Template.Annotations[FlavorSplitOfAnnotation]; base != "" {
++		return kueue.PodSetReference(base)
++	}
++	return ps.Name
++}
++
++// IsSplitEntry reports whether ps is a split entry of another PodSet.
++func IsSplitEntry(ps *kueue.PodSet) bool {
++	return ps.Template.Annotations[FlavorSplitOfAnnotation] != ""
++}
++
++// HasSplitEntries reports whether any PodSet is a split entry.
++func HasSplitEntries(podSets []kueue.PodSet) bool {
++	return slices.ContainsFunc(podSets, func(ps kueue.PodSet) bool { return IsSplitEntry(&ps) })
++}
++
++// splitGroups returns the indexes of the entries of each job PodSet in spec order, which puts
++// the job PodSet's own entry first and its split entries in the order they were added.
++func splitGroups(podSets []kueue.PodSet) map[kueue.PodSetReference][]int {
++	groups := make(map[kueue.PodSetReference][]int, len(podSets))
++	for i := range podSets {
++		base := SplitBase(&podSets[i])
++		groups[base] = append(groups[base], i)
++	}
++	return groups
++}
++
++// FoldSplitCounts sums counts, keyed by the entries of podSets, into counts per job PodSet.
++// Without split entries it returns counts.
++func FoldSplitCounts(podSets []kueue.PodSet, counts workload.PodSetsCounts) workload.PodSetsCounts {
++	if !HasSplitEntries(podSets) {
++		return counts
++	}
++	folded := make(workload.PodSetsCounts, len(counts))
++	for i := range podSets {
++		if count, found := counts[podSets[i].Name]; found {
++			folded[SplitBase(&podSets[i])] += count
++		}
++	}
++	return folded
++}
++
++// entryCountsForJob maps the job's count of each PodSet onto the entries of podSets. A PodSet
++// that grows grows in its newest entry. One that shrinks keeps, with running set, the running
++// pods of each entry and gives the rest of its count to its entries in order, so the newest
++// entries shrink first; with running nil it shrinks its newest entries first. It reports false
++// when an entry runs more pods than the job asks for, which happens until the job's controller
++// deletes the pods it removed, since which entry loses them is not known yet. A job PodSet with
++// no entry keeps its own key, so the keys still differ. Without split entries it returns jobCounts.
++func entryCountsForJob(podSets []kueue.PodSet, jobCounts, running workload.PodSetsCounts) (workload.PodSetsCounts, bool) {
++	if !HasSplitEntries(podSets) {
++		return jobCounts, true
++	}
++	groups := splitGroups(podSets)
++	counts := make(workload.PodSetsCounts, len(podSets))
++	for name, count := range jobCounts {
++		if _, found := groups[name]; !found {
++			counts[name] = count
++		}
++	}
++	for base, idxs := range groups {
++		want, found := jobCounts[base]
++		if !found {
++			continue
++		}
++		current := make([]int32, len(idxs))
++		var total int32
++		for i, idx := range idxs {
++			current[i] = podSets[idx].Count
++			total += current[i]
++		}
++		switch {
++		case want >= total:
++			current[len(current)-1] += want - total
++		case running == nil:
++			excess := total - want
++			for i := len(current) - 1; i >= 0 && excess > 0; i-- {
++				cut := min(current[i], excess)
++				current[i] -= cut
++				excess -= cut
++			}
++		default:
++			rest := want
++			kept := make([]int32, len(idxs))
++			for i, idx := range idxs {
++				kept[i] = min(current[i], running[podSets[idx].Name])
++				rest -= kept[i]
++			}
++			if rest < 0 {
++				return nil, false
++			}
++			for i := range kept {
++				add := min(current[i]-kept[i], rest)
++				kept[i] += add
++				rest -= add
++			}
++			current = kept
++		}
++		for i, idx := range idxs {
++			counts[podSets[idx].Name] = current[i]
++		}
++	}
++	return counts, true
++}
++
++// jobCountsForSlice maps the job's counts onto the entries of wl. A slice that holds quota
++// shrinks by its running pods (see entryCountsForJob), so the entry whose pods the job's
++// controller deleted is the one that shrinks.
++func jobCountsForSlice(ctx context.Context, c client.Client, wl *kueue.Workload, jobCounts workload.PodSetsCounts) (workload.PodSetsCounts, bool, error) {
++	counts, settled := entryCountsForJob(wl.Spec.PodSets, jobCounts, nil)
++	if !HasSplitEntries(wl.Spec.PodSets) || !workload.HasQuotaReservation(wl) ||
++		!counts.HasFewerReplicasThan(workload.ExtractPodSetCountsFromWorkload(wl)) {
++		return counts, settled, nil
++	}
++	running, err := runningPodsPerPodSet(ctx, c, wl)
++	if err != nil {
++		return nil, false, fmt.Errorf("listing the running pods of the split workload slice: %w", err)
++	}
++	live := make(workload.PodSetsCounts, len(running))
++	for ps, pods := range running {
++		for _, p := range pods {
++			if p.DeletionTimestamp == nil {
++				live[ps]++
++			}
++		}
++	}
++	counts, settled = entryCountsForJob(wl.Spec.PodSets, jobCounts, live)
++	return counts, settled, nil
++}
++
++// newSplitEntry returns a split entry of base named name, with base's template.
++func newSplitEntry(base *kueue.PodSet, name kueue.PodSetReference, count int32) kueue.PodSet {
++	entry := *base.DeepCopy()
++	entry.Name = name
++	entry.Count = count
++	entry.MinCount = nil
++	if !placesByTopology(entry.TopologyRequest) {
++		// Only the pod index labels, which describe the job PodSet's pods as a whole.
++		entry.TopologyRequest = nil
++	}
++	metav1.SetMetaDataAnnotation(&entry.Template.ObjectMeta, FlavorSplitOfAnnotation, string(base.Name))
++	return entry
++}
++
++// placesByTopology reports whether the topology request constrains where the pods go, which a split
++// entry cannot honor for pods spread over several entries. A request that only names the pod index
++// labels, as the RayCluster integration writes for every worker group, does not.
++func placesByTopology(tr *kueue.PodSetTopologyRequest) bool {
++	return tr != nil && (tr.Required != nil || tr.Preferred != nil || ptr.Deref(tr.Unconstrained, false) ||
++		tr.PodSetGroupName != nil || tr.PodSetSliceRequiredTopology != nil)
++}
++
++// nextSplitName returns the first "<base>--<n>" name, from n = 2, that no PodSet uses, and false
++// when it would be longer than a PodSet name may be.
++func nextSplitName(podSets []kueue.PodSet, base kueue.PodSetReference) (kueue.PodSetReference, bool) {
++	for n := 2; ; n++ {
++		name := kueue.PodSetReference(fmt.Sprintf("%s--%d", base, n))
++		if len(name) > validation.DNS1123LabelMaxLength {
++			return "", false
++		}
++		if !slices.ContainsFunc(podSets, func(ps kueue.PodSet) bool { return ps.Name == name }) {
++			return name, true
++		}
++	}
++}
++
++// CarrySplitEntries returns the PodSets of a new slice of the job that replaces prev: the job's
++// PodSets, followed by the split entries of prev that still have pods, each entry keeping its
++// count in prev. A split entry at 0 is dropped, so its PodSet merges back into fewer entries.
++// The job's counts are then mapped onto the entries: growth goes to a PodSet's newest entry and
++// a shrink takes its newest entries first. Without split entries in prev it returns jobPodSets.
++func CarrySplitEntries(jobPodSets []kueue.PodSet, prev *kueue.Workload) []kueue.PodSet {
++	if prev == nil || !HasSplitEntries(prev.Spec.PodSets) {
++		return jobPodSets
++	}
++	out := slices.Clone(jobPodSets)
++	byName := func(name kueue.PodSetReference) int {
++		return slices.IndexFunc(out, func(ps kueue.PodSet) bool { return ps.Name == name })
++	}
++	prevCounts := workload.ExtractPodSetCountsFromWorkload(prev)
++	var splits []kueue.PodSet
++	for i := range prev.Spec.PodSets {
++		ps := &prev.Spec.PodSets[i]
++		if !IsSplitEntry(ps) || ps.Count == 0 {
++			continue
++		}
++		baseIdx := byName(SplitBase(ps))
++		if baseIdx < 0 {
++			continue
++		}
++		// The job PodSet's own entry keeps its count in prev too, so the job's count is
++		// mapped onto all of its entries below.
++		out[baseIdx].Count = prevCounts[out[baseIdx].Name]
++		splits = append(splits, newSplitEntry(&jobPodSets[baseIdx], ps.Name, ps.Count))
++	}
++	out = append(out, splits...)
++	counts, _ := entryCountsForJob(out, workload.ExtractPodSetCounts(jobPodSets), nil)
++	for i := range out {
++		out[i].Count = counts[out[i].Name]
++		if out[i].MinCount != nil && *out[i].MinCount > out[i].Count {
++			out[i].MinCount = ptr.To(out[i].Count)
++		}
++	}
++	return out
++}
++
++// ExpandToSplitEntries gives each split entry of podSets a floor of 0 when its job PodSet has a
++// floor, so partial preemption may stop all of its pods while the job PodSet keeps its own
++// floor, and the step of its job PodSet. Without split entries it returns its arguments.
++func ExpandToSplitEntries(podSets []kueue.PodSet, floors, steps workload.PodSetsCounts) (workload.PodSetsCounts, workload.PodSetsCounts) {
++	if !HasSplitEntries(podSets) {
++		return floors, steps
++	}
++	floors, steps = maps.Clone(floors), maps.Clone(steps)
++	for i := range podSets {
++		if !IsSplitEntry(&podSets[i]) {
++			continue
++		}
++		base := SplitBase(&podSets[i])
++		if _, found := floors[base]; found {
++			floors[podSets[i].Name] = 0
++		}
++		if step, found := steps[base]; found {
++			steps[podSets[i].Name] = step
++		}
++	}
++	return floors, steps
++}
++
++// splitTriedProbe reports whether probe, a pending replacement of the admitted slice replaced,
++// should move its growth to split entries: the scheduler tried this spec of probe and could not
++// admit it, a flavor it skipped because replaced keeps a PodSet off it would take that PodSet's
++// growth (flavorassigner.GrowthFitsOtherFlavorReason), and the slices place
++// flavors on the pods, so a split entry's pods can follow its flavor. A probe refused for any
++// other reason, such as a single-flavor ClusterQueue without room or a hold while partial
++// preemption releases quota, is not split, because another flavor would not help it.
++func splitTriedProbe(probe, replaced *kueue.Workload) bool {
++	if workload.HasQuotaReservation(probe) || workloadevict.IsEvicted(probe) ||
++		!FlavorPlacementOnPods(probe) || !FlavorPlacementOnPods(replaced) ||
++		len(workload.PendingReclaimTargetCounts(replaced)) > 0 {
++		return false
++	}
++	cond := apimeta.FindStatusCondition(probe.Status.Conditions, kueue.WorkloadQuotaReserved)
++	return cond != nil && cond.Status == metav1.ConditionFalse && cond.ObservedGeneration == probe.Generation &&
++		strings.Contains(cond.Message, flavorassigner.GrowthFitsOtherFlavorReason)
++}
++
++// SplitGrowth moves the growth of each PodSet of probe over what replaced runs in its entries to
++// a new split entry, so the scheduler may place the added pods on another flavor while
++// the running pods keep theirs. The flavor assigner keeps an entry on the flavor replaced gives
++// it, and a new entry, which replaced does not have, takes the first flavor that fits in the
++// ClusterQueue's order. With partial set, a new entry may be admitted down to one pod. PodSets
++// with a topology request or a count step above 1 are not split, nor any once the Workload has
++// as many PodSets as the API allows. It reports whether it changed probe.
++func SplitGrowth(probe, replaced *kueue.Workload, partial bool) bool {
++	running := AfterReclaimBaseline(replaced)
++	steps := workload.PodSetCountSteps(probe)
++	groups := splitGroups(probe.Spec.PodSets)
++	floors := workload.ReclaimMinCounts(probe)
++	changed := false
++	for _, base := range slices.Sorted(maps.Keys(groups)) {
++		if len(probe.Spec.PodSets) >= maxWorkloadPodSets {
++			break
++		}
++		idxs := groups[base]
++		if placesByTopology(probe.Spec.PodSets[idxs[0]].TopologyRequest) || steps[base] > 1 {
++			continue
++		}
++		// Every entry that runs pods in replaced and asks for more keeps what it runs, and
++		// the rest goes to one new entry. An entry with no pods may take any flavor whole.
++		var delta int32
++		for _, idx := range idxs {
++			ps := &probe.Spec.PodSets[idx]
++			if have, found := running[ps.Name]; found && have > 0 && ps.Count > have {
++				delta += ps.Count - have
++			}
++		}
++		if delta == 0 {
++			continue
++		}
++		name, ok := nextSplitName(probe.Spec.PodSets, base)
++		if !ok {
++			continue
++		}
++		for _, idx := range idxs {
++			ps := &probe.Spec.PodSets[idx]
++			if have, found := running[ps.Name]; found && have > 0 && ps.Count > have {
++				ps.Count = have
++				if ps.MinCount != nil && *ps.MinCount > have {
++					ps.MinCount = ptr.To(have)
++				}
++			}
++		}
++		entry := newSplitEntry(&probe.Spec.PodSets[idxs[0]], name, delta)
++		if partial {
++			entry.MinCount = ptr.To[int32](1)
++		}
++		probe.Spec.PodSets = append(probe.Spec.PodSets, entry)
++		if _, found := floors[base]; found {
++			floors[name] = 0
++		}
++		changed = true
++	}
++	if changed && len(floors) > 0 {
++		workload.SetReclaimMinCounts(probe, floors)
++	}
++	if changed && len(steps) > 0 {
++		_, steps = ExpandToSplitEntries(probe.Spec.PodSets, nil, steps)
++		workload.SetPodSetCountSteps(probe, steps)
++	}
++	return changed
++}
+diff --git a/pkg/workloadslicing/flavor_split_test.go b/pkg/workloadslicing/flavor_split_test.go
+new file mode 100644
+index 0000000..7b72dce
+--- /dev/null
++++ b/pkg/workloadslicing/flavor_split_test.go
+@@ -0,0 +1,560 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests for flavor-split PodSets: mapping job counts onto entries, carrying entries to the next
++// slice, splitting a refused probe, and EnsureWorkloadSlices on slices with split entries.
++
++package workloadslicing
++
++import (
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	batchv1 "k8s.io/api/batch/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/uuid"
++	"k8s.io/component-base/featuregate"
++	testingclock "k8s.io/utils/clock/testing"
++	"k8s.io/utils/ptr"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// splitPodSet returns a split entry of base with count pods.
++func splitPodSet(base, name string, count int) kueue.PodSet {
++	return *utiltestingapi.MakePodSet(kueue.PodSetReference(name), count).
++		Annotations(map[string]string{FlavorSplitOfAnnotation: base}).
++		Request(corev1.ResourceCPU, "1").Obj()
++}
++
++func plainPodSet(name string, count int) kueue.PodSet {
++	return *utiltestingapi.MakePodSet(kueue.PodSetReference(name), count).Request(corev1.ResourceCPU, "1").Obj()
++}
++
++func TestEntryCountsForJob(t *testing.T) {
++	split := []kueue.PodSet{plainPodSet("head", 1), plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4), splitPodSet("workers", "workers--3", 2)}
++	cases := map[string]struct {
++		podSets     []kueue.PodSet
++		jobCounts   workload.PodSetsCounts
++		running     workload.PodSetsCounts
++		want        workload.PodSetsCounts
++		wantSettled bool
++	}{
++		"without split entries the job's counts are returned": {
++			podSets:     []kueue.PodSet{plainPodSet("workers", 8)},
++			jobCounts:   workload.PodSetsCounts{"workers": 5},
++			want:        workload.PodSetsCounts{"workers": 5},
++			wantSettled: true,
++		},
++		"equal totals keep every entry": {
++			podSets:     split,
++			jobCounts:   workload.PodSetsCounts{"head": 1, "workers": 14},
++			want:        workload.PodSetsCounts{"head": 1, "workers": 8, "workers--2": 4, "workers--3": 2},
++			wantSettled: true,
++		},
++		"growth goes to the newest entry": {
++			podSets:     split,
++			jobCounts:   workload.PodSetsCounts{"head": 1, "workers": 17},
++			want:        workload.PodSetsCounts{"head": 1, "workers": 8, "workers--2": 4, "workers--3": 5},
++			wantSettled: true,
++		},
++		"a shrink without pods takes the newest entries first": {
++			podSets:     split,
++			jobCounts:   workload.PodSetsCounts{"head": 1, "workers": 9},
++			want:        workload.PodSetsCounts{"head": 1, "workers": 8, "workers--2": 1, "workers--3": 0},
++			wantSettled: true,
++		},
++		"a shrink with pods follows the entries that lost them": {
++			podSets:     split,
++			jobCounts:   workload.PodSetsCounts{"head": 1, "workers": 12},
++			running:     workload.PodSetsCounts{"head": 1, "workers": 6, "workers--2": 4, "workers--3": 2},
++			want:        workload.PodSetsCounts{"head": 1, "workers": 6, "workers--2": 4, "workers--3": 2},
++			wantSettled: true,
++		},
++		"pods not started yet go to the oldest entries, so the newest shrink first": {
++			podSets:     split,
++			jobCounts:   workload.PodSetsCounts{"head": 1, "workers": 11},
++			running:     workload.PodSetsCounts{"head": 1, "workers": 6, "workers--2": 1},
++			want:        workload.PodSetsCounts{"head": 1, "workers": 8, "workers--2": 3, "workers--3": 0},
++			wantSettled: true,
++		},
++		"more running pods than the job asks for is not settled": {
++			podSets:   split,
++			jobCounts: workload.PodSetsCounts{"head": 1, "workers": 12},
++			running:   workload.PodSetsCounts{"head": 1, "workers": 8, "workers--2": 4, "workers--3": 2},
++		},
++		"a job PodSet without entries keeps its key": {
++			podSets:     split,
++			jobCounts:   workload.PodSetsCounts{"head": 1, "workers": 14, "other": 2},
++			want:        workload.PodSetsCounts{"head": 1, "workers": 8, "workers--2": 4, "workers--3": 2, "other": 2},
++			wantSettled: true,
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			got, settled := entryCountsForJob(tc.podSets, tc.jobCounts, tc.running)
++			if settled != tc.wantSettled {
++				t.Fatalf("entryCountsForJob() settled = %v, want %v", settled, tc.wantSettled)
++			}
++			if diff := cmp.Diff(tc.want, got); diff != "" {
++				t.Errorf("entryCountsForJob() (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestFoldSplitCounts(t *testing.T) {
++	podSets := []kueue.PodSet{plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)}
++	got := FoldSplitCounts(podSets, workload.PodSetsCounts{"workers": 8, "workers--2": 3})
++	if diff := cmp.Diff(workload.PodSetsCounts{"workers": 11}, got); diff != "" {
++		t.Errorf("FoldSplitCounts() (-want,+got):\n%s", diff)
++	}
++}
++
++func TestCarrySplitEntries(t *testing.T) {
++	prevWith := func(podSets ...kueue.PodSet) *kueue.Workload {
++		return utiltestingapi.MakeWorkload("prev", "ns").PodSets(podSets...).Obj()
++	}
++	cases := map[string]struct {
++		jobPodSets []kueue.PodSet
++		prev       *kueue.Workload
++		want       workload.PodSetsCounts
++		wantNames  []kueue.PodSetReference
++	}{
++		"no predecessor keeps the job's PodSets": {
++			jobPodSets: []kueue.PodSet{plainPodSet("workers", 12)},
++			want:       workload.PodSetsCounts{"workers": 12},
++			wantNames:  []kueue.PodSetReference{"workers"},
++		},
++		"a predecessor without split entries keeps the job's PodSets": {
++			jobPodSets: []kueue.PodSet{plainPodSet("workers", 12)},
++			prev:       prevWith(plainPodSet("workers", 8)),
++			want:       workload.PodSetsCounts{"workers": 12},
++			wantNames:  []kueue.PodSetReference{"workers"},
++		},
++		"growth goes to the newest entry": {
++			jobPodSets: []kueue.PodSet{plainPodSet("head", 1), plainPodSet("workers", 14)},
++			prev:       prevWith(plainPodSet("head", 1), plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)),
++			want:       workload.PodSetsCounts{"head": 1, "workers": 8, "workers--2": 6},
++			wantNames:  []kueue.PodSetReference{"head", "workers", "workers--2"},
++		},
++		"an entry at 0 is dropped": {
++			jobPodSets: []kueue.PodSet{plainPodSet("workers", 10)},
++			prev:       prevWith(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 0), splitPodSet("workers", "workers--3", 1)),
++			want:       workload.PodSetsCounts{"workers": 8, "workers--3": 2},
++			wantNames:  []kueue.PodSetReference{"workers", "workers--3"},
++		},
++		"the job's own entry is kept at 0": {
++			jobPodSets: []kueue.PodSet{plainPodSet("workers", 5)},
++			prev:       prevWith(plainPodSet("workers", 0), splitPodSet("workers", "workers--2", 4)),
++			want:       workload.PodSetsCounts{"workers": 0, "workers--2": 5},
++			wantNames:  []kueue.PodSetReference{"workers", "workers--2"},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			got := CarrySplitEntries(tc.jobPodSets, tc.prev)
++			if diff := cmp.Diff(tc.want, workload.ExtractPodSetCounts(got)); diff != "" {
++				t.Errorf("CarrySplitEntries() counts (-want,+got):\n%s", diff)
++			}
++			names := make([]kueue.PodSetReference, len(got))
++			for i := range got {
++				names[i] = got[i].Name
++			}
++			if diff := cmp.Diff(tc.wantNames, names); diff != "" {
++				t.Errorf("CarrySplitEntries() names (-want,+got):\n%s", diff)
++			}
++			for i := range got {
++				if IsSplitEntry(&got[i]) && SplitBase(&got[i]) != "workers" {
++					t.Errorf("Split entry %s is of %s, want workers", got[i].Name, SplitBase(&got[i]))
++				}
++			}
++		})
++	}
++}
++
++func TestExpandToSplitEntries(t *testing.T) {
++	podSets := []kueue.PodSet{plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)}
++	floors, steps := ExpandToSplitEntries(podSets, workload.PodSetsCounts{"workers": 2}, workload.PodSetsCounts{"workers": 1})
++	if diff := cmp.Diff(workload.PodSetsCounts{"workers": 2, "workers--2": 0}, floors); diff != "" {
++		t.Errorf("ExpandToSplitEntries() floors (-want,+got):\n%s", diff)
++	}
++	if diff := cmp.Diff(workload.PodSetsCounts{"workers": 1, "workers--2": 1}, steps); diff != "" {
++		t.Errorf("ExpandToSplitEntries() steps (-want,+got):\n%s", diff)
++	}
++}
++
++func TestSplitGrowth(t *testing.T) {
++	now := time.Now()
++	admitted := func(podSets ...kueue.PodSet) *kueue.Workload {
++		var assignments []kueue.PodSetAssignment
++		for _, ps := range podSets {
++			assignments = append(assignments, utiltestingapi.MakePodSetAssignment(ps.Name).Count(ps.Count).Assignment(corev1.ResourceCPU, "reserved", "1").Obj())
++		}
++		admission := utiltestingapi.MakeAdmission("cq").PodSets(assignments...)
++		return utiltestingapi.MakeWorkload("slice", "ns").PodSets(podSets...).
++			ReserveQuotaAt(admission.Obj(), now).AdmittedAt(true, now).Obj()
++	}
++	full := func() []kueue.PodSet {
++		ps := []kueue.PodSet{plainPodSet("head", 1), plainPodSet("workers", 8)}
++		for i := 2; i <= 7; i++ {
++			ps = append(ps, splitPodSet("workers", "workers--"+string(rune('0'+i)), 1))
++		}
++		return ps
++	}
++	cases := map[string]struct {
++		probe     *kueue.Workload
++		replaced  *kueue.Workload
++		partial   bool
++		want      workload.PodSetsCounts
++		wantMin   map[kueue.PodSetReference]*int32
++		wantFloor workload.PodSetsCounts
++	}{
++		"growth of a PodSet moves to a new split entry": {
++			probe:    utiltestingapi.MakeWorkload("probe", "ns").PodSets(plainPodSet("head", 1), plainPodSet("workers", 12)).Obj(),
++			replaced: admitted(plainPodSet("head", 1), plainPodSet("workers", 8)),
++			want:     workload.PodSetsCounts{"head": 1, "workers": 8, "workers--2": 4},
++			wantMin:  map[kueue.PodSetReference]*int32{"head": nil, "workers": nil, "workers--2": nil},
++		},
++		"partial scale-up admits a new entry down to one pod": {
++			probe: utiltestingapi.MakeWorkload("probe", "ns").
++				Annotation(constants.ReclaimMinCountsAnnotation, "workers=2").
++				PodSets(*utiltestingapi.MakePodSet("workers", 12).SetMinimumCount(8).Request(corev1.ResourceCPU, "1").Obj()).Obj(),
++			replaced:  admitted(plainPodSet("workers", 8)),
++			partial:   true,
++			want:      workload.PodSetsCounts{"workers": 8, "workers--2": 4},
++			wantMin:   map[kueue.PodSetReference]*int32{"workers": ptr.To[int32](8), "workers--2": ptr.To[int32](1)},
++			wantFloor: workload.PodSetsCounts{"workers": 2, "workers--2": 0},
++		},
++		"growth of a split entry moves to the next one": {
++			probe:    utiltestingapi.MakeWorkload("probe", "ns").PodSets(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 6)).Obj(),
++			replaced: admitted(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)),
++			want:     workload.PodSetsCounts{"workers": 8, "workers--2": 4, "workers--3": 2},
++			wantMin:  map[kueue.PodSetReference]*int32{"workers": nil, "workers--2": nil, "workers--3": nil},
++		},
++		"regrowth after a partial reclaim of an older entry moves to a new entry": {
++			probe: utiltestingapi.MakeWorkload("probe", "ns").PodSets(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)).Obj(),
++			replaced: func() *kueue.Workload {
++				wl := admitted(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4))
++				workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{"workers": 2})
++				wl.Status.ReclaimablePods = []kueue.ReclaimablePod{{Name: "workers", Count: 6}}
++				return wl
++			}(),
++			want: workload.PodSetsCounts{"workers": 2, "workers--2": 4, "workers--3": 6},
++		},
++		"a newest entry the replaced slice does not run is not split again": {
++			probe:    utiltestingapi.MakeWorkload("probe", "ns").PodSets(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)).Obj(),
++			replaced: admitted(plainPodSet("workers", 8)),
++			want:     workload.PodSetsCounts{"workers": 8, "workers--2": 4},
++		},
++		"a PodSet with no running pods may move whole, so it is not split": {
++			probe:    utiltestingapi.MakeWorkload("probe", "ns").PodSets(plainPodSet("workers", 4)).Obj(),
++			replaced: admitted(plainPodSet("workers", 0)),
++			want:     workload.PodSetsCounts{"workers": 4},
++		},
++		"a PodSet with a count step above 1 is not split": {
++			probe: utiltestingapi.MakeWorkload("probe", "ns").
++				Annotation(constants.PodSetCountStepsAnnotation, "workers=2").
++				PodSets(plainPodSet("workers", 12)).Obj(),
++			replaced: admitted(plainPodSet("workers", 8)),
++			want:     workload.PodSetsCounts{"workers": 12},
++		},
++		"a PodSet with a topology request is not split": {
++			probe: utiltestingapi.MakeWorkload("probe", "ns").
++				PodSets(*utiltestingapi.MakePodSet("workers", 12).RequiredTopologyRequest("rack").Request(corev1.ResourceCPU, "1").Obj()).Obj(),
++			replaced: admitted(plainPodSet("workers", 8)),
++			want:     workload.PodSetsCounts{"workers": 12},
++		},
++		"a PodSet whose topology request only names pod index labels is split": {
++			probe: utiltestingapi.MakeWorkload("probe", "ns").
++				PodSets(*utiltestingapi.MakePodSet("workers", 12).PodIndexLabel(ptr.To("ray.io/worker-group-replica-index")).Request(corev1.ResourceCPU, "1").Obj()).Obj(),
++			replaced: admitted(plainPodSet("workers", 8)),
++			want:     workload.PodSetsCounts{"workers": 8, "workers--2": 4},
++		},
++		"a Workload with the most PodSets the API allows is not split": {
++			probe: func() *kueue.Workload {
++				ps := full()
++				ps[len(ps)-1].Count = 3
++				return utiltestingapi.MakeWorkload("probe", "ns").PodSets(ps...).Obj()
++			}(),
++			replaced: admitted(full()...),
++			want: workload.PodSetsCounts{"head": 1, "workers": 8, "workers--2": 1, "workers--3": 1, "workers--4": 1,
++				"workers--5": 1, "workers--6": 1, "workers--7": 3},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			probe := tc.probe.DeepCopy()
++			changed := SplitGrowth(probe, tc.replaced, tc.partial)
++			got := workload.ExtractPodSetCountsFromWorkload(probe)
++			if diff := cmp.Diff(tc.want, got); diff != "" {
++				t.Errorf("SplitGrowth() counts (-want,+got):\n%s", diff)
++			}
++			if wantChanged := len(tc.want) != len(tc.probe.Spec.PodSets); changed != wantChanged {
++				t.Errorf("SplitGrowth() = %v, want %v", changed, wantChanged)
++			}
++			for i := range probe.Spec.PodSets {
++				ps := &probe.Spec.PodSets[i]
++				if want, found := tc.wantMin[ps.Name]; found {
++					if diff := cmp.Diff(want, ps.MinCount); diff != "" {
++						t.Errorf("SplitGrowth() minCount of %s (-want,+got):\n%s", ps.Name, diff)
++					}
++				}
++				if len(ps.Name) > len("workers") && SplitBase(ps) != "workers" {
++					t.Errorf("SplitGrowth() entry %s is of %q, want workers", ps.Name, SplitBase(ps))
++				}
++			}
++			if tc.wantFloor != nil {
++				if diff := cmp.Diff(tc.wantFloor, workload.ReclaimMinCounts(probe)); diff != "" {
++					t.Errorf("SplitGrowth() floors (-want,+got):\n%s", diff)
++				}
++			}
++		})
++	}
++}
++
++func TestEnsureWorkloadSlicesFlavorSplit(t *testing.T) {
++	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns", UID: uuid.NewUUID()}}
++	now := time.Now()
++	slice := func(podSets ...kueue.PodSet) *utiltestingapi.WorkloadWrapper {
++		var assignments []kueue.PodSetAssignment
++		for _, ps := range podSets {
++			assignments = append(assignments, utiltestingapi.MakePodSetAssignment(ps.Name).Count(ps.Count).Assignment(corev1.ResourceCPU, "reserved", "1").Obj())
++		}
++		admission := utiltestingapi.MakeAdmission("cq").PodSets(assignments...)
++		return utiltestingapi.MakeWorkload("slice", job.Namespace).
++			OwnerReference(testJobGVK, job.Name, string(job.UID)).
++			Creation(now.Add(-time.Minute)).
++			Annotation(EnabledAnnotationKey, EnabledAnnotationValue).
++			Annotation(kueue.WorkloadSliceNameAnnotation, "slice").
++			Annotation(FlavorPlacementOnPodsAnnotation, "true").
++			PodSets(podSets...).
++			ReserveQuotaAt(admission.Obj(), now).AdmittedAt(true, now)
++	}
++	refused := func(podSets ...kueue.PodSet) *kueue.Workload {
++		return utiltestingapi.MakeWorkload("probe", job.Namespace).
++			OwnerReference(testJobGVK, job.Name, string(job.UID)).
++			Creation(now).
++			Annotation(EnabledAnnotationKey, EnabledAnnotationValue).
++			Annotation(kueue.WorkloadSliceNameAnnotation, "slice").
++			Annotation(FlavorPlacementOnPodsAnnotation, "true").
++			Annotation(WorkloadSliceReplacementFor, "ns/slice").
++			PodSets(podSets...).
++			Condition(metav1.Condition{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse, Reason: "Pending",
++				Message: "couldn't assign flavors to pod set workers: could not assign spot flavor since the original workload is assigned: reserved; " + flavorassigner.GrowthFitsOtherFlavorReason}).
++			Obj()
++	}
++	worker := func(name, podSet string, gated bool) *corev1.Pod {
++		p := testingpod.MakePod(name, job.Namespace).
++			Annotation(kueue.WorkloadSliceNameAnnotation, "slice").
++			Label(constants.PodSetLabel, podSet)
++		if gated {
++			p.Gate(kueue.ElasticJobSchedulingGate)
++		}
++		return p.Obj()
++	}
++	cases := map[string]struct {
++		gate     bool
++		objs     []client.Object
++		jobCount int32
++		// wantName is the slice EnsureWorkloadSlices returns, "" for a new one.
++		wantName   string
++		wantCounts workload.PodSetsCounts
++	}{
++		"a split slice matching the job is returned unchanged": {
++			objs:       []client.Object{slice(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)).Obj()},
++			jobCount:   12,
++			wantName:   "slice",
++			wantCounts: workload.PodSetsCounts{"workers": 8, "workers--2": 4},
++		},
++		"growth of a split slice asks for a new slice": {
++			objs:     []client.Object{slice(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)).Obj()},
++			jobCount: 14,
++		},
++		"a scale-down shrinks the entry whose pods were deleted": {
++			objs: []client.Object{
++				slice(plainPodSet("workers", 3), splitPodSet("workers", "workers--2", 2)).Obj(),
++				worker("a", "workers", false), worker("b", "workers", false), worker("c", "workers", false),
++				worker("d", "workers--2", false),
++			},
++			jobCount:   4,
++			wantName:   "slice",
++			wantCounts: workload.PodSetsCounts{"workers": 3, "workers--2": 1},
++		},
++		"a scale-down waits for the deleted pods": {
++			objs: []client.Object{
++				slice(plainPodSet("workers", 3), splitPodSet("workers", "workers--2", 2)).Obj(),
++				worker("a", "workers", false), worker("b", "workers", false), worker("c", "workers", false),
++				worker("d", "workers--2", false), worker("e", "workers--2", false),
++			},
++			jobCount:   4,
++			wantName:   "slice",
++			wantCounts: workload.PodSetsCounts{"workers": 3, "workers--2": 2},
++		},
++		"a scale-down with gated pods shrinks the newest entry first": {
++			objs: []client.Object{
++				slice(plainPodSet("workers", 3), splitPodSet("workers", "workers--2", 2)).Obj(),
++				worker("a", "workers", false), worker("b", "workers", true), worker("c", "workers", true),
++			},
++			jobCount:   4,
++			wantName:   "slice",
++			wantCounts: workload.PodSetsCounts{"workers": 3, "workers--2": 1},
++		},
++		"a refused probe is split with the gate on": {
++			gate: true,
++			objs: []client.Object{
++				slice(plainPodSet("workers", 8)).Obj(),
++				refused(plainPodSet("workers", 12)),
++			},
++			jobCount:   12,
++			wantName:   "probe",
++			wantCounts: workload.PodSetsCounts{"workers": 8, "workers--2": 4},
++		},
++		"a refused probe is left alone with the gate off": {
++			objs: []client.Object{
++				slice(plainPodSet("workers", 8)).Obj(),
++				refused(plainPodSet("workers", 12)),
++			},
++			jobCount:   12,
++			wantName:   "probe",
++			wantCounts: workload.PodSetsCounts{"workers": 12},
++		},
++		"a probe whose growth no other flavor would take is not split": {
++			gate: true,
++			objs: []client.Object{
++				slice(plainPodSet("workers", 8)).Obj(),
++				func() *kueue.Workload {
++					wl := refused(plainPodSet("workers", 12))
++					wl.Status.Conditions[0].Message = "couldn't assign flavors to pod set workers: could not assign spot flavor since the original workload is assigned: reserved"
++					return wl
++				}(),
++			},
++			jobCount:   12,
++			wantName:   "probe",
++			wantCounts: workload.PodSetsCounts{"workers": 12},
++		},
++		"a probe the scheduler has not tried is not split": {
++			gate: true,
++			objs: []client.Object{
++				slice(plainPodSet("workers", 8)).Obj(),
++				func() *kueue.Workload {
++					wl := refused(plainPodSet("workers", 12))
++					wl.Status.Conditions = nil
++					return wl
++				}(),
++			},
++			jobCount:   12,
++			wantName:   "probe",
++			wantCounts: workload.PodSetsCounts{"workers": 12},
++		},
++		"a probe held back for a pending reclaim target is not split": {
++			gate: true,
++			objs: []client.Object{
++				slice(plainPodSet("workers", 8)).Annotation(constants.ReclaimTargetCountsAnnotation, "workers=4").Obj(),
++				refused(plainPodSet("workers", 12)),
++			},
++			jobCount:   12,
++			wantName:   "probe",
++			wantCounts: workload.PodSetsCounts{"workers": 12},
++		},
++		"a pending split probe shrinks its newest entries first": {
++			gate: true,
++			objs: []client.Object{
++				slice(plainPodSet("workers", 8)).Obj(),
++				refused(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)),
++			},
++			jobCount:   10,
++			wantName:   "probe",
++			wantCounts: workload.PodSetsCounts{"workers": 8, "workers--2": 2},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: tc.gate,
++				features.ElasticJobsViaWorkloadSlicesFlavorSplit:          tc.gate,
++			})
++			ctx, _ := utiltesting.ContextWithLog(t)
++			clnt := utiltesting.NewClientBuilder().
++				WithObjects(tc.objs...).
++				WithStatusSubresource(&kueue.Workload{}).
++				WithIndex(&kueue.Workload{}, indexer.OwnerReferenceIndexKey(testJobGVK), indexer.WorkloadOwnerIndexFunc(testJobGVK)).
++				WithIndex(&corev1.Pod{}, indexer.WorkloadSliceNameKey, indexer.IndexPodWorkloadSliceName).
++				Build()
++			manager := Manager{Client: clnt, Clock: testingclock.NewFakeClock(now)}
++			jobPodSets := []kueue.PodSet{plainPodSet("workers", int(tc.jobCount))}
++
++			got, compatible, err := manager.EnsureWorkloadSlices(ctx, jobPodSets, job, testJobGVK)
++			if err != nil || !compatible {
++				t.Fatalf("EnsureWorkloadSlices() compatible = %v, error = %v", compatible, err)
++			}
++			if tc.wantName == "" {
++				if got != nil {
++					t.Fatalf("EnsureWorkloadSlices() = %s, want a new slice", got.Name)
++				}
++				return
++			}
++			if got == nil || got.Name != tc.wantName {
++				t.Fatalf("EnsureWorkloadSlices() = %v, want %s", got, tc.wantName)
++			}
++			var stored kueue.Workload
++			if err := clnt.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: tc.wantName}, &stored); err != nil {
++				t.Fatalf("Get(%s) error: %v", tc.wantName, err)
++			}
++			if diff := cmp.Diff(tc.wantCounts, workload.ExtractPodSetCountsFromWorkload(&stored)); diff != "" {
++				t.Errorf("Stored counts (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestDeletePodGroupsAboveCountsKeepsOtherEntries(t *testing.T) {
++	ctx, _ := utiltesting.ContextWithLog(t)
++	wl := utiltestingapi.MakeWorkload("slice", "ns").Annotation(kueue.WorkloadSliceNameAnnotation, "origin").Obj()
++	pod := func(name, podSet string) *corev1.Pod {
++		return testingpod.MakePod(name, "ns").Annotation(kueue.WorkloadSliceNameAnnotation, "origin").Label(constants.PodSetLabel, podSet).Obj()
++	}
++	objs := []client.Object{pod("r1", "workers"), pod("r2", "workers"), pod("s1", "workers--2"), pod("s2", "workers--2")}
++	clnt := utiltesting.NewClientBuilder().WithObjects(objs...).
++		WithIndex(&corev1.Pod{}, indexer.WorkloadSliceNameKey, indexer.IndexPodWorkloadSliceName).Build()
++	// Reclaiming the flavor of "workers" stops its pods only.
++	if _, err := DeletePodGroupsAboveCounts(ctx, clnt, wl, workload.PodSetsCounts{"workers": 0}, func(p *corev1.Pod) string { return p.Name }); err != nil {
++		t.Fatalf("DeletePodGroupsAboveCounts() error: %v", err)
++	}
++	var pods corev1.PodList
++	if err := clnt.List(ctx, &pods); err != nil {
++		t.Fatal(err)
++	}
++	var left []string
++	for _, p := range pods.Items {
++		left = append(left, p.Name)
++	}
++	if diff := cmp.Diff([]string{"s1", "s2"}, left); diff != "" {
++		t.Errorf("Pods left (-want,+got):\n%s", diff)
++	}
++}
+diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
+index f3816d3..66dce78 100644
+--- a/pkg/workloadslicing/manager.go
++++ b/pkg/workloadslicing/manager.go
+@@ -21,12 +21,16 @@ import (
+ 	"fmt"
+ 	"slices"
+ 
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 	"k8s.io/client-go/tools/events"
++	"k8s.io/client-go/util/retry"
+ 	"k8s.io/utils/clock"
++	ctrl "sigs.k8s.io/controller-runtime"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/features"
+ 	"sigs.k8s.io/kueue/pkg/metrics"
+ 	"sigs.k8s.io/kueue/pkg/util/roletracker"
+ 	"sigs.k8s.io/kueue/pkg/workload"
+@@ -56,8 +60,8 @@ func (r *Manager) EnsureWorkloadSlices(
+ 	opts ...EnsureOption,
+ ) (*kueue.Workload, bool, error) {
+ 	options := newEnsureOptions(opts)
+-	jobPodSetsCounts := workload.ExtractPodSetCounts(jobPodSets)
+-	applyPodSetCounts := func(wl *kueue.Workload) {
++	jobBaseCounts := workload.ExtractPodSetCounts(jobPodSets)
++	applyPodSetCounts := func(wl *kueue.Workload, jobPodSetsCounts workload.PodSetsCounts) {
+ 		workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
+ 		// Only initial admission follows the job's current minimum. Replacements
+ 		// and readmissions retain their baseline, even after a zero-second admission.
+@@ -112,6 +116,16 @@ func (r *Manager) EnsureWorkloadSlices(
+ 		// A single active workload was found.
+ 		wl := &workloads[0]
+ 		wlPodSetsCounts := workload.ExtractPodSetCountsFromWorkload(wl)
++		jobPodSetsCounts, settled, err := jobCountsForSlice(ctx, r.Client, wl, jobBaseCounts)
++		if err != nil {
++			return nil, true, err
++		}
++
++		if !settled {
++			// The job's controller has not deleted the pods the job removed from a split
++			// slice yet, so which entry shrinks is not known; keep the slice until it has.
++			return wl, true, nil
++		}
+ 
+ 		// Check if pod sets are structurally compatible (same number and names).
+ 		if !jobPodSetsCounts.HasSamePodSetKeys(wlPodSetsCounts) {
+@@ -143,7 +157,7 @@ func (r *Manager) EnsureWorkloadSlices(
+ 			if reclaim.keepsSlice(wlPodSetsCounts, jobPodSetsCounts) {
+ 				return wl, true, nil
+ 			}
+-			applyPodSetCounts(wl)
++			applyPodSetCounts(wl, jobPodSetsCounts)
+ 			reclaim.apply(wl)
+ 			if err := r.Client.Update(ctx, wl); err != nil {
+ 				return nil, true, fmt.Errorf("failed to update workload's pod sets counts: %w", err)
+@@ -165,12 +179,20 @@ func (r *Manager) EnsureWorkloadSlices(
+ 		if selectedWorkload == nil {
+ 			return nil, true, nil
+ 		}
+-		selectedWorkload, err = r.dropProbeAfterScaleDown(ctx, workloads, selectedWorkload, jobPodSetsCounts)
++		selectedWorkload, err = r.dropProbeAfterScaleDown(ctx, workloads, selectedWorkload, jobBaseCounts)
+ 		if err != nil {
+ 			return nil, true, err
+ 		}
+ 
+ 		selectedCounts := workload.ExtractPodSetCountsFromWorkload(selectedWorkload)
++		jobPodSetsCounts, settled, err := jobCountsForSlice(ctx, r.Client, selectedWorkload, jobBaseCounts)
++		if err != nil {
++			return nil, true, err
++		}
++
++		if !settled {
++			return selectedWorkload, true, nil
++		}
+ 
+ 		if !jobPodSetsCounts.HasSamePodSetKeys(selectedCounts) {
+ 			return nil, false, nil
+@@ -181,6 +203,9 @@ func (r *Manager) EnsureWorkloadSlices(
+ 		}
+ 
+ 		if jobPodSetsCounts.EqualTo(selectedCounts) {
++			if err := r.splitRefusedProbe(ctx, jobObject, workloads, selectedWorkload); err != nil {
++				return nil, true, err
++			}
+ 			return selectedWorkload, true, nil
+ 		}
+ 
+@@ -189,7 +214,7 @@ func (r *Manager) EnsureWorkloadSlices(
+ 			if reclaim.keepsSlice(selectedCounts, jobPodSetsCounts) {
+ 				return selectedWorkload, true, nil
+ 			}
+-			applyPodSetCounts(selectedWorkload)
++			applyPodSetCounts(selectedWorkload, jobPodSetsCounts)
+ 			reclaim.apply(selectedWorkload)
+ 			if err := r.Client.Update(ctx, selectedWorkload); err != nil {
+ 				return nil, true, fmt.Errorf("failed to update workload pod set counts: %w", err)
+@@ -205,6 +230,44 @@ func (r *Manager) EnsureWorkloadSlices(
+ 	}
+ }
+ 
++// splitRefusedProbe moves the growth of the pending replacement probe to split entries when
++// the scheduler refused it, so the added pods may run on another flavor than the running pods
++// of their PodSet (see SplitGrowth). It needs ElasticJobsViaWorkloadSlicesFlavorSplit; the
++// rest of the flavor-split handling follows the split entries, so turning the gate off
++// strands no pod.
++func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object, workloads []kueue.Workload, probe *kueue.Workload) error {
++	if !features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorSplit) {
++		return nil
++	}
++	replaced := admittedPredecessor(workloads, probe)
++	if replaced == nil {
++		return nil
++	}
++	// The scheduler writes the probe's status while the reconciler decides, so a conflict
++	// re-reads the probe and decides again.
++	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
++		if !splitTriedProbe(probe, replaced) {
++			return nil
++		}
++		split := probe.DeepCopy()
++		if !SplitGrowth(split, replaced, partialScaleUpEnabled(jobObject)) {
++			return nil
++		}
++		ctrl.LoggerFrom(ctx).V(2).Info("Splitting the growth of a refused workload slice into PodSets that may take another flavor",
++			"workload", workload.Key(probe), "replaced", workload.Key(replaced))
++		if err := r.Client.Update(ctx, split); err != nil {
++			if apierrors.IsConflict(err) {
++				if getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(probe), probe); getErr != nil {
++					return getErr
++				}
++			}
++			return fmt.Errorf("failed to split the workload slice's pod sets: %w", err)
++		}
++		*probe = *split
++		return nil
++	})
++}
++
+ // refreshFloors brings the reclaim floor and step annotations of every slice up to the
+ // job's, when the caller asked for that. It writes metadata only.
+ func (r *Manager) refreshFloors(ctx context.Context, active []kueue.Workload, options ensureOptions) error {
+diff --git a/pkg/workloadslicing/reclaim_floors.go b/pkg/workloadslicing/reclaim_floors.go
+index a3ce0fc..a88e855 100644
+--- a/pkg/workloadslicing/reclaim_floors.go
++++ b/pkg/workloadslicing/reclaim_floors.go
+@@ -57,8 +57,9 @@ func (o *ensureOptions) apply(wl *kueue.Workload) bool {
+ 	if !o.refreshFloors {
+ 		return false
+ 	}
+-	changed := syncAnnotation(wl, constants.ReclaimMinCountsAnnotation, o.floorsFor(wl), workload.SetReclaimMinCounts)
+-	return syncAnnotation(wl, constants.PodSetCountStepsAnnotation, o.steps, workload.SetPodSetCountSteps) || changed
++	floors, steps := ExpandToSplitEntries(wl.Spec.PodSets, o.floorsFor(wl), o.steps)
++	changed := syncAnnotation(wl, constants.ReclaimMinCountsAnnotation, floors, workload.SetReclaimMinCounts)
++	return syncAnnotation(wl, constants.PodSetCountStepsAnnotation, steps, workload.SetPodSetCountSteps) || changed
+ }
+ 
+ // floorsFor caps each floor at the PodSet's count in wl, since a slice smaller than the job,
+diff --git a/pkg/workloadslicing/regrow_after_reclaim.go b/pkg/workloadslicing/regrow_after_reclaim.go
+index d3d6f92..5ff5cf8 100644
+--- a/pkg/workloadslicing/regrow_after_reclaim.go
++++ b/pkg/workloadslicing/regrow_after_reclaim.go
+@@ -86,9 +86,10 @@ func (r *Manager) dropProbeAfterScaleDown(ctx context.Context, workloads []kueue
+ 	return replaced, nil
+ }
+ 
+-// growsPast reports whether the job asks for more pods in some PodSet than wl runs after reclaim.
++// growsPast reports whether the job asks for more pods in some PodSet than wl runs after reclaim,
++// in all the entries of the PodSet when wl has split entries.
+ func growsPast(jobCounts workload.PodSetsCounts, wl *kueue.Workload) bool {
+-	running := AfterReclaimBaseline(wl)
++	running := FoldSplitCounts(wl.Spec.PodSets, AfterReclaimBaseline(wl))
+ 	for name, count := range jobCounts {
+ 		if granted, found := running[name]; found && count > granted {
+ 			return true

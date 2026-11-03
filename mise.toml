@@ -592,8 +592,4 @@ run = "kind delete cluster --name $CLUSTER_NAME"
 description = "Run the scenarios that pass with PartialPreemption off, or every scenario with CHAINSAW_SELECTOR set to an empty string"
 # CHAINSAW_SELECTOR is a label selector over the scenarios. Those labeled partial-preemption=required need the
 # PartialPreemption gate, so when it is unset only the others run; set it to "" to run every scenario.
-run = 'chainsaw test tests/scenarios/ --selector "${CHAINSAW_SELECTOR-partial-preemption!=required,flavor-split!=required}" --parallel 1 --assert-timeout 60s --cleanup-timeout 120s --force-termination-grace-period 0s'
-
-[tasks."test:flavor-split"]
-description = "Run the flavor-split PodSets e2e scenarios on Kind"
-run = 'TEST_FLAVOR_SPLIT=1 chainsaw test tests/scenarios/kueue/07-flavor-split-podsets/ --selector "${CHAINSAW_SELECTOR-}" --parallel 1 --assert-timeout 60s --cleanup-timeout 120s --force-termination-grace-period 0s'
+run = 'chainsaw test tests/scenarios/ --selector "${CHAINSAW_SELECTOR-partial-preemption!=required}" --parallel 1 --assert-timeout 60s --cleanup-timeout 120s --force-termination-grace-period 0s'

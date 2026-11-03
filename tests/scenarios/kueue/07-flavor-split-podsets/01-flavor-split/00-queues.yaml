@@ -1,31 +1,16 @@
-# Multi-flavor ClusterQueue and cohort setup for flavor-split PodSets.
-# "flavor-a" (quota 8) then "flavor-b" (quota 8) in ClusterQueue order.
-# The cohort-mate queue at higher priority shares the cohort, allowing clean reclaim.
+# Two flavors in ClusterQueue order, flavor-a then flavor-b, for a team that borrows its flavor-a GPUs from a lender that reclaims them.
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata:
-  name: pc-flavor-split-low
+  name: pc-flavor-split
 value: 100
-globalDefault: false
----
-apiVersion: scheduling.k8s.io/v1
-kind: PriorityClass
-metadata:
-  name: pc-flavor-split-high
-value: 1000
 globalDefault: false
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: WorkloadPriorityClass
 metadata:
-  name: pc-flavor-split-low
+  name: pc-flavor-split
 value: 100
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: WorkloadPriorityClass
-metadata:
-  name: pc-flavor-split-high
-value: 1000
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
@@ -34,10 +19,6 @@ metadata:
 spec:
   nodeLabels:
     instance-type: flavor-a
-  tolerations:
-    - key: node.kubernetes.io/not-ready
-      operator: Exists
-      effect: NoSchedule
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
@@ -47,20 +28,21 @@ spec:
   nodeLabels:
     instance-type: flavor-b
   tolerations:
-    - key: node.kubernetes.io/not-ready
+    - key: example.com/spot
       operator: Exists
       effect: NoSchedule
 ---
+# The team owns 4 GPUs of flavor-b and borrows up to 8 of flavor-a.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
-  name: flavor-split-cq
+  name: flavor-split-team
 spec:
   cohortName: flavor-split-cohort
   namespaceSelector: {}
   preemption:
-    withinClusterQueue: LowerPriority
     reclaimWithinCohort: Any
+    withinClusterQueue: LowerPriority
   resourceGroups:
     - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
       flavors:
@@ -71,7 +53,8 @@ spec:
             - name: "memory"
               nominalQuota: "256Gi"
             - name: "nvidia.com/gpu"
-              nominalQuota: "8"
+              nominalQuota: "0"
+              borrowingLimit: "8"
         - name: flavor-b
           resources:
             - name: "cpu"
@@ -79,34 +62,30 @@ spec:
             - name: "memory"
               nominalQuota: "256Gi"
             - name: "nvidia.com/gpu"
-              nominalQuota: "8"
+              nominalQuota: "4"
 ---
+# The lender owns the 8 GPUs of flavor-a and reclaims them for its own job.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
-  name: flavor-split-cohort-mate-cq
+  name: flavor-split-lender
 spec:
   cohortName: flavor-split-cohort
   namespaceSelector: {}
   preemption:
-    withinClusterQueue: LowerPriority
     reclaimWithinCohort: Any
-    borrowWithinCohort:
-      policy: LowerPriority
+    withinClusterQueue: LowerPriority
   resourceGroups:
     - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
       flavors:
         - name: flavor-a
           resources:
             - name: "cpu"
-              nominalQuota: "0"
-              borrowingLimit: "64"
+              nominalQuota: "64"
             - name: "memory"
-              nominalQuota: "0"
-              borrowingLimit: "256Gi"
+              nominalQuota: "256Gi"
             - name: "nvidia.com/gpu"
-              nominalQuota: "0"
-              borrowingLimit: "8"
+              nominalQuota: "8"
         - name: flavor-b
           resources:
             - name: "cpu"
@@ -121,11 +100,11 @@ kind: LocalQueue
 metadata:
   name: lq-flavor-split
 spec:
-  clusterQueue: flavor-split-cq
+  clusterQueue: flavor-split-team
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
-  name: lq-cohort-mate
+  name: lq-flavor-split-lender
 spec:
-  clusterQueue: flavor-split-cohort-mate-cq
+  clusterQueue: flavor-split-lender

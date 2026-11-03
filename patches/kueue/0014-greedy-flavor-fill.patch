@@ -1094,12 +1094,25 @@ diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
 index 2fb96f1..2f6eff7 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
-@@ -1581,7 +1581,8 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -520,6 +520,9 @@ func (s *Scheduler) processEntry(
+ 	}
+ 
+ 	if mode == flavorassigner.NoFit {
++		if _, ok := flavorassigner.ParseGreedySplit(e.assignment.Message()); ok {
++			e.FlavorScanState = nil
++		}
+ 		e.requeueReason = qcache.RequeueReasonNoFit
+ 		log.V(3).Info("Skipping workload as FlavorAssigner assigned NoFit mode")
+ 		e.quotaReservedReason = e.assignment.NoFitReason
+@@ -1581,7 +1584,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  	assignmentPlan := planner.Plan(ctx, &initialAssignment)
  	topologyRetry := assignmentPlan.TopologyRetry
  
 -	if !assignmentPlan.CanFit() && workload.MinCountsUsable(wl.Obj) && wl.CanBePartiallyAdmitted() {
 +	_, needsGreedySplit := flavorassigner.ParseGreedySplit(initialAssignment.Message())
++	if needsGreedySplit {
++		wl.FlavorScanState = nil
++	}
 +	if !needsGreedySplit && !assignmentPlan.CanFit() && workload.MinCountsUsable(wl.Obj) && wl.CanBePartiallyAdmitted() {
  		// bestPA is tracked here, not returned by fitsFn(), so it can't drift from
  		// the counts Reduce returns.

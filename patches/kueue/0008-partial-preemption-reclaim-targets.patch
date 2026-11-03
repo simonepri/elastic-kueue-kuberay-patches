@@ -76,6 +76,52 @@ index 0000000..0b3061c
 +	// were first set.
 +	ReclaimRequestedAtAnnotation = "kueue.x-k8s.io/reclaim-requested-at"
 +)
+diff --git a/pkg/controller/core/indexer/indexer.go b/pkg/controller/core/indexer/indexer.go
+index 1c69baa..dc9416d 100644
+--- a/pkg/controller/core/indexer/indexer.go
++++ b/pkg/controller/core/indexer/indexer.go
+@@ -19,6 +19,7 @@ package indexer
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	resourceapi "k8s.io/api/resource/v1"
+@@ -36,6 +37,7 @@ import (
+ )
+ 
+ const (
++	PodNodeNameKey                              = "spec.nodeName"
+ 	WorkloadQueueKey                            = "spec.queueName"
+ 	WorkloadClusterQueueKey                     = "status.admission.clusterQueue"
+ 	QueueClusterQueueKey                        = "spec.clusterQueue"
+@@ -216,6 +218,15 @@ func IndexPodWorkloadSliceName(obj client.Object) []string {
+ 	return nil
+ }
+ 
++// IndexPodNodeName indexes Pods by spec.nodeName.
++func IndexPodNodeName(obj client.Object) []string {
++	pod, ok := obj.(*corev1.Pod)
++	if !ok || pod.Spec.NodeName == "" {
++		return nil
++	}
++	return []string{pod.Spec.NodeName}
++}
++
+ func IndexWorkloadAdmissionCheck(obj client.Object) []string {
+ 	wl, ok := obj.(*kueue.Workload)
+ 	if !ok || len(wl.Status.AdmissionChecks) == 0 {
+@@ -341,6 +352,9 @@ func Setup(ctx context.Context, indexer client.FieldIndexer, opts ...Option) err
+ 	for _, opt := range opts {
+ 		opt(&o)
+ 	}
++	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameKey, IndexPodNodeName); err != nil && !strings.Contains(err.Error(), "indexer conflict") {
++		return fmt.Errorf("setting index on %s for Pod: %w", PodNodeNameKey, err)
++	}
+ 	if err := indexer.IndexField(ctx, &kueue.Workload{}, WorkloadQueueKey, IndexWorkloadQueue); err != nil {
+ 		return fmt.Errorf("setting index on queue for Workload: %w", err)
+ 	}
 diff --git a/pkg/controller/core/reclaim_targets.go b/pkg/controller/core/reclaim_targets.go
 new file mode 100644
 index 0000000..a70f580
@@ -1066,6 +1112,27 @@ index 7724dad..82eafab 100644
  		return j.Status.State == rayv1.Ready
  	}
  	// RayClusters are commonly used as devboxes, where users may already be
+diff --git a/pkg/controller/tas/indexer/indexer.go b/pkg/controller/tas/indexer/indexer.go
+index 804aadf..61a23e5 100644
+--- a/pkg/controller/tas/indexer/indexer.go
++++ b/pkg/controller/tas/indexer/indexer.go
+@@ -19,6 +19,7 @@ package indexer
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 	"strconv"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+@@ -119,7 +120,7 @@ func SetupIndexes(ctx context.Context, indexer client.FieldIndexer) error {
+ 	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeSelectorHostnameKey, indexPodNodeSelectorHostname); err != nil {
+ 		return fmt.Errorf("setting index pod node selector hostname: %w", err)
+ 	}
+-	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameKey, indexPodNodeName); err != nil {
++	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameKey, indexPodNodeName); err != nil && !strings.Contains(err.Error(), "indexer conflict") {
+ 		return fmt.Errorf("setting index on %s for Pod: %w", PodNodeNameKey, err)
+ 	}
+ 	if err := indexer.IndexField(ctx, &corev1.Node{}, NodeHostnameKey, indexNodeHostname); err != nil {
 diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
 index bcc4dd9..644b856 100644
 --- a/pkg/features/kube_features.go
@@ -1672,10 +1739,9 @@ index 209983e..d2491ef 100644
  
 diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
 new file mode 100644
-index 0000000..8818749
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption.go
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,540 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1703,6 +1769,7 @@ index 0000000..8818749
 +	"strings"
 +
 +	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
 +	"k8s.io/klog/v2"
 +	ctrl "sigs.k8s.io/controller-runtime"
 +	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1713,6 +1780,7 @@ index 0000000..8818749
 +	clientutil "sigs.k8s.io/kueue/pkg/util/client"
 +	"sigs.k8s.io/kueue/pkg/util/parallelize"
 +	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
++	utilresource "sigs.k8s.io/kueue/pkg/util/resource"
 +	"sigs.k8s.io/kueue/pkg/workload"
 +)
 +
@@ -1780,18 +1848,22 @@ index 0000000..8818749
 +}
 +
 +type nodeReclaimUsage struct {
-+	name      string
-+	podCount  int32
-+	otherPods int
-+	otherGPUs int64
++	name              string
++	deletionCost      int64
++	podCount          int32
++	otherPods         int
++	otherAccelerators int64
 +}
 +
 +func compareNodes(a, b *nodeReclaimUsage) int {
++	if a.deletionCost != b.deletionCost {
++		return cmp.Compare(a.deletionCost, b.deletionCost) // prefer lower total deletion cost
++	}
 +	if a.podCount != b.podCount {
 +		return cmp.Compare(b.podCount, a.podCount) // prefer node holding most pods
 +	}
-+	if a.otherGPUs != b.otherGPUs {
-+		return cmp.Compare(a.otherGPUs, b.otherGPUs) // prefer fewer other GPUs
++	if a.otherAccelerators != b.otherAccelerators {
++		return cmp.Compare(a.otherAccelerators, b.otherAccelerators) // prefer fewer other accelerators
 +	}
 +	if a.otherPods != b.otherPods {
 +		return cmp.Compare(a.otherPods, b.otherPods) // prefer fewer other pods
@@ -1799,29 +1871,47 @@ index 0000000..8818749
 +	return strings.Compare(a.name, b.name)
 +}
 +
-+func computeNodeUsages(allPods []corev1.Pod) map[string]*nodeReclaimUsage {
-+	usages := make(map[string]*nodeReclaimUsage)
-+	for i := range allPods {
-+		p := &allPods[i]
-+		if p.Spec.NodeName == "" || utilpod.IsTerminated(p) {
++func computeNodeUsages(
++	candidateNodes sets.Set[string],
++	candidatePods []corev1.Pod,
++	ourPodUIDs, ourPodNames sets.Set[string],
++	acceleratorResources sets.Set[corev1.ResourceName],
++) map[string]*nodeReclaimUsage {
++	usages := make(map[string]*nodeReclaimUsage, len(candidateNodes))
++	for nodeName := range candidateNodes {
++		usages[nodeName] = &nodeReclaimUsage{name: nodeName}
++	}
++	for i := range candidatePods {
++		p := &candidatePods[i]
++		if p.Spec.NodeName == "" || !candidateNodes.Has(p.Spec.NodeName) || utilpod.IsTerminated(p) || p.DeletionTimestamp != nil {
 +			continue
 +		}
-+		u, ok := usages[p.Spec.NodeName]
-+		if !ok {
-+			u = &nodeReclaimUsage{name: p.Spec.NodeName}
-+			usages[p.Spec.NodeName] = u
++		if (p.UID != "" && ourPodUIDs.Has(string(p.UID))) || ourPodNames.Has(p.Name) {
++			continue
 +		}
++		u := usages[p.Spec.NodeName]
 +		u.otherPods++
-+		for _, c := range p.Spec.Containers {
-+			if q, ok := c.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")]; ok {
-+				u.otherGPUs += q.Value()
++		for _, containers := range [][]corev1.Container{p.Spec.InitContainers, p.Spec.Containers} {
++			for _, c := range containers {
++				for resName := range acceleratorResources {
++					if q, ok := c.Resources.Requests[resName]; ok {
++						u.otherAccelerators += q.Value()
++					}
++				}
 +			}
 +		}
 +	}
 +	return usages
 +}
 +
-+func podsToReclaim(groups []*podGroup, needed int32, allPods []corev1.Pod) []*corev1.Pod {
++func podsToReclaim(
++	groups []*podGroup,
++	needed int32,
++	candidateNodes sets.Set[string],
++	candidatePods []corev1.Pod,
++	ourPodUIDs, ourPodNames sets.Set[string],
++	acceleratorResources sets.Set[corev1.ResourceName],
++) []*corev1.Pod {
 +	var toDelete []*corev1.Pod
 +
 +	// 1. Separate unscheduled and scheduled groups. Unscheduled groups are deleted first.
@@ -1856,32 +1946,29 @@ index 0000000..8818749
 +	}
 +
 +	// 2. Group scheduled replica groups by node.
-+	nodeUsages := computeNodeUsages(allPods)
++	// Account each pod on its own node; a group whose pods span several nodes counts toward each of them.
++	nodeUsages := computeNodeUsages(candidateNodes, candidatePods, ourPodUIDs, ourPodNames, acceleratorResources)
 +	nodeGroups := make(map[string][]*podGroup)
 +	for _, g := range scheduled {
-+		nodeName := g.pods[0].Spec.NodeName
-+		nodeGroups[nodeName] = append(nodeGroups[nodeName], g)
-+	}
-+
-+	for nodeName, grps := range nodeGroups {
-+		u, ok := nodeUsages[nodeName]
-+		if !ok {
-+			u = &nodeReclaimUsage{name: nodeName}
-+			nodeUsages[nodeName] = u
-+		}
-+		for _, g := range grps {
-+			u.podCount += int32(len(g.pods))
-+			u.otherPods -= len(g.pods)
-+			for _, p := range g.pods {
-+				for _, c := range p.Spec.Containers {
-+					if q, ok := c.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")]; ok {
-+						u.otherGPUs -= q.Value()
-+					}
++		nodesForGroup := sets.New[string]()
++		for _, p := range g.pods {
++			if p.Spec.NodeName != "" {
++				nodesForGroup.Insert(p.Spec.NodeName)
++				u := nodeUsages[p.Spec.NodeName]
++				if u == nil {
++					u = &nodeReclaimUsage{name: p.Spec.NodeName}
++					nodeUsages[p.Spec.NodeName] = u
 +				}
++				u.podCount++
 +			}
 +		}
++		for nodeName := range nodesForGroup {
++			nodeGroups[nodeName] = append(nodeGroups[nodeName], g)
++			nodeUsages[nodeName].deletionCost += g.deletionCost
++		}
 +	}
 +
++	deletedGroups := make(map[*podGroup]bool)
 +	for needed > 0 && len(nodeGroups) > 0 {
 +		var wholeCandidates []*nodeReclaimUsage
 +		for nodeName := range nodeGroups {
@@ -1895,11 +1982,21 @@ index 0000000..8818749
 +			slices.SortFunc(wholeCandidates, compareNodes)
 +			chosen := wholeCandidates[0]
 +			for _, g := range nodeGroups[chosen.name] {
++				if deletedGroups[g] {
++					continue
++				}
++				deletedGroups[g] = true
 +				toDelete = append(toDelete, g.pods...)
 +				needed -= int32(len(g.pods))
++				for _, p := range g.pods {
++					if p.Spec.NodeName != "" {
++						if nu, ok := nodeUsages[p.Spec.NodeName]; ok {
++							nu.podCount--
++						}
++					}
++				}
 +			}
 +			delete(nodeGroups, chosen.name)
-+			chosen.podCount = 0
 +			continue
 +		}
 +
@@ -1919,15 +2016,25 @@ index 0000000..8818749
 +		slices.SortFunc(grps, comparePodGroups)
 +		var remainingGrps []*podGroup
 +		for _, g := range grps {
++			if deletedGroups[g] {
++				continue
++			}
 +			if needed <= 0 {
 +				remainingGrps = append(remainingGrps, g)
 +			} else {
++				deletedGroups[g] = true
 +				toDelete = append(toDelete, g.pods...)
 +				needed -= int32(len(g.pods))
-+				chosen.podCount -= int32(len(g.pods))
++				for _, p := range g.pods {
++					if p.Spec.NodeName != "" {
++						if nu, ok := nodeUsages[p.Spec.NodeName]; ok {
++							nu.podCount--
++						}
++					}
++				}
 +			}
 +		}
-+		if len(remainingGrps) == 0 {
++		if len(remainingGrps) == 0 || nodeUsages[chosen.name].podCount <= 0 {
 +			delete(nodeGroups, chosen.name)
 +		} else {
 +			nodeGroups[chosen.name] = remainingGrps
@@ -1937,15 +2044,46 @@ index 0000000..8818749
 +	return toDelete
 +}
 +
++// extractAcceleratorResources finds accelerator extended resource names from the pod set's container requests.
++func extractAcceleratorResources(wl *kueue.Workload, psRef kueue.PodSetReference, live []*corev1.Pod) sets.Set[corev1.ResourceName] {
++	accelerators := sets.New[corev1.ResourceName]()
++	if idx := slices.IndexFunc(wl.Spec.PodSets, func(ps kueue.PodSet) bool { return ps.Name == psRef }); idx >= 0 {
++		for _, containers := range [][]corev1.Container{wl.Spec.PodSets[idx].Template.Spec.InitContainers, wl.Spec.PodSets[idx].Template.Spec.Containers} {
++			for _, c := range containers {
++				for resName, qty := range c.Resources.Requests {
++					if !qty.IsZero() && utilresource.IsExtendedResourceName(resName) {
++						accelerators.Insert(resName)
++					}
++				}
++			}
++		}
++	}
++	if accelerators.Len() == 0 {
++		for _, p := range live {
++			for _, containers := range [][]corev1.Container{p.Spec.InitContainers, p.Spec.Containers} {
++				for _, c := range containers {
++					for resName, qty := range c.Resources.Requests {
++						if !qty.IsZero() && utilresource.IsExtendedResourceName(resName) {
++							accelerators.Insert(resName)
++						}
++					}
++				}
++			}
++		}
++	}
++	return accelerators
++}
++
 +// DeletePodGroupsAboveCounts deletes running Pods of the workload slice until
 +// each PodSet in counts runs at most its count. When deleting pods, unscheduled
-+// pods are deleted first, then whole nodes' worth of pods are deleted (preferring
-+// nodes where this pod set holds the most pods, breaking ties by fewer other GPUs
-+// or other pods on the node, then node name). Any remaining pods are deleted from
-+// a partial node in deletion cost / age order. Multi-host replica groups are kept
-+// whole. Terminating Pods are neither deleted again nor counted, so a call made
-+// while earlier deletions are still terminating deletes nothing more. It returns
-+// whether any Pod was deleted.
++// pods are deleted first, then whole nodes' worth of pods are deleted (ranking
++// candidate nodes first by lower total deletion cost of this pod set's groups on
++// the node, then greedily preferring nodes where this pod set holds the most pods,
++// breaking ties by fewer other accelerators or other pods on the node, then node
++// name). Any remaining pods are deleted from a partial node in deletion cost / age
++// order. Multi-host replica groups are kept whole. Terminating Pods are neither
++// deleted again nor counted, so a call made while earlier deletions are still
++// terminating deletes nothing more. It returns whether any Pod was deleted.
 +func DeletePodGroupsAboveCounts(ctx context.Context, c client.Client, wl *kueue.Workload, counts workload.PodSetsCounts, groupOf func(*corev1.Pod) string) (bool, error) {
 +	running, err := runningPodsPerPodSet(ctx, c, wl)
 +	if err != nil {
@@ -1975,13 +2113,46 @@ index 0000000..8818749
 +			}
 +		}
 +		groups := slices.Collect(maps.Values(groupsByKey))
-+		var allPods corev1.PodList
-+		if slices.ContainsFunc(live, func(p *corev1.Pod) bool { return p.Spec.NodeName != "" }) {
-+			if err := c.List(ctx, &allPods); err != nil {
-+				return false, err
++		candidateNodes := sets.New[string]()
++		ourPodUIDs := sets.New[string]()
++		ourPodNames := sets.New[string]()
++		for _, p := range live {
++			if p.UID != "" {
++				ourPodUIDs.Insert(string(p.UID))
++			}
++			ourPodNames.Insert(p.Name)
++			if p.Spec.NodeName != "" {
++				candidateNodes.Insert(p.Spec.NodeName)
 +			}
 +		}
-+		toDelete = append(toDelete, podsToReclaim(groups, remaining-counts[ps], allPods.Items)...)
++		var candidatePods []corev1.Pod
++		if candidateNodes.Len() > 0 {
++			nodeNames := candidateNodes.UnsortedList()
++			slices.Sort(nodeNames)
++			for _, nodeName := range nodeNames {
++				var list corev1.PodList
++				err := c.List(ctx, &list, client.MatchingFields{"spec.nodeName": nodeName})
++				if err != nil {
++					if strings.Contains(err.Error(), "does not exist") {
++						// Index not registered on this client; fallback to cluster list
++						var allPods corev1.PodList
++						if err := c.List(ctx, &allPods); err != nil {
++							return false, err
++						}
++						for _, p := range allPods.Items {
++							if candidateNodes.Has(p.Spec.NodeName) {
++								candidatePods = append(candidatePods, p)
++							}
++						}
++						break
++					}
++					return false, err
++				}
++				candidatePods = append(candidatePods, list.Items...)
++			}
++		}
++		accelerators := extractAcceleratorResources(wl, ps, live)
++		toDelete = append(toDelete, podsToReclaim(groups, remaining-counts[ps], candidateNodes, candidatePods, ourPodUIDs, ourPodNames, accelerators)...)
 +	}
 +	log := ctrl.LoggerFrom(ctx)
 +	err = parallelize.Until(ctx, len(toDelete), func(i int) error {
@@ -2113,10 +2284,9 @@ index 0000000..8818749
 +}
 diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go
 new file mode 100644
-index 0000000..acb3491
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption_test.go
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,721 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2319,6 +2489,7 @@ index 0000000..acb3491
 +		return testingpod.MakePod(name, "ns").
 +			Annotation(kueue.WorkloadSliceNameAnnotation, "origin").
 +			Label(constants.PodSetLabel, "workers").
++			Request(corev1.ResourceName("nvidia.com/gpu"), "1").
 +			CreationTimestamp(now.Add(created))
 +	}
 +	group := func(p *corev1.Pod) string {
@@ -2340,6 +2511,85 @@ index 0000000..acb3491
 +		wantAbove   bool
 +		wantStopped bool
 +	}{
++		"node A holds 8 idle pods (cost 0); node B holds 8 pods, 4 of them with a high deletion cost. Deleting 8 must empty node A": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			for i := range 8 {
++				name := fmt.Sprintf("w-a-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-a").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			for i := range 4 {
++				name := fmt.Sprintf("w-b-idle-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			for i := range 4 {
++				name := fmt.Sprintf("w-b-busy-%d", i)
++				pods = append(pods, worker(name, time.Duration(i+4)*time.Second).
++					NodeName("node-b").
++					Annotation(corev1.PodDeletionCost, "1000").
++					Obj())
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 8},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"multi-host 2-pod group split across two nodes": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			for i := range 2 {
++				pods = append(pods, worker(fmt.Sprintf("w-a-%d", i), time.Duration(i)*time.Second).NodeName("node-a").Obj())
++			}
++			for i := range 2 {
++				pods = append(pods, worker(fmt.Sprintf("w-b-%d", i), time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			p1 := worker("g1-0", 2*time.Second).Label("group", "g1").NodeName("node-a").Obj()
++			p2 := worker("g1-1", 2*time.Second).Label("group", "g1").NodeName("node-b").Obj()
++			pods = append(pods, p1, p2)
++			wantDeleted := []string{"g1-0", "g1-1"}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 4},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
 +		"16 pods 8+8 on two nodes, delete 8 empties one node": func() struct {
 +			pods        []*corev1.Pod
 +			otherPods   []*corev1.Pod
@@ -2710,6 +2960,7 @@ index 0000000..acb3491
 +			clnt := utiltesting.NewClientBuilder().
 +				WithObjects(objs...).
 +				WithIndex(&corev1.Pod{}, indexer.WorkloadSliceNameKey, indexer.IndexPodWorkloadSliceName).
++				WithIndex(&corev1.Pod{}, indexer.PodNodeNameKey, indexer.IndexPodNodeName).
 +				Build()
 +			stopped, err := DeletePodGroupsAboveCounts(ctx, clnt, wl, tc.counts, group)
 +			if err != nil {

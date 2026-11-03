@@ -29,8 +29,8 @@ spec:
                   memory: "256Mi"
     workerGroupSpecs:
       - groupName: workers
-        replicas: 8
-        minReplicas: 4
+        replicas: 2
+        minReplicas: 2
         maxReplicas: 8
         rayStartParams: {}
         template:
@@ -38,6 +38,13 @@ spec:
             priorityClassName: priority-low
             nodeSelector:
               fake-gpu-node: "true"
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: kubernetes.io/hostname
+                whenUnsatisfiable: DoNotSchedule
+                labelSelector:
+                  matchLabels:
+                    ray.io/group: workers
             containers:
               - name: ray-worker
                 image: rayproject/ray:2.38.0

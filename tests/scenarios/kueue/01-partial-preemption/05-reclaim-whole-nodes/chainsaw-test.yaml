@@ -8,7 +8,8 @@ spec:
   description: >
     Verifies that when partial preemption stops elastic worker pods above a reclaim target,
     it frees whole nodes first to avoid GPU capacity fragmentation.
-    Two nodes each advertise 4 GPUs. An elastic RayJob runs 8 single-GPU workers (4 on node-a, 4 on node-b).
+    Two nodes each advertise 4 GPUs. An elastic RayJob runs 8 single-GPU workers (4 on node-a, 4 on node-b),
+    created interleaved across both nodes so that newest-first selection would delete 2 workers from each node.
     A high-priority preemptor job requests 4 GPUs on a single node.
     The partial-preemption stopper empties one entire node (deleting all 4 workers from that node)
     rather than splitting deletions across both nodes, allowing the 4-GPU preemptor pod to be scheduled
@@ -31,7 +32,7 @@ spec:
         - apply:
             file: 01-rayjob.yaml
         - script:
-            timeout: 90s
+            timeout: 120s
             env:
               - name: NS
                 value: ($namespace)

@@ -1031,10 +1031,10 @@ index 0000000..590423c
 +}
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
 new file mode 100644
-index 0000000..d1b3f22
+index 0000000..8d9a02e
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split.go
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,363 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1333,8 +1333,8 @@ index 0000000..d1b3f22
 +		strings.Contains(cond.Message, flavorassigner.GrowthFitsOtherFlavorReason)
 +}
 +
-+// SplitGrowth moves the growth of each PodSet of probe over what replaced runs in its newest
-+// entry to a new split entry, so the scheduler may place the added pods on another flavor while
++// SplitGrowth moves the growth of each PodSet of probe over what replaced runs in its entries to
++// a new split entry, so the scheduler may place the added pods on another flavor while
 +// the running pods keep theirs. The flavor assigner keeps an entry on the flavor replaced gives
 +// it, and a new entry, which replaced does not have, takes the first flavor that fits in the
 +// ClusterQueue's order. With partial set, a new entry may be admitted down to one pod. PodSets
@@ -1351,19 +1351,33 @@ index 0000000..d1b3f22
 +			break
 +		}
 +		idxs := groups[base]
-+		newest := &probe.Spec.PodSets[idxs[len(idxs)-1]]
-+		have, found := running[newest.Name]
-+		if !found || have == 0 || newest.Count <= have || placesByTopology(newest.TopologyRequest) || steps[base] > 1 {
++		if placesByTopology(probe.Spec.PodSets[idxs[0]].TopologyRequest) || steps[base] > 1 {
++			continue
++		}
++		// Every entry that runs pods in replaced and asks for more keeps what it runs, and
++		// the rest goes to one new entry. An entry with no pods may take any flavor whole.
++		var delta int32
++		for _, idx := range idxs {
++			ps := &probe.Spec.PodSets[idx]
++			if have, found := running[ps.Name]; found && have > 0 && ps.Count > have {
++				delta += ps.Count - have
++			}
++		}
++		if delta == 0 {
 +			continue
 +		}
 +		name, ok := nextSplitName(probe.Spec.PodSets, base)
 +		if !ok {
 +			continue
 +		}
-+		delta := newest.Count - have
-+		newest.Count = have
-+		if newest.MinCount != nil && *newest.MinCount > have {
-+			newest.MinCount = ptr.To(have)
++		for _, idx := range idxs {
++			ps := &probe.Spec.PodSets[idx]
++			if have, found := running[ps.Name]; found && have > 0 && ps.Count > have {
++				ps.Count = have
++				if ps.MinCount != nil && *ps.MinCount > have {
++					ps.MinCount = ptr.To(have)
++				}
++			}
 +		}
 +		entry := newSplitEntry(&probe.Spec.PodSets[idxs[0]], name, delta)
 +		if partial {
@@ -1386,10 +1400,10 @@ index 0000000..d1b3f22
 +}
 diff --git a/pkg/workloadslicing/flavor_split_test.go b/pkg/workloadslicing/flavor_split_test.go
 new file mode 100644
-index 0000000..6152323
+index 0000000..7b72dce
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split_test.go
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,560 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1604,10 +1618,11 @@ index 0000000..6152323
 +func TestSplitGrowth(t *testing.T) {
 +	now := time.Now()
 +	admitted := func(podSets ...kueue.PodSet) *kueue.Workload {
-+		admission := utiltestingapi.MakeAdmission("cq")
++		var assignments []kueue.PodSetAssignment
 +		for _, ps := range podSets {
-+			admission.PodSets(utiltestingapi.MakePodSetAssignment(ps.Name).Count(ps.Count).Assignment(corev1.ResourceCPU, "reserved", "1").Obj())
++			assignments = append(assignments, utiltestingapi.MakePodSetAssignment(ps.Name).Count(ps.Count).Assignment(corev1.ResourceCPU, "reserved", "1").Obj())
 +		}
++		admission := utiltestingapi.MakeAdmission("cq").PodSets(assignments...)
 +		return utiltestingapi.MakeWorkload("slice", "ns").PodSets(podSets...).
 +			ReserveQuotaAt(admission.Obj(), now).AdmittedAt(true, now).Obj()
 +	}
@@ -1647,6 +1662,16 @@ index 0000000..6152323
 +			replaced: admitted(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)),
 +			want:     workload.PodSetsCounts{"workers": 8, "workers--2": 4, "workers--3": 2},
 +			wantMin:  map[kueue.PodSetReference]*int32{"workers": nil, "workers--2": nil, "workers--3": nil},
++		},
++		"regrowth after a partial reclaim of an older entry moves to a new entry": {
++			probe: utiltestingapi.MakeWorkload("probe", "ns").PodSets(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)).Obj(),
++			replaced: func() *kueue.Workload {
++				wl := admitted(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4))
++				workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{"workers": 2})
++				wl.Status.ReclaimablePods = []kueue.ReclaimablePod{{Name: "workers", Count: 6}}
++				return wl
++			}(),
++			want: workload.PodSetsCounts{"workers": 2, "workers--2": 4, "workers--3": 6},
 +		},
 +		"a newest entry the replaced slice does not run is not split again": {
 +			probe:    utiltestingapi.MakeWorkload("probe", "ns").PodSets(plainPodSet("workers", 8), splitPodSet("workers", "workers--2", 4)).Obj(),
@@ -1723,10 +1748,11 @@ index 0000000..6152323
 +	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns", UID: uuid.NewUUID()}}
 +	now := time.Now()
 +	slice := func(podSets ...kueue.PodSet) *utiltestingapi.WorkloadWrapper {
-+		admission := utiltestingapi.MakeAdmission("cq")
++		var assignments []kueue.PodSetAssignment
 +		for _, ps := range podSets {
-+			admission.PodSets(utiltestingapi.MakePodSetAssignment(ps.Name).Count(ps.Count).Assignment(corev1.ResourceCPU, "reserved", "1").Obj())
++			assignments = append(assignments, utiltestingapi.MakePodSetAssignment(ps.Name).Count(ps.Count).Assignment(corev1.ResourceCPU, "reserved", "1").Obj())
 +		}
++		admission := utiltestingapi.MakeAdmission("cq").PodSets(assignments...)
 +		return utiltestingapi.MakeWorkload("slice", job.Namespace).
 +			OwnerReference(testJobGVK, job.Name, string(job.UID)).
 +			Creation(now.Add(-time.Minute)).
@@ -1939,12 +1965,17 @@ index 0000000..6152323
 +	}
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index f3816d3..b0b61f4 100644
+index f3816d3..66dce78 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
-@@ -24,9 +24,11 @@ import (
+@@ -21,12 +21,16 @@ import (
+ 	"fmt"
+ 	"slices"
+ 
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
  	"k8s.io/apimachinery/pkg/runtime/schema"
  	"k8s.io/client-go/tools/events"
++	"k8s.io/client-go/util/retry"
  	"k8s.io/utils/clock"
 +	ctrl "sigs.k8s.io/controller-runtime"
  	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1954,7 +1985,7 @@ index f3816d3..b0b61f4 100644
  	"sigs.k8s.io/kueue/pkg/metrics"
  	"sigs.k8s.io/kueue/pkg/util/roletracker"
  	"sigs.k8s.io/kueue/pkg/workload"
-@@ -56,8 +58,8 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -56,8 +60,8 @@ func (r *Manager) EnsureWorkloadSlices(
  	opts ...EnsureOption,
  ) (*kueue.Workload, bool, error) {
  	options := newEnsureOptions(opts)
@@ -1965,7 +1996,7 @@ index f3816d3..b0b61f4 100644
  		workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
  		// Only initial admission follows the job's current minimum. Replacements
  		// and readmissions retain their baseline, even after a zero-second admission.
-@@ -112,6 +114,16 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -112,6 +116,16 @@ func (r *Manager) EnsureWorkloadSlices(
  		// A single active workload was found.
  		wl := &workloads[0]
  		wlPodSetsCounts := workload.ExtractPodSetCountsFromWorkload(wl)
@@ -1982,7 +2013,7 @@ index f3816d3..b0b61f4 100644
  
  		// Check if pod sets are structurally compatible (same number and names).
  		if !jobPodSetsCounts.HasSamePodSetKeys(wlPodSetsCounts) {
-@@ -143,7 +155,7 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -143,7 +157,7 @@ func (r *Manager) EnsureWorkloadSlices(
  			if reclaim.keepsSlice(wlPodSetsCounts, jobPodSetsCounts) {
  				return wl, true, nil
  			}
@@ -1991,7 +2022,7 @@ index f3816d3..b0b61f4 100644
  			reclaim.apply(wl)
  			if err := r.Client.Update(ctx, wl); err != nil {
  				return nil, true, fmt.Errorf("failed to update workload's pod sets counts: %w", err)
-@@ -165,12 +177,20 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -165,12 +179,20 @@ func (r *Manager) EnsureWorkloadSlices(
  		if selectedWorkload == nil {
  			return nil, true, nil
  		}
@@ -2013,7 +2044,7 @@ index f3816d3..b0b61f4 100644
  
  		if !jobPodSetsCounts.HasSamePodSetKeys(selectedCounts) {
  			return nil, false, nil
-@@ -181,6 +201,9 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -181,6 +203,9 @@ func (r *Manager) EnsureWorkloadSlices(
  		}
  
  		if jobPodSetsCounts.EqualTo(selectedCounts) {
@@ -2023,7 +2054,7 @@ index f3816d3..b0b61f4 100644
  			return selectedWorkload, true, nil
  		}
  
-@@ -189,7 +212,7 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -189,7 +214,7 @@ func (r *Manager) EnsureWorkloadSlices(
  			if reclaim.keepsSlice(selectedCounts, jobPodSetsCounts) {
  				return selectedWorkload, true, nil
  			}
@@ -2032,7 +2063,7 @@ index f3816d3..b0b61f4 100644
  			reclaim.apply(selectedWorkload)
  			if err := r.Client.Update(ctx, selectedWorkload); err != nil {
  				return nil, true, fmt.Errorf("failed to update workload pod set counts: %w", err)
-@@ -205,6 +228,32 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -205,6 +230,44 @@ func (r *Manager) EnsureWorkloadSlices(
  	}
  }
  
@@ -2046,20 +2077,32 @@ index f3816d3..b0b61f4 100644
 +		return nil
 +	}
 +	replaced := admittedPredecessor(workloads, probe)
-+	if replaced == nil || !splitTriedProbe(probe, replaced) {
++	if replaced == nil {
 +		return nil
 +	}
-+	split := probe.DeepCopy()
-+	if !SplitGrowth(split, replaced, partialScaleUpEnabled(jobObject)) {
++	// The scheduler writes the probe's status while the reconciler decides, so a conflict
++	// re-reads the probe and decides again.
++	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
++		if !splitTriedProbe(probe, replaced) {
++			return nil
++		}
++		split := probe.DeepCopy()
++		if !SplitGrowth(split, replaced, partialScaleUpEnabled(jobObject)) {
++			return nil
++		}
++		ctrl.LoggerFrom(ctx).V(2).Info("Splitting the growth of a refused workload slice into PodSets that may take another flavor",
++			"workload", workload.Key(probe), "replaced", workload.Key(replaced))
++		if err := r.Client.Update(ctx, split); err != nil {
++			if apierrors.IsConflict(err) {
++				if getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(probe), probe); getErr != nil {
++					return getErr
++				}
++			}
++			return fmt.Errorf("failed to split the workload slice's pod sets: %w", err)
++		}
++		*probe = *split
 +		return nil
-+	}
-+	ctrl.LoggerFrom(ctx).V(2).Info("Splitting the growth of a refused workload slice into PodSets that may take another flavor",
-+		"workload", workload.Key(probe), "replaced", workload.Key(replaced))
-+	if err := r.Client.Update(ctx, split); err != nil {
-+		return fmt.Errorf("failed to split the workload slice's pod sets: %w", err)
-+	}
-+	*probe = *split
-+	return nil
++	})
 +}
 +
  // refreshFloors brings the reclaim floor and step annotations of every slice up to the

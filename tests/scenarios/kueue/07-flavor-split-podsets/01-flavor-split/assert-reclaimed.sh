@@ -1,6 +1,7 @@
 #!/bin/sh
-# Waits until the lender's reclaim of flavor-a has stopped every worker of entry "workers" of flavor-split-cluster in
-# namespace $NS, left the 4 workers of "workers--2" running and the cluster unsuspended, and admitted the lender's job.
+# Waits until the lender's reclaim of flavor-a has left flavor-split-cluster in namespace $NS with $1 ungated workers in
+# entry "workers", $2 in "workers--2" and $3 gated (either "-" for any number), the cluster unsuspended, and the lender's
+# job admitted.
 set -eu
 cluster=flavor-split-cluster
 state() {
@@ -13,9 +14,14 @@ state() {
   suspended=$(kubectl -n "$NS" get raycluster "$cluster" -o jsonpath='{.spec.suspend}')
   lender=$(kubectl -n "$NS" get workloads -o json | jq -r '[.items[] | select(any(.metadata.ownerReferences[]?; .name == "flavor-split-lender-job"))
     | select(.status.admission != null)] | length')
-  echo "workers=$(ungated workers) workers--2=$(ungated workers--2) gated=$gated suspended=${suspended:-false} lender-admitted=$lender"
+  split=$(ungated workers--2)
+  [ "$want_split" = "-" ] && split=-
+  [ "$want_gated" = "-" ] && gated=-
+  echo "workers=$(ungated workers) workers--2=$split gated=$gated suspended=${suspended:-false} lender-admitted=$lender"
 }
-want="workers=0 workers--2=4 gated=8 suspended=false lender-admitted=1"
+want_split=$2
+want_gated=$3
+want="workers=$1 workers--2=$2 gated=$3 suspended=false lender-admitted=1"
 start=$(date +%s)
 until got=$(state) && [ "$got" = "$want" ]; do
   if [ $(($(date +%s) - start)) -ge "${WAIT_SECONDS:-90}" ]; then

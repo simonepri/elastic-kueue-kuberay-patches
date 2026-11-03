@@ -9,8 +9,9 @@ spec:
   description: >
     Verifies flavor-split PodSets (ElasticJobsViaWorkloadSlicesFlavorSplit) for an elastic RayCluster worker group.
     The team borrows 8 GPUs of flavor-a and owns 4 of flavor-b, in that ClusterQueue order.
-    1. Overflow: scaling from 0 to 12 workers admits 8 on flavor-a, then splits the refused growth into the
-       entry workers--2, which runs the other 4 on flavor-b, in one admitted Workload.
+    1. Overflow: the worker group scales from 0 to 8 workers on flavor-a, then to 12; the scale-up slice is
+       refused on flavor-a, and its growth moves to the entry workers--2, which runs the other 4 on flavor-b,
+       in one admitted Workload.
     2. Reclaim: the lender's job reclaims flavor-a; partial preemption stops only the 8 workers of entry workers,
        which KubeRay recreates gated, while the 4 on flavor-b keep running and the cluster is not suspended.
        Once the lender's job is gone, the cluster regrows to 8 on flavor-a.
@@ -45,6 +46,17 @@ spec:
             env:
               - name: NS
                 value: ($namespace)
+            content: ./scale.sh 8
+        - script:
+            timeout: 100s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./assert-entries.sh workers=8@flavor-a
+        - script:
+            env:
+              - name: NS
+                value: ($namespace)
             content: ./scale.sh 12
         - script:
             timeout: 100s
@@ -61,7 +73,7 @@ spec:
             env:
               - name: NS
                 value: ($namespace)
-            content: ./assert-reclaimed.sh
+            content: ./assert-reclaimed.sh 0 4 8
         - delete:
             ref:
               apiVersion: batch/v1

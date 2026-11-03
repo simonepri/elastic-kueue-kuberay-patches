@@ -6,8 +6,10 @@ worker group whose growth does not fit on that flavor stays pending even when
 the next flavor in the ClusterQueue has room, and a second Workload for the
 overflow would break the one-Workload-per-job rule of KEP-77.
 
-With ElasticJobsViaWorkloadSlicesFlavorSplit on, once the scheduler has tried
-and refused a pending scale-up probe, the job reconciler keeps each PodSet's
+With ElasticJobsViaWorkloadSlicesFlavorSplit on, the flavor assigner notes in a
+refused replacement slice's message when a PodSet's growth would fit on a flavor
+that the sticky-flavor check skipped. Once the scheduler has refused a pending
+scale-up probe with that note, the job reconciler keeps each PodSet's
 newest entry at what the replaced slice runs and moves the growth to a split
 entry, <podSet>--<n>, marked with the template annotation
 kueue.x-k8s.io/flavor-split-of. The new entry is absent from the replaced slice,
@@ -732,6 +734,195 @@ index 644b856..366b609 100644
  	TASFailedNodeReplacementFailFast: {
  		{Version: version.MustParse("0.13"), Default: false, PreRelease: featuregate.Alpha},
  		{Version: version.MustParse("0.14"), Default: true, PreRelease: featuregate.Beta},
+diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
+new file mode 100644
+index 0000000..7f8fe2e
+--- /dev/null
++++ b/pkg/scheduler/flavorassigner/flavor_split.go
+@@ -0,0 +1,61 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tells the job reconciler when the growth of a replacement slice would fit on a flavor that the
++// PodSet's running pods keep it off, so it can split that growth into its own PodSet.
++
++package flavorassigner
++
++import (
++	"context"
++
++	corev1 "k8s.io/api/core/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/resources"
++)
++
++// GrowthFitsOtherFlavorReason ends the message the flavor assigner gives a flavor it skips because
++// the replaced slice keeps the PodSet on another flavor, when the PodSet's growth over the replaced
++// slice would fit on the skipped flavor without preemption. With
++// ElasticJobsViaWorkloadSlicesFlavorSplit, the job reconciler splits the growth of a refused slice
++// only when its message contains it (see workloadslicing.SplitGrowth), so a slice that no other
++// flavor would take keeps its PodSets.
++const GrowthFitsOtherFlavorReason = "its growth fits this flavor"
++
++// growthFits reports whether the growth of the PodSets psIDs over the slice that the workload
++// replaces fits on the flavor fName without preemption, for every resource in requests. PodSets
++// that do not grow report false, since only growth can move to a split PodSet.
++func (a *FlavorAssigner) growthFits(ctx context.Context, fName kueue.ResourceFlavorReference, psIDs []int, requests resources.Requests, assignmentUsage resources.FlavorResourceQuantities) bool {
++	fits, grows := true, false
++	requests.ForEach(func(rName corev1.ResourceName, val resources.Amount) {
++		if !fits {
++			return
++		}
++		for _, psID := range psIDs {
++			if replaced := podSetResourcesByName(a.replaceWorkloadSlice.TotalRequests, a.wl.Obj.Spec.PodSets[psID].Name); replaced != nil && replaced.Requests != nil {
++				val = val.Sub(replaced.Requests.ResourceValue(rName))
++			}
++		}
++		if val.Sign() > 0 {
++			grows = true
++		}
++		fr := resources.FlavorResource{Flavor: fName, Resource: rName}
++		mode, _, _ := a.fitsResourceQuota(ctx, fr, assignmentUsage[fr], val, a.cq.QuotaFor(fr))
++		fits = mode == fit
++	})
++	return fits && grows
++}
+diff --git a/pkg/scheduler/flavorassigner/flavor_split_test.go b/pkg/scheduler/flavorassigner/flavor_split_test.go
+new file mode 100644
+index 0000000..e925df0
+--- /dev/null
++++ b/pkg/scheduler/flavorassigner/flavor_split_test.go
+@@ -0,0 +1,102 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package flavorassigner
++
++import (
++	"strings"
++	"testing"
++	"time"
++
++	"k8s.io/component-base/featuregate"
++
++	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// A replacement slice refused because its PodSet's running pods keep it on a full flavor says so,
++// and says whether its growth would fit on the flavor it skipped, which is what lets the job
++// reconciler split the growth into its own PodSet.
++func TestGrowthFitsOtherFlavorReason(t *testing.T) {
++	cases := map[string]struct {
++		gate       bool
++		secondGPUs string
++		wantMarker bool
++	}{
++		"the growth fits the second flavor":           {gate: true, secondGPUs: "4", wantMarker: true},
++		"the growth does not fit the second flavor":   {gate: true, secondGPUs: "2"},
++		"the gate off leaves the message as upstream": {secondGPUs: "4"},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: tc.gate,
++				features.ElasticJobsViaWorkloadSlicesFlavorSplit:          tc.gate,
++			})
++			ctx, log := utiltesting.ContextWithLog(t)
++			now := time.Now()
++			cq := utiltestingapi.MakeClusterQueue("cq").
++				ResourceGroup(
++					*utiltestingapi.MakeFlavorQuotas("first").Resource("nvidia.com/gpu", "8").Obj(),
++					*utiltestingapi.MakeFlavorQuotas("second").Resource("nvidia.com/gpu", tc.secondGPUs).Obj(),
++				).Obj()
++			replaced := utiltestingapi.MakeWorkload("slice", "default").
++				PodSets(*utiltestingapi.MakePodSet("workers", 8).Request("nvidia.com/gpu", "1").Obj()).
++				ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++					utiltestingapi.MakePodSetAssignment("workers").Count(8).Assignment("nvidia.com/gpu", "first", "8").Obj()).Obj(), now).
++				Obj()
++			cache := schdcache.New(utiltesting.NewFakeClient())
++			flavors := map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor{
++				"first":  utiltestingapi.MakeResourceFlavor("first").Obj(),
++				"second": utiltestingapi.MakeResourceFlavor("second").Obj(),
++			}
++			for _, f := range flavors {
++				cache.AddOrUpdateResourceFlavor(log, f)
++			}
++			if err := cache.AddClusterQueue(ctx, cq); err != nil {
++				t.Fatal(err)
++			}
++			if !cache.AddOrUpdateWorkload(ctx, log, replaced) {
++				t.Fatal("Could not add the replaced slice to the cache")
++			}
++			snapshot, err := cache.Snapshot(ctx)
++			if err != nil {
++				t.Fatal(err)
++			}
++			probe := workload.NewInfo(log, utiltestingapi.MakeWorkload("probe", "default").
++				PodSets(*utiltestingapi.MakePodSet("workers", 12).Request("nvidia.com/gpu", "1").Obj()).Obj())
++			assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, workload.NewInfo(log, replaced),
++				configapi.QuotaCheckBlockUndeclared, resources.NewResourceFormatter(), 0)
++			assignment := assigner.AssignFlavors(ctx, log, nil)
++			if mode := assignment.RepresentativeMode(); mode == Fit {
++				t.Fatalf("AssignFlavors() mode = %s, want the probe refused", mode)
++			}
++			msg := assignment.Message()
++			if !strings.Contains(msg, "since the original workload is assigned: first") {
++				t.Errorf("AssignFlavors() message %q does not name the replaced slice's flavor", msg)
++			}
++			if got := strings.Contains(msg, GrowthFitsOtherFlavorReason); got != tc.wantMarker {
++				t.Errorf("AssignFlavors() message %q has the growth marker = %v, want %v", msg, got, tc.wantMarker)
++			}
++		})
++	}
++}
+diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
+index def383f..568186b 100644
+--- a/pkg/scheduler/flavorassigner/flavorassigner.go
++++ b/pkg/scheduler/flavorassigner/flavorassigner.go
+@@ -889,6 +889,9 @@ func (a *FlavorAssigner) findFlavorForPodSets(
+ 						// Flavor mismatch. Skip further checks for this resource.
+ 						representativeMode = worstGranularMode()
+ 						msg := fmt.Sprintf("could not assign %s flavor since the original workload is assigned: %s", fName, originalFlavor)
++						if features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorSplit) && a.growthFits(ctx, fName, psIDs, requests, assignmentUsage) {
++							msg += "; " + GrowthFitsOtherFlavorReason
++						}
+ 						status.reasons = append(status.reasons, msg)
+ 						flavorQuotaReasons = append(flavorQuotaReasons, msg)
+ 						flavorNoFitReason = mostSevereReason(flavorNoFitReason, kueue.WorkloadQuotaReservedReasonNoMatchingFlavor)
 diff --git a/pkg/scheduler/preemption/flavor_split_test.go b/pkg/scheduler/preemption/flavor_split_test.go
 new file mode 100644
 index 0000000..590423c
@@ -840,10 +1031,10 @@ index 0000000..590423c
 +}
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
 new file mode 100644
-index 0000000..72f6acc
+index 0000000..d1b3f22
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split.go
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,349 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -871,6 +1062,7 @@ index 0000000..72f6acc
 +	"fmt"
 +	"maps"
 +	"slices"
++	"strings"
 +
 +	apimeta "k8s.io/apimachinery/pkg/api/meta"
 +	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -879,6 +1071,7 @@ index 0000000..72f6acc
 +	"sigs.k8s.io/controller-runtime/pkg/client"
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
 +	"sigs.k8s.io/kueue/pkg/workload"
 +	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
 +)
@@ -1124,9 +1317,11 @@ index 0000000..72f6acc
 +
 +// splitTriedProbe reports whether probe, a pending replacement of the admitted slice replaced,
 +// should move its growth to split entries: the scheduler tried this spec of probe and could not
-+// admit it, and the slices place flavors on the pods, so a split entry's pods can follow its
-+// flavor. A probe held back while replaced's reclaim target is pending is not split, because
-+// it was not refused for its flavors.
++// admit it, a flavor it skipped because replaced keeps a PodSet off it would take that PodSet's
++// growth (flavorassigner.GrowthFitsOtherFlavorReason), and the slices place
++// flavors on the pods, so a split entry's pods can follow its flavor. A probe refused for any
++// other reason, such as a single-flavor ClusterQueue without room or a hold while partial
++// preemption releases quota, is not split, because another flavor would not help it.
 +func splitTriedProbe(probe, replaced *kueue.Workload) bool {
 +	if workload.HasQuotaReservation(probe) || workloadevict.IsEvicted(probe) ||
 +		!FlavorPlacementOnPods(probe) || !FlavorPlacementOnPods(replaced) ||
@@ -1134,7 +1329,8 @@ index 0000000..72f6acc
 +		return false
 +	}
 +	cond := apimeta.FindStatusCondition(probe.Status.Conditions, kueue.WorkloadQuotaReserved)
-+	return cond != nil && cond.Status == metav1.ConditionFalse && cond.ObservedGeneration == probe.Generation
++	return cond != nil && cond.Status == metav1.ConditionFalse && cond.ObservedGeneration == probe.Generation &&
++		strings.Contains(cond.Message, flavorassigner.GrowthFitsOtherFlavorReason)
 +}
 +
 +// SplitGrowth moves the growth of each PodSet of probe over what replaced runs in its newest
@@ -1190,10 +1386,10 @@ index 0000000..72f6acc
 +}
 diff --git a/pkg/workloadslicing/flavor_split_test.go b/pkg/workloadslicing/flavor_split_test.go
 new file mode 100644
-index 0000000..fef3c29
+index 0000000..6152323
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split_test.go
-@@ -0,0 +1,532 @@
+@@ -0,0 +1,548 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1234,6 +1430,7 @@ index 0000000..fef3c29
 +	"sigs.k8s.io/kueue/pkg/constants"
 +	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 +	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
 +	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 +	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 +	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
@@ -1548,7 +1745,8 @@ index 0000000..fef3c29
 +			Annotation(FlavorPlacementOnPodsAnnotation, "true").
 +			Annotation(WorkloadSliceReplacementFor, "ns/slice").
 +			PodSets(podSets...).
-+			Condition(metav1.Condition{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse, Reason: "Pending"}).
++			Condition(metav1.Condition{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse, Reason: "Pending",
++				Message: "couldn't assign flavors to pod set workers: could not assign spot flavor since the original workload is assigned: reserved; " + flavorassigner.GrowthFitsOtherFlavorReason}).
 +			Obj()
 +	}
 +	worker := func(name, podSet string, gated bool) *corev1.Pod {
@@ -1621,6 +1819,20 @@ index 0000000..fef3c29
 +			objs: []client.Object{
 +				slice(plainPodSet("workers", 8)).Obj(),
 +				refused(plainPodSet("workers", 12)),
++			},
++			jobCount:   12,
++			wantName:   "probe",
++			wantCounts: workload.PodSetsCounts{"workers": 12},
++		},
++		"a probe whose growth no other flavor would take is not split": {
++			gate: true,
++			objs: []client.Object{
++				slice(plainPodSet("workers", 8)).Obj(),
++				func() *kueue.Workload {
++					wl := refused(plainPodSet("workers", 12))
++					wl.Status.Conditions[0].Message = "couldn't assign flavors to pod set workers: could not assign spot flavor since the original workload is assigned: reserved"
++					return wl
++				}(),
 +			},
 +			jobCount:   12,
 +			wantName:   "probe",

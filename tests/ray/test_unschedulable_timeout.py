@@ -82,8 +82,9 @@ class MockScheduler(IResourceScheduler):
 
 
 class MockAutoscalingConfig:
-    def __init__(self, reconcile_config):
+    def __init__(self, reconcile_config, pending_idle_timeout_s=None):
         self._reconcile_config = reconcile_config
+        self._pending_idle_timeout_s = pending_idle_timeout_s
 
     def get_node_type_configs(self):
         return {}
@@ -112,6 +113,9 @@ class MockAutoscalingConfig:
     def get_idle_timeout_s(self):
         return 999
 
+    def get_pending_idle_timeout_s(self):
+        return self._pending_idle_timeout_s
+
     def get_provider_instance_type(self, ray_node_type):
         return ""
 
@@ -121,7 +125,7 @@ class MockAutoscalingConfig:
 
 
 class UnschedulableTimeoutTest(unittest.TestCase):
-    def reconcile(self, pod, allocated_for_s):
+    def reconcile(self, pod, allocated_for_s, pending_idle_timeout_s=None):
         """Reconcile one ALLOCATED instance backed by pod and return its status history."""
         storage = InstanceStorage(cluster_id="test", storage=InMemoryStorage())
         instance_manager = InstanceManager(
@@ -160,7 +164,8 @@ class UnschedulableTimeoutTest(unittest.TestCase):
                     InstanceReconcileConfig(
                         allocate_status_timeout_s=ALLOCATE_TIMEOUT_S,
                         unschedulable_status_timeout_s=UNSCHEDULABLE_TIMEOUT_S,
-                    )
+                    ),
+                    pending_idle_timeout_s=pending_idle_timeout_s,
                 ),
             )
         instances, _ = storage.get_instances()
@@ -191,6 +196,14 @@ class UnschedulableTimeoutTest(unittest.TestCase):
 
     def test_scheduled_pod_still_times_out_at_the_allocate_timeout(self):
         history = self.reconcile(PULLING_POD, ALLOCATE_TIMEOUT_S + 1)
+        self.assertIn(Instance.ALLOCATION_TIMEOUT, history)
+
+    def test_unschedulable_pod_times_out_with_pending_idle_timeout_configured(self):
+        history = self.reconcile(
+            UNSCHEDULABLE_POD,
+            UNSCHEDULABLE_TIMEOUT_S + 1,
+            pending_idle_timeout_s=600.0,
+        )
         self.assertIn(Instance.ALLOCATION_TIMEOUT, history)
 
 

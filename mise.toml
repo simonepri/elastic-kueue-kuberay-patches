@@ -21,7 +21,7 @@ KARPENTER_UPSTREAM = "v1.15.1"
 # renovate: datasource=github-releases depName=interlink-hq/interLink
 INTERLINK_UPSTREAM = "0.6.2"
 # renovate: datasource=docker depName=rayproject/ray
-RAY_UPSTREAM = "2.59.0"
+RAY_UPSTREAM = "2.60.0"
 RAY_PYTHON = "py313"
 # Upstream Ray image variant (the tag suffix after the Python version, such as "-gpu") and its platforms;
 # CI builds every variant in patches/ray/variants.json by setting both.

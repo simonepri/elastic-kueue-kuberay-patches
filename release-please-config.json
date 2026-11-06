@@ -47,6 +47,8 @@
     "patches/ray": {
       "component": "ray",
       "release-type": "simple",
+      "draft": true,
+      "force-tag-creation": true,
       "skip-changelog": true,
       "bump-minor-pre-major": true,
       "initial-version": "0.1.0",

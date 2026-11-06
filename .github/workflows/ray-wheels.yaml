@@ -111,14 +111,28 @@ jobs:
       - name: Run Patched Ray Unit Tests Against the Wheel
         run: RAY_WHEEL_DIR="$PWD/dist/ray" mise run test:ray
 
+  # The Ray release is created as a draft (release-please-config.json) because GitHub makes a published release
+  # immutable: assets can only be uploaded while it is a draft. Publishing comes last, and only then do the images
+  # download the wheel from the release.
   release:
-    name: Attach Wheels To The Release
+    name: Attach Wheels And Publish The Release
     if: ${{ inputs.release-tag != '' }}
     needs: [build, image]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.release-tag }}
     steps:
+      - name: Require A Draft Release
+        run: |
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [ "$draft" != true ]; then
+            echo "::error::$TAG is already published, so it is immutable and cannot take assets"
+            exit 1
+          fi
+
       - name: Download Wheels
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -127,6 +141,16 @@ jobs:
           path: dist/ray
 
       - name: Upload To The Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ inputs.release-tag }}" dist/ray/*.whl dist/ray/*.whl.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+        run: gh release upload "$TAG" dist/ray/*.whl dist/ray/*.whl.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+
+      # The image build downloads each wheel by its exact name, so GitHub must keep it unchanged.
+      - name: Check The Uploaded Asset Names
+        run: |
+          assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for file in dist/ray/*.whl dist/ray/*.whl.sha256; do
+            name="$(basename "$file")"
+            echo "$assets" | grep -Fxq -- "$name" || { echo "::error::asset $name is missing or was renamed"; exit 1; }
+          done
+
+      - name: Publish The Release
+        run: gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"

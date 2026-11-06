@@ -41,6 +41,14 @@ INTERLINK_IMAGE_TAG = "{{env.INTERLINK_UPSTREAM}}-p{{env.INTERLINK_PATCH_VERSION
 RAY_BASE_IMAGE = "rayproject/ray:{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}"
 RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}-p{{env.RAY_PATCH_VERSION}}"
 
+# The patched Ray wheel: its PEP 440 local version and the release that carries it.
+RAY_LOCAL_VERSION = "{{env.RAY_UPSTREAM}}+p{{env.RAY_PATCH_VERSION}}"
+RAY_WHEEL_BASE_URL = "https://github.com/simonepri/elastic-kueue-kuberay-patches/releases/download/ray-v{{env.RAY_PATCH_VERSION}}"
+# "1" installs the patched wheel into the Ray image; otherwise the image only overlays the patched Python files.
+# RAY_WHEEL_DIR, when set, supplies the wheel from a local directory instead of the release.
+RAY_INSTALL_WHEEL = "{{ get_env(name='RAY_INSTALL_WHEEL', default='0') }}"
+RAY_WHEEL_DIR = "{{ get_env(name='RAY_WHEEL_DIR', default='') }}"
+
 # Kueue feature gates for cluster:up. The default leaves PartialPreemption off; CI runs a second leg with
 # KUEUE_FEATURE_GATES set to the readme's full gate list, which turns partial preemption on.
 KUEUE_FEATURE_GATES = "{{ get_env(name='KUEUE_FEATURE_GATES', default='ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true') }}"
@@ -219,11 +227,28 @@ INTERLINK_IMG=$(cat .interlink-image.txt)
 echo "Built interLink virtual kubelet image: $INTERLINK_IMG"
 """
 
+[tasks."build:ray-wheel"]
+description = "Build the patched Ray wheel for this machine's architecture into dist/ray (set RAY_WHEEL_ARCH to override)"
+run = "patches/ray/wheel/build.sh"
+
+# Docker build arguments that make the Ray image install the patched wheel.
+[tasks."ray:wheel-args"]
+hide = true
+run = """
+if [ "$RAY_INSTALL_WHEEL" != 1 ]; then exit 0; fi
+printf '%s ' --build-arg RAY_LOCAL_VERSION="$RAY_LOCAL_VERSION" --build-arg RAY_PYTHON_TAG="cp${RAY_PYTHON#py}"
+if [ -n "$RAY_WHEEL_DIR" ]; then
+  printf '%s ' --build-context wheels="$RAY_WHEEL_DIR"
+else
+  printf '%s ' --build-arg RAY_WHEEL_BASE_URL="$RAY_WHEEL_BASE_URL"
+fi
+"""
+
 [tasks."build:ray"]
 description = "Build the patched Ray image for RAY_VARIANT"
 depends = ["patch:ray"]
 run = """
-docker build -f docker/ray.Dockerfile --build-arg BASE_IMAGE=$RAY_BASE_IMAGE -t kind.local/ray:$RAY_IMAGE_TAG -t kind.local/ray:latest third_party/ray
+docker build -f docker/ray.Dockerfile --build-arg BASE_IMAGE=$RAY_BASE_IMAGE $(mise run ray:wheel-args) -t kind.local/ray:$RAY_IMAGE_TAG -t kind.local/ray:latest third_party/ray
 echo "kind.local/ray:$RAY_IMAGE_TAG" > .ray-image.txt
 RAY_IMG=$(cat .ray-image.txt)
 echo "Built Ray image: $RAY_IMG"
@@ -233,7 +258,9 @@ echo "Built Ray image: $RAY_IMG"
 description = "Run patched Ray unit tests inside the patched Ray image for RAY_VARIANT"
 depends = ["build:ray"]
 run = """
-docker run --rm -v "$PWD/tests/ray:/tests:ro" -v "$PWD/third_party/ray/python/ray:/patched:ro" -e RAY_PATCHED_SOURCES=/patched \
+expected=""
+if [ "$RAY_INSTALL_WHEEL" = 1 ]; then expected="$RAY_LOCAL_VERSION"; fi
+docker run --rm -v "$PWD/tests/ray:/tests:ro" -v "$PWD/third_party/ray/python/ray:/patched:ro" -e RAY_PATCHED_SOURCES=/patched -e RAY_EXPECTED_VERSION="$expected" \
   "$(cat .ray-image.txt)" python -m unittest discover -v -s /tests -p 'test_*.py'
 """
 
@@ -335,6 +362,7 @@ echo "Publishing Ray image ghcr.io/simonepri/ray:$RAY_IMAGE_TAG from $RAY_BASE_I
 docker buildx build --platform "$RAY_PLATFORMS" \
   -f docker/ray.Dockerfile \
   --build-arg BASE_IMAGE="$RAY_BASE_IMAGE" \
+  $(mise run ray:wheel-args) \
   -t "ghcr.io/simonepri/ray:$RAY_IMAGE_TAG" \
   --push \
   third_party/ray

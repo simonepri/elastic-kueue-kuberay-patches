@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       releases_created: ${{ steps.release.outputs.releases_created }}
+      ray_release_created: ${{ steps.release.outputs['patches/ray--release_created'] }}
+      ray_tag_name: ${{ steps.release.outputs['patches/ray--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: release
@@ -75,9 +77,20 @@ jobs:
         id: variants
         run: echo "matrix=$(jq -c . patches/ray/variants.json)" >> "$GITHUB_OUTPUT"
 
+  ray-wheels:
+    needs: [release-please]
+    if: ${{ needs.release-please.outputs.ray_release_created == 'true' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/ray-wheels.yaml
+    with:
+      release-tag: ${{ needs.release-please.outputs.ray_tag_name }}
+
   publish-ray-images:
     name: publish-ray-images (py313${{ matrix.variant }})
-    needs: [ray-variants]
+    # The images install the wheel of the current Ray patch version; a Ray release builds it first.
+    needs: [ray-variants, ray-wheels]
+    if: ${{ always() && needs.ray-variants.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.ray-wheels.result) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -89,6 +102,7 @@ jobs:
     env:
       RAY_VARIANT: ${{ matrix.variant }}
       RAY_PLATFORMS: ${{ matrix.platforms }}
+      RAY_INSTALL_WHEEL: "1"
     steps:
       - uses: actions/checkout@v7
 

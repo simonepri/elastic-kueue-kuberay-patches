@@ -1,0 +1,132 @@
+name: Ray Wheels
+
+# Builds the patched Ray wheel (stock PyPI wheel with the patched raylet, gcs_server and Python files) on the free
+# GitHub-hosted runners for each architecture. Pull requests that touch the patches or the build prove it works end to
+# end; a Ray release passes its tag to attach the wheels to the release.
+
+on:
+  pull_request:
+    branches: [ main, release-please--branches--main, redesign/partial-preemption ]
+    paths:
+      - patches/ray/**
+      - .github/workflows/ray-wheels.yaml
+      - docker/ray.Dockerfile
+  workflow_call:
+    inputs:
+      release-tag:
+        description: Release to attach the wheels to; empty only uploads workflow artifacts.
+        type: string
+        default: ""
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Wheel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      RAY_WHEEL_ARCH: ${{ matrix.arch }}
+      CACHE_DIR: .ray-wheel/cache-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The Bazel build needs far more than the 14 GB the runner leaves free.
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          docker image prune --all --force
+          df -h /
+
+      - name: Install Mise
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5
+        with:
+          install: false
+
+      - name: Read Ray Upstream Version
+        id: ray
+        run: echo "upstream=$(mise env --json | jq -r .RAY_UPSTREAM)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Bazel Cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.CACHE_DIR }}/disk
+            ${{ env.CACHE_DIR }}/repos
+          key: ray-wheel-${{ matrix.arch }}-${{ steps.ray.outputs.upstream }}-${{ hashFiles('patches/ray/*.patch') }}
+          restore-keys: |
+            ray-wheel-${{ matrix.arch }}-${{ steps.ray.outputs.upstream }}-
+
+      - name: Build Wheel
+        run: mise run build:ray-wheel
+
+      # Saved even when the build fails or times out, so the next run resumes from the progress made.
+      - name: Save Bazel Cache
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.CACHE_DIR }}/disk
+            ${{ env.CACHE_DIR }}/repos
+          key: ray-wheel-${{ matrix.arch }}-${{ steps.ray.outputs.upstream }}-${{ hashFiles('patches/ray/*.patch') }}
+
+      - name: Upload Wheel
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ray-wheel-${{ matrix.arch }}
+          path: |
+            dist/ray/*.whl
+            dist/ray/*.whl.sha256
+          if-no-files-found: error
+
+  image:
+    name: Test Wheel In Ray Image
+    needs: [build]
+    runs-on: ubuntu-24.04
+    env:
+      RAY_INSTALL_WHEEL: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Mise
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5
+
+      - name: Download Wheel
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ray-wheel-x86_64
+          path: dist/ray
+
+      - name: Run Patched Ray Unit Tests Against the Wheel
+        run: RAY_WHEEL_DIR="$PWD/dist/ray" mise run test:ray
+
+  release:
+    name: Attach Wheels To The Release
+    if: ${{ inputs.release-tag != '' }}
+    needs: [build, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Wheels
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ray-wheel-*
+          merge-multiple: true
+          path: dist/ray
+
+      - name: Upload To The Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release-tag }}" dist/ray/*.whl dist/ray/*.whl.sha256 --clobber --repo "$GITHUB_REPOSITORY"

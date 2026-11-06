@@ -1,5 +1,14 @@
 #!/bin/bash
 set -euo pipefail
+cleanup() {
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    kubectl -n "$NS" get workloads,pods -o yaml >&2 || true
+  fi
+  ./finish-job.sh delayed-tas-fallback-gang || rc=$?
+  return "$rc"
+}
+trap cleanup EXIT
 selector="kueue.x-k8s.io/workload-namespace=$NS"
 # Wait for the preceding gang's claims to be cleaned up.
 until [ "$(kubectl get nodeclaims -l "$selector" -o json | jq '.items | length')" = 0 ]; do sleep 1; done

@@ -10,8 +10,9 @@ cleanup() {
     kubectl get nodes -l "example.com/delayed-tas-test=$NS" -o yaml >&2 || true
   fi
   kubectl -n "$NS" delete pod rogue --ignore-not-found --force --grace-period=0 >/dev/null
-  kubectl -n "$NS" delete job delayed-tas-gang --ignore-not-found --wait=false >/dev/null
+  ./finish-job.sh delayed-tas-gang || rc=$?
   kubectl delete node -l "example.com/delayed-tas-test=$NS" --ignore-not-found >/dev/null
+  return "$rc"
 }
 trap cleanup EXIT
 until [ "$(kubectl get nodeclaims -l "$selector" -o json | jq '.items | length')" = 2 ]; do sleep 1; done

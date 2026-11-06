@@ -1,0 +1,123 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: delayed-tas-pool
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+      requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: [linux]
+        - key: karpenter.k8s.aws/instance-cpu
+          operator: In
+          values: ["1"]
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Topology
+metadata:
+  name: delayed-tas
+spec:
+  levels:
+    - nodeLabel: kubernetes.io/hostname
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: delayed-tas-karpenter
+spec:
+  nodeLabels:
+    karpenter.sh/nodepool: delayed-tas-pool
+  topologyName: delayed-tas
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: delayed-tas-reserved
+spec:
+  nodeLabels:
+    example.com/capacity: delayed-tas-reserved
+  topologyName: delayed-tas
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: AdmissionCheck
+metadata:
+  name: delayed-tas-karpenter
+  annotations:
+    kueue.x-k8s.io/karpenter-launch-timeout: 2m
+spec:
+  controllerName: kueue.x-k8s.io/karpenter
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: AdmissionCheck
+metadata:
+  name: delayed-tas-fallback
+  annotations:
+    kueue.x-k8s.io/karpenter-launch-timeout: 15s
+spec:
+  controllerName: kueue.x-k8s.io/karpenter
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: delayed-tas
+spec:
+  namespaceSelector: {}
+  admissionChecksStrategy:
+    admissionChecks:
+      - name: delayed-tas-karpenter
+  resourceGroups:
+    - coveredResources: [cpu]
+      flavors:
+        - name: delayed-tas-karpenter
+          resources:
+            - name: cpu
+              nominalQuota: "4"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: delayed-tas-fallback
+spec:
+  namespaceSelector: {}
+  # Queue-wide check: the reserved fallback must need neither provisioning nor a delayed request.
+  admissionChecksStrategy:
+    admissionChecks:
+      - name: delayed-tas-fallback
+  resourceGroups:
+    - coveredResources: [cpu]
+      flavors:
+        - name: delayed-tas-karpenter
+          resources:
+            - name: cpu
+              nominalQuota: "4"
+        - name: delayed-tas-reserved
+          resources:
+            - name: cpu
+              nominalQuota: "4"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: delayed-tas
+spec:
+  clusterQueue: delayed-tas
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: delayed-tas-fallback
+spec:
+  clusterQueue: delayed-tas-fallback
+---
+apiVersion: v1
+kind: Node
+metadata:
+  name: delayed-tas-reserved
+  labels:
+    kubernetes.io/hostname: delayed-tas-reserved
+    example.com/capacity: delayed-tas-reserved

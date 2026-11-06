@@ -81,12 +81,236 @@ index ff3e6fb..8070848 100644
  func Test_Delete(t *testing.T) {
  	ctx, log := utiltesting.ContextWithLog(t)
  	cq := newClusterQueueImpl(ctx, nil, defaultOrdering, testingclock.NewFakeClock(time.Now()))
+diff --git a/pkg/cache/scheduler/admissioncheck.go b/pkg/cache/scheduler/admissioncheck.go
+index c8d840c..edc5d38 100644
+--- a/pkg/cache/scheduler/admissioncheck.go
++++ b/pkg/cache/scheduler/admissioncheck.go
+@@ -17,6 +17,7 @@ limitations under the License.
+ package scheduler
+ 
+ type AdmissionCheck struct {
+-	Active     bool
+-	Controller string
++	Active             bool
++	Controller         string
++	KarpenterNodeClass bool
+ }
+diff --git a/pkg/cache/scheduler/cache.go b/pkg/cache/scheduler/cache.go
+index 56a7704..dbf0a89 100644
+--- a/pkg/cache/scheduler/cache.go
++++ b/pkg/cache/scheduler/cache.go
+@@ -40,6 +40,7 @@ import (
+ 	"sigs.k8s.io/kueue/pkg/cache/hierarchy"
+ 	schddra "sigs.k8s.io/kueue/pkg/cache/scheduler/dra"
+ 	"sigs.k8s.io/kueue/pkg/cache/scheduler/simulator"
++	"sigs.k8s.io/kueue/pkg/constants"
+ 	utilindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
+ 	"sigs.k8s.io/kueue/pkg/dra"
+ 	"sigs.k8s.io/kueue/pkg/features"
+@@ -406,8 +407,9 @@ func (c *Cache) AddOrUpdateAdmissionCheck(log logr.Logger, ac *kueue.AdmissionCh
+ 	defer c.Unlock()
+ 
+ 	newAC := AdmissionCheck{
+-		Active:     apimeta.IsStatusConditionTrue(ac.Status.Conditions, kueue.AdmissionCheckActive),
+-		Controller: ac.Spec.ControllerName,
++		Active:             apimeta.IsStatusConditionTrue(ac.Status.Conditions, kueue.AdmissionCheckActive),
++		Controller:         ac.Spec.ControllerName,
++		KarpenterNodeClass: ac.Annotations[constants.KarpenterNodeClassAnnotation] != "",
+ 	}
+ 	c.admissionChecks[kueue.AdmissionCheckReference(ac.Name)] = newAC
+ 
+diff --git a/pkg/cache/scheduler/clusterqueue_snapshot.go b/pkg/cache/scheduler/clusterqueue_snapshot.go
+index d7cd326..678f0c9 100644
+--- a/pkg/cache/scheduler/clusterqueue_snapshot.go
++++ b/pkg/cache/scheduler/clusterqueue_snapshot.go
+@@ -86,8 +86,9 @@ type ClusterQueueSnapshot struct {
+ 	TASFlavors map[kueue.ResourceFlavorReference]*TASFlavorSnapshot
+ 	tasOnly    bool
+ 
+-	flavorsForProvReqACs sets.Set[kueue.ResourceFlavorReference]
+-	hasMultiKueueAC      bool
++	flavorsForKarpenterACs sets.Set[kueue.ResourceFlavorReference]
++	flavorsForProvReqACs   sets.Set[kueue.ResourceFlavorReference]
++	hasMultiKueueAC        bool
+ }
+ 
+ // RGByResource returns the ResourceGroup which contains capacity
+diff --git a/pkg/cache/scheduler/karpenter.go b/pkg/cache/scheduler/karpenter.go
+new file mode 100644
+index 0000000..f80cfed
+--- /dev/null
++++ b/pkg/cache/scheduler/karpenter.go
+@@ -0,0 +1,46 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package scheduler
++
++import (
++	"k8s.io/apimachinery/pkg/util/sets"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++// Only flavors this check actually provisions delay topology. A check applied to
++// an entire queue must leave reserved and remote flavors on their normal path.
++func (c *Cache) flavorsWithKarpenterAdmissionCheck(cq *clusterQueue) sets.Set[kueue.ResourceFlavorReference] {
++	flavors := sets.New[kueue.ResourceFlavorReference]()
++	for name, onFlavors := range cq.AdmissionChecks {
++		ac := c.admissionChecks[name]
++		if ac.Controller != constants.KarpenterControllerName {
++			continue
++		}
++		for flavor := range onFlavors {
++			rf := c.resourceFlavors[flavor]
++			if rf != nil && (rf.Spec.NodeLabels[constants.KarpenterNodePoolLabel] != "" || ac.KarpenterNodeClass) {
++				flavors.Insert(flavor)
++			}
++		}
++	}
++	return flavors
++}
++
++func (c *ClusterQueueSnapshot) HasKarpenterAdmissionCheck(rf kueue.ResourceFlavorReference) bool {
++	return c.flavorsForKarpenterACs.Has(rf)
++}
+diff --git a/pkg/cache/scheduler/karpenter_test.go b/pkg/cache/scheduler/karpenter_test.go
+new file mode 100644
+index 0000000..c896d74
+--- /dev/null
++++ b/pkg/cache/scheduler/karpenter_test.go
+@@ -0,0 +1,71 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package scheduler
++
++import (
++	"testing"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++)
++
++func TestKarpenterDelayedTopologyFlavors(t *testing.T) {
++	for name, tc := range map[string]struct {
++		onFlavors  []kueue.ResourceFlavorReference
++		controller string
++		nodeClass  bool
++		want       sets.Set[kueue.ResourceFlavorReference]
++	}{
++		"queue-wide check leaves reserved capacity alone": {controller: constants.KarpenterControllerName, want: sets.New[kueue.ResourceFlavorReference]("karpenter")},
++		"per-flavor check":                                     {controller: constants.KarpenterControllerName, onFlavors: []kueue.ResourceFlavorReference{"karpenter"}, want: sets.New[kueue.ResourceFlavorReference]("karpenter")},
++		"check only on reserved capacity":                      {controller: constants.KarpenterControllerName, onFlavors: []kueue.ResourceFlavorReference{"reserved"}, want: sets.New[kueue.ResourceFlavorReference]()},
++		"other controller does not delay":                      {controller: "other", want: sets.New[kueue.ResourceFlavorReference]()},
++		"explicit node class provisions flavors without pools": {controller: constants.KarpenterControllerName, nodeClass: true, want: sets.New[kueue.ResourceFlavorReference]("karpenter", "reserved")},
++	} {
++		t.Run(name, func(t *testing.T) {
++			ctx, log := utiltesting.ContextWithLog(t)
++			cache := New(utiltesting.NewFakeClient())
++			cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("karpenter").NodeLabel(constants.KarpenterNodePoolLabel, "pool").Obj())
++			cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("reserved").Obj())
++			ac := utiltestingapi.MakeAdmissionCheck("check").ControllerName(tc.controller).Active(metav1.ConditionTrue).Obj()
++			if tc.nodeClass {
++				ac.Annotations = map[string]string{constants.KarpenterNodeClassAnnotation: "test/NodeClass/default"}
++			}
++			cache.AddOrUpdateAdmissionCheck(log, ac)
++			cq := utiltestingapi.MakeClusterQueue("cq").ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas("karpenter").Resource(corev1.ResourceCPU, "10").Obj(),
++				*utiltestingapi.MakeFlavorQuotas("reserved").Resource(corev1.ResourceCPU, "10").Obj(),
++			).AdmissionCheckStrategy(*utiltestingapi.MakeAdmissionCheckStrategyRule("check", tc.onFlavors...).Obj()).Obj()
++			if err := cache.AddClusterQueue(ctx, cq); err != nil {
++				t.Fatal(err)
++			}
++			got := cache.flavorsWithKarpenterAdmissionCheck(cache.hm.ClusterQueue("cq"))
++			if !tc.want.Equal(got) {
++				t.Fatalf("delayed flavors = %v, want %v", got, tc.want)
++			}
++			cache.DeleteAdmissionCheck(log, ac)
++			if got := cache.flavorsWithKarpenterAdmissionCheck(cache.hm.ClusterQueue("cq")); got.Len() != 0 {
++				t.Fatalf("deleted check still delays %v", got)
++			}
++		})
++	}
++}
+diff --git a/pkg/cache/scheduler/snapshot.go b/pkg/cache/scheduler/snapshot.go
+index 3feb9fc..738fcc9 100644
+--- a/pkg/cache/scheduler/snapshot.go
++++ b/pkg/cache/scheduler/snapshot.go
+@@ -465,6 +465,7 @@ func (c *Cache) snapshotClusterQueue(
+ 		TASFlavors:                    make(map[kueue.ResourceFlavorReference]*TASFlavorSnapshot),
+ 		tasOnly:                       cq.isTASOnly(),
+ 		flavorsForProvReqACs:          cq.flavorsWithProvReqAdmissionCheck(),
++		flavorsForKarpenterACs:        c.flavorsWithKarpenterAdmissionCheck(cq),
+ 		hasMultiKueueAC:               cq.hasMultiKueueAdmissionCheck(),
+ 		draBackedResources:            c.draBackedResources,
+ 	}
+diff --git a/pkg/constants/karpenter.go b/pkg/constants/karpenter.go
+new file mode 100644
+index 0000000..08ac1d5
+--- /dev/null
++++ b/pkg/constants/karpenter.go
+@@ -0,0 +1,23 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package constants
++
++const (
++	KarpenterControllerName      = "kueue.x-k8s.io/karpenter"
++	KarpenterNodePoolLabel       = "karpenter.sh/nodepool"
++	KarpenterNodeClassAnnotation = "kueue.x-k8s.io/karpenter-node-class"
++)
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
 new file mode 100644
-index 0000000..e613e58
+index 0000000..4abdc76
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
-@@ -0,0 +1,1064 @@
+@@ -0,0 +1,1125 @@
 +// Package karpenter implements an AdmissionCheck that provisions Karpenter NodeClaims sized for the admitted pods
 +// in the flavor's NodePool, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
 +package karpenter
@@ -120,7 +344,9 @@ index 0000000..e613e58
 +	"sigs.k8s.io/controller-runtime/pkg/log"
 +	"sigs.k8s.io/controller-runtime/pkg/manager"
 +
++	"k8s.io/apimachinery/pkg/api/equality"
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
 +	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
 +	"sigs.k8s.io/kueue/pkg/features"
 +	"sigs.k8s.io/kueue/pkg/resources"
@@ -133,7 +359,7 @@ index 0000000..e613e58
 +)
 +
 +const (
-+	ControllerName     = "kueue.x-k8s.io/karpenter"
++	ControllerName     = constants.KarpenterControllerName
 +	AdmissionCheckName = "karpenter-provision"
 +	AntiTheftTaintKey  = "karpenter.sh/claimed-by"
 +	GangIDLabelKey     = "kueue.x-k8s.io/gang-id"
@@ -152,7 +378,7 @@ index 0000000..e613e58
 +	FlavorCooldownAnnotation = "kueue.x-k8s.io/karpenter-flavor-cooldown"
 +	// NodeClassAnnotation on the AdmissionCheck names the node class, as "group/Kind/name", of NodeClaims for
 +	// flavors whose node labels name no NodePool. Flavors that name a NodePool use the NodePool's nodeClassRef.
-+	NodeClassAnnotation = "kueue.x-k8s.io/karpenter-node-class"
++	NodeClassAnnotation = constants.KarpenterNodeClassAnnotation
 +	// NodeFillFractionAnnotation on the AdmissionCheck sets the share of the largest instance the NodePool allows
 +	// that the pods packed onto one NodeClaim may request, between 0 (exclusive) and 1.
 +	NodeFillFractionAnnotation = "kueue.x-k8s.io/karpenter-node-fill-fraction"
@@ -176,7 +402,7 @@ index 0000000..e613e58
 +	PodsAnnotation = "kueue.x-k8s.io/karpenter-pods"
 +
 +	// Karpenter's well-known label and annotations.
-+	NodePoolLabelKey                 = "karpenter.sh/nodepool"
++	NodePoolLabelKey                 = constants.KarpenterNodePoolLabel
 +	DoNotDisruptAnnotationKey        = "karpenter.sh/do-not-disrupt"
 +	nodePoolHashAnnotationKey        = "karpenter.sh/nodepool-hash"
 +	nodePoolHashVersionAnnotationKey = "karpenter.sh/nodepool-hash-version"
@@ -490,11 +716,23 @@ index 0000000..e613e58
 +
 +	// Right after a reservation on a flavor the check does not guard, the check is still Pending
 +	// until Kueue drops it from the Workload; it needs no NodeClaims.
-+	if guarded, err := c.guardedFlavors(ctx, wl, checkName); err != nil || len(guarded) == 0 {
++	guarded, err := c.guardedFlavors(ctx, wl, checkName, cfg)
++	if err != nil {
 +		return ctrl.Result{}, err
 +	}
++	if len(guarded) == 0 {
++		return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady, "No pods require NodeClaims")
++	}
++	// A delayed TAS request needs real nodes. Keep the launch timeout running
++	// through registration even when ordinary non-TAS jobs wait only for launch.
++	for _, psa := range wl.Status.Admission.PodSetAssignments {
++		if psa.DelayedTopologyRequest != nil {
++			cfg.waitFor = conditionRegistered
++			break
++		}
++	}
 +
-+	expected, problem, err := c.desiredNodeClaims(ctx, wl, attempt, cfg)
++	expected, problem, err := c.desiredNodeClaims(ctx, wl, attempt, cfg, guarded)
 +	if err != nil {
 +		return ctrl.Result{}, err
 +	}
@@ -582,7 +820,7 @@ index 0000000..e613e58
 +	}
 +	if failure == "" && ready == len(expected) {
 +		return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady,
-+			fmt.Sprintf("All %d NodeClaims are %s", ready, cfg.waitFor))
++			fmt.Sprintf("All %d NodeClaims are %s", ready, cfg.waitFor), nodeClaimPodSetUpdates(wl, attempt, expected)...)
 +	}
 +	elapsed := c.Clock.Since(reservedAt)
 +	if failure == "" && elapsed >= cfg.launchTimeout {
@@ -611,7 +849,7 @@ index 0000000..e613e58
 +	if _, foreign := wl.Annotations[controllerconstants.WorkloadAllowedResourceFlavorAnnotation]; foreign && !owned {
 +		log.FromContext(ctx).Info("Not excluding flavors because another controller set the allowed flavors", "check", checkName)
 +	} else {
-+		flavors, err := c.guardedFlavors(ctx, wl, checkName)
++		flavors, err := c.guardedFlavors(ctx, wl, checkName, cfg)
 +		if err != nil {
 +			return err
 +		}
@@ -629,7 +867,7 @@ index 0000000..e613e58
 +}
 +
 +// guardedFlavors returns the flavors of the Workload's admission that the ClusterQueue runs the check for.
-+func (c *Controller) guardedFlavors(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference) ([]string, error) {
++func (c *Controller) guardedFlavors(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, cfg config) ([]string, error) {
 +	cq := &kueue.ClusterQueue{}
 +	if err := c.Get(ctx, types.NamespacedName{Name: string(wl.Status.Admission.ClusterQueue)}, cq); err != nil {
 +		return nil, err
@@ -639,7 +877,13 @@ index 0000000..e613e58
 +	for _, psa := range wl.Status.Admission.PodSetAssignments {
 +		for _, f := range psa.Flavors {
 +			if onFlavors.Has(f) && !slices.Contains(flavors, string(f)) {
-+				flavors = append(flavors, string(f))
++				rf := &kueue.ResourceFlavor{}
++				if err := c.Get(ctx, types.NamespacedName{Name: string(f)}, rf); err != nil {
++					return nil, err
++				}
++				if rf.Spec.NodeLabels[NodePoolLabelKey] != "" || cfg.nodeClass.name != "" {
++					flavors = append(flavors, string(f))
++				}
 +			}
 +		}
 +	}
@@ -677,16 +921,17 @@ index 0000000..e613e58
 +	return c.Patch(ctx, wl, patch)
 +}
 +
-+func (c *Controller) setCheck(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, state kueue.CheckState, message string) error {
++func (c *Controller) setCheck(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, state kueue.CheckState, message string, updates ...kueue.PodSetUpdate) error {
 +	if current := admissioncheck.FindAdmissionCheck(wl.Status.AdmissionChecks, checkName); current != nil &&
-+		current.State == state && current.Message == message {
++		current.State == state && current.Message == message && equality.Semantic.DeepEqual(current.PodSetUpdates, updates) {
 +		return nil
 +	}
 +	return workloadpatching.PatchAdmissionStatus(ctx, c.Client, wl, c.Clock, func(wl *kueue.Workload) (bool, error) {
 +		return workloadpatching.SetAdmissionCheckState(&wl.Status.AdmissionChecks, kueue.AdmissionCheckState{
-+			Name:    checkName,
-+			State:   state,
-+			Message: message,
++			Name:          checkName,
++			State:         state,
++			Message:       message,
++			PodSetUpdates: updates,
 +		}, c.Clock), nil
 +	}, workloadpatching.WithLooseOnApply(), workloadpatching.WithRetryOnConflict())
 +}
@@ -694,7 +939,7 @@ index 0000000..e613e58
 +// desiredNodeClaims returns the NodeClaims for the admitted pods. A pod set's NodeClaims are restricted to the
 +// node labels of its flavors, use the NodePool those labels name, and each requests the resources of the pods
 +// packed onto it. A non-empty problem means the check cannot provision this reservation on its flavors.
-+func (c *Controller) desiredNodeClaims(ctx context.Context, wl *kueue.Workload, attempt string, cfg config) ([]*unstructured.Unstructured, string, error) {
++func (c *Controller) desiredNodeClaims(ctx context.Context, wl *kueue.Workload, attempt string, cfg config, guarded []string) ([]*unstructured.Unstructured, string, error) {
 +	podSets := make(map[kueue.PodSetReference]kueue.PodSet, len(wl.Spec.PodSets))
 +	for _, ps := range wl.Spec.PodSets {
 +		podSets[ps.Name] = ps
@@ -702,6 +947,13 @@ index 0000000..e613e58
 +	nodeLabels := map[kueue.ResourceFlavorReference]map[string]string{}
 +	var claims []*unstructured.Unstructured
 +	for _, psa := range wl.Status.Admission.PodSetAssignments {
++		provision := false
++		for _, flavor := range psa.Flavors {
++			provision = provision || slices.Contains(guarded, string(flavor))
++		}
++		if !provision {
++			continue
++		}
 +		labels := map[string]string{}
 +		for _, f := range psa.Flavors {
 +			if _, ok := nodeLabels[f]; !ok {
@@ -731,7 +983,11 @@ index 0000000..e613e58
 +		perClaim := min(podsPerNodeClaim(perPod, tmpl.requirements, cfg.nodeFillFraction), count)
 +		for i := int32(0); i*perClaim < count; i++ {
 +			pods := min(perClaim, count-i*perClaim)
-+			claims = append(claims, tmpl.nodeClaim(wl, attempt, fmt.Sprintf("%s-%d", psa.Name, i), pods, perPod))
++			claim := tmpl.nodeClaim(wl, attempt, fmt.Sprintf("%s-%d", psa.Name, i), pods, perPod)
++			labels := claim.GetLabels()
++			labels[constants.PodSetLabel] = string(psa.Name)
++			claim.SetLabels(labels)
++			claims = append(claims, claim)
 +		}
 +	}
 +	if len(claims) > cfg.maxNodeClaims {
@@ -1004,6 +1260,35 @@ index 0000000..e613e58
 +	if err != nil {
 +		return ctrl.Result{}, err
 +	}
++	// TAS uses real allocatable capacity, which can pack the gang differently
++	// from the claim request estimates. Keep all holds until the assigned gang
++	// has bound, then release even claims TAS did not need.
++	delayed := slices.ContainsFunc(wl.Status.Admission.PodSetAssignments, func(psa kueue.PodSetAssignment) bool { return psa.DelayedTopologyRequest != nil })
++	if delayed {
++		if !workload.IsAdmitted(wl) {
++			return ctrl.Result{RequeueAfter: pollInterval}, nil
++		}
++		bound, want := 0, 0
++		for i := range claims {
++			if claims[i].GetLabels()[AttemptLabelKey] != attempt {
++				continue
++			}
++			count, err := strconv.Atoi(claims[i].GetAnnotations()[PodsAnnotation])
++			if err != nil {
++				count = 1
++			}
++			want += count
++			nodeName, _, _ := unstructured.NestedString(claims[i].Object, "status", "nodeName")
++			count, err = c.boundPods(ctx, nodeName)
++			if err != nil {
++				return ctrl.Result{}, err
++			}
++			bound += count
++		}
++		if bound < want {
++			return ctrl.Result{RequeueAfter: pollInterval}, nil
++		}
++	}
 +	held := 0
 +	for i := range claims {
 +		claim := &claims[i]
@@ -1019,7 +1304,7 @@ index 0000000..e613e58
 +		if err != nil {
 +			want = 1
 +		}
-+		if bound < want {
++		if !delayed && bound < want {
 +			held++
 +			continue
 +		}
@@ -1153,10 +1438,10 @@ index 0000000..e613e58
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/controller_test.go b/pkg/controller/admissionchecks/karpenter/controller_test.go
 new file mode 100644
-index 0000000..1f1ab4f
+index 0000000..306a3ca
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller_test.go
-@@ -0,0 +1,953 @@
+@@ -0,0 +1,950 @@
 +// Tests for the Karpenter AdmissionCheck: the feature gate, NodeClaims built from the NodePool and sized for packed pods,
 +// readiness, failures, flavor exclusion and its expiry, disruption holds, and NodeClaim cleanup.
 +package karpenter
@@ -1360,6 +1645,7 @@ index 0000000..1f1ab4f
 +	for _, claim := range claims {
 +		wantLabels := map[string]string{
 +			ManagedLabelKey:                  "kueue",
++			"kueue.x-k8s.io/podset":          string(kueue.DefaultPodSetName),
 +			GangIDLabelKey:                   "gang-" + wlName,
 +			WorkloadLabelKey:                 wlName,
 +			WorkloadNamespaceLabelKey:        ns,
@@ -1976,10 +2262,6 @@ index 0000000..1f1ab4f
 +		mutatePool  func(f *fixture)
 +		wantMessage string
 +	}{
-+		"no NodePool and no node class": {
-+			flavor:      "karpenter-b",
-+			wantMessage: "the flavor names no NodePool",
-+		},
 +		"missing NodePool": {
 +			flavor: "karpenter-a",
 +			mutatePool: func(f *fixture) {
@@ -2110,3 +2392,500 @@ index 0000000..1f1ab4f
 +		t.Errorf("holds released annotation = %q, want the attempt", got)
 +	}
 +}
+diff --git a/pkg/controller/admissionchecks/karpenter/topology.go b/pkg/controller/admissionchecks/karpenter/topology.go
+new file mode 100644
+index 0000000..6543643
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/topology.go
+@@ -0,0 +1,47 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package karpenter
++
++import (
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/util/sets"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++// TAS and the job controller both consume Ready PodSetUpdates. The exact
++// toleration preserves the anti-theft taint; the selector binds placement to
++// this reservation's capacity, including when older nodes exist in the pool.
++func nodeClaimPodSetUpdates(wl *kueue.Workload, attempt string, claims []*unstructured.Unstructured) []kueue.PodSetUpdate {
++	provisioned := sets.New[string]()
++	for _, claim := range claims {
++		provisioned.Insert(claim.GetLabels()[constants.PodSetLabel])
++	}
++	var updates []kueue.PodSetUpdate
++	for _, ps := range wl.Spec.PodSets {
++		if !provisioned.Has(string(ps.Name)) {
++			continue
++		}
++		updates = append(updates, kueue.PodSetUpdate{
++			Name:         ps.Name,
++			NodeSelector: map[string]string{AttemptLabelKey: attempt},
++			Tolerations:  []corev1.Toleration{{Key: AntiTheftTaintKey, Operator: corev1.TolerationOpEqual, Value: wl.Name, Effect: corev1.TaintEffectNoSchedule}},
++		})
++	}
++	return updates
++}
+diff --git a/pkg/controller/admissionchecks/karpenter/topology_test.go b/pkg/controller/admissionchecks/karpenter/topology_test.go
+new file mode 100644
+index 0000000..07fe1fc
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/topology_test.go
+@@ -0,0 +1,164 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package karpenter
++
++import (
++	"fmt"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++)
++
++func delayedWorkload() *kueue.Workload {
++	wl := reservedWorkload("karpenter-a").Obj()
++	wl.Spec.PodSets[0].TopologyRequest = &kueue.PodSetTopologyRequest{Unconstrained: new(true)}
++	wl.Status.Admission.PodSetAssignments[0].DelayedTopologyRequest = new(kueue.DelayedTopologyRequestStatePending)
++	return wl
++}
++
++func TestDelayedTopologyWaitsForRegistrationAndPublishesPlacement(t *testing.T) {
++	f := newFixture(t, delayedWorkload(), nil)
++	// Two admitted pods fit on one claim, using the same packing as non-TAS jobs.
++	f.setPoolField([]any{map[string]any{"key": "karpenter.k8s.aws/instance-cpu", "operator": "In", "values": []any{"4"}}}, "spec", "template", "spec", "requirements")
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 1 {
++		t.Fatalf("got %d claims, want one packed claim", len(claims))
++	}
++	requests, _, _ := unstructured.NestedString(claims[0].Object, "spec", "resources", "requests", "cpu")
++	if requests != "2" || claims[0].GetAnnotations()[PodsAnnotation] != "2" {
++		t.Fatalf("claim does not cover both pods: %v", claims[0])
++	}
++	f.setCondition(&claims[0], conditionLaunched)
++	f.reconcile()
++	if f.check().State != kueue.CheckStatePending {
++		t.Fatal("TAS must wait for registration")
++	}
++	claims = f.claims()
++	f.setCondition(&claims[0], conditionRegistered)
++	f.reconcile()
++	check := f.check()
++	if check.State != kueue.CheckStateReady {
++		t.Fatalf("got check %v, want Ready", check)
++	}
++	want := []kueue.PodSetUpdate{{
++		Name:         kueue.DefaultPodSetName,
++		NodeSelector: map[string]string{AttemptLabelKey: claims[0].GetLabels()[AttemptLabelKey]},
++		Tolerations:  []corev1.Toleration{{Key: AntiTheftTaintKey, Value: wlName, Operator: corev1.TolerationOpEqual, Effect: corev1.TaintEffectNoSchedule}},
++	}}
++	if diff := cmp.Diff(want, check.PodSetUpdates); diff != "" {
++		t.Fatalf("placement (-want +got): %s", diff)
++	}
++	// The controller never writes topology or changes the reserved counts.
++	psa := f.workload().Status.Admission.PodSetAssignments[0]
++	if psa.TopologyAssignment != nil || *psa.DelayedTopologyRequest != kueue.DelayedTopologyRequestStatePending || *psa.Count != 2 {
++		t.Fatalf("controller changed scheduler-owned assignment: %v", psa)
++	}
++}
++
++func TestDelayedTopologyRegistrationTimeoutFallsBack(t *testing.T) {
++	f := newFixture(t, delayedWorkload(), map[string]string{LaunchTimeoutAnnotation: "1m"})
++	f.reconcile()
++	claims := f.claims()
++	for i := range claims {
++		f.setCondition(&claims[i], conditionLaunched)
++	}
++	f.clk.SetTime(reservedAt.Add(time.Minute))
++	f.reconcile()
++	assertRetriedWithExclusion(t, f, reservedAt.Add(time.Minute+DefaultFlavorCooldown))
++	if len(f.check().PodSetUpdates) != 0 {
++		t.Fatal("Retry must not retain placement from the failed attempt")
++	}
++}
++
++func TestExistingCapacityNeedsNoClaims(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-b").Obj(), nil)
++	f.reconcile()
++	if len(f.claims()) != 0 || f.check().State != kueue.CheckStateReady || len(f.check().PodSetUpdates) != 0 {
++		t.Fatalf("existing capacity was provisioned: %v", f.check())
++	}
++}
++
++func TestMixedPodSetsProvisionOnlyGuardedCapacity(t *testing.T) {
++	wl := delayedWorkload()
++	wl.Spec.PodSets = append(wl.Spec.PodSets, *utiltestingapi.MakePodSet("head", 1).Request(corev1.ResourceCPU, "1").Obj())
++	wl.Status.Admission.PodSetAssignments = append(wl.Status.Admission.PodSetAssignments, utiltestingapi.MakePodSetAssignment("head").Flavor(corev1.ResourceCPU, "remote").Count(1).Obj())
++	f := newFixture(t, wl, nil)
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d claims, want 2 workers only", len(claims))
++	}
++	for i := range claims {
++		if claims[i].GetLabels()[constants.PodSetLabel] != string(kueue.DefaultPodSetName) {
++			t.Fatal("provisioned the reserved head")
++		}
++		f.setCondition(&claims[i], conditionRegistered)
++	}
++	f.reconcile()
++	if updates := f.check().PodSetUpdates; len(updates) != 1 || updates[0].Name != kueue.DefaultPodSetName {
++		t.Fatalf("updates affect existing capacity: %v", updates)
++	}
++}
++
++func TestDelayedTopologyReleasesHoldsAfterActualPlacement(t *testing.T) {
++	f := newFixture(t, delayedWorkload(), nil)
++	f.reconcile()
++	claims := f.claims()
++	for i := range claims {
++		name := fmt.Sprintf("node-%d", i)
++		if err := unstructured.SetNestedField(claims[i].Object, name, "status", "nodeName"); err != nil {
++			t.Fatal(err)
++		}
++		f.setCondition(&claims[i], conditionRegistered)
++		if err := f.c.Create(f.ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	f.reconcile()
++	if res := f.reconcile(); res.RequeueAfter == 0 {
++		t.Fatal("hold released before TAS admitted the gang")
++	}
++	wl := f.workload()
++	apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted"})
++	if err := f.c.Status().Update(f.ctx, wl); err != nil {
++		t.Fatal(err)
++	}
++	// An oversized instance lets TAS place both pods on node-0, leaving node-1 empty.
++	for i := range 2 {
++		if err := f.c.Create(f.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("worker-%d", i), Namespace: ns}, Spec: corev1.PodSpec{NodeName: "node-0"}}); err != nil {
++			t.Fatal(err)
++		}
++		f.reconcile()
++		if i == 0 && f.workload().Annotations[HoldsReleasedAnnotation] != "" {
++			t.Fatal("hold released before the whole gang bound")
++		}
++	}
++	for _, claim := range f.claims() {
++		if claim.GetAnnotations()[DoNotDisruptAnnotationKey] != "" {
++			t.Fatalf("hold remains after placement on %s", claim.GetName())
++		}
++	}
++}
+diff --git a/pkg/scheduler/flavorassigner/tas_flavorassigner.go b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
+index 3894955..4f9b86a 100644
+--- a/pkg/scheduler/flavorassigner/tas_flavorassigner.go
++++ b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
+@@ -102,9 +102,10 @@ func podSetTopologyRequest(psAssignment *PodSetAssignment,
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if cq.HasMultiKueueAdmissionCheck() || (!workload.HasQuotaReservation(wl.Obj) && cq.HasProvRequestAdmissionCheck(*tasFlvr)) {
++	if cq.HasMultiKueueAdmissionCheck() || (!workload.HasQuotaReservation(wl.Obj) && (cq.HasProvRequestAdmissionCheck(*tasFlvr) || cq.HasKarpenterAdmissionCheck(*tasFlvr))) {
+ 		// Delay TAS when MultiKueue is used (topology always assigned on worker cluster).
+-		// For ProvisioningRequest, delay TAS on first scheduling pass only (topology assigned after provisioning).
++		// For provisioning checks, delay TAS on the first scheduling pass only.
++		// The second pass consumes the Ready check's PodSetUpdates to place pods on the new nodes.
+ 		psAssignment.DelayedTopologyRequest = new(kueue.DelayedTopologyRequestStatePending)
+ 		return nil, nil
+ 	}
+diff --git a/test/integration/singlecluster/tas/karpenter-crds.yaml b/test/integration/singlecluster/tas/karpenter-crds.yaml
+new file mode 100644
+index 0000000..a463f09
+--- /dev/null
++++ b/test/integration/singlecluster/tas/karpenter-crds.yaml
+@@ -0,0 +1,58 @@
++# Minimal Karpenter schemas for envtest. Kind scenarios use the upstream CRDs.
++apiVersion: apiextensions.k8s.io/v1
++kind: CustomResourceDefinition
++metadata:
++  name: nodeclaims.karpenter.sh
++spec:
++  group: karpenter.sh
++  names:
++    kind: NodeClaim
++    listKind: NodeClaimList
++    plural: nodeclaims
++    singular: nodeclaim
++  scope: Cluster
++  versions:
++    - name: v1
++      served: true
++      storage: true
++      subresources:
++        status: {}
++      schema:
++        openAPIV3Schema:
++          type: object
++          properties:
++            spec:
++              type: object
++              x-kubernetes-preserve-unknown-fields: true
++            status:
++              type: object
++              x-kubernetes-preserve-unknown-fields: true
++---
++apiVersion: apiextensions.k8s.io/v1
++kind: CustomResourceDefinition
++metadata:
++  name: nodepools.karpenter.sh
++spec:
++  group: karpenter.sh
++  names:
++    kind: NodePool
++    listKind: NodePoolList
++    plural: nodepools
++    singular: nodepool
++  scope: Cluster
++  versions:
++    - name: v1
++      served: true
++      storage: true
++      subresources:
++        status: {}
++      schema:
++        openAPIV3Schema:
++          type: object
++          properties:
++            spec:
++              type: object
++              x-kubernetes-preserve-unknown-fields: true
++            status:
++              type: object
++              x-kubernetes-preserve-unknown-fields: true
+diff --git a/test/integration/singlecluster/tas/suite_test.go b/test/integration/singlecluster/tas/suite_test.go
+index 8bca331..eaf7662 100644
+--- a/test/integration/singlecluster/tas/suite_test.go
++++ b/test/integration/singlecluster/tas/suite_test.go
+@@ -65,6 +65,7 @@ var _ = ginkgo.BeforeSuite(func() {
+ 		WebhookPath: behavioral.WebhookPath,
+ 		DepCRDPaths: []string{
+ 			behavioral.AutoscalerCrds,
++			"karpenter-crds.yaml",
+ 		},
+ 	}
+ 	cfg = fwk.Init()
+diff --git a/test/integration/singlecluster/tas/tas_karpenter_test.go b/test/integration/singlecluster/tas/tas_karpenter_test.go
+new file mode 100644
+index 0000000..7af2f7d
+--- /dev/null
++++ b/test/integration/singlecluster/tas/tas_karpenter_test.go
+@@ -0,0 +1,175 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package tas
++
++import (
++	"context"
++	"fmt"
++	"strconv"
++
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/manager"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/karpenter"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/util/admissioncheck"
++	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++	"sigs.k8s.io/kueue/test/util/behavioral/integration"
++)
++
++var _ = ginkgo.Describe("Karpenter delayed topology", func() {
++	var ns *corev1.Namespace
++	var topology *kueue.Topology
++	var flavor, reserved *kueue.ResourceFlavor
++	var ac *kueue.AdmissionCheck
++	var cq *kueue.ClusterQueue
++	var pool *unstructured.Unstructured
++	var nodes []corev1.Node
++	claimGVK := schema.GroupVersionKind{Group: "karpenter.sh", Version: "v1", Kind: "NodeClaim"}
++	listClaims := func() []unstructured.Unstructured {
++		list := &unstructured.UnstructuredList{}
++		list.SetGroupVersionKind(claimGVK.GroupVersion().WithKind("NodeClaimList"))
++		gomega.Expect(k8sClient.List(ctx, list, client.MatchingLabels{karpenter.WorkloadNamespaceLabelKey: ns.Name})).To(gomega.Succeed())
++		return list.Items
++	}
++	ginkgo.BeforeEach(func() {
++		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ConcurrentAdmission, true)
++		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.TopologyAwareScheduling, true)
++		fwk.StartManager(ctx, cfg, func(ctx context.Context, mgr manager.Manager) {
++			managerSetup()(ctx, mgr)
++			gomega.Expect(karpenter.SetupWithManager(mgr)).To(gomega.Succeed())
++		})
++		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "karpenter-tas-")
++		nodes = nil
++		topology = utiltestingapi.MakeDefaultOneLevelTopology("karpenter-topology")
++		flavor = utiltestingapi.MakeResourceFlavor("karpenter-tas").NodeLabel(karpenter.NodePoolLabelKey, "tas-pool").TopologyName(topology.Name).Obj()
++		reserved = utiltestingapi.MakeResourceFlavor("reserved-tas").NodeLabel("capacity", "reserved").TopologyName(topology.Name).Obj()
++		ac = utiltestingapi.MakeAdmissionCheck("karpenter-tas").ControllerName(karpenter.ControllerName).Obj()
++		ac.Annotations = map[string]string{karpenter.LaunchTimeoutAnnotation: "1m"}
++		pool = &unstructured.Unstructured{Object: map[string]any{
++			"apiVersion": "karpenter.sh/v1", "kind": "NodePool", "metadata": map[string]any{"name": "tas-pool"},
++			"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
++				"nodeClassRef": map[string]any{"group": "test", "kind": "NodeClass", "name": "test"},
++				"requirements": []any{map[string]any{"key": "karpenter.k8s.aws/instance-cpu", "operator": "In", "values": []any{"4"}}},
++			}}},
++		}}
++		for _, obj := range []client.Object{topology, flavor, reserved, ac, pool} {
++			behavioral.MustCreate(ctx, k8sClient, obj)
++		}
++		behavioral.ExpectAdmissionChecksToBeActive(ctx, k8sClient, ac)
++		cq = utiltestingapi.MakeClusterQueue("karpenter-tas").ResourceGroup(
++			*utiltestingapi.MakeFlavorQuotas(flavor.Name).Resource(corev1.ResourceCPU, "10").Obj(),
++			*utiltestingapi.MakeFlavorQuotas(reserved.Name).Resource(corev1.ResourceCPU, "10").Obj(),
++		).AdmissionChecks(kueue.AdmissionCheckReference(ac.Name)).Obj()
++		behavioral.MustCreate(ctx, k8sClient, cq)
++		behavioral.ExpectClusterQueuesToBeActive(ctx, k8sClient, cq)
++		behavioral.MustCreate(ctx, k8sClient, utiltestingapi.MakeLocalQueue("lq", ns.Name).ClusterQueue(cq.Name).Obj())
++	})
++	ginkgo.AfterEach(func() {
++		gomega.Expect(behavioral.DeleteWorkloadsInNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++		gomega.Eventually(listClaims, behavioral.MediumTimeout, behavioral.Interval).Should(gomega.BeEmpty())
++		gomega.Expect(forceDeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++		for _, obj := range []client.Object{cq, flavor, reserved, topology, ac, pool} {
++			gomega.Expect(k8sClient.Delete(ctx, obj)).To(gomega.Succeed())
++		}
++		for i := range nodes {
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, &nodes[i], true)
++		}
++		fwk.StopManager(ctx)
++	})
++	newWorkload := func() *kueue.Workload {
++		wl := utiltestingapi.MakeWorkload("gang", ns.Name).Queue("lq").PodSets(
++			*utiltestingapi.MakePodSet("workers", 3).Request(corev1.ResourceCPU, "1").UnconstrainedTopologyRequest().Obj(),
++		).Obj()
++		behavioral.MustCreate(ctx, k8sClient, wl)
++		return wl
++	}
++	ginkgo.It("reserves quota without nodes, then assigns the packed gang only to its registered, tainted nodes", func() {
++		wl := newWorkload()
++		behavioral.ExpectWorkloadsToHaveQuotaReservation(ctx, k8sClient, cq.Name, wl)
++		gomega.Eventually(listClaims, behavioral.Timeout, behavioral.Interval).Should(gomega.HaveLen(2))
++		claims := listClaims()
++		assertPending := func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
++			g.Expect(workload.IsAdmitted(wl)).To(gomega.BeFalse())
++			g.Expect(wl.Status.Admission.PodSetAssignments[0].TopologyAssignment).To(gomega.BeNil())
++			g.Expect(*wl.Status.Admission.PodSetAssignments[0].DelayedTopologyRequest).To(gomega.Equal(kueue.DelayedTopologyRequestStatePending))
++		}
++		for i := range claims {
++			gomega.Expect(unstructured.SetNestedSlice(claims[i].Object, []any{map[string]any{"type": "Launched", "status": "True"}}, "status", "conditions")).To(gomega.Succeed())
++			gomega.Expect(k8sClient.Status().Update(ctx, &claims[i])).To(gomega.Succeed())
++		}
++		gomega.Consistently(assertPending, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
++		for i := range claims {
++			pods, err := strconv.Atoi(claims[i].GetAnnotations()[karpenter.PodsAnnotation])
++			gomega.Expect(err).NotTo(gomega.HaveOccurred())
++			name := fmt.Sprintf("karpenter-node-%d", i)
++			node := testingnode.MakeNode(name).Label(karpenter.NodePoolLabelKey, pool.GetName()).Label(corev1.LabelHostname, name).
++				Label(karpenter.AttemptLabelKey, claims[i].GetLabels()[karpenter.AttemptLabelKey]).
++				Taints(corev1.Taint{Key: karpenter.AntiTheftTaintKey, Value: wl.Name, Effect: corev1.TaintEffectNoSchedule}).
++				StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(strconv.Itoa(pods)), corev1.ResourcePods: resource.MustParse("10")}).Ready().Obj()
++			nodes = append(nodes, *node)
++			gomega.Expect(unstructured.SetNestedField(claims[i].Object, name, "status", "nodeName")).To(gomega.Succeed())
++			gomega.Expect(unstructured.SetNestedSlice(claims[i].Object, []any{map[string]any{"type": "Launched", "status": "True"}, map[string]any{"type": "Registered", "status": "True"}}, "status", "conditions")).To(gomega.Succeed())
++			gomega.Expect(k8sClient.Status().Update(ctx, &claims[i])).To(gomega.Succeed())
++		}
++		integration.CreateNodesWithStatus(ctx, k8sClient, nodes)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
++			g.Expect(workload.IsAdmitted(wl)).To(gomega.BeTrue())
++		}, behavioral.MediumTimeout, behavioral.Interval).Should(gomega.Succeed())
++		psa := wl.Status.Admission.PodSetAssignments[0]
++		gomega.Expect(*psa.DelayedTopologyRequest).To(gomega.Equal(kueue.DelayedTopologyRequestStateReady))
++		gomega.Expect(assignedPodCount(psa.TopologyAssignment)).To(gomega.Equal(int32(3)))
++		gomega.Expect(utiltas.TotalDomainCount(psa.TopologyAssignment)).To(gomega.Equal(2))
++		for domain := range utiltas.InternalSeqFrom(psa.TopologyAssignment) {
++			gomega.Expect(domain.Values[0]).To(gomega.BeElementOf(nodes[0].Name, nodes[1].Name))
++		}
++		gomega.Expect(admissioncheck.FindAdmissionCheck(wl.Status.AdmissionChecks, kueue.AdmissionCheckReference(ac.Name)).PodSetUpdates).To(gomega.HaveLen(1))
++	})
++	ginkgo.It("times out unregistered capacity and falls back to an existing-node flavor even with a queue-wide check", func() {
++		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ac), ac)).To(gomega.Succeed())
++		ac.Annotations[karpenter.LaunchTimeoutAnnotation] = "5s"
++		gomega.Expect(k8sClient.Update(ctx, ac)).To(gomega.Succeed())
++		node := testingnode.MakeNode("reserved-node").Label("capacity", "reserved").Label(corev1.LabelHostname, "reserved-node").
++			StatusAllocatable(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3"), corev1.ResourcePods: resource.MustParse("10")}).Ready().Obj()
++		nodes = []corev1.Node{*node}
++		integration.CreateNodesWithStatus(ctx, k8sClient, nodes)
++		wl := newWorkload()
++		gomega.Eventually(listClaims, behavioral.Timeout, behavioral.Interval).Should(gomega.HaveLen(2))
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
++			g.Expect(workload.IsAdmitted(wl)).To(gomega.BeTrue())
++			g.Expect(wl.Status.Admission.PodSetAssignments[0].Flavors[corev1.ResourceCPU]).To(gomega.Equal(kueue.ResourceFlavorReference(reserved.Name)))
++		}, behavioral.MediumTimeout, behavioral.Interval).Should(gomega.Succeed())
++		psa := wl.Status.Admission.PodSetAssignments[0]
++		gomega.Expect(psa.DelayedTopologyRequest).To(gomega.BeNil())
++		gomega.Expect(assignedPodCount(psa.TopologyAssignment)).To(gomega.Equal(int32(3)))
++		gomega.Expect(listClaims()).To(gomega.BeEmpty())
++	})
++})

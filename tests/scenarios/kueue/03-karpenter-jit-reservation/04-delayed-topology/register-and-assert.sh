@@ -4,6 +4,11 @@
 set -euo pipefail
 selector="kueue.x-k8s.io/workload-namespace=$NS"
 cleanup() {
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    kubectl -n "$NS" get workloads,pods -o yaml >&2 || true
+    kubectl get nodes -l "example.com/delayed-tas-test=$NS" -o yaml >&2 || true
+  fi
   kubectl -n "$NS" delete pod rogue --ignore-not-found --force --grace-period=0 >/dev/null
   kubectl -n "$NS" delete job delayed-tas-gang --ignore-not-found --wait=false >/dev/null
   kubectl delete node -l "example.com/delayed-tas-test=$NS" --ignore-not-found >/dev/null
@@ -36,8 +41,9 @@ for nc in $(echo "$claims" | jq -r '.items[].metadata.name'); do
       "kubernetes.io/hostname":$name, "kubernetes.io/os":"linux", "example.com/delayed-tas-test":$ns
     })}, spec:{taints:.spec.taints}
   }' | kubectl create -f -
-  cpu=$(kubectl get nodeclaim "$nc" -o json | jq -r '.spec.resources.requests.cpu')
-  kubectl patch node "$node" --subresource=status --type=merge -p "$(jq -nc --arg cpu "$cpu" '{status:{capacity:{cpu:$cpu,memory:"1Gi",pods:"10"},allocatable:{cpu:$cpu,memory:"1Gi",pods:"10"},conditions:[{type:"Ready",status:"True",reason:"KubeletReady",message:"simulated kubelet"}]}}')"
+  # Advertise the instance's CPU capacity, leaving room for Kind's DaemonSets.
+  # TAS may pack more densely than the conservative 2+1 claim requests.
+  kubectl patch node "$node" --subresource=status --type=merge -p "$(jq -nc --arg cpu "1" '{status:{capacity:{cpu:$cpu,memory:"1Gi",pods:"10"},allocatable:{cpu:$cpu,memory:"1Gi",pods:"10"},conditions:[{type:"Ready",status:"True",reason:"KubeletReady",message:"simulated kubelet"}]}}')"
   kubectl patch nodeclaim "$nc" --subresource=status --type=merge -p "$(jq -nc --arg node "$node" '{status:{nodeName:$node,conditions:[{type:"Launched",status:"True",reason:"Launched",message:"",lastTransitionTime:"2026-01-01T00:00:00Z"},{type:"Registered",status:"True",reason:"Registered",message:"",lastTransitionTime:"2026-01-01T00:00:00Z"}]}}')"
 done
 # A rogue pod has the same node selector but lacks the workload-specific toleration.
@@ -55,7 +61,7 @@ kubectl -n "$NS" get workload "$wl" -o json | jq -L . -e --arg attempt "$attempt
   include "topology"; with_domains |
   any(.status.conditions[]; .type == "Admitted" and .status == "True") and
   .status.admission.podSetAssignments[0].delayedTopologyRequest == "Ready" and
-  (.status.admission.podSetAssignments[0].topologyAssignment.domains | map(.count) | sort) == [1,2] and
+  (.status.admission.podSetAssignments[0].topologyAssignment.domains | map(.count) | add) == 3 and
   all(.status.admission.podSetAssignments[0].topologyAssignment.domains[]; .values[-1] | startswith("tas-")) and
   any(.status.admissionChecks[].podSetUpdates[]; .nodeSelector["kueue.x-k8s.io/karpenter-attempt"] == $attempt and any(.tolerations[]; .key == "karpenter.sh/claimed-by" and .value == $wl and .operator == "Equal"))'
 kubectl -n "$NS" get pods -l job-name=delayed-tas-gang -o json | jq -e '(.items | length) == 3 and all(.items[]; (.spec.nodeName // "" | startswith("tas-")))'

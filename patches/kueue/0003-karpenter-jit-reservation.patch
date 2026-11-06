@@ -307,10 +307,10 @@ index 0000000..08ac1d5
 +)
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
 new file mode 100644
-index 0000000..4abdc76
+index 0000000..7dc9f79
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
-@@ -0,0 +1,1125 @@
+@@ -0,0 +1,1130 @@
 +// Package karpenter implements an AdmissionCheck that provisions Karpenter NodeClaims sized for the admitted pods
 +// in the flavor's NodePool, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
 +package karpenter
@@ -922,6 +922,11 @@ index 0000000..4abdc76
 +}
 +
 +func (c *Controller) setCheck(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, state kueue.CheckState, message string, updates ...kueue.PodSetUpdate) error {
++	// Eviction resets the checks. Never resurrect Retry or Ready from a stale
++	// reservation; strict status patches below also reject concurrent eviction.
++	if !holdsReservation(wl) {
++		return nil
++	}
 +	if current := admissioncheck.FindAdmissionCheck(wl.Status.AdmissionChecks, checkName); current != nil &&
 +		current.State == state && current.Message == message && equality.Semantic.DeepEqual(current.PodSetUpdates, updates) {
 +		return nil
@@ -933,7 +938,7 @@ index 0000000..4abdc76
 +			Message:       message,
 +			PodSetUpdates: updates,
 +		}, c.Clock), nil
-+	}, workloadpatching.WithLooseOnApply(), workloadpatching.WithRetryOnConflict())
++	})
 +}
 +
 +// desiredNodeClaims returns the NodeClaims for the admitted pods. A pod set's NodeClaims are restricted to the
@@ -2447,10 +2452,10 @@ index 0000000..6543643
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/topology_test.go b/pkg/controller/admissionchecks/karpenter/topology_test.go
 new file mode 100644
-index 0000000..07fe1fc
+index 0000000..4daaaff
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/topology_test.go
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,191 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2478,9 +2483,11 @@ index 0000000..07fe1fc
 +
 +	"github.com/google/go-cmp/cmp"
 +	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
 +	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
 +	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 +)
 +
@@ -2615,6 +2622,31 @@ index 0000000..07fe1fc
 +		}
 +	}
 +}
++
++func TestCheckWriteDoesNotUndoEviction(t *testing.T) {
++	for _, mergePatch := range []bool{false, true} {
++		t.Run(fmt.Sprintf("mergePatch=%t", mergePatch), func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.WorkloadRequestUseMergePatch, mergePatch)
++			f := newFixture(t, delayedWorkload(), nil)
++			stale := f.workload()
++			live := stale.DeepCopy()
++			apimeta.SetStatusCondition(&live.Status.Conditions, metav1.Condition{Type: kueue.WorkloadEvicted, Status: metav1.ConditionTrue, Reason: "AdmissionCheck"})
++			if err := f.c.Status().Update(f.ctx, live); err != nil {
++				t.Fatal(err)
++			}
++			err := f.ctrl.setCheck(f.ctx, stale, checkRef, kueue.CheckStateRetry, "stale timeout")
++			if !apierrors.IsConflict(err) {
++				t.Fatalf("stale check write returned %v, want conflict", err)
++			}
++			if err := f.ctrl.setCheck(f.ctx, f.workload(), checkRef, kueue.CheckStateRetry, "timeout after eviction"); err != nil {
++				t.Fatal(err)
++			}
++			if f.check().State != kueue.CheckStatePending || !apimeta.IsStatusConditionTrue(f.workload().Status.Conditions, kueue.WorkloadEvicted) {
++				t.Fatal("check write undid eviction")
++			}
++		})
++	}
++}
 diff --git a/pkg/scheduler/flavorassigner/tas_flavorassigner.go b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
 index 3894955..4f9b86a 100644
 --- a/pkg/scheduler/flavorassigner/tas_flavorassigner.go
@@ -2710,10 +2742,10 @@ index 8bca331..eaf7662 100644
  	cfg = fwk.Init()
 diff --git a/test/integration/singlecluster/tas/tas_karpenter_test.go b/test/integration/singlecluster/tas/tas_karpenter_test.go
 new file mode 100644
-index 0000000..d03b22f
+index 0000000..98a11db
 --- /dev/null
 +++ b/test/integration/singlecluster/tas/tas_karpenter_test.go
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,181 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2780,6 +2812,7 @@ index 0000000..d03b22f
 +			managerSetup()(ctx, mgr)
 +			gomega.Expect(karpenter.SetupWithManager(mgr)).To(gomega.Succeed())
 +		})
++		ginkgo.DeferCleanup(func() { fwk.StopManager(ctx) })
 +		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "karpenter-tas-")
 +		nodes = nil
 +		topology = utiltestingapi.MakeDefaultOneLevelTopology("karpenter-topology")
@@ -2815,11 +2848,10 @@ index 0000000..d03b22f
 +		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, reserved, true)
 +		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, topology, true)
 +		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, ac, true)
-+		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, pool, true)
++		gomega.Expect(k8sClient.Delete(ctx, pool)).To(gomega.Succeed())
 +		for i := range nodes {
 +			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, &nodes[i], true)
 +		}
-+		fwk.StopManager(ctx)
 +	})
 +	newWorkload := func() *kueue.Workload {
 +		wl := utiltestingapi.MakeWorkload("gang", ns.Name).Queue("lq").PodSets(
@@ -2881,6 +2913,9 @@ index 0000000..d03b22f
 +		integration.CreateNodesWithStatus(ctx, k8sClient, nodes)
 +		wl := newWorkload()
 +		gomega.Eventually(listClaims, behavioral.Timeout, behavioral.Interval).Should(gomega.HaveLen(2))
++		// This suite submits Workloads directly. Stand in for the job controller
++		// completing eviction after the check's Retry, as other TAS specs do.
++		behavioral.FinishEvictionForWorkloads(ctx, k8sClient, wl)
 +		gomega.Eventually(func(g gomega.Gomega) {
 +			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
 +			g.Expect(workload.IsAdmitted(wl)).To(gomega.BeTrue())

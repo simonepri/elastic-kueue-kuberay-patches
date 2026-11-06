@@ -75,6 +75,16 @@ jobs:
             git apply --whitespace=nowarn "$patch" || (echo "Failed to apply $patch" && exit 1)
           done
 
+  release-order:
+    name: Check Ray Release Order
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Check The Ray Release Stays A Draft Until Its Assets Are Uploaded
+        run: tests/release/check-ray-release-order.sh
+
   ray-variants:
     name: List Ray Image Variants
     runs-on: ubuntu-latest

@@ -26,8 +26,9 @@ else
   esac
   name="ray-${RAY_LOCAL_VERSION}-${RAY_PYTHON_TAG}-${RAY_PYTHON_TAG}-manylinux2014_${arch}.whl"
   if [ -n "$RAY_WHEEL_BASE_URL" ]; then
-    curl -fsSL -o "/tmp/$name" "$RAY_WHEEL_BASE_URL/$name"
-    curl -fsSL -o "/tmp/$name.sha256" "$RAY_WHEEL_BASE_URL/$name.sha256"
+    url_name="$(printf %s "$name" | sed 's/+/%2B/g')"
+    curl -fsSL -o "/tmp/$name" "$RAY_WHEEL_BASE_URL/$url_name"
+    curl -fsSL -o "/tmp/$name.sha256" "$RAY_WHEEL_BASE_URL/$url_name.sha256"
     (cd /tmp && sha256sum -c "$name.sha256")
     wheel="/tmp/$name"
   else

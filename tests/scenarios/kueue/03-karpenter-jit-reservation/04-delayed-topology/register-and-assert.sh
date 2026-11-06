@@ -65,7 +65,9 @@ kubectl -n "$NS" get workload "$wl" -o json | jq -L . -e --arg attempt "$attempt
   all(.status.admission.podSetAssignments[0].topologyAssignment.domains[]; .values[-1] | startswith("tas-")) and
   any(.status.admissionChecks[].podSetUpdates[]; .nodeSelector["kueue.x-k8s.io/karpenter-attempt"] == $attempt and any(.tolerations[]; .key == "karpenter.sh/claimed-by" and .value == $wl and .operator == "Equal"))'
 kubectl -n "$NS" get pods -l job-name=delayed-tas-gang -o json | jq -e '(.items | length) == 3 and all(.items[]; (.spec.nodeName // "" | startswith("tas-")))'
-kubectl -n "$NS" get pod rogue -o json | jq -e '(.spec.nodeName // "") == "" and any(.status.conditions[]; .type == "PodScheduled" and .status == "False" and (.message | contains("karpenter.sh/claimed-by")))'
+kubectl get nodes -l "example.com/delayed-tas-test=$NS" -o json | jq -e --arg wl "$wl" '(.items | length) == 2 and all(.items[]; any(.spec.taints[]; .key == "karpenter.sh/claimed-by" and .value == $wl and .effect == "NoSchedule"))'
+kubectl -n "$NS" wait pod rogue --for=condition=PodScheduled=False --timeout=15s
+kubectl -n "$NS" get pod rogue -o json | jq -e '(.spec.nodeName // "") == "" and any(.status.conditions[]; .type == "PodScheduled" and .status == "False" and (.message | contains("untolerated taint")))'
 # Every bound pod is on one of the domains actually assigned by TAS.
 assigned=$(kubectl -n "$NS" get workload "$wl" -o json | jq -L . 'include "topology"; with_domains | [.status.admission.podSetAssignments[0].topologyAssignment.domains[].values[-1]]')
 kubectl -n "$NS" get pods -l job-name=delayed-tas-gang -o json | jq -e --argjson assigned "$assigned" 'all(.items[]; .spec.nodeName as $node | $assigned | index($node) != null)'

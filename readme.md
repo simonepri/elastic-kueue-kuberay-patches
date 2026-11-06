@@ -184,7 +184,15 @@ CI runs the Ray unit tests inside every variant, including a check that the imag
 
 ### Ray C++ patches
 
-Patches 0003 and 0004 change the C++ raylet and `gcs_server`, so the patched images above do not include them: the image only overlays Python files. CI checks that they apply to the upstream tag. Their tests are Ray's own Bazel tests; run them on a checkout of the upstream tag with the patches applied (`mise run patch:ray` sparse-checks only the touched files, so use a full clone):
+Patches 0003 and 0004 change the C++ raylet and `gcs_server`, so the Ray release also ships a patched wheel, and the images install it instead of copying Python files. Every Ray release attaches `ray-<upstream>+p<patch-version>-<python>-<python>-manylinux2014_<arch>.whl` (for `x86_64` and `aarch64`, each with a `.sha256` file) to its `ray-v<patch-version>` GitHub release. The name comes from the same `RAY_UPSTREAM` and `RAY_PATCH_VERSION` as the image tags, so `ray-2.60.0+p0.4.0-cp313-cp313-manylinux2014_x86_64.whl` goes with `ghcr.io/simonepri/ray:2.60.0-py313-p0.4.0`. Install it by URL like any wheel:
+
+```bash
+pip install "ray[default] @ https://github.com/simonepri/elastic-kueue-kuberay-patches/releases/download/ray-v0.4.0/ray-2.60.0+p0.4.0-cp313-cp313-manylinux2014_x86_64.whl"
+```
+
+[`patches/ray/wheel/build.sh`](patches/ray/wheel/build.sh) (`mise run build:ray-wheel`) builds one wheel: it applies the patches to the upstream tag, compiles only `//src/ray/gcs:gcs_server` and `//src/ray/raylet:raylet` with Bazel inside the manylinux image Ray's own wheel builds use (so glibc matches the stock wheel), then swaps those binaries, the patched Python files and the local version into the stock PyPI wheel, whose sha256 it checks against PyPI. It needs Docker and a host of the target architecture. The [Ray Wheels workflow](.github/workflows/ray-wheels.yaml) runs it on the free GitHub-hosted runners (`ubuntu-24.04` and `ubuntu-24.04-arm`) for every pull request that touches `patches/ray/` and on every Ray release, with the Bazel disk cache kept in the Actions cache.
+
+The C++ tests are Ray's own Bazel tests; run them on a full checkout of the upstream tag with the patches applied:
 
 ```bash
 bazel test --config=ci //src/ray/ray_syncer/tests:ray_syncer_test //src/ray/raylet/tests:node_manager_test

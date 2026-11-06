@@ -1,0 +1,307 @@
+Back off with jitter when a syncer client reconnects.
+
+A syncer client that loses its connection reconnects after a fixed 2 seconds, with
+no backoff or jitter. When many raylets lose the GCS at once they all retry in
+lockstep, and every retry makes the GCS send each of them the full cluster view
+again, which can keep the connections breaking.
+
+The delay is now exponential backoff with full jitter: uniform between zero and a
+ceiling that starts at RAY_ray_syncer_reconnect_base_delay_ms (2000, the previous
+fixed delay) and doubles per consecutive failure up to
+RAY_ray_syncer_reconnect_max_delay_ms (60000). The count resets once the
+connection receives a message.
+
+Upstream status: not yet reported to ray-project/ray.
+
+diff --git a/src/ray/common/ray_config_def.h b/src/ray/common/ray_config_def.h
+index ed640d1..c66fcd5 100644
+--- a/src/ray/common/ray_config_def.h
++++ b/src/ray/common/ray_config_def.h
+@@ -596,6 +596,15 @@ RAY_CONFIG(int32_t, grpc_client_check_connection_status_interval_milliseconds, 1
+ /// Refer to https://tinyurl.com/n6kvsp87 for more details
+ RAY_CONFIG(int64_t, ray_syncer_message_refresh_interval_ms, 3000)
+ 
++/// Base delay before a ray syncer client reconnects after its connection breaks. Each
++/// further consecutive failure doubles the upper bound of the randomized delay until it
++/// reaches `ray_syncer_reconnect_max_delay_ms`; a connection that receives a message
++/// resets it.
++RAY_CONFIG(uint64_t, ray_syncer_reconnect_base_delay_ms, 2000)
++
++/// Upper bound of the randomized delay before a ray syncer client reconnects.
++RAY_CONFIG(uint64_t, ray_syncer_reconnect_max_delay_ms, 60000)
++
+ /// The batch size for metrics export.
+ /// Normally each time-series << 1Kb. Batch size of 10_000 means expected payload
+ /// will be under 10Mb.
+diff --git a/src/ray/ray_syncer/BUILD.bazel b/src/ray/ray_syncer/BUILD.bazel
+index 0b6f733..d12803a 100644
+--- a/src/ray/ray_syncer/BUILD.bazel
++++ b/src/ray/ray_syncer/BUILD.bazel
+@@ -16,6 +16,7 @@ ray_cc_library(
+         "ray_syncer_bidi_reactor_base.h",
+         "ray_syncer_client.h",
+         "ray_syncer_server.h",
++        "reconnect_backoff.h",
+     ],
+     deps = [
+         "//src/ray/asio:instrumented_io_context",
+@@ -29,5 +30,6 @@ ray_cc_library(
+         "//src/ray/rpc/authentication:authentication_token_validator",
+         "@com_github_grpc_grpc//:grpc++",
+         "@com_google_absl//absl/container:flat_hash_map",
++        "@com_google_absl//absl/random",
+     ],
+ )
+diff --git a/src/ray/ray_syncer/ray_syncer.cc b/src/ray/ray_syncer/ray_syncer.cc
+index bf9b1aa..62380f8 100644
+--- a/src/ray/ray_syncer/ray_syncer.cc
++++ b/src/ray/ray_syncer/ray_syncer.cc
+@@ -23,6 +23,7 @@
+ #include "ray/asio/asio_util.h"
+ #include "ray/common/ray_config.h"
+ #include "ray/ray_syncer/node_state.h"
++#include "ray/ray_syncer/reconnect_backoff.h"
+ #include "ray/ray_syncer/ray_syncer_client.h"
+ #include "ray/ray_syncer/ray_syncer_server.h"
+ 
+@@ -102,15 +103,23 @@ void RaySyncer::Connect(const std::string &node_id,
+                 sync_reactors_.erase(iter);
+               }
+               if (restart) {
++                const auto attempt = reconnect_attempts_[remote_node_id]++;
++                const auto delay_ms = ComputeReconnectDelayMs(
++                    attempt,
++                    RayConfig::instance().ray_syncer_reconnect_base_delay_ms(),
++                    RayConfig::instance().ray_syncer_reconnect_max_delay_ms(),
++                    RandomUnitInterval());
+                 execute_after(
+                     io_context_,
+-                    [this, remote_node_id, channel]() {
++                    [this, remote_node_id, channel, attempt, delay_ms]() {
+                       RAY_LOG(INFO).WithField(NodeID::FromBinary(remote_node_id))
+-                          << "Connection to the node was broken, reconnecting.";
++                          << "Connection to the node was broken, reconnecting after "
++                          << delay_ms << " ms (attempt " << attempt + 1 << ").";
+                       Connect(remote_node_id, channel);
+                     },
+-                    /* delay_microseconds = */ std::chrono::milliseconds(2000));
++                    /* delay_microseconds = */ std::chrono::milliseconds(delay_ms));
+               } else {
++                reconnect_attempts_.erase(remote_node_id);
+                 node_state_->RemoveNode(remote_node_id);
+               }
+             },
+@@ -118,16 +127,31 @@ void RaySyncer::Connect(const std::string &node_id,
+             /* max_batch_size */ max_batch_size_,
+             /* max_batch_delay_ms */ max_batch_delay_ms_);
+         reactor->SetSelfRef(reactor);
+-        Connect(reactor);
++        Connect(reactor, [this, node_id]() { reconnect_attempts_.erase(node_id); });
+         reactor->StartCall();
+       }))
+       .get();
+ }
+ 
+-void RaySyncer::Connect(std::shared_ptr<RaySyncerBidiReactor> reactor) {
++void RaySyncer::Connect(std::shared_ptr<RaySyncerBidiReactor> reactor,
++                        std::function<void()> on_first_message) {
+   // Bind rpc completion callback.
+-  if (on_rpc_completion_) {
+-    reactor->SetRpcCompletionCallbackForOnce(on_rpc_completion_);
++  RpcCompletionCallback rpc_completion = on_rpc_completion_;
++  if (on_first_message) {
++    rpc_completion = [on_rpc_completion = on_rpc_completion_,
++                      on_first_message = std::move(on_first_message),
++                      first_message_seen = false](const NodeID &node_id) mutable {
++      if (!first_message_seen) {
++        first_message_seen = true;
++        on_first_message();
++      }
++      if (on_rpc_completion) {
++        on_rpc_completion(node_id);
++      }
++    };
++  }
++  if (rpc_completion) {
++    reactor->SetRpcCompletionCallbackForOnce(std::move(rpc_completion));
+   }
+ 
+   boost::asio::dispatch(
+diff --git a/src/ray/ray_syncer/ray_syncer.h b/src/ray/ray_syncer/ray_syncer.h
+index 06da1f3..2325a78 100644
+--- a/src/ray/ray_syncer/ray_syncer.h
++++ b/src/ray/ray_syncer/ray_syncer.h
+@@ -176,7 +176,10 @@ class RaySyncer {
+   std::vector<std::string> GetAllConnectedNodeIDs() const;
+ 
+  private:
+-  void Connect(std::shared_ptr<RaySyncerBidiReactor> connection);
++  /// \param on_first_message Called once, when the connection receives its first
++  /// message.
++  void Connect(std::shared_ptr<RaySyncerBidiReactor> connection,
++               std::function<void()> on_first_message = {});
+ 
+   std::shared_ptr<bool> stopped_;
+ 
+@@ -211,6 +214,10 @@ class RaySyncer {
+   /// Tells whether a node is known to be dead; empty if the syncer has no such source.
+   std::function<bool(const std::string &)> is_node_dead_;
+ 
++  /// Consecutive failed connection attempts per remote node, driving the reconnect
++  /// backoff. An entry is removed once the connection to the node works again.
++  absl::flat_hash_map<std::string, uint32_t> reconnect_attempts_;
++
+   friend class RaySyncerService;
+   /// Test purpose
+   friend struct SyncerServerTest;
+@@ -220,6 +227,7 @@ class RaySyncer {
+   FRIEND_TEST(SyncerTest, Test1ToN);
+   FRIEND_TEST(SyncerTest, TestMToN);
+   FRIEND_TEST(SyncerTest, Reconnect);
++  FRIEND_TEST(SyncerTest, ReconnectBackoffResetsAfterConnection);
+   FRIEND_TEST(SyncerTest, MessagesAboutDeadNodesAreNeitherStoredNorForwarded);
+   FRIEND_TEST(SyncerTest, RemovedNodeIsNotSentToNewPeers);
+ };
+diff --git a/src/ray/ray_syncer/reconnect_backoff.h b/src/ray/ray_syncer/reconnect_backoff.h
+new file mode 100644
+index 0000000..49c9a99
+--- /dev/null
++++ b/src/ray/ray_syncer/reconnect_backoff.h
+@@ -0,0 +1,50 @@
++// Copyright 2026 The Ray Authors.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//  http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++
++#include "absl/random/random.h"
++
++namespace ray::syncer {
++
++/// Compute how long to wait before the next reconnect attempt, using exponential
++/// backoff with full jitter: the delay is uniform in [0, ceiling), where the ceiling is
++/// `base_delay_ms` doubled once per earlier failed attempt and capped at `max_delay_ms`.
++///
++/// \param attempt The number of consecutive failed attempts so far (0 for the first).
++/// \param base_delay_ms The ceiling of the first delay.
++/// \param max_delay_ms The largest ceiling.
++/// \param unit_random A random number in [0, 1).
++/// \return The delay in milliseconds.
++inline uint64_t ComputeReconnectDelayMs(uint32_t attempt,
++                                        uint64_t base_delay_ms,
++                                        uint64_t max_delay_ms,
++                                        double unit_random) {
++  uint64_t ceiling = std::min(base_delay_ms, max_delay_ms);
++  for (uint32_t i = 0; i < attempt && ceiling < max_delay_ms; ++i) {
++    ceiling = ceiling > max_delay_ms / 2 ? max_delay_ms : ceiling * 2;
++  }
++  return static_cast<uint64_t>(unit_random * static_cast<double>(ceiling));
++}
++
++/// Return a random number in [0, 1).
++inline double RandomUnitInterval() {
++  thread_local absl::BitGen generator;
++  return absl::Uniform<double>(generator, 0.0, 1.0);
++}
++
++}  // namespace ray::syncer
+diff --git a/src/ray/ray_syncer/tests/ray_syncer_test.cc b/src/ray/ray_syncer/tests/ray_syncer_test.cc
+index 88289fc..20b3b14 100644
+--- a/src/ray/ray_syncer/tests/ray_syncer_test.cc
++++ b/src/ray/ray_syncer/tests/ray_syncer_test.cc
+@@ -34,11 +34,13 @@
+ #include <vector>
+ 
+ #include "ray/asio/periodical_runner.h"
++#include "ray/common/ray_config.h"
+ #include "ray/common/test_utils.h"
+ #include "ray/ray_syncer/node_state.h"
+ #include "ray/ray_syncer/ray_syncer.h"
+ #include "ray/ray_syncer/ray_syncer_client.h"
+ #include "ray/ray_syncer/ray_syncer_server.h"
++#include "ray/ray_syncer/reconnect_backoff.h"
+ #include "ray/rpc/authentication/authentication_token.h"
+ #include "ray/rpc/grpc_server.h"
+ #include "ray/util/env.h"
+@@ -699,6 +701,68 @@ TEST_F(SyncerTest, Reconnect) {
+       5));
+ }
+ 
++TEST(ReconnectBackoffTest, CeilingDoublesFromBaseUpToCap) {
++  // A random fraction just below 1 makes the delay equal to the ceiling.
++  const double almost_one = 0.999999;
++  auto ceiling = [&](uint32_t attempt) {
++    return ComputeReconnectDelayMs(attempt, 2000, 60000, almost_one);
++  };
++  EXPECT_EQ(ceiling(0), 1999);
++  EXPECT_EQ(ceiling(1), 3999);
++  EXPECT_EQ(ceiling(2), 7999);
++  EXPECT_EQ(ceiling(4), 31999);
++  EXPECT_EQ(ceiling(5), 59999);
++  EXPECT_EQ(ceiling(6), 59999);
++  EXPECT_EQ(ceiling(1000000), 59999);
++}
++
++TEST(ReconnectBackoffTest, FullJitterSpansZeroToCeiling) {
++  EXPECT_EQ(ComputeReconnectDelayMs(3, 2000, 60000, 0.0), 0);
++  EXPECT_EQ(ComputeReconnectDelayMs(3, 2000, 60000, 0.5), 8000);
++  EXPECT_EQ(ComputeReconnectDelayMs(0, 2000, 60000, 0.5), 1000);
++}
++
++TEST(ReconnectBackoffTest, BaseAboveCapIsClampedToCap) {
++  EXPECT_EQ(ComputeReconnectDelayMs(0, 90000, 60000, 0.5), 30000);
++}
++
++TEST(ReconnectBackoffTest, RandomUnitIntervalStaysInRange) {
++  for (int i = 0; i < 1000; ++i) {
++    const double value = RandomUnitInterval();
++    EXPECT_GE(value, 0.0);
++    EXPECT_LT(value, 1.0);
++  }
++}
++
++TEST_F(SyncerTest, ReconnectBackoffResetsAfterConnection) {
++  RayConfig::instance().initialize(R"({
++    "ray_syncer_reconnect_base_delay_ms": 20,
++    "ray_syncer_reconnect_max_delay_ms": 80
++  })");
++  auto &s1 = MakeServer("19980");
++  const auto s2_node_id = NodeID::FromRandom();
++
++  // Nothing listens yet, so every attempt fails and the attempt count grows.
++  s1.syncer->Connect(s2_node_id.Binary(), MakeChannel("19981"));
++  ASSERT_TRUE(s1.WaitUntil(
++      [&s1, &s2_node_id]() {
++        auto it = s1.syncer->reconnect_attempts_.find(s2_node_id.Binary());
++        return it != s1.syncer->reconnect_attempts_.end() && it->second >= 3;
++      },
++      10));
++
++  // Once the server is up, the next attempt connects and receives a message.
++  auto &s2 = MakeServer("19981", s2_node_id, /*on_rpc_completion=*/{});
++  ASSERT_TRUE(s1.WaitUntil(
++      [&s1, &s2_node_id]() {
++        return s1.syncer->sync_reactors_.size() == 1 &&
++               s1.syncer->reconnect_attempts_.count(s2_node_id.Binary()) == 0 &&
++               s1.received_versions.count(s2_node_id.Binary()) == 1;
++      },
++      10));
++  (void)s2;
++}
++
+ TEST_F(SyncerTest, MessagesAboutDeadNodesAreNeitherStoredNorForwarded) {
+   auto &s1 = MakeServer("19982");
+   auto &s2 = MakeServer("19983");

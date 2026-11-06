@@ -1,0 +1,76 @@
+Spread the dashboard agent's node stats reports over time.
+
+The reporter agent publishes a node stats snapshot every REPORTER_UPDATE_INTERVAL_MS
+(5000 by default) with a fixed sleep, so after a cluster start every node publishes in
+lockstep and the GCS receives the reports in bursts.
+
+The first report now waits a random part of the interval, and every later wait varies
+by up to REPORTER_UPDATE_INTERVAL_JITTER_FRACTION (0.2 by default) of the interval in
+either direction. REPORTER_UPDATE_INTERVAL_MS stays the base interval.
+
+Upstream status: not yet reported to ray-project/ray.
+
+diff --git a/python/ray/dashboard/modules/reporter/reporter_agent.py b/python/ray/dashboard/modules/reporter/reporter_agent.py
+index 8919451..e97d7ba 100644
+--- a/python/ray/dashboard/modules/reporter/reporter_agent.py
++++ b/python/ray/dashboard/modules/reporter/reporter_agent.py
+@@ -3,6 +3,7 @@ import datetime
+ import json
+ import logging
+ import os
++import random
+ import socket
+ import sys
+ import traceback
+@@ -85,6 +86,11 @@ import psutil
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def _jittered_interval_s(interval_ms: float, jitter_fraction: float) -> float:
++    """Return the update interval in seconds, varied by up to `jitter_fraction`."""
++    return interval_ms / 1000 * (1 + random.uniform(-jitter_fraction, jitter_fraction))
++
+ enable_tpu_usage_check = True
+ 
+ # Are we in a K8s pod?
+@@ -2050,6 +2056,11 @@ class ReporterAgent(
+         """Get any changes to the log files and push updates to kv."""
+         loop = get_or_create_event_loop()
+ 
++        # Spread the first report of all nodes over one interval.
++        await asyncio.sleep(
++            random.uniform(0, reporter_consts.REPORTER_UPDATE_INTERVAL_MS / 1000)
++        )
++
+         while True:
+             try:
+                 # Fetch autoscaler debug status
+@@ -2096,7 +2107,12 @@ class ReporterAgent(
+             except Exception:
+                 logger.exception("Error publishing node physical stats.")
+ 
+-            await asyncio.sleep(reporter_consts.REPORTER_UPDATE_INTERVAL_MS / 1000)
++            await asyncio.sleep(
++                _jittered_interval_s(
++                    reporter_consts.REPORTER_UPDATE_INTERVAL_MS,
++                    reporter_consts.REPORTER_UPDATE_INTERVAL_JITTER_FRACTION,
++                )
++            )
+ 
+     def _run_in_executor(
+         self,
+diff --git a/python/ray/dashboard/modules/reporter/reporter_consts.py b/python/ray/dashboard/modules/reporter/reporter_consts.py
+index b3254fd..3430eb6 100644
+--- a/python/ray/dashboard/modules/reporter/reporter_consts.py
++++ b/python/ray/dashboard/modules/reporter/reporter_consts.py
+@@ -5,3 +5,9 @@ REPORTER_PREFIX = "RAY_REPORTER:"
+ REPORTER_UPDATE_INTERVAL_MS = ray_constants.env_integer(
+     "REPORTER_UPDATE_INTERVAL_MS", 5000
+ )
++# Each wait between reports varies by up to this fraction of the update interval in either
++# direction, and the first report waits a random part of the interval, so the nodes of a
++# large cluster do not report in lockstep.
++REPORTER_UPDATE_INTERVAL_JITTER_FRACTION = ray_constants.env_float(
++    "REPORTER_UPDATE_INTERVAL_JITTER_FRACTION", 0.2
++)

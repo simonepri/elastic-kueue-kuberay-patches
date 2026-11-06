@@ -11,7 +11,8 @@ import os
 import pathlib
 import unittest
 
-import ray
+# NOTE: Ray is imported inside the tests. Importing it here would load it before test_node_agent_proxy sets its
+# environment, because unittest discovery imports every test module into one process in alphabetical order.
 
 EXPECTED_VERSION = os.environ.get("RAY_EXPECTED_VERSION", "")
 PATCHED_BINARIES = (
@@ -23,10 +24,14 @@ PATCHED_BINARIES = (
 @unittest.skipUnless(EXPECTED_VERSION, "RAY_EXPECTED_VERSION is not set")
 class InstalledWheelTest(unittest.TestCase):
     def test_installed_version_is_the_patched_local_version(self):
+        import ray
+
         self.assertEqual(importlib.metadata.version("ray"), EXPECTED_VERSION)
         self.assertEqual(ray.__version__, EXPECTED_VERSION)
 
     def test_binaries_match_the_wheel_record(self):
+        import ray
+
         record = {
             str(file): file.hash
             for file in importlib.metadata.distribution("ray").files

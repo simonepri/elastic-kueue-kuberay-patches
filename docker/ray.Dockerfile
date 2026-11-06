@@ -26,9 +26,12 @@ else
   esac
   name="ray-${RAY_LOCAL_VERSION}-${RAY_PYTHON_TAG}-${RAY_PYTHON_TAG}-manylinux2014_${arch}.whl"
   if [ -n "$RAY_WHEEL_BASE_URL" ]; then
-    url_name="$(printf %s "$name" | sed 's/+/%2B/g')"
-    curl -fsSL -o "/tmp/$name" "$RAY_WHEEL_BASE_URL/$url_name"
-    curl -fsSL -o "/tmp/$name.sha256" "$RAY_WHEEL_BASE_URL/$url_name.sha256"
+    # The image has no curl, so Python downloads the wheel and its checksum.
+    python -c 'import sys, urllib.parse, urllib.request
+base, name = sys.argv[1:3]
+for suffix in ("", ".sha256"):
+    urllib.request.urlretrieve(f"{base}/{urllib.parse.quote(name)}{suffix}", f"/tmp/{name}{suffix}")' \
+      "$RAY_WHEEL_BASE_URL" "$name"
     (cd /tmp && sha256sum -c "$name.sha256")
     wheel="/tmp/$name"
   else

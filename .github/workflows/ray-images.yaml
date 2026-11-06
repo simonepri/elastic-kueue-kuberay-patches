@@ -1,0 +1,90 @@
+name: Ray Images
+
+# Builds and publishes the patched Ray image for every variant in patches/ray/variants.json. The images install the
+# wheel attached to a published Ray release. Run it by hand with a release tag to publish the images of an existing
+# release; image tags are not immutable, so this also repairs a release whose image build failed.
+
+on:
+  workflow_call:
+    inputs:
+      release-tag:
+        description: Ray release whose version and wheels to use, such as ray-v0.4.1; empty uses the checked-out version.
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Published Ray release whose images to build, such as ray-v0.4.1.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  ray-variants:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.variants.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read Ray Image Variants
+        id: variants
+        run: echo "matrix=$(jq -c . patches/ray/variants.json)" >> "$GITHUB_OUTPUT"
+
+  publish-ray-images:
+    name: publish-ray-images (py313${{ matrix.variant }})
+    needs: [ray-variants]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.ray-variants.outputs.matrix) }}
+    env:
+      RAY_VARIANT: ${{ matrix.variant }}
+      RAY_PLATFORMS: ${{ matrix.platforms }}
+      RAY_INSTALL_WHEEL: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      # Build with the current Dockerfile and tasks, but for the upstream and patch versions the release shipped.
+      - name: Use the Versions of the Release
+        if: ${{ inputs.release-tag != '' }}
+        env:
+          TAG: ${{ inputs.release-tag }}
+        run: |
+          git fetch --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG"
+          for var in RAY_UPSTREAM RAY_PATCH_VERSION; do
+            line="$(git show "$TAG:mise.toml" | grep "^$var = ")"
+            sed -i "s|^$var = .*|$line|" mise.toml
+          done
+          grep -E "^RAY_(UPSTREAM|PATCH_VERSION) =" mise.toml
+
+      - name: Free Disk Space for the CUDA Base Image
+        if: ${{ matrix.variant != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Publish the Patched Ray Image to GHCR
+        run: mise run publish:ray

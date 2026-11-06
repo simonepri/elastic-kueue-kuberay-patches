@@ -45,7 +45,8 @@ RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}-p{{e
 RAY_LOCAL_VERSION = "{{env.RAY_UPSTREAM}}+p{{env.RAY_PATCH_VERSION}}"
 RAY_WHEEL_BASE_URL = "https://github.com/simonepri/elastic-kueue-kuberay-patches/releases/download/ray-v{{env.RAY_PATCH_VERSION}}"
 # "1" installs the patched wheel into the Ray image; otherwise the image only overlays the patched Python files.
-# RAY_WHEEL_DIR, when set, supplies the wheel from a local directory instead of the release.
+# RAY_WHEEL_DIR, when set, supplies the wheel from a local directory instead of the release, and
+# RAY_WHEEL_SERVER_URL from another server (CI serves the wheel it just built).
 RAY_INSTALL_WHEEL = "{{ get_env(name='RAY_INSTALL_WHEEL', default='0') }}"
 RAY_WHEEL_DIR = "{{ get_env(name='RAY_WHEEL_DIR', default='') }}"
 
@@ -240,7 +241,7 @@ printf '%s ' --build-arg RAY_LOCAL_VERSION="$RAY_LOCAL_VERSION" --build-arg RAY_
 if [ -n "$RAY_WHEEL_DIR" ]; then
   printf '%s ' --build-context wheels="$RAY_WHEEL_DIR"
 else
-  printf '%s ' --build-arg RAY_WHEEL_BASE_URL="$RAY_WHEEL_BASE_URL"
+  printf '%s ' --build-arg RAY_WHEEL_BASE_URL="${RAY_WHEEL_SERVER_URL:-$RAY_WHEEL_BASE_URL}"
 fi
 """
 

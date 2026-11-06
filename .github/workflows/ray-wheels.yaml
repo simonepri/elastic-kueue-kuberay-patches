@@ -111,6 +111,16 @@ jobs:
       - name: Run Patched Ray Unit Tests Against the Wheel
         run: RAY_WHEEL_DIR="$PWD/dist/ray" mise run test:ray
 
+      # The same download the published images do: over HTTP, by the wheel's exact name.
+      - name: Run Patched Ray Unit Tests With the Wheel Downloaded Over HTTP
+        run: |
+          gateway="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
+          python3 -m http.server 8000 --bind 0.0.0.0 --directory dist/ray &
+          server=$!
+          trap 'kill $server' EXIT
+          sleep 2
+          RAY_WHEEL_SERVER_URL="http://$gateway:8000" mise run test:ray
+
   # The Ray release is created as a draft (release-please-config.json) because GitHub makes a published release
   # immutable: assets can only be uploaded while it is a draft. Publishing comes last, and only then do the images
   # download the wheel from the release.

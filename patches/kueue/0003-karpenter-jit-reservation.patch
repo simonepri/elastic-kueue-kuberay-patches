@@ -2710,10 +2710,10 @@ index 8bca331..eaf7662 100644
  	cfg = fwk.Init()
 diff --git a/test/integration/singlecluster/tas/tas_karpenter_test.go b/test/integration/singlecluster/tas/tas_karpenter_test.go
 new file mode 100644
-index 0000000..7af2f7d
+index 0000000..d03b22f
 --- /dev/null
 +++ b/test/integration/singlecluster/tas/tas_karpenter_test.go
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,178 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2810,9 +2810,12 @@ index 0000000..7af2f7d
 +		gomega.Expect(behavioral.DeleteWorkloadsInNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
 +		gomega.Eventually(listClaims, behavioral.MediumTimeout, behavioral.Interval).Should(gomega.BeEmpty())
 +		gomega.Expect(forceDeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
-+		for _, obj := range []client.Object{cq, flavor, reserved, topology, ac, pool} {
-+			gomega.Expect(k8sClient.Delete(ctx, obj)).To(gomega.Succeed())
-+		}
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, cq, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, flavor, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, reserved, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, topology, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, ac, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, pool, true)
 +		for i := range nodes {
 +			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, &nodes[i], true)
 +		}

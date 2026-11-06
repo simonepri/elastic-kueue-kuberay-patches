@@ -2,6 +2,8 @@
 # Build the patched Ray wheel for one CPU architecture: compile the patched raylet and gcs_server, then graft them
 # and the patched Python files onto the stock PyPI wheel. Reads RAY_UPSTREAM, RAY_PATCH_VERSION and RAY_PYTHON from
 # the environment (mise.toml sets them); RAY_WHEEL_ARCH, RAY_WHEEL_BUILDER, RAY_WHEEL_WORKDIR and RAY_WHEEL_OUT tune it.
+# Releases are immutable once published, so the release workflow uploads these wheels to a draft release and
+# publishes it afterwards; nothing can be attached to a published release.
 
 set -euo pipefail
 

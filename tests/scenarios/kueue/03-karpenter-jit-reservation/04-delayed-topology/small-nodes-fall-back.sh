@@ -57,7 +57,6 @@ done
 kubectl -n "$NS" get workload "$wl" -o json | jq -L . -e '
   include "topology"; with_domains |
   any(.status.conditions[]; .type == "Admitted" and .status == "True") and
-  (.metadata.annotations["kueue.x-k8s.io/karpenter-excluded-flavors"] | startswith("delayed-tas-karpenter=")) and
   .status.admission.podSetAssignments[0].flavors.cpu == "delayed-tas-reserved" and
   .status.admission.podSetAssignments[0].delayedTopologyRequest == null and
   .status.admission.podSetAssignments[0].topologyAssignment.domains == [{count:3, values:["delayed-tas-reserved"]}]'

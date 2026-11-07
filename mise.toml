@@ -1,0 +1,41 @@
+[tools]
+go = "1.27.3"
+kind = "0.33.0"
+kubectl = "1.37.2"
+"aqua:kyverno/chainsaw" = "0.2.15"
+helm = "4.3.1"
+ko = "0.19.1"
+colima = "0.10.3"
+docker-cli = "29.9.3"
+jq = "1.8.1"
+python = "3.13.3"
+
+[env]
+CLUSTER_NAME = "elastic-scale-lab"
+# renovate: datasource=github-releases depName=kubernetes-sigs/kueue
+KUEUE_UPSTREAM = "v0.20.5"
+# renovate: datasource=github-releases depName=ray-project/kuberay
+KUBERAY_UPSTREAM = "v1.7.2"
+# renovate: datasource=github-releases depName=kubernetes-sigs/karpenter
+KARPENTER_UPSTREAM = "v1.15.1"
+# renovate: datasource=github-releases depName=interlink-hq/interLink
+INTERLINK_UPSTREAM = "0.6.2"
+# renovate: datasource=github-releases depName=ray-project/ray
+RAY_UPSTREAM = "2.60.0"
+RAY_PYTHON = "py313"
+RAY_VARIANT = "{{ get_env(name='RAY_VARIANT', default='') }}"
+KUEUE_PATCH_VERSION = "1.0.0"
+KUBERAY_PATCH_VERSION = "1.0.0"
+INTERLINK_PATCH_VERSION = "1.0.0"
+RAY_PATCH_VERSION = "1.0.0"
+
+KUEUE_IMAGE_TAG = "{{env.KUEUE_UPSTREAM}}-p{{env.KUEUE_PATCH_VERSION}}"
+KUBERAY_IMAGE_TAG = "{{env.KUBERAY_UPSTREAM}}-p{{env.KUBERAY_PATCH_VERSION}}"
+INTERLINK_IMAGE_TAG = "{{env.INTERLINK_UPSTREAM}}-p{{env.INTERLINK_PATCH_VERSION}}"
+RAY_BASE_IMAGE = "rayproject/ray:{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}"
+RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}-p{{env.RAY_PATCH_VERSION}}"
+RAY_LOCAL_VERSION = "{{env.RAY_UPSTREAM}}+p{{env.RAY_PATCH_VERSION}}"
+RAY_WHEEL_BASE_URL = "https://github.com/simonepri/elastic-kueue-kuberay-patches/releases/download/ray-v{{env.RAY_PATCH_VERSION}}"
+RAY_INSTALL_WHEEL = "{{ get_env(name='RAY_INSTALL_WHEEL', default='0') }}"
+RAY_WHEEL_DIR = "{{ get_env(name='RAY_WHEEL_DIR', default='') }}"
+KUEUE_FEATURE_GATES = "{{ get_env(name='KUEUE_FEATURE_GATES', default='ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true,ElasticJobsViaWorkloadSlicesFlavorSplit=true') }}"

@@ -1,0 +1,6 @@
+{
+  "patches/kueue": "1.0.0",
+  "patches/kuberay": "1.0.0",
+  "patches/interlink": "1.0.0",
+  "patches/ray": "1.0.0"
+}

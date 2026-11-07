@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, release-please--branches--main ]
+  pull_request:
+    branches: [ main, release-please--branches--main ]
+
+jobs:
+  static-checks:
+    name: Static & Release Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+        with:
+          cache: true
+      - name: Run Static & Policy Checks
+        run: mise run test:checks
+
+  validate-patches:
+    name: Validate Upstream Patch Rebase
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+        with:
+          cache: true
+      - name: Apply All Patches
+        run: mise run patch
+
+  kueue-unit-tests:
+    name: Kueue Unit Tests
+    needs: [validate-patches]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+        with:
+          cache: true
+      - name: Run Patched Kueue Unit Tests
+        run: mise run test:kueue
+
+  kueue-integration-tests:
+    name: Kueue Integration Tests
+    needs: [validate-patches]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+        with:
+          cache: true
+      - name: Run Patched Kueue Integration Tests
+        run: mise run test:kueue-integration
+
+  kuberay-unit-tests:
+    name: KubeRay Unit Tests
+    needs: [validate-patches]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+        with:
+          cache: true
+      - name: Run Patched KubeRay Unit Tests
+        run: mise run test:kuberay
+
+  interlink-unit-tests:
+    name: interLink Unit Tests
+    needs: [validate-patches]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+        with:
+          cache: true
+      - name: Run Patched Virtual Kubelet Unit Tests
+        run: mise run test:interlink
+
+  e2e-integration-tests:
+    name: Canonical E2E Integration Test
+    needs: [validate-patches, kueue-unit-tests, kuberay-unit-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+        with:
+          cache: true
+      - name: Build Patched Images
+        run: mise run build
+      - name: Spin up Cluster and Deploy Patched Controllers
+        run: mise run cluster:up
+      - name: Run Canonical E2E Integration Test
+        run: mise run test:e2e
+      - name: Dump Controller Logs on Failure
+        if: failure()
+        run: |
+          echo "=== Kueue Controller Logs ==="
+          kubectl logs -n kueue-system -l app.kubernetes.io/name=kueue --tail=200 || true
+          echo "=== KubeRay Operator Logs ==="
+          kubectl logs -n default -l app.kubernetes.io/name=kuberay-operator --tail=200 || true

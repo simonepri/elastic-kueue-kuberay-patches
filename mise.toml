@@ -34,8 +34,8 @@ KUBERAY_IMAGE_TAG = "{{env.KUBERAY_UPSTREAM}}-p{{env.KUBERAY_PATCH_VERSION}}"
 INTERLINK_IMAGE_TAG = "{{env.INTERLINK_UPSTREAM}}-p{{env.INTERLINK_PATCH_VERSION}}"
 RAY_BASE_IMAGE = "rayproject/ray:{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}"
 RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}-p{{env.RAY_PATCH_VERSION}}"
-RAY_LOCAL_VERSION = "{{env.RAY_UPSTREAM}}+p{{env.RAY_PATCH_VERSION}}"
-RAY_WHEEL_BASE_URL = "https://github.com/simonepri/elastic-kueue-kuberay-patches/releases/download/ray-v{{env.RAY_PATCH_VERSION}}"
+RAY_LOCAL_VERSION = "{{ get_env(name='RAY_LOCAL_VERSION', default='') }}"
+RAY_WHEEL_BASE_URL = "{{ get_env(name='RAY_WHEEL_BASE_URL', default='') }}"
 RAY_INSTALL_WHEEL = "{{ get_env(name='RAY_INSTALL_WHEEL', default='0') }}"
 RAY_WHEEL_DIR = "{{ get_env(name='RAY_WHEEL_DIR', default='') }}"
 KUEUE_FEATURE_GATES = "{{ get_env(name='KUEUE_FEATURE_GATES', default='ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true,ElasticJobsViaWorkloadSlicesFlavorSplit=true') }}"
@@ -116,3 +116,38 @@ run = "build/cluster/up.sh"
 [tasks."cluster:down"]
 description = "Tear down local Kind cluster"
 run = "kind delete cluster --name {{env.CLUSTER_NAME}}"
+
+[tasks."test:checks"]
+description = "Run static analysis and release order assertions"
+run = """
+python3 tests/checks/check-kueue-setup-rbac.py
+python3 tests/checks/check-delayed-topology-bounds.py
+bash tests/checks/check-ray-release-order.sh
+"""
+
+[tasks."test:interlink"]
+description = "Run patched interLink unit tests"
+dir = "third_party/interlink"
+depends = ["patch:interlink"]
+run = "go test ./pkg/virtualkubelet/..."
+
+[tasks."test:kuberay"]
+description = "Run patched KubeRay unit tests"
+dir = "third_party/kuberay/ray-operator"
+depends = ["patch:kuberay"]
+run = "go test -race ./controllers/ray/... -skip TestAPIs"
+
+[tasks."test:kueue"]
+description = "Run patched Kueue unit tests"
+dir = "third_party/kueue"
+depends = ["patch:kueue"]
+run = "go test -race ./pkg/..."
+
+[tasks."test:kueue-integration"]
+description = "Run patched Kueue Ginkgo integration tests"
+depends = ["patch:kueue"]
+run = "build/kueue/test-integration.sh"
+
+[tasks."test:e2e"]
+description = "Run end-to-end integration tests using Chainsaw"
+run = "chainsaw test --config tests/e2e/chainsaw-config.yaml tests/e2e/ tests/checks/fixtures/delayed-topology/"

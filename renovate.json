@@ -72,7 +72,7 @@
         "^readme\\.md$"
       ],
       "matchStrings": [
-        "<!--\\s*renovate:\\s*datasource=(?<datasource>.*?)\\s+depName=(?<depName>.*?)(?:\\s+versioning=(?<versioning>.*?))?\\s*-->\\n\\[!\\[.*?\\]\\(https://img\\.shields\\.io/badge/.*-(?<currentValue>v?[0-9.]+)-.*\\.svg\\)\\]\\(https://github\\.com/.*?/releases/tag/.*?\\)"
+        "<!--\\s*renovate:\\s*datasource=(?<datasource>.*?)\\s+depName=(?<depName>.*?)(?:\\s+versioning=(?<versioning>.*?))?\\s*-->\\n\\[!\\[.*?\\]\\(https://img\\.shields\\.io/badge/.*-(?<currentValue>v?[0-9.]+)-[^)]*\\)\\]\\(https://github\\.com/.*?/releases/tag/.*?\\)"
       ]
     }
   ]

@@ -1,0 +1,45 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: 04-karpenter-delayed-topology
+spec:
+  concurrent: false
+  description: >
+    A TAS gang reserves quota before any Karpenter nodes exist. Three packed NodeClaims
+    must register before the gang gets a topology assignment; the real kube-scheduler
+    binds all three pods to the tainted nodes and leaves a rogue pod unscheduled.
+    A second gang times out and uses a TAS reserved flavor with a queue-wide check.
+    NodeClaims and kubelet status are simulated; provisioning never needs a cloud account.
+  steps:
+    - name: setup
+      try:
+        - apply:
+            file: 00-queues.yaml
+    - name: submit-cold-gang
+      try:
+        - apply:
+            file: 01-job.yaml
+    - name: register-claims-and-verify-topology-and-pod-binding
+      try:
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./register-and-assert.sh
+    - name: launch-timeout-falls-back-to-reserved-tas
+      try:
+        - script:
+            timeout: 90s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./fallback-and-assert.sh
+    - name: registered-nodes-too-small-fall-back-to-reserved-tas
+      try:
+        - script:
+            timeout: 150s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./small-nodes-fall-back.sh

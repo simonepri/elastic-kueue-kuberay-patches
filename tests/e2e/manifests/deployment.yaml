@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: queued-serving-deployment
+  labels:
+    kueue.x-k8s.io/queue-name: standard-local-queue
+    kueue.x-k8s.io/priority-class: priority-low
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: queued-serving
+  template:
+    metadata:
+      labels:
+        app: queued-serving
+        kueue.x-k8s.io/queue-name: standard-local-queue
+        kueue.x-k8s.io/priority-class: priority-low
+    spec:
+      priorityClassName: priority-low
+      containers:
+        - name: web
+          image: busybox:latest
+          command: ["sleep", "3600"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"

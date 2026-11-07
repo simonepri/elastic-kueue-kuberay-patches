@@ -1,0 +1,47 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: elastic-rayjob
+  labels:
+    kueue.x-k8s.io/queue-name: elastic-local-queue
+    kueue.x-k8s.io/priority-class: priority-low
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+    kueue.x-k8s.io/elastic-job-scale-up-strategy: partial
+    kueue.x-k8s.io/reclaim-min-counts: '{"workers":1}'
+spec:
+  submissionMode: HTTPMode
+  entrypoint: "python -c 'import time; time.sleep(120)'"
+  shutdownAfterJobFinishes: true
+  rayClusterSpec:
+    rayVersion: "2.60.0"
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+      template:
+        spec:
+          priorityClassName: priority-low
+          containers:
+            - name: ray-head
+              image: kind.local/ray:latest
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: "250m"
+                  memory: "256Mi"
+    workerGroupSpecs:
+      - groupName: workers
+        replicas: 3
+        minReplicas: 1
+        maxReplicas: 4
+        template:
+          spec:
+            priorityClassName: priority-low
+            containers:
+              - name: ray-worker
+                image: kind.local/ray:latest
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "250m"
+                    memory: "256Mi"

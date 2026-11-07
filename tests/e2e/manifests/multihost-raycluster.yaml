@@ -1,0 +1,43 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: multihost-raycluster
+  labels:
+    kueue.x-k8s.io/queue-name: elastic-local-queue
+    kueue.x-k8s.io/priority-class: priority-low
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+    kueue.x-k8s.io/elastic-job-scale-up-strategy: partial
+spec:
+  rayVersion: "2.60.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        priorityClassName: priority-low
+        containers:
+          - name: ray-head
+            image: kind.local/ray:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "250m"
+                memory: "256Mi"
+  workerGroupSpecs:
+    - groupName: multihost-workers
+      numOfHosts: 2
+      replicas: 4
+      minReplicas: 2
+      maxReplicas: 4
+      template:
+        spec:
+          priorityClassName: priority-low
+          containers:
+            - name: ray-worker
+              image: kind.local/ray:latest
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: "250m"
+                  memory: "256Mi"

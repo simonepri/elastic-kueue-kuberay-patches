@@ -1,0 +1,58 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: priority-low
+value: 100
+globalDefault: false
+description: "Low priority elastic ray workloads"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: priority-low
+value: 100
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: flavor-primary
+spec:
+  nodeLabels:
+    instance-tier: primary
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: flavor-secondary
+spec:
+  nodeLabels:
+    instance-tier: secondary
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: multiflavor-cluster-queue
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: flavor-primary
+          resources:
+            - name: "cpu"
+              nominalQuota: "2"
+            - name: "memory"
+              nominalQuota: "4Gi"
+        - name: flavor-secondary
+          resources:
+            - name: "cpu"
+              nominalQuota: "2"
+            - name: "memory"
+              nominalQuota: "4Gi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: multiflavor-local-queue
+spec:
+  clusterQueue: multiflavor-cluster-queue

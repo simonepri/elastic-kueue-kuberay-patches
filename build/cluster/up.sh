@@ -24,6 +24,8 @@ if ! kind get clusters | grep -q "^$CLUSTER_NAME$"; then
   echo "Creating Kind cluster $CLUSTER_NAME..."
   kind create cluster --config kind-config.yaml --name "$CLUSTER_NAME"
 fi
+echo "Labeling Kind nodes for elastic nodepool workloads..."
+kubectl label nodes --all karpenter.sh/nodepool=elastic-nodepool --overwrite
 
 # 3. Sideload patched images into Kind
 KUEUE_IMG=$(cat .kueue-image.txt)
@@ -35,6 +37,7 @@ if [ -f .ray-image.txt ]; then
   RAY_IMG=$(cat .ray-image.txt)
   echo "Loading Ray image into Kind: $RAY_IMG..."
   kind load docker-image "$RAY_IMG" --name "$CLUSTER_NAME"
+  kind load docker-image "kind.local/ray:latest" --name "$CLUSTER_NAME"
 fi
 
 # 4. Install CRDs

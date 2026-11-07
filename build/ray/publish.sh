@@ -21,9 +21,9 @@ fi
 python_tag="cp${RAY_PYTHON#py}"
 build_args=(
   --build-arg BASE_IMAGE="$BASE_IMAGE"
-  --build-arg RAY_LOCAL_VERSION="$RAY_LOCAL_VERSION"
+  --build-arg RAY_LOCAL_VERSION="${RAY_LOCAL_VERSION:-${RAY_UPSTREAM}+p${RAY_PATCH_VERSION}}"
   --build-arg RAY_PYTHON_TAG="$python_tag"
-  --build-arg RAY_WHEEL_BASE_URL="$RAY_WHEEL_BASE_URL"
+  --build-arg RAY_WHEEL_BASE_URL="${RAY_WHEEL_BASE_URL:-https://github.com/simonepri/elastic-kueue-kuberay-patches/releases/download/ray-v${RAY_PATCH_VERSION}}"
 )
 
 echo "Publishing Ray image ghcr.io/simonepri/ray:$TAG from $BASE_IMAGE for $PLATFORMS..."

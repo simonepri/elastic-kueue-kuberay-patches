@@ -61,6 +61,8 @@ helm template kuberay-operator kuberay/kuberay-operator \
   --set image.repository="${KUBERAY_IMG%:*}" \
   --set image.tag="${KUBERAY_IMG##*:}" \
   --set leaderElectionEnabled=false \
+  --set 'featureGates[0].name=ScaleGate' \
+  --set 'featureGates[0].enabled=true' \
   --set env[0].name=SCALEGATE_FLAVOR_SPLIT \
   --set-string env[0].value="$scalegate_flavor_split" \
   --set resources.limits.cpu=2 \
@@ -81,8 +83,8 @@ rules:
   resources: ["configmaps"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: ["kueue.x-k8s.io"]
-  resources: ["clusterqueues", "localqueues", "cohorts", "workloads", "workloads/status"]
-  verbs: ["get", "list", "watch", "update", "patch"]
+  resources: ["clusterqueues", "localqueues", "cohorts", "workloads"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

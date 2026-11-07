@@ -1,0 +1,1919 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simone Primarosa <simone.primarosa@gmail.com>
+Date: Sat, 7 Nov 2026 12:00:00 +01:00
+Subject: [PATCH] feat: clamp raycluster worker scale up to kueue clusterqueue quota
+
+Ray's in-tree autoscaler calculates desired worker counts based purely on application task and actor resource requirements without awareness of Kubernetes scheduling queue limits. In an environment managed by Kueue, uncoordinated scale-up requests periodically exceed ClusterQueue nominal quota and cohort borrowing limits, creating surplus worker pods that remain indefinitely gated or pending, consuming namespace resources and triggering controller thrashing.
+
+Introduce a ScaleGate reconciler guarded by the ScaleGate feature gate that inspects the managing Kueue ClusterQueue, cohort tree, and flavor definitions to dynamically calculate the maximum feasible worker capacity after deducting head pod requests. Clamp spec.workerGroupSpecs[].maxReplicas to this computed ceiling while preserving original configured limits in annotations so maxReplicas can be restored upon quota growth.
+---
+diff --git a/helm-chart/kuberay-operator/templates/_helpers.tpl b/helm-chart/kuberay-operator/templates/_helpers.tpl
+index cd6443e..fc5c5d1 100644
+--- a/helm-chart/kuberay-operator/templates/_helpers.tpl
++++ b/helm-chart/kuberay-operator/templates/_helpers.tpl
+@@ -316,6 +316,17 @@ rules:
+   - list
+   - update
+   - watch
++- apiGroups:
++  - kueue.x-k8s.io
++  resources:
++  - clusterqueues
++  - cohorts
++  - localqueues
++  - workloads
++  verbs:
++  - get
++  - list
++  - watch
+ - apiGroups:
+   - networking.k8s.io
+   resources:
+diff --git a/helm-chart/kuberay-operator/values.yaml b/helm-chart/kuberay-operator/values.yaml
+index 570971a..672520f 100644
+--- a/helm-chart/kuberay-operator/values.yaml
++++ b/helm-chart/kuberay-operator/values.yaml
+@@ -163,6 +163,8 @@ featureGates:
+   enabled: false
+ - name: RayClusterHistoryServer
+   enabled: false
++- name: ScaleGate
++  enabled: false
+ 
+ # Configurations for KubeRay operator metrics.
+ metrics:
+diff --git a/ray-operator/config/rbac/role.yaml b/ray-operator/config/rbac/role.yaml
+index 953bf6f..98f933f 100644
+--- a/ray-operator/config/rbac/role.yaml
++++ b/ray-operator/config/rbac/role.yaml
+@@ -162,6 +162,17 @@ rules:
+   - list
+   - update
+   - watch
++- apiGroups:
++  - kueue.x-k8s.io
++  resources:
++  - clusterqueues
++  - cohorts
++  - localqueues
++  - workloads
++  verbs:
++  - get
++  - list
++  - watch
+ - apiGroups:
+   - networking.k8s.io
+   resources:
+diff --git a/ray-operator/controllers/ray/scalegate_controller.go b/ray-operator/controllers/ray/scalegate_controller.go
+new file mode 100644
+index 0000000..eb05ef7
+--- /dev/null
++++ b/ray-operator/controllers/ray/scalegate_controller.go
+@@ -0,0 +1,832 @@
++package ray
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"math"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/api/meta"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/discovery"
++	"k8s.io/client-go/rest"
++	"k8s.io/client-go/util/retry"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/builder"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/handler"
++	"sigs.k8s.io/controller-runtime/pkg/log"
++	"sigs.k8s.io/controller-runtime/pkg/predicate"
++
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++)
++
++// +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=clusterqueues;localqueues;cohorts;workloads,verbs=get;list;watch
++
++// unlimitedQuota marks a quota that this ClusterQueue alone does not bound.
++const unlimitedQuota = int64(math.MaxInt64)
++
++// scaleLimitsAnnotation stores the user's un-clamped maxReplicas and the last clamped value per worker group.
++const scaleLimitsAnnotation = "scalegate.kuberay.io/scale-limits"
++
++type workerScaleLimit struct {
++	Original int64 `json:"original"`
++	Clamped  int64 `json:"clamped"`
++}
++
++// flavorSplitEnv names the operator environment variable that, set to true, makes ScaleGate bound a worker group by
++// the sum of its flavors in a resource group rather than the largest one. Set it when Kueue runs with the
++// ElasticJobsViaWorkloadSlicesFlavorSplit gate, which lets one worker group span flavors through split pod sets.
++const flavorSplitEnv = "SCALEGATE_FLAVOR_SPLIT"
++
++// kueueVersions lists the Kueue API versions ScaleGate reads, newest first.
++var kueueVersions = []string{"v1beta2", "v1beta1"}
++
++// ScaleGateReconciler caps the maxReplicas of each worker group of a Kueue-queued RayCluster at the most workers its
++// ClusterQueue could ever hold, so the Ray autoscaler cannot request pods Kueue can never admit. It writes nothing
++// else: the Ray autoscaler is the only writer of replicas and workersToDelete, and the operator already limits the
++// pods it creates to maxReplicas.
++type ScaleGateReconciler struct {
++	client.Client
++	Scheme *runtime.Scheme
++	// FlavorSplit sums the flavors of a resource group in the bound, as Kueue may split a worker group across them.
++	FlavorSplit bool
++}
++
++// flavorQuota maps each resource a flavor offers to the most of it one ClusterQueue can use on that flavor.
++type flavorQuota struct {
++	name   string
++	limits map[string]int64
++}
++
++// resourceGroupQuota is one ClusterQueue resource group: a set of resources and the flavors that offer them.
++type resourceGroupQuota struct {
++	covered map[string]bool
++	flavors []flavorQuota
++}
++
++// clusterQueueQuota is the most of each resource a ClusterQueue can use, per resource group and flavor.
++type clusterQueueQuota struct {
++	groups []resourceGroupQuota
++}
++
++// maxWorkers returns how many workers needing unit fit in the quota after reserving otherRequests
++// (e.g. head pod requests), and false when the quota does not bound them.
++func (q clusterQueueQuota) maxWorkers(unit map[string]int64, headUnit map[string]int64, headFlavors map[string]string, flavorSplit bool) (int64, bool) {
++	bound := unlimitedQuota
++	for _, group := range q.groups {
++		var needed []string
++		for res, amount := range unit {
++			if amount > 0 && group.covered[res] {
++				needed = append(needed, res)
++			}
++		}
++		if len(needed) == 0 {
++			continue
++		}
++
++		if flavorSplit {
++			best := unlimitedQuota
++			for _, res := range needed {
++				resTotal := int64(0)
++				for _, flavor := range group.flavors {
++					limit, ok := flavor.limits[res]
++					if !ok {
++						continue
++					}
++					resTotal += limit
++				}
++				headReq := headUnit[res]
++				available := resTotal - headReq
++				if available <= 0 {
++					best = 0
++				} else {
++					best = min(best, available/unit[res])
++				}
++			}
++			bound = min(bound, best)
++		} else {
++			best := int64(0)
++			for _, flavor := range group.flavors {
++				deductHead := false
++				if len(headFlavors) > 0 {
++					for _, hf := range headFlavors {
++						if flavor.name == hf {
++							deductHead = true
++							break
++						}
++					}
++				} else {
++					canAnotherHoldHead := false
++					for _, other := range group.flavors {
++						if other.name == flavor.name {
++							continue
++						}
++						holdsAll := true
++						for hRes, hReq := range headUnit {
++							if hReq > 0 && group.covered[hRes] && other.limits[hRes] < hReq {
++								holdsAll = false
++								break
++							}
++						}
++						if holdsAll {
++							canAnotherHoldHead = true
++							break
++						}
++					}
++					if !canAnotherHoldHead {
++						deductHead = true
++					}
++				}
++
++				fit := unlimitedQuota
++				for _, res := range needed {
++					limit, ok := flavor.limits[res]
++					if !ok {
++						fit = 0
++						break
++					}
++					headReq := int64(0)
++					if deductHead {
++						headReq = headUnit[res]
++					}
++					available := limit - headReq
++					if available <= 0 {
++						fit = 0
++						break
++					}
++					fit = min(fit, available/unit[res])
++				}
++				best = max(best, fit)
++			}
++			bound = min(bound, best)
++		}
++	}
++	if bound == unlimitedQuota {
++		return 0, false
++	}
++	return bound, true
++}
++
++// maxReplicasCeiling returns the highest maxReplicas ScaleGate leaves a worker group with under a quota bound. The
++// ceiling never drops below the count Kueue admitted for the group, since Kueue's admission is the authority on what
++// fits, nor below minReplicas, since a smaller maxReplicas makes the operator reject the spec.
++func maxReplicasCeiling(quotaBound int64, admitted int64, minReplicas int64) int64 {
++	return max(quotaBound, admitted, minReplicas)
++}
++
++func getScaleLimits(rc *rayv1.RayCluster) map[string]workerScaleLimit {
++	if rc.Annotations == nil || rc.Annotations[scaleLimitsAnnotation] == "" {
++		return make(map[string]workerScaleLimit)
++	}
++	var res map[string]workerScaleLimit
++	if err := json.Unmarshal([]byte(rc.Annotations[scaleLimitsAnnotation]), &res); err != nil {
++		return make(map[string]workerScaleLimit)
++	}
++	return res
++}
++
++func setScaleLimits(rc *rayv1.RayCluster, limits map[string]workerScaleLimit) {
++	if rc.Annotations == nil {
++		rc.Annotations = make(map[string]string)
++	}
++	if len(limits) == 0 {
++		delete(rc.Annotations, scaleLimitsAnnotation)
++	} else {
++		data, _ := json.Marshal(limits)
++		rc.Annotations[scaleLimitsAnnotation] = string(data)
++	}
++}
++
++// extractPodUnitResources returns the resources one pod requests, in millicores for cpu and whole units
++// for every other resource, plus one "pods", which Kueue counts per pod when a ClusterQueue covers it.
++func extractPodUnitResources(podSpec *corev1.PodSpec) map[string]int64 {
++	unit := map[string]int64{"pods": 1}
++	if podSpec == nil {
++		return unit
++	}
++	for _, c := range podSpec.Containers {
++		for resName, q := range c.Resources.Requests {
++			name := string(resName)
++			var amount int64
++			if name == "cpu" {
++				amount = q.MilliValue()
++			} else {
++				amount = q.Value()
++			}
++			if amount > 0 {
++				unit[name] += amount
++			}
++		}
++	}
++	return unit
++}
++
++func (r *ScaleGateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
++	logger := log.FromContext(ctx)
++
++	rc := &rayv1.RayCluster{}
++	if err := r.Get(ctx, req.NamespacedName, rc); err != nil {
++		if errors.IsNotFound(err) {
++			return ctrl.Result{}, nil
++		}
++		return ctrl.Result{}, err
++	}
++
++	queueName := rc.Labels["kueue.x-k8s.io/queue-name"]
++	if queueName == "" {
++		return ctrl.Result{}, nil
++	}
++	if len(rc.Spec.WorkerGroupSpecs) == 0 {
++		return ctrl.Result{}, nil
++	}
++
++	quota, err := r.resolveQuota(ctx, rc.Namespace, queueName)
++	if err != nil {
++		logger.Info("could not resolve Kueue quota for queue", "queue", queueName, "error", err)
++		return ctrl.Result{}, nil
++	}
++	admitted, headFlavors, err := r.admittedWorkerCounts(ctx, rc)
++	if err != nil {
++		logger.Info("could not read the Kueue admission of the RayCluster", "cluster", rc.Name, "error", err)
++		return ctrl.Result{}, nil
++	}
++
++	headUnit := extractPodUnitResources(&rc.Spec.HeadGroupSpec.Template.Spec)
++	anyClamped := false
++
++	cond := meta.FindStatusCondition(rc.Status.Conditions, "ScaleGateClamped")
++	hadClampedCondition := cond != nil && cond.Status == metav1.ConditionTrue
++
++	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
++		latest := &rayv1.RayCluster{}
++		if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
++			return err
++		}
++		limitsMap := getScaleLimits(latest)
++		limitsChanged := false
++		changed := false
++		anyClamped = false
++
++		for i := range latest.Spec.WorkerGroupSpecs {
++			wg := &latest.Spec.WorkerGroupSpecs[i]
++			groupName := wg.GroupName
++			var currMax int64
++			if wg.MaxReplicas != nil {
++				currMax = int64(*wg.MaxReplicas)
++			}
++			numOfHosts := int64(wg.NumOfHosts)
++			if numOfHosts <= 0 {
++				numOfHosts = 1
++			}
++
++			stored, hasStored := limitsMap[groupName]
++			var origMax int64
++			if !hasStored {
++				origMax = currMax
++			} else if currMax != stored.Clamped {
++				origMax = currMax
++			} else {
++				origMax = stored.Original
++			}
++
++			boundInPods, ok := quota.maxWorkers(extractPodUnitResources(&wg.Template.Spec), headUnit, headFlavors, r.FlavorSplit)
++			if !ok {
++				if hasStored {
++					delete(limitsMap, groupName)
++					limitsChanged = true
++					if currMax != origMax {
++						target32 := int32(origMax)
++						wg.MaxReplicas = &target32
++						changed = true
++					}
++				}
++				continue
++			}
++
++			boundInReplicas := boundInPods / numOfHosts
++			admittedInReplicas := admitted[strings.ToLower(groupName)] / numOfHosts
++			var minReplicas int64
++			if wg.MinReplicas != nil {
++				minReplicas = int64(*wg.MinReplicas)
++			}
++			ceiling := maxReplicasCeiling(boundInReplicas, admittedInReplicas, minReplicas)
++
++			if origMax > ceiling {
++				anyClamped = true
++				targetMax := ceiling
++				if !hasStored || stored.Original != origMax || stored.Clamped != targetMax {
++					limitsMap[groupName] = workerScaleLimit{Original: origMax, Clamped: targetMax}
++					limitsChanged = true
++				}
++				if currMax != targetMax {
++					logger.Info("clamping RayCluster maxReplicas to Kueue quota",
++						"cluster", latest.Name, "group", groupName, "requestedMax", origMax, "clamped", targetMax)
++					target32 := int32(targetMax)
++					wg.MaxReplicas = &target32
++					changed = true
++				}
++			} else {
++				targetMax := origMax
++				if hasStored {
++					delete(limitsMap, groupName)
++					limitsChanged = true
++				}
++				if currMax != targetMax {
++					logger.Info("restoring RayCluster maxReplicas from Kueue quota growth",
++						"cluster", latest.Name, "group", groupName, "restoredMax", targetMax)
++					target32 := int32(targetMax)
++					wg.MaxReplicas = &target32
++					changed = true
++				}
++			}
++		}
++
++		if limitsChanged {
++			setScaleLimits(latest, limitsMap)
++			changed = true
++		}
++		if !changed {
++			return nil
++		}
++		return r.Update(ctx, latest)
++	})
++	if err != nil {
++		return ctrl.Result{}, err
++	}
++
++	if anyClamped || hadClampedCondition {
++		_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
++			latest := &rayv1.RayCluster{}
++			if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
++				return err
++			}
++			status := metav1.ConditionFalse
++			reason := "QuotaUnbounded"
++			message := "Worker maxReplicas is within available Kueue ClusterQueue quota"
++			if anyClamped {
++				status = metav1.ConditionTrue
++				reason = "KueueQuotaCapped"
++				message = "Worker maxReplicas clamped to available Kueue ClusterQueue quota"
++			}
++			currCond := meta.FindStatusCondition(latest.Status.Conditions, "ScaleGateClamped")
++			if currCond != nil && currCond.Status == status && currCond.Reason == reason && currCond.Message == message {
++				return nil
++			}
++			meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
++				Type:    "ScaleGateClamped",
++				Status:  status,
++				Reason:  reason,
++				Message: message,
++			})
++			if err := r.Status().Update(ctx, latest); err != nil {
++				logger.Info("could not update ScaleGateClamped condition", "cluster", latest.Name, "error", err)
++				return err
++			}
++			return nil
++		})
++	}
++
++	if anyClamped {
++		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
++	}
++	return ctrl.Result{}, nil
++}
++
++// parseResourceValue returns a quantity in millicores for cpu and in whole units for every other resource.
++func parseResourceValue(resName string, raw interface{}) int64 {
++	if raw == nil {
++		return 0
++	}
++	q, err := resource.ParseQuantity(fmt.Sprint(raw))
++	if err != nil {
++		return 0
++	}
++	if resName == "cpu" {
++		return q.MilliValue()
++	}
++	return q.Value()
++}
++
++// getKueueObject reads a Kueue object at the newest API version the cluster serves.
++func (r *ScaleGateReconciler) getKueueObject(ctx context.Context, kind string, key client.ObjectKey) (*unstructured.Unstructured, error) {
++	var lastErr error
++	for _, v := range kueueVersions {
++		obj := &unstructured.Unstructured{}
++		obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: v, Kind: kind})
++		if lastErr = r.Get(ctx, key, obj); lastErr == nil {
++			return obj, nil
++		}
++		if !meta.IsNoMatchError(lastErr) {
++			return nil, lastErr
++		}
++	}
++	return nil, lastErr
++}
++
++// listKueueObjects lists Kueue objects at the newest API version the cluster serves.
++func (r *ScaleGateReconciler) listKueueObjects(ctx context.Context, kind string, opts ...client.ListOption) ([]unstructured.Unstructured, error) {
++	var lastErr error
++	for _, v := range kueueVersions {
++		list := &unstructured.UnstructuredList{}
++		list.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: v, Kind: kind + "List"})
++		if lastErr = r.List(ctx, list, opts...); lastErr == nil {
++			return list.Items, nil
++		}
++		if !meta.IsNoMatchError(lastErr) {
++			return nil, lastErr
++		}
++	}
++	return nil, lastErr
++}
++
++// resolveClusterQueue returns the ClusterQueue that queueName names through a LocalQueue.
++func (r *ScaleGateReconciler) resolveClusterQueue(ctx context.Context, namespace, queueName string) (*unstructured.Unstructured, error) {
++	lq, err := r.getKueueObject(ctx, "LocalQueue", client.ObjectKey{Namespace: namespace, Name: queueName})
++	if err != nil {
++		return nil, fmt.Errorf("local queue %s not found in namespace %s: %w", queueName, namespace, err)
++	}
++	target, _, _ := unstructured.NestedString(lq.Object, "spec", "clusterQueue")
++	if target == "" {
++		return nil, fmt.Errorf("local queue %s/%s names no cluster queue", namespace, queueName)
++	}
++	return r.getKueueObject(ctx, "ClusterQueue", client.ObjectKey{Name: target})
++}
++
++// resolveQuota returns the most of each resource the ClusterQueue behind queueName can use on each flavor.
++func (r *ScaleGateReconciler) resolveQuota(ctx context.Context, namespace, queueName string) (clusterQueueQuota, error) {
++	cq, err := r.resolveClusterQueue(ctx, namespace, queueName)
++	if err != nil {
++		return clusterQueueQuota{}, err
++	}
++	var supply map[string]map[string]int64
++	if cohort := cohortOf(cq); cohort != "" {
++		clusterQueues, err := r.listKueueObjects(ctx, "ClusterQueue")
++		if err != nil {
++			return clusterQueueQuota{}, err
++		}
++		cohorts, err := r.listKueueObjects(ctx, "Cohort")
++		if err != nil && !meta.IsNoMatchError(err) {
++			return clusterQueueQuota{}, err
++		}
++		supply = cohortTreeSupply(cohort, clusterQueues, cohorts)
++	}
++	return buildClusterQueueQuota(cq, supply)
++}
++
++// cohortOf returns the cohort a ClusterQueue belongs to, or "" when it cannot borrow.
++func cohortOf(cq *unstructured.Unstructured) string {
++	if cohort, _, _ := unstructured.NestedString(cq.Object, "spec", "cohortName"); cohort != "" {
++		return cohort
++	}
++	cohort, _, _ := unstructured.NestedString(cq.Object, "spec", "cohort")
++	return cohort
++}
++
++// cohortTreeSupply sums the nominal quota per flavor and resource of every ClusterQueue and Cohort in the cohort
++// tree that contains cohort. Nothing in the tree can use more than that sum, so it bounds borrowing from above
++// however the cohorts nest, ignoring the lending and borrowing limits that may lower the real ceiling.
++func cohortTreeSupply(cohort string, clusterQueues, cohorts []unstructured.Unstructured) map[string]map[string]int64 {
++	parents := map[string]string{}
++	for i := range cohorts {
++		parent, _, _ := unstructured.NestedString(cohorts[i].Object, "spec", "parentName")
++		if parent == "" {
++			parent, _, _ = unstructured.NestedString(cohorts[i].Object, "spec", "parent")
++		}
++		parents[cohorts[i].GetName()] = parent
++	}
++	root := func(name string) string {
++		seen := map[string]bool{}
++		for parents[name] != "" && !seen[name] {
++			seen[name] = true
++			name = parents[name]
++		}
++		return name
++	}
++	treeRoot := root(cohort)
++
++	supply := map[string]map[string]int64{}
++	add := func(obj *unstructured.Unstructured) {
++		rGroups, _, _ := unstructured.NestedSlice(obj.Object, "spec", "resourceGroups")
++		forEachFlavorResource(rGroups, func(flavor, res string, resMap map[string]interface{}) {
++			if supply[flavor] == nil {
++				supply[flavor] = map[string]int64{}
++			}
++			supply[flavor][res] += parseResourceValue(res, resMap["nominalQuota"])
++		})
++	}
++	for i := range clusterQueues {
++		if c := cohortOf(&clusterQueues[i]); c != "" && root(c) == treeRoot {
++			add(&clusterQueues[i])
++		}
++	}
++	for i := range cohorts {
++		if root(cohorts[i].GetName()) == treeRoot {
++			add(&cohorts[i])
++		}
++	}
++	return supply
++}
++
++// forEachFlavorResource calls fn for every resource of every flavor in rGroups, a spec.resourceGroups list.
++func forEachFlavorResource(rGroups []interface{}, fn func(flavor, res string, resMap map[string]interface{})) {
++	for _, rg := range rGroups {
++		rgMap, ok := rg.(map[string]interface{})
++		if !ok {
++			continue
++		}
++		flavors, _, _ := unstructured.NestedSlice(rgMap, "flavors")
++		for _, fl := range flavors {
++			flMap, ok := fl.(map[string]interface{})
++			if !ok {
++				continue
++			}
++			flavorName, _ := flMap["name"].(string)
++			resources, _, _ := unstructured.NestedSlice(flMap, "resources")
++			for _, res := range resources {
++				if resMap, ok := res.(map[string]interface{}); ok {
++					resName, _ := resMap["name"].(string)
++					fn(flavorName, resName, resMap)
++				}
++			}
++		}
++	}
++}
++
++// buildClusterQueueQuota computes the most of each resource the ClusterQueue can use on each flavor: its nominal
++// quota without a cohort, and with one the cohort tree's supply, lowered to nominal plus borrowingLimit when the
++// ClusterQueue sets a borrowingLimit. A missing borrowingLimit means unlimited borrowing in Kueue, so only the
++// supply of the cohort tree bounds it.
++func buildClusterQueueQuota(cq *unstructured.Unstructured, supply map[string]map[string]int64) (clusterQueueQuota, error) {
++	rGroups, found, _ := unstructured.NestedSlice(cq.Object, "spec", "resourceGroups")
++	if !found || len(rGroups) == 0 {
++		return clusterQueueQuota{}, fmt.Errorf("no resource groups found in cluster queue %s", cq.GetName())
++	}
++	hasCohort := cohortOf(cq) != ""
++	quota := clusterQueueQuota{}
++	for _, rg := range rGroups {
++		rgMap, ok := rg.(map[string]interface{})
++		if !ok {
++			continue
++		}
++		group := resourceGroupQuota{covered: map[string]bool{}}
++		covered, _, _ := unstructured.NestedStringSlice(rgMap, "coveredResources")
++		for _, res := range covered {
++			group.covered[res] = true
++		}
++		flavorIndex := map[string]int{}
++		forEachFlavorResource([]interface{}{rgMap}, func(flavor, res string, resMap map[string]interface{}) {
++			idx, ok := flavorIndex[flavor]
++			if !ok {
++				idx = len(group.flavors)
++				flavorIndex[flavor] = idx
++				group.flavors = append(group.flavors, flavorQuota{name: flavor, limits: map[string]int64{}})
++			}
++			group.covered[res] = true
++			nominal := parseResourceValue(res, resMap["nominalQuota"])
++			limit := nominal
++			if hasCohort {
++				limit = max(supply[flavor][res], nominal)
++				if resMap["borrowingLimit"] != nil {
++					limit = min(limit, nominal+parseResourceValue(res, resMap["borrowingLimit"]))
++				}
++			}
++			group.flavors[idx].limits[res] = limit
++		})
++		quota.groups = append(quota.groups, group)
++	}
++	return quota, nil
++}
++
++// admittedWorkerCounts returns, by lowercased base pod set name, the pod counts Kueue admitted for the Workload of the
++// RayCluster or of the RayJob that owns it; the map is empty when that Workload is not admitted. If a worker group's
++// pod set is split into multiple entries (<group>, <group>--2, ...), the counts are summed.
++func (r *ScaleGateReconciler) admittedWorkerCounts(ctx context.Context, rc *rayv1.RayCluster) (map[string]int64, map[string]string, error) {
++	owners := map[types.UID]bool{rc.UID: true}
++	for _, ref := range rc.OwnerReferences {
++		if ref.Kind == "RayJob" {
++			owners[ref.UID] = true
++		}
++	}
++	workloads, err := r.listKueueObjects(ctx, "Workload", client.InNamespace(rc.Namespace))
++	if err != nil {
++		return nil, nil, err
++	}
++	counts := map[string]int64{}
++	headFlavors := map[string]string{}
++	for i := range workloads {
++		wl := &workloads[i]
++		owned := false
++		for _, ref := range wl.GetOwnerReferences() {
++			owned = owned || owners[ref.UID]
++		}
++		if !owned {
++			continue
++		}
++		assignments, found, _ := unstructured.NestedSlice(wl.Object, "status", "admission", "podSetAssignments")
++		if !found {
++			continue
++		}
++		specCounts := map[string]int64{}
++		podSetBases := map[string]string{}
++		podSetNames := map[string]bool{}
++		podSets, _, _ := unstructured.NestedSlice(wl.Object, "spec", "podSets")
++		for _, ps := range podSets {
++			if psMap, ok := ps.(map[string]interface{}); ok {
++				name, _ := psMap["name"].(string)
++				lowerName := strings.ToLower(name)
++				specCounts[lowerName], _ = getInt64(psMap["count"])
++				podSetNames[lowerName] = true
++				if base, found, _ := unstructured.NestedString(psMap, "template", "metadata", "annotations", "kueue.x-k8s.io/flavor-split-of"); found && base != "" {
++					podSetBases[lowerName] = strings.ToLower(base)
++				}
++			}
++		}
++		wlCounts := map[string]int64{}
++		for _, a := range assignments {
++			aMap, ok := a.(map[string]interface{})
++			if !ok {
++				continue
++			}
++			name, _ := aMap["name"].(string)
++			lowerName := strings.ToLower(name)
++			if lowerName == "head" {
++				if fls, found, _ := unstructured.NestedStringMap(aMap, "flavors"); found {
++					for res, fl := range fls {
++						headFlavors[res] = fl
++					}
++				}
++			}
++			base := resolvePodSetBase(lowerName, podSetBases, podSetNames)
++			count, ok := getInt64(aMap["count"])
++			if !ok {
++				count = specCounts[lowerName]
++			}
++			wlCounts[base] += count
++		}
++		for base, count := range wlCounts {
++			counts[base] = max(counts[base], count)
++		}
++	}
++	return counts, headFlavors, nil
++}
++
++// resolvePodSetBase resolves the base pod set name of a potentially split pod set entry.
++// The kueue.x-k8s.io/flavor-split-of annotation on the Workload's PodSet template is authoritative.
++// If only the name is available, a trailing --<digits> is stripped only when the stripped name
++// is another PodSet in the same Workload.
++func resolvePodSetBase(name string, podSetBases map[string]string, podSetNames map[string]bool) string {
++	if base, ok := podSetBases[name]; ok && base != "" {
++		return base
++	}
++	if idx := strings.LastIndex(name, "--"); idx != -1 {
++		suffix := name[idx+2:]
++		if len(suffix) > 0 && isAllDigits(suffix) {
++			candidate := name[:idx]
++			if podSetNames[candidate] {
++				return candidate
++			}
++		}
++	}
++	return name
++}
++
++func isAllDigits(s string) bool {
++	for _, r := range s {
++		if r < '0' || r > '9' {
++			return false
++		}
++	}
++	return true
++}
++
++func getInt64(val interface{}) (int64, bool) {
++	switch v := val.(type) {
++	case int64:
++		return v, true
++	case int32:
++		return int64(v), true
++	case int:
++		return int64(v), true
++	case float64:
++		return int64(v), true
++	default:
++		return 0, false
++	}
++}
++
++// kueueAPIAvailable returns true if the kueue.x-k8s.io/v1beta2 API (ClusterQueue, LocalQueue, Workload) is
++// available in the cluster. Used to avoid registering watches on Kueue CRDs when Kueue is not installed,
++// which would cause manager startup to time out waiting for the CRD cache to sync.
++func kueueAPIAvailable(restConfig *rest.Config) bool {
++	if restConfig == nil {
++		return false
++	}
++	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
++	if err != nil || discoveryClient == nil {
++		return false
++	}
++	_, resources, err := discoveryClient.ServerGroupsAndResources()
++	if err != nil {
++		return false
++	}
++	for _, r := range resources {
++		if r.GroupVersion == "kueue.x-k8s.io/v1beta2" {
++			return true
++		}
++	}
++	return false
++}
++
++func (r *ScaleGateReconciler) SetupWithManager(mgr ctrl.Manager) error {
++	if enabled, err := strconv.ParseBool(os.Getenv(flavorSplitEnv)); err == nil && enabled {
++		r.FlavorSplit = true
++	}
++	bld := ctrl.NewControllerManagedBy(mgr).
++		Named("scalegate").
++		For(&rayv1.RayCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{}))
++
++	if !kueueAPIAvailable(mgr.GetConfig()) {
++		mgr.GetLogger().WithName("scalegate").Info("kueue.x-k8s.io/v1beta2 API not found; skipping Kueue watches (ScaleGate will only reconcile RayClusters directly)")
++		return bld.Complete(r)
++	}
++
++	cqObj := &unstructured.Unstructured{}
++	cqObj.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "ClusterQueue"})
++	bld.Watches(cqObj, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
++		cqName := obj.GetName()
++		lqList := &unstructured.UnstructuredList{}
++		lqList.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueueList"})
++		if err := r.List(ctx, lqList); err != nil {
++			return nil
++		}
++		targetQueues := map[string]bool{}
++		for _, lq := range lqList.Items {
++			target, _, _ := unstructured.NestedString(lq.Object, "spec", "clusterQueue")
++			if target == cqName {
++				targetQueues[lq.GetNamespace()+"/"+lq.GetName()] = true
++			}
++		}
++		rcList := &rayv1.RayClusterList{}
++		if err := r.List(ctx, rcList); err != nil {
++			return nil
++		}
++		var reqs []ctrl.Request
++		for _, item := range rcList.Items {
++			qName := item.Labels["kueue.x-k8s.io/queue-name"]
++			if qName != "" && targetQueues[item.Namespace+"/"+qName] {
++				reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
++					Namespace: item.Namespace,
++					Name:      item.Name,
++				}})
++			}
++		}
++		return reqs
++	}), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
++
++	lqObj := &unstructured.Unstructured{}
++	lqObj.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "LocalQueue"})
++	bld.Watches(lqObj, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
++		rcList := &rayv1.RayClusterList{}
++		if err := r.List(ctx, rcList, client.InNamespace(obj.GetNamespace())); err != nil {
++			return nil
++		}
++		var reqs []ctrl.Request
++		for _, item := range rcList.Items {
++			if item.Labels["kueue.x-k8s.io/queue-name"] == obj.GetName() {
++				reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{
++					Namespace: item.Namespace,
++					Name:      item.Name,
++				}})
++			}
++		}
++		return reqs
++	}), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
++
++	wlObj := &unstructured.Unstructured{}
++	wlObj.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"})
++	bld.Watches(wlObj, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
++		for _, ref := range obj.GetOwnerReferences() {
++			if ref.Kind == "RayCluster" {
++				return []ctrl.Request{{NamespacedName: types.NamespacedName{
++					Namespace: obj.GetNamespace(),
++					Name:      ref.Name,
++				}}}
++			}
++		}
++		return nil
++	}))
++
++	return bld.Complete(r)
++}
+diff --git a/ray-operator/main.go b/ray-operator/main.go
+index d033987..ae5b956 100644
+--- a/ray-operator/main.go
++++ b/ray-operator/main.go
+@@ -368,6 +368,12 @@ func main() {
+ 		setupLog.Info("RayClusterNetworkPolicy feature gate is disabled, skipping NetworkPolicy controller setup")
+ 	}
+ 
++	if features.Enabled(features.ScaleGate) {
++		exitOnError((&ray.ScaleGateReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ScaleGate")
++	} else {
++		setupLog.Info("ScaleGate feature gate is disabled, skipping ScaleGate controller setup")
++	}
++
+ 	// +kubebuilder:scaffold:builder
+ 
+ 	exitOnError(mgr.AddHealthzCheck("healthz", healthz.Ping), "unable to set up health check")
+diff --git a/ray-operator/pkg/features/features.go b/ray-operator/pkg/features/features.go
+index 8b1db76..b5811de 100644
+--- a/ray-operator/pkg/features/features.go
++++ b/ray-operator/pkg/features/features.go
+@@ -96,6 +96,13 @@ const (
+ 	// selects the scheduler; it is mutually exclusive with --batch-scheduler and --enable-batch-scheduler.
+ 	// Requires a Kubernetes cluster that serves the scheduling.k8s.io API with GenericWorkload enabled.
+ 	KubernetesWAS featuregate.Feature = "KubernetesWAS"
++
++	// owner: @simonepri
++	// rep: N/A
++	// alpha: v1.8
++	//
++	// Enables ScaleGate controller to clamp RayCluster worker maxReplicas to Kueue ClusterQueue quota.
++	ScaleGate featuregate.Feature = "ScaleGate"
+ )
+ 
+ func init() {
+@@ -114,6 +121,7 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
+ 	RayClusterMTLS:                   {Default: false, PreRelease: featuregate.Alpha},
+ 	RayClusterHistoryServer:          {Default: false, PreRelease: featuregate.Alpha},
+ 	KubernetesWAS:                    {Default: false, PreRelease: featuregate.Alpha},
++	ScaleGate:                        {Default: false, PreRelease: featuregate.Alpha},
+ }
+ 
+ // SetFeatureGateDuringTest is a helper method to override feature gates in tests.
+diff --git a/ray-operator/controllers/ray/scalegate_controller_unit_test.go b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
+new file mode 100644
+index 0000000..2f6eb90
+--- /dev/null
++++ b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
+@@ -0,0 +1,966 @@
++package ray
++
++import (
++	"context"
++	"fmt"
++	"reflect"
++	"testing"
++
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/meta"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	clientFake "sigs.k8s.io/controller-runtime/pkg/client/fake"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
++
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++)
++
++// Tests for the ScaleGate quota bound: flavor and resource group combination, cohort borrowing, Kueue admission,
++// the minReplicas floor that keeps the clamped spec valid, and the rule that maxReplicas is the only field ScaleGate
++// writes.
++
++type sgFlavor struct {
++	name      string
++	resources []map[string]interface{}
++}
++
++func sgResource(name string, nominal interface{}, borrowingLimit ...interface{}) map[string]interface{} {
++	res := map[string]interface{}{"name": name, "nominalQuota": nominal}
++	if len(borrowingLimit) > 0 {
++		res["borrowingLimit"] = borrowingLimit[0]
++	}
++	return res
++}
++
++func sgResourceGroups(groups ...[]sgFlavor) []interface{} {
++	out := []interface{}{}
++	for _, flavors := range groups {
++		covered := []interface{}{}
++		seen := map[string]bool{}
++		fls := []interface{}{}
++		for _, fl := range flavors {
++			resources := []interface{}{}
++			for _, res := range fl.resources {
++				resources = append(resources, res)
++				if name := res["name"].(string); !seen[name] {
++					seen[name] = true
++					covered = append(covered, name)
++				}
++			}
++			fls = append(fls, map[string]interface{}{"name": fl.name, "resources": resources})
++		}
++		out = append(out, map[string]interface{}{"coveredResources": covered, "flavors": fls})
++	}
++	return out
++}
++
++func sgKueueObject(kind, name, namespace string, spec map[string]interface{}) *unstructured.Unstructured {
++	obj := &unstructured.Unstructured{Object: map[string]interface{}{"spec": spec}}
++	obj.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: kind})
++	obj.SetName(name)
++	obj.SetNamespace(namespace)
++	return obj
++}
++
++func sgClusterQueue(name, cohort string, groups []interface{}) *unstructured.Unstructured {
++	spec := map[string]interface{}{"resourceGroups": groups}
++	if cohort != "" {
++		spec["cohortName"] = cohort
++	}
++	return sgKueueObject("ClusterQueue", name, "", spec)
++}
++
++func sgLocalQueue(name, namespace, clusterQueue string) *unstructured.Unstructured {
++	spec := map[string]interface{}{"clusterQueue": clusterQueue}
++	return sgKueueObject("LocalQueue", name, namespace, spec)
++}
++
++func sgRayCluster(queue string, replicas, minReplicas, maxReplicas int64) *rayv1.RayCluster {
++	rep := int32(replicas)
++	minRep := int32(minReplicas)
++	maxRep := int32(maxReplicas)
++	rc := &rayv1.RayCluster{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      "gang",
++			Namespace: "default",
++			UID:       types.UID("raycluster-uid"),
++			Labels:    map[string]string{"kueue.x-k8s.io/queue-name": queue},
++		},
++		Spec: rayv1.RayClusterSpec{
++			WorkerGroupSpecs: []rayv1.WorkerGroupSpec{
++				{
++					GroupName:   "gpu-workers",
++					Replicas:    &rep,
++					MinReplicas: &minRep,
++					MaxReplicas: &maxRep,
++					ScaleStrategy: rayv1.ScaleStrategy{
++						WorkersToDelete: sgWorkersToDelete(),
++					},
++					Template: corev1.PodTemplateSpec{
++						Spec: corev1.PodSpec{
++							Containers: []corev1.Container{
++								{
++									Name: "ray-worker",
++									Resources: corev1.ResourceRequirements{
++										Requests: corev1.ResourceList{
++											corev1.ResourceCPU: resource.MustParse("4"),
++											"nvidia.com/gpu":   resource.MustParse("1"),
++										},
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++	}
++	return rc
++}
++
++func sgAdmittedWorkload(count int64) *unstructured.Unstructured {
++	wl := sgKueueObject("Workload", "raycluster-gang", "default", map[string]interface{}{
++		"podSets": []interface{}{
++			map[string]interface{}{"name": "head", "count": int64(1)},
++			map[string]interface{}{"name": "gpu-workers", "count": count},
++		},
++	})
++	wl.Object["status"] = map[string]interface{}{"admission": map[string]interface{}{
++		"clusterQueue": "team-queue",
++		"podSetAssignments": []interface{}{
++			map[string]interface{}{"name": "head", "count": int64(1)},
++			map[string]interface{}{"name": "gpu-workers", "count": count},
++		},
++	}}
++	wl.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "ray.io/v1", Kind: "RayCluster", Name: "gang", UID: "raycluster-uid"}})
++	return wl
++}
++
++// sgWorkersToDelete returns the pods the Ray autoscaler asked the operator to delete from the test worker group.
++func sgWorkersToDelete() []string {
++	return []string{"gang-gpu-workers-aaaaa", "gang-gpu-workers-bbbbb"}
++}
++
++func sgReconcile(t *testing.T, objs ...client.Object) (*rayv1.RayCluster, bool) {
++	t.Helper()
++	return sgReconcileWith(t, interceptor.Funcs{}, objs...)
++}
++
++// sgReconcileWith reconciles the RayCluster "gang" against a fake client that routes calls through funcs, and returns
++// the stored RayCluster and whether it carries the ScaleGateClamped condition.
++func sgReconcileWith(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) (*rayv1.RayCluster, bool) {
++	t.Helper()
++	mapper := meta.NewDefaultRESTMapper(nil)
++	for _, kind := range []string{"ClusterQueue", "Cohort"} {
++		mapper.Add(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: kind}, meta.RESTScopeRoot)
++	}
++	for _, kind := range []string{"LocalQueue", "Workload"} {
++		mapper.Add(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: kind}, meta.RESTScopeNamespace)
++	}
++	scheme := runtime.NewScheme()
++	if err := rayv1.AddToScheme(scheme); err != nil {
++		t.Fatalf("AddToScheme: %v", err)
++	}
++	allObjs := append([]client.Object{}, objs...)
++	var hasLQ bool
++	for _, obj := range objs {
++		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "LocalQueue" {
++			hasLQ = true
++			break
++		}
++	}
++	if !hasLQ {
++		for _, obj := range objs {
++			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "ClusterQueue" {
++				allObjs = append(allObjs, sgLocalQueue(u.GetName(), "default", u.GetName()))
++			}
++		}
++	}
++
++	fakeClient := clientFake.NewClientBuilder().
++		WithScheme(scheme).
++		WithStatusSubresource(&rayv1.RayCluster{}).
++		WithRESTMapper(mapper).
++		WithInterceptorFuncs(funcs).
++		WithObjects(allObjs...).
++		Build()
++	r := &ScaleGateReconciler{Client: fakeClient}
++	key := types.NamespacedName{Namespace: "default", Name: "gang"}
++	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
++		t.Fatalf("Reconcile returned an error: %v", err)
++	}
++	got := &rayv1.RayCluster{}
++	if err := fakeClient.Get(context.Background(), key, got); err != nil {
++		t.Fatalf("Get RayCluster: %v", err)
++	}
++	cond := meta.FindStatusCondition(got.Status.Conditions, "ScaleGateClamped")
++	clamped := cond != nil && cond.Status == metav1.ConditionTrue
++	return got, clamped
++}
++
++func sgWorkerGroup(rc *rayv1.RayCluster) rayv1.WorkerGroupSpec {
++	return rc.Spec.WorkerGroupSpecs[0]
++}
++
++// sgWorkersToDeleteOf returns the workersToDelete list of the test worker group.
++func sgWorkersToDeleteOf(rc *rayv1.RayCluster) []string {
++	return sgWorkerGroup(rc).ScaleStrategy.WorkersToDelete
++}
++
++func sgWorkerCounts(t *testing.T, rc *rayv1.RayCluster) (replicas, minReplicas, maxReplicas int64) {
++	t.Helper()
++	wg := sgWorkerGroup(rc)
++	if wg.Replicas != nil {
++		replicas = int64(*wg.Replicas)
++	}
++	if wg.MinReplicas != nil {
++		minReplicas = int64(*wg.MinReplicas)
++	}
++	if wg.MaxReplicas != nil {
++		maxReplicas = int64(*wg.MaxReplicas)
++	}
++	return replicas, minReplicas, maxReplicas
++}
++
++// A fixed-size gang admitted on a flavor that has no nominal GPUs and borrows from the cohort without a
++// borrowingLimit keeps its size, even though another flavor of the ClusterQueue holds only 2 GPUs.
++func TestScaleGateKeepsAdmittedGangOnBorrowOnlyFlavor(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "shared", sgResourceGroups([]sgFlavor{
++		{name: "reserved", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "2")}},
++		{name: "borrowed", resources: []map[string]interface{}{sgResource("cpu", "0"), sgResource("nvidia.com/gpu", "0")}},
++	}))
++	lender := sgClusterQueue("lender-queue", "shared", sgResourceGroups([]sgFlavor{
++		{name: "borrowed", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "64")}},
++	}))
++	rc, clamped := sgReconcile(t, queue, lender, sgRayCluster("team-queue", 50, 50, 50), sgAdmittedWorkload(50))
++	if replicas, minReplicas, maxReplicas := sgWorkerCounts(t, rc); replicas != 50 || minReplicas != 50 || maxReplicas != 50 {
++		t.Errorf("worker group = replicas %d, min %d, max %d; want 50, 50, 50", replicas, minReplicas, maxReplicas)
++	}
++	if clamped {
++		t.Errorf("ScaleGateClamped condition set on a gang Kueue admitted")
++	}
++}
++
++// Borrowing without a borrowingLimit is bounded by the supply of the whole cohort tree, including parent cohorts.
++func TestScaleGateBoundsUnlimitedBorrowingByCohortTree(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "shared", sgResourceGroups([]sgFlavor{
++		{name: "reserved", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "2")}},
++		{name: "borrowed", resources: []map[string]interface{}{sgResource("cpu", "0"), sgResource("nvidia.com/gpu", "0")}},
++	}))
++	cohort := sgKueueObject("Cohort", "shared", "", map[string]interface{}{"parentName": "org"})
++	parent := sgKueueObject("Cohort", "org", "", map[string]interface{}{"resourceGroups": sgResourceGroups([]sgFlavor{
++		{name: "borrowed", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "40")}},
++	})})
++	rc, clamped := sgReconcile(t, queue, cohort, parent, sgRayCluster("team-queue", 32, 1, 64))
++	if replicas, _, maxReplicas := sgWorkerCounts(t, rc); replicas != 32 || maxReplicas != 40 || !clamped {
++		t.Errorf("worker group = replicas %d, max %d, clamped %v; want 32, 40 (the parent cohort's supply), true", replicas, maxReplicas, clamped)
++	}
++}
++
++// Kueue's admission is the authority: a RayJob's gang admitted at 50 workers keeps them even when the quota
++// ScaleGate can see holds only 2.
++func TestScaleGateNeverClampsBelowAdmittedCount(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "shared", sgResourceGroups([]sgFlavor{
++		{name: "reserved", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "2")}},
++	}))
++	job := []metav1.OwnerReference{{APIVersion: "ray.io/v1", Kind: "RayJob", Name: "gang-job", UID: "rayjob-uid"}}
++	rc := sgRayCluster("team-queue", 50, 50, 50)
++	rc.SetOwnerReferences(job)
++	wl := sgAdmittedWorkload(50)
++	wl.SetOwnerReferences(job)
++	got, clamped := sgReconcile(t, queue, rc, wl)
++	if replicas, minReplicas, maxReplicas := sgWorkerCounts(t, got); replicas != 50 || minReplicas != 50 || maxReplicas != 50 || clamped {
++		t.Errorf("worker group = replicas %d, min %d, max %d, clamped %v; want 50, 50, 50, false", replicas, minReplicas, maxReplicas, clamped)
++	}
++
++	rc = sgRayCluster("team-queue", 50, 1, 50)
++	rc.SetOwnerReferences(job)
++	got, _ = sgReconcile(t, queue, rc, wl)
++	if replicas, _, maxReplicas := sgWorkerCounts(t, got); replicas != 50 || maxReplicas != 50 {
++		t.Errorf("worker group = replicas %d, max %d; want 50, 50 (the admitted count)", replicas, maxReplicas)
++	}
++}
++
++// A real borrowingLimit still bounds maxReplicas at nominal quota plus borrowingLimit, while replicas stays as the
++// Ray autoscaler wrote it: the operator caps the pods it creates at maxReplicas.
++func TestScaleGateClampsToBorrowingLimit(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "shared", sgResourceGroups([]sgFlavor{
++		{name: "spot", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "4", "4")}},
++	}))
++	lender := sgClusterQueue("lender-queue", "shared", sgResourceGroups([]sgFlavor{
++		{name: "spot", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "64")}},
++	}))
++	rc, clamped := sgReconcile(t, queue, lender, sgRayCluster("team-queue", 16, 1, 32))
++	if replicas, minReplicas, maxReplicas := sgWorkerCounts(t, rc); replicas != 16 || minReplicas != 1 || maxReplicas != 8 {
++		t.Errorf("worker group = replicas %d, min %d, max %d; want 16, 1, 8", replicas, minReplicas, maxReplicas)
++	}
++	if !clamped {
++		t.Errorf("ScaleGateClamped condition missing after clamping")
++	}
++}
++
++// Clamping stops at minReplicas, so the operator never sees a worker group whose minReplicas exceeds maxReplicas.
++// replicas is not raised or lowered to follow it.
++func TestScaleGateNeverClampsBelowMinReplicas(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{
++		{name: "on-demand", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "4")}},
++	}))
++	rc, _ := sgReconcile(t, queue, sgRayCluster("team-queue", 10, 6, 10))
++	replicas, minReplicas, maxReplicas := sgWorkerCounts(t, rc)
++	if minReplicas > maxReplicas {
++		t.Fatalf("minReplicas %d exceeds maxReplicas %d", minReplicas, maxReplicas)
++	}
++	if replicas != 10 || minReplicas != 6 || maxReplicas != 6 {
++		t.Errorf("worker group = replicas %d, min %d, max %d; want 10, 6, 6", replicas, minReplicas, maxReplicas)
++	}
++}
++
++// sgWriteRecorder records a copy of every RayCluster the reconciler sends to the API server, by Update or by
++// status Update.
++type sgWriteRecorder struct {
++	written []*rayv1.RayCluster
++}
++
++func (w *sgWriteRecorder) record(obj client.Object) {
++	if rc, ok := obj.(*rayv1.RayCluster); ok {
++		w.written = append(w.written, rc.DeepCopy())
++	}
++}
++
++func (w *sgWriteRecorder) funcs() interceptor.Funcs {
++	return interceptor.Funcs{
++		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
++			w.record(obj)
++			return c.Update(ctx, obj, opts...)
++		},
++		SubResourceUpdate: func(ctx context.Context, c client.Client, subResource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
++			w.record(obj)
++			return c.SubResource(subResource).Update(ctx, obj, opts...)
++		},
++	}
++}
++
++// ScaleGate writes only maxReplicas. On every path, each RayCluster it writes carries the replicas and
++// workersToDelete the Ray autoscaler wrote, and it writes nothing when maxReplicas needs no clamp.
++func TestScaleGateWritesOnlyMaxReplicas(t *testing.T) {
++	gpuQueue := func(gpus string) *unstructured.Unstructured {
++		return sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{
++			{name: "on-demand", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", gpus)}},
++		}))
++	}
++	tests := []struct {
++		name                               string
++		queue                              *unstructured.Unstructured
++		replicas, minReplicas, maxReplicas int64
++		admitted                           int64
++		wantMaxReplicas                    int64
++		wantClamped                        bool
++	}{
++		{name: "quota bound clamps maxReplicas below replicas", queue: gpuQueue("8"), replicas: 16, minReplicas: 1, maxReplicas: 32, wantMaxReplicas: 8, wantClamped: true},
++		{name: "minReplicas floor clamps maxReplicas below replicas", queue: gpuQueue("4"), replicas: 10, minReplicas: 6, maxReplicas: 10, wantMaxReplicas: 6, wantClamped: true},
++		{name: "admitted count floor clamps maxReplicas below replicas", queue: gpuQueue("2"), replicas: 60, minReplicas: 1, maxReplicas: 100, admitted: 50, wantMaxReplicas: 50, wantClamped: true},
++		{name: "replicas above the bound with maxReplicas within it is not a clamp", queue: gpuQueue("8"), replicas: 16, minReplicas: 1, maxReplicas: 8, wantMaxReplicas: 8},
++		{name: "quota above maxReplicas does not raise it", queue: gpuQueue("16"), replicas: 2, minReplicas: 1, maxReplicas: 4, wantMaxReplicas: 4},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			objs := []client.Object{tc.queue, sgRayCluster("team-queue", tc.replicas, tc.minReplicas, tc.maxReplicas)}
++			if tc.admitted > 0 {
++				objs = append(objs, sgAdmittedWorkload(tc.admitted))
++			}
++			recorder := &sgWriteRecorder{}
++			got, clamped := sgReconcileWith(t, recorder.funcs(), objs...)
++
++			if replicas, _, maxReplicas := sgWorkerCounts(t, got); replicas != tc.replicas || maxReplicas != tc.wantMaxReplicas {
++				t.Errorf("worker group = replicas %d, max %d; want %d, %d", replicas, maxReplicas, tc.replicas, tc.wantMaxReplicas)
++			}
++			if !reflect.DeepEqual(sgWorkersToDeleteOf(got), sgWorkersToDelete()) {
++				t.Errorf("workersToDelete = %v; want %v", sgWorkersToDeleteOf(got), sgWorkersToDelete())
++			}
++			if clamped != tc.wantClamped {
++				t.Errorf("ScaleGateClamped condition set = %v; want %v", clamped, tc.wantClamped)
++			}
++			if tc.wantClamped && len(recorder.written) == 0 {
++				t.Errorf("ScaleGate wrote nothing; want the clamped maxReplicas")
++			}
++			if !tc.wantClamped && len(recorder.written) != 0 {
++				t.Errorf("ScaleGate wrote %d RayCluster updates; want none", len(recorder.written))
++			}
++			for _, written := range recorder.written {
++				if replicas, _, _ := sgWorkerCounts(t, written); replicas != tc.replicas {
++					t.Errorf("ScaleGate wrote replicas %d; want %d, the value it read", replicas, tc.replicas)
++				}
++				if !reflect.DeepEqual(sgWorkersToDeleteOf(written), sgWorkersToDelete()) {
++					t.Errorf("ScaleGate wrote workersToDelete %v; want %v, the value it read", sgWorkersToDeleteOf(written), sgWorkersToDelete())
++				}
++			}
++		})
++	}
++}
++
++// When the Ray autoscaler writes between ScaleGate's read and its write, the write conflicts, and ScaleGate retries
++// on the new version and keeps what the autoscaler wrote.
++func TestScaleGateKeepsAutoscalerWriteOnConflict(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{
++		{name: "on-demand", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "8")}},
++	}))
++	autoscalerWrote := false
++	funcs := interceptor.Funcs{
++		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
++			if !autoscalerWrote {
++				autoscalerWrote = true
++				latest := &rayv1.RayCluster{}
++				if err := c.Get(ctx, client.ObjectKeyFromObject(obj), latest); err != nil {
++					return err
++				}
++				rep24 := int32(24)
++				latest.Spec.WorkerGroupSpecs[0].Replicas = &rep24
++				latest.Spec.WorkerGroupSpecs[0].ScaleStrategy.WorkersToDelete = []string{"gang-gpu-workers-ccccc"}
++				if err := c.Update(ctx, latest); err != nil {
++					return err
++				}
++			}
++			return c.Update(ctx, obj, opts...)
++		},
++	}
++	got, clamped := sgReconcileWith(t, funcs, queue, sgRayCluster("team-queue", 16, 1, 32))
++	if !autoscalerWrote {
++		t.Fatalf("the autoscaler write never happened, so the test checked nothing")
++	}
++	if replicas, _, maxReplicas := sgWorkerCounts(t, got); replicas != 24 || maxReplicas != 8 {
++		t.Errorf("worker group = replicas %d, max %d; want 24 (the autoscaler's write), 8", replicas, maxReplicas)
++	}
++	if want := []string{"gang-gpu-workers-ccccc"}; !reflect.DeepEqual(sgWorkersToDeleteOf(got), want) {
++		t.Errorf("workersToDelete = %v; want %v (the autoscaler's write)", sgWorkersToDeleteOf(got), want)
++	}
++	if !clamped {
++		t.Errorf("ScaleGateClamped condition missing after clamping")
++	}
++}
++
++func TestClusterQueueQuotaMaxWorkers(t *testing.T) {
++	unit := map[string]int64{"pods": 1, "cpu": 2000, "nvidia.com/gpu": 1}
++	cpuGroup := resourceGroupQuota{covered: map[string]bool{"cpu": true}, flavors: []flavorQuota{{name: "default", limits: map[string]int64{"cpu": 100000}}}}
++	tests := []struct {
++		name      string
++		quota     clusterQueueQuota
++		want      int64
++		wantBound bool
++	}{
++		{
++			name: "largest flavor of a group bounds it",
++			quota: clusterQueueQuota{groups: []resourceGroupQuota{cpuGroup, {
++				covered: map[string]bool{"nvidia.com/gpu": true},
++				flavors: []flavorQuota{
++					{name: "f1", limits: map[string]int64{"nvidia.com/gpu": 2}},
++					{name: "f2", limits: map[string]int64{"nvidia.com/gpu": 0}},
++					{name: "f3", limits: map[string]int64{"nvidia.com/gpu": 12}},
++				},
++			}}},
++			want: 12, wantBound: true,
++		},
++		{
++			name: "smallest group bounds the worker",
++			quota: clusterQueueQuota{groups: []resourceGroupQuota{cpuGroup, {
++				covered: map[string]bool{"nvidia.com/gpu": true},
++				flavors: []flavorQuota{{name: "f1", limits: map[string]int64{"nvidia.com/gpu": 3}}},
++			}}},
++			want: 3, wantBound: true,
++		},
++		{
++			name: "groups the worker does not use do not bound it",
++			quota: clusterQueueQuota{groups: []resourceGroupQuota{cpuGroup, {
++				covered: map[string]bool{"example.com/fpga": true},
++				flavors: []flavorQuota{{name: "f1", limits: map[string]int64{"example.com/fpga": 0}}},
++			}}},
++			want: 50, wantBound: true,
++		},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			got, bound := tc.quota.maxWorkers(unit, nil, nil, false)
++			if bound != tc.wantBound || (bound && got != tc.want) {
++				t.Errorf("maxWorkers = %d, %v; want %d, %v", got, bound, tc.want, tc.wantBound)
++			}
++		})
++	}
++}
++
++// With Kueue's flavor split, a worker group may run on every flavor of a resource group at once.
++func TestClusterQueueQuotaMaxWorkersFlavorSplit(t *testing.T) {
++	unit := map[string]int64{"nvidia.com/gpu": 1}
++	group := func(limits ...int64) clusterQueueQuota {
++		var fls []flavorQuota
++		for i, lim := range limits {
++			fls = append(fls, flavorQuota{name: fmt.Sprintf("f%d", i), limits: map[string]int64{"nvidia.com/gpu": lim}})
++		}
++		return clusterQueueQuota{groups: []resourceGroupQuota{{covered: map[string]bool{"nvidia.com/gpu": true}, flavors: fls}}}
++	}
++	tests := []struct {
++		name        string
++		quota       clusterQueueQuota
++		flavorSplit bool
++		want        int64
++		wantBound   bool
++	}{
++		{name: "the largest flavor without the split", quota: group(8, 4), want: 8, wantBound: true},
++		{name: "the sum of the flavors with the split", quota: group(8, 4), flavorSplit: true, want: 12, wantBound: true},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			got, bound := tc.quota.maxWorkers(unit, nil, nil, tc.flavorSplit)
++			if bound != tc.wantBound || (bound && got != tc.want) {
++				t.Errorf("maxWorkers = %d, %v; want %d, %v", got, bound, tc.want, tc.wantBound)
++			}
++		})
++	}
++}
++
++// admittedWorkerCounts sums split pod set entries (<group>, <group>--2, ...) belonging to the same worker group.
++func TestScaleGateAdmittedWorkerCounts(t *testing.T) {
++	rc := sgRayCluster("team-queue", 16, 1, 32)
++	tests := []struct {
++		name        string
++		podSets     []map[string]interface{}
++		assignments []map[string]interface{}
++		wantCounts  map[string]int64
++	}{
++		{
++			name: "no suffix",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++			},
++			wantCounts: map[string]int64{"head": 1, "gpu-workers": 8},
++		},
++		{
++			name: "two entries 8+4 giving 12",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++				{
++					"name":  "gpu-workers--2",
++					"count": int64(4),
++					"template": map[string]interface{}{
++						"metadata": map[string]interface{}{
++							"annotations": map[string]interface{}{
++								"kueue.x-k8s.io/flavor-split-of": "gpu-workers",
++							},
++						},
++					},
++				},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++				{"name": "gpu-workers--2", "count": int64(4)},
++			},
++			wantCounts: map[string]int64{"head": 1, "gpu-workers": 12},
++		},
++		{
++			name: "two entries 8+4 giving 12 without annotation fallback to name",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++				{"name": "gpu-workers--2", "count": int64(4)},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(8)},
++				{"name": "gpu-workers--2", "count": int64(4)},
++			},
++			wantCounts: map[string]int64{"head": 1, "gpu-workers": 12},
++		},
++		{
++			name: "an entry at 0",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(0)},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "gpu-workers", "count": int64(0)},
++			},
++			wantCounts: map[string]int64{"head": 1, "gpu-workers": 0},
++		},
++		{
++			name: "trailing digits when base is not a podset in workload",
++			podSets: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "standalone--2", "count": int64(5)},
++			},
++			assignments: []map[string]interface{}{
++				{"name": "head", "count": int64(1)},
++				{"name": "standalone--2", "count": int64(5)},
++			},
++			wantCounts: map[string]int64{"head": 1, "standalone--2": 5},
++		},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			podSets := make([]interface{}, len(tc.podSets))
++			for i, ps := range tc.podSets {
++				entry := map[string]interface{}{"name": ps["name"], "count": ps["count"]}
++				if tmpl, ok := ps["template"]; ok {
++					entry["template"] = tmpl
++				}
++				podSets[i] = entry
++			}
++			podSetAssignments := make([]interface{}, len(tc.assignments))
++			for i, a := range tc.assignments {
++				podSetAssignments[i] = map[string]interface{}{"name": a["name"], "count": a["count"]}
++			}
++			wl := sgKueueObject("Workload", "raycluster-gang", "default", map[string]interface{}{
++				"podSets": podSets,
++			})
++			wl.Object["status"] = map[string]interface{}{"admission": map[string]interface{}{
++				"clusterQueue":      "team-queue",
++				"podSetAssignments": podSetAssignments,
++			}}
++			wl.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "ray.io/v1", Kind: "RayCluster", Name: "gang", UID: "raycluster-uid"}})
++
++			mapper := meta.NewDefaultRESTMapper(nil)
++			mapper.Add(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"}, meta.RESTScopeNamespace)
++			scheme := runtime.NewScheme()
++			if err := rayv1.AddToScheme(scheme); err != nil {
++				t.Fatalf("AddToScheme: %v", err)
++			}
++			fakeClient := clientFake.NewClientBuilder().
++				WithScheme(scheme).
++				WithRESTMapper(mapper).
++				WithObjects(rc, wl).
++				Build()
++			r := &ScaleGateReconciler{Client: fakeClient}
++
++			got, _, err := r.admittedWorkerCounts(context.Background(), rc)
++			if err != nil {
++				t.Fatalf("admittedWorkerCounts: %v", err)
++			}
++			if !reflect.DeepEqual(got, tc.wantCounts) {
++				t.Errorf("admittedWorkerCounts = %v; want %v", got, tc.wantCounts)
++			}
++		})
++	}
++}
++
++// Kueue admitting split pod sets for 8+4=12 workers bounds maxReplicas at 12 instead of quota 2.
++func TestScaleGateNeverClampsBelowAdmittedCountSplitPodSets(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "shared", sgResourceGroups([]sgFlavor{
++		{name: "reserved", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "2")}},
++	}))
++	rc := sgRayCluster("team-queue", 16, 1, 32)
++	wl := sgKueueObject("Workload", "raycluster-gang", "default", map[string]interface{}{
++		"podSets": []interface{}{
++			map[string]interface{}{"name": "head", "count": int64(1)},
++			map[string]interface{}{"name": "gpu-workers", "count": int64(8)},
++			map[string]interface{}{
++				"name":  "gpu-workers--2",
++				"count": int64(4),
++				"template": map[string]interface{}{
++					"metadata": map[string]interface{}{
++						"annotations": map[string]interface{}{
++							"kueue.x-k8s.io/flavor-split-of": "gpu-workers",
++						},
++					},
++				},
++			},
++		},
++	})
++	wl.Object["status"] = map[string]interface{}{"admission": map[string]interface{}{
++		"clusterQueue": "team-queue",
++		"podSetAssignments": []interface{}{
++			map[string]interface{}{"name": "head", "count": int64(1)},
++			map[string]interface{}{"name": "gpu-workers", "count": int64(8)},
++			map[string]interface{}{"name": "gpu-workers--2", "count": int64(4)},
++		},
++	}}
++	wl.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "ray.io/v1", Kind: "RayCluster", Name: "gang", UID: "raycluster-uid"}})
++	got, _ := sgReconcile(t, queue, rc, wl)
++	if replicas, _, maxReplicas := sgWorkerCounts(t, got); replicas != 16 || maxReplicas != 12 {
++		t.Errorf("worker group = replicas %d, max %d; want 16, 12 (the admitted count from 8+4)", replicas, maxReplicas)
++	}
++}
++
++func sgRayClusterWithHead(queue string, headCPU string, workerCPU string, replicas, minReplicas, maxReplicas int64) *rayv1.RayCluster {
++	rc := sgRayCluster(queue, replicas, minReplicas, maxReplicas)
++	if headCPU != "" {
++		rc.Spec.HeadGroupSpec = rayv1.HeadGroupSpec{
++			Template: corev1.PodTemplateSpec{
++				Spec: corev1.PodSpec{
++					Containers: []corev1.Container{
++						{
++							Name: "ray-head",
++							Resources: corev1.ResourceRequirements{
++								Requests: corev1.ResourceList{
++									corev1.ResourceCPU: resource.MustParse(headCPU),
++								},
++							},
++						},
++					},
++				},
++			},
++		}
++	}
++	if workerCPU != "" {
++		rc.Spec.WorkerGroupSpecs[0].Template.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU] = resource.MustParse(workerCPU)
++	}
++	return rc
++}
++
++func TestScaleGateHeadPodQuotaDeduction(t *testing.T) {
++	// Nominal quota is 10 CPU. Head requests 2 CPU, worker requests 2 CPU.
++	// Without head deduction: 10 / 2 = 5 workers.
++	// With head deduction: (10 - 2) / 2 = 4 workers.
++	cq := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{{
++		name:      "default",
++		resources: []map[string]interface{}{sgResource("cpu", "10")},
++	}}))
++	rc := sgRayClusterWithHead("team-queue", "2", "2", 1, 1, 10)
++	got, clamped := sgReconcile(t, rc, cq)
++	if !clamped {
++		t.Fatalf("expected ScaleGateClamped condition")
++	}
++	_, _, maxReplicas := sgWorkerCounts(t, got)
++	if maxReplicas != 4 {
++		t.Fatalf("expected maxReplicas clamped to 4 after head pod deduction, got %d", maxReplicas)
++	}
++}
++
++func TestScaleGateRestoresMaxReplicasOnQuotaGrowth(t *testing.T) {
++	// User configures maxReplicas = 10.
++	// Initial quota fits 2 workers -> clamped to 2.
++	// Quota grows to 6 workers -> restored to 6.
++	// Quota grows to 20 workers -> restored to user's original 10 (not 20).
++	cq := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{{
++		name:      "default",
++		resources: []map[string]interface{}{sgResource("cpu", "8"), sgResource("nvidia.com/gpu", "2")},
++	}}))
++	rc := sgRayCluster("team-queue", 1, 1, 10)
++	got, clamped := sgReconcile(t, rc, cq)
++	if !clamped {
++		t.Fatalf("expected ScaleGateClamped condition")
++	}
++	_, _, maxReplicas := sgWorkerCounts(t, got)
++	if maxReplicas != 2 {
++		t.Fatalf("expected maxReplicas clamped to 2, got %d", maxReplicas)
++	}
++
++	// Now reconcile with larger quota
++	cqLarger := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{{
++		name:      "default",
++		resources: []map[string]interface{}{sgResource("cpu", "24"), sgResource("nvidia.com/gpu", "6")},
++	}}))
++	got2, clamped2 := sgReconcile(t, got, cqLarger)
++	if !clamped2 {
++		t.Fatalf("expected ScaleGateClamped condition at 6")
++	}
++	_, _, maxReplicas2 := sgWorkerCounts(t, got2)
++	if maxReplicas2 != 6 {
++		t.Fatalf("expected maxReplicas raised to 6, got %d", maxReplicas2)
++	}
++
++	// Now reconcile with quota exceeding user's original maxReplicas of 10
++	cqHuge := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{{
++		name:      "default",
++		resources: []map[string]interface{}{sgResource("cpu", "100"), sgResource("nvidia.com/gpu", "25")},
++	}}))
++	got3, clamped3 := sgReconcile(t, got2, cqHuge)
++	if clamped3 {
++		t.Fatalf("expected ScaleGateClamped condition to be False when within quota")
++	}
++	_, _, maxReplicas3 := sgWorkerCounts(t, got3)
++	if maxReplicas3 != 10 {
++		t.Fatalf("expected maxReplicas restored to original 10, got %d", maxReplicas3)
++	}
++}
++
++func TestScaleGateQueueResolutionThroughLocalQueue(t *testing.T) {
++	// LocalQueue "team-queue" points to ClusterQueue "real-cluster-queue" (fits 2 workers).
++	// An unrelated ClusterQueue named "team-queue" exists (fits 10 workers).
++	// ScaleGate must resolve through LocalQueue and clamp to 2, not 10.
++	lq := sgLocalQueue("team-queue", "default", "real-cluster-queue")
++	cqReal := sgClusterQueue("real-cluster-queue", "", sgResourceGroups([]sgFlavor{{
++		name:      "default",
++		resources: []map[string]interface{}{sgResource("cpu", "8"), sgResource("nvidia.com/gpu", "2")},
++	}}))
++	cqUnrelated := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{{
++		name:      "default",
++		resources: []map[string]interface{}{sgResource("cpu", "40"), sgResource("nvidia.com/gpu", "10")},
++	}}))
++	rc := sgRayCluster("team-queue", 1, 1, 10)
++	got, clamped := sgReconcile(t, rc, lq, cqReal, cqUnrelated)
++	if !clamped {
++		t.Fatalf("expected ScaleGateClamped condition")
++	}
++	_, _, maxReplicas := sgWorkerCounts(t, got)
++	if maxReplicas != 2 {
++		t.Fatalf("expected maxReplicas clamped to 2 from real-cluster-queue, got %d", maxReplicas)
++	}
++}
++
++func TestScaleGateMultiHostWorkerGroup(t *testing.T) {
++	// Worker group has numOfHosts: 2.
++	// Each worker pod requests 2 CPU.
++	// ClusterQueue has 8 CPU.
++	// Available quota in pods = 8 / 2 = 4 pods.
++	// In multi-host groups, 1 replica = 2 pods.
++	// Available quota in replicas = 4 / 2 = 2 replicas.
++	// Configured maxReplicas: 5.
++	// Must clamp maxReplicas to 2 replicas (not 4 pods).
++	cq := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{{
++		name:      "default",
++		resources: []map[string]interface{}{sgResource("cpu", "8")},
++	}}))
++	rc := sgRayCluster("team-queue", 1, 1, 5)
++	rc.Spec.WorkerGroupSpecs[0].NumOfHosts = 2
++	rc.Spec.WorkerGroupSpecs[0].Template.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU] = resource.MustParse("2")
++
++	got, clamped := sgReconcile(t, rc, cq)
++	if !clamped {
++		t.Fatalf("expected ScaleGateClamped condition")
++	}
++	_, _, maxReplicas := sgWorkerCounts(t, got)
++	if maxReplicas != 2 {
++		t.Fatalf("expected maxReplicas clamped to 2 replicas (4 pods / 2 hosts), got %d", maxReplicas)
++	}
++}
++
++func TestScaleGateUserEditWhileClamped(t *testing.T) {
++	// User sets maxReplicas = 10.
++	// Initial quota fits 2 workers -> clamped to 2.
++	// User edits maxReplicas from 2 to 6 (still clamped since 6 > 2).
++	// ScaleGate should record the new user original as 6, not overwrite with 10.
++	// When quota grows to 20, maxReplicas should be restored to 6, not 10.
++	cq := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{{
++		name:      "default",
++		resources: []map[string]interface{}{sgResource("cpu", "8"), sgResource("nvidia.com/gpu", "2")},
++	}}))
++	rc := sgRayCluster("team-queue", 1, 1, 10)
++	got, clamped := sgReconcile(t, rc, cq)
++	if !clamped {
++		t.Fatalf("expected ScaleGateClamped condition")
++	}
++	_, _, maxReplicas := sgWorkerCounts(t, got)
++	if maxReplicas != 2 {
++		t.Fatalf("expected maxReplicas clamped to 2, got %d", maxReplicas)
++	}
++
++	// User edits maxReplicas on the object to 6 while still clamped
++	max6 := int32(6)
++	got.Spec.WorkerGroupSpecs[0].MaxReplicas = &max6
++
++	// Reconcile with same quota (fits 2)
++	gotEdited, clampedEdited := sgReconcile(t, got, cq)
++	if !clampedEdited {
++		t.Fatalf("expected ScaleGateClamped condition after user edit")
++	}
++	_, _, maxReplicasEdited := sgWorkerCounts(t, gotEdited)
++	if maxReplicasEdited != 2 {
++		t.Fatalf("expected maxReplicas to remain clamped to 2, got %d", maxReplicasEdited)
++	}
++
++	// Now quota grows to fit 20 workers. Restored value should be 6, not 10!
++	cqHuge := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{{
++		name:      "default",
++		resources: []map[string]interface{}{sgResource("cpu", "100"), sgResource("nvidia.com/gpu", "25")},
++	}}))
++	gotRestored, clampedRestored := sgReconcile(t, gotEdited, cqHuge)
++	if clampedRestored {
++		t.Fatalf("expected ScaleGateClamped condition to be False when quota is abundant")
++	}
++	_, _, maxReplicasRestored := sgWorkerCounts(t, gotRestored)
++	if maxReplicasRestored != 6 {
++		t.Fatalf("expected maxReplicas restored to user-edited 6, got %d", maxReplicasRestored)
++	}
++}
++
++func TestScaleGateHeadDeductionMultiFlavorProbe(t *testing.T) {
++	// Probe from F58: two 2-CPU flavors, 500m head, 1-CPU workers.
++	// In split mode (flavorSplit = true): total = 4 CPU - 0.5 CPU = 3.5 CPU -> 3 workers.
++	// Without split mode (flavorSplit = false):
++	// - Before admission: flavor A can hold 2 workers (while flavor B holds 500m head) -> 2 workers.
++	// - After admission with head on flavor A: flavor B holds 2 workers -> 2 workers.
++	cq := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{
++		{name: "flavor-a", resources: []map[string]interface{}{sgResource("cpu", "2000m")}},
++		{name: "flavor-b", resources: []map[string]interface{}{sgResource("cpu", "2000m")}},
++	}))
++	rc := sgRayClusterWithHead("team-queue", "500m", "1000m", 1, 1, 10)
++
++	// Without split mode before admission:
++	got, clamped := sgReconcile(t, rc, cq)
++	if !clamped {
++		t.Fatalf("expected ScaleGateClamped condition")
++	}
++	_, _, maxReplicas := sgWorkerCounts(t, got)
++	if maxReplicas != 2 {
++		t.Fatalf("expected maxReplicas = 2 without flavor split, got %d", maxReplicas)
++	}
++
++	// Test maxWorkers directly
++	q, err := buildClusterQueueQuota(cq, nil)
++	if err != nil {
++		t.Fatalf("buildClusterQueueQuota: %v", err)
++	}
++	workerUnit := map[string]int64{"cpu": 1000, "pods": 1}
++	headUnit := map[string]int64{"cpu": 500, "pods": 1}
++
++	splitBound, ok := q.maxWorkers(workerUnit, headUnit, nil, true)
++	if !ok || splitBound != 3 {
++		t.Fatalf("expected split mode bound = 3, got %d (ok=%v)", splitBound, ok)
++	}
++
++	noSplitBound, ok := q.maxWorkers(workerUnit, headUnit, nil, false)
++	if !ok || noSplitBound != 2 {
++		t.Fatalf("expected non-split mode bound = 2, got %d (ok=%v)", noSplitBound, ok)
++	}
++
++	// Admitted on flavor-a:
++	headFlavors := map[string]string{"cpu": "flavor-a"}
++	admittedBound, ok := q.maxWorkers(workerUnit, headUnit, headFlavors, false)
++	if !ok || admittedBound != 2 {
++		t.Fatalf("expected admitted non-split bound = 2, got %d (ok=%v)", admittedBound, ok)
++	}
++}
++
++func TestScaleGateNonSplitHeadCheckAcrossAllResources(t *testing.T) {
++	// Probe from F60:
++	// Flavor A: 2 CPU, 4Gi memory
++	// Flavor B: 4 CPU, 512Mi memory
++	// Flavor C: 500m CPU, 4Gi memory
++	// Head: 1 CPU, 2Gi memory
++	// Worker: 1 CPU, 1Gi memory
++	// Neither B (not enough memory) nor C (not enough CPU) can hold head.
++	// Therefore A must hold head and has 1 CPU, 2Gi left -> fits 1 worker.
++	cq := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{
++		{name: "flavor-a", resources: []map[string]interface{}{sgResource("cpu", "2"), sgResource("memory", "4Gi")}},
++		{name: "flavor-b", resources: []map[string]interface{}{sgResource("cpu", "4"), sgResource("memory", "512Mi")}},
++		{name: "flavor-c", resources: []map[string]interface{}{sgResource("cpu", "500m"), sgResource("memory", "4Gi")}},
++	}))
++	q, err := buildClusterQueueQuota(cq, nil)
++	if err != nil {
++		t.Fatalf("buildClusterQueueQuota: %v", err)
++	}
++	workerUnit := map[string]int64{"cpu": 1000, "memory": 1024 * 1024 * 1024, "pods": 1}
++	headUnit := map[string]int64{"cpu": 1000, "memory": 2 * 1024 * 1024 * 1024, "pods": 1}
++	bound, ok := q.maxWorkers(workerUnit, headUnit, nil, false)
++	if !ok || bound != 1 {
++		t.Fatalf("expected bound = 1 worker, got %d (ok=%v)", bound, ok)
++	}
++}
++
++func TestKueueAPIAvailable(t *testing.T) {
++	if kueueAPIAvailable(nil) {
++		t.Fatalf("expected kueueAPIAvailable(nil) to return false")
++	}
++}

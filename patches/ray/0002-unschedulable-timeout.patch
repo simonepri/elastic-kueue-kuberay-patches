@@ -10,28 +10,102 @@ trying the next one.
 
 KubeRayProvider now marks a worker pod that has no node and either keeps
 scheduling gates (such as a queue's admission gate) or is reported Unschedulable
-by the scheduler. The reconciler times out an ALLOCATED instance whose pod still
-has scheduling gates after RAY_AUTOSCALER_RECONCILE_UNSCHEDULABLE_TIMEOUT_S (two
-minutes by default). A pod that is not gated but that the scheduler rejected may
-only wait for a new node to boot and register its devices, such as the GPU device
-plugin, so it times out after RAY_AUTOSCALER_RECONCILE_PROVISIONING_TIMEOUT_S
-(ten minutes by default). Both are capped by the allocate timeout, and a pod
-bound to a node keeps the allocate timeout.
+by the scheduler, and the reconciler times out such an ALLOCATED instance after
+RAY_AUTOSCALER_RECONCILE_UNSCHEDULABLE_TIMEOUT_S (two minutes by default, never
+longer than the allocate timeout). A pod bound to a node keeps the allocate
+timeout.
+
+A pod the scheduler rejected can also be waiting for a new node that is still
+booting or registering its devices. When a Karpenter NodeClaim (karpenter.sh/v1)
+that is not being deleted and whose Initialized condition is not True agrees with
+the pod's node selector, the provider marks the pod as having a host
+provisioning, and the reconciler gives it
+RAY_AUTOSCALER_RECONCILE_PROVISIONING_TIMEOUT_S (ten minutes by default, never
+longer than the allocate timeout) instead. A failed NodeClaim lookup, such as a
+missing CRD or missing permission, leaves the two-minute timeout.
 
 Upstream status: not yet reported to ray-project/ray.
 
+diff --git a/python/ray/autoscaler/_private/kuberay/node_provider.py b/python/ray/autoscaler/_private/kuberay/node_provider.py
+index 791ee90..786f3e7 100644
+--- a/python/ray/autoscaler/_private/kuberay/node_provider.py
++++ b/python/ray/autoscaler/_private/kuberay/node_provider.py
+@@ -262,7 +262,7 @@ def url_from_resource(
+     Args:
+         namespace: The K8s namespace of the resource
+         path: The part of the resource path that starts with the resource type.
+-            Supported resource types are "pods" and "rayclusters".
++            Supported resource types are "pods", "rayclusters" and "nodeclaims".
+         kuberay_crd_version: The API version of the KubeRay CRD.
+             Looks like "v1alpha1", "v1".
+         kubernetes_host: The host of the Kubernetes API server.
+@@ -286,6 +286,9 @@ def url_from_resource(
+         api_group = "/api/v1"
+     elif path.startswith("rayclusters"):
+         api_group = "/apis/ray.io/" + kuberay_crd_version
++    elif path.startswith("nodeclaims"):
++        # Karpenter NodeClaims are cluster-scoped (karpenter.sh/v1).
++        return kubernetes_host + "/apis/karpenter.sh/v1/" + path
+     else:
+         raise NotImplementedError("Tried to access unknown entity at {}".format(path))
+     return kubernetes_host + api_group + "/namespaces/" + namespace + "/" + path
 diff --git a/python/ray/autoscaler/v2/instance_manager/cloud_providers/kuberay/cloud_provider.py b/python/ray/autoscaler/v2/instance_manager/cloud_providers/kuberay/cloud_provider.py
-index 4a645cf..579f5b1 100644
+index 4a645cf..2aec61b 100644
 --- a/python/ray/autoscaler/v2/instance_manager/cloud_providers/kuberay/cloud_provider.py
 +++ b/python/ray/autoscaler/v2/instance_manager/cloud_providers/kuberay/cloud_provider.py
-@@ -673,8 +673,38 @@ class KubeRayProvider(ICloudInstanceProvider):
+@@ -621,6 +621,8 @@ class KubeRayProvider(ICloudInstanceProvider):
+             f"Fetched pod data at resource version" f" {fetched_resource_version}."
+         )
+ 
++        node_claims = self._list_node_claims(pod_list["items"])
++
+         # Extract node data from the pod list.
+         cloud_instances = {}
+         for pod in pod_list["items"]:
+@@ -632,7 +634,7 @@ class KubeRayProvider(ICloudInstanceProvider):
+                 # Ignore pods marked for termination.
+                 continue
+             pod_name = pod["metadata"]["name"]
+-            cloud_instance = self._cloud_instance_from_pod(pod)
++            cloud_instance = self._cloud_instance_from_pod(pod, node_claims)
+             if cloud_instance:
+                 cloud_instances[pod_name] = cloud_instance
+ 
+@@ -640,8 +642,25 @@ class KubeRayProvider(ICloudInstanceProvider):
+ 
+         return cloud_instances
+ 
++    def _list_node_claims(self, pods: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++        """List the Karpenter NodeClaims, only when a pod waits on the scheduler.
++
++        Returns an empty list when no pod needs them or when the lookup fails,
++        for example because the cluster has no Karpenter or the autoscaler may not
++        read NodeClaims; every pod then keeps the unschedulable timeout.
++        """
++        if not any(KubeRayProvider._is_rejected(pod) for pod in pods):
++            return []
++        try:
++            return self._get("nodeclaims").get("items") or []
++        except Exception as e:
++            logger.warning(f"Could not list Karpenter NodeClaims: {e}")
++            return []
++
+     @staticmethod
+-    def _cloud_instance_from_pod(pod: Dict[str, Any]) -> Optional[CloudInstance]:
++    def _cloud_instance_from_pod(
++        pod: Dict[str, Any], node_claims: Optional[List[Dict[str, Any]]] = None
++    ) -> Optional[CloudInstance]:
+         """
+         Convert a pod to a Ray CloudInstance.
+ 
+@@ -673,8 +692,96 @@ class KubeRayProvider(ICloudInstanceProvider):
              node_type=type,
              node_kind=kind,
              is_running=KubeRayProvider._is_running(pod),
 +            is_unschedulable=KubeRayProvider._is_unschedulable(pod),
-+            is_gated=KubeRayProvider._is_gated(pod),
-         )
- 
++            host_provisioning=KubeRayProvider._is_host_provisioning(pod, node_claims),
++        )
++
 +    @staticmethod
 +    def _is_unschedulable(pod) -> bool:
 +        """Whether the pod can't be placed on a node yet.
@@ -55,16 +129,74 @@ index 4a645cf..579f5b1 100644
 +        return False
 +
 +    @staticmethod
-+    def _is_gated(pod) -> bool:
-+        """Whether the pod has no node and a queue still holds it behind scheduling gates."""
-+        spec = pod.get("spec", {})
-+        return not spec.get("nodeName") and bool(spec.get("schedulingGates"))
++    def _is_rejected(pod) -> bool:
++        """Whether the scheduler, not a queue, is what keeps the pod off a node.
++
++        The pod has no node, no scheduling gates, and the scheduler reported it
++        as Unschedulable.
++        """
++        return KubeRayProvider._is_unschedulable(pod) and not pod.get("spec", {}).get(
++            "schedulingGates"
+         )
+ 
++    @staticmethod
++    def _is_host_provisioning(
++        pod, node_claims: Optional[List[Dict[str, Any]]]
++    ) -> bool:
++        """Whether a Karpenter NodeClaim that is not initialized yet could host the pod.
++
++        The scheduler reports a pod Unschedulable until a new node has joined and
++        registered its devices, so only a NodeClaim, whose conditions the
++        Karpenter API documents, tells a host coming for the pod apart from no
++        capacity at all. A NodeClaim counts while it is not being deleted and
++        its Initialized condition is not True, and when the pod's node selector
++        agrees with the NodeClaim's requirements and labels. A node selector
++        key the NodeClaim does not mention does not agree.
++        """
++        selector = pod.get("spec", {}).get("nodeSelector") or {}
++        if not node_claims or not selector or not KubeRayProvider._is_rejected(pod):
++            return False
++        for claim in node_claims:
++            if claim.get("metadata", {}).get("deletionTimestamp"):
++                continue
++            conditions = claim.get("status", {}).get("conditions") or []
++            if any(
++                c.get("type") == "Initialized" and c.get("status") == "True"
++                for c in conditions
++            ):
++                continue
++            if KubeRayProvider._claim_matches_selector(claim, selector):
++                return True
++        return False
++
++    @staticmethod
++    def _claim_matches_selector(claim, selector) -> bool:
++        """Whether every key of the node selector agrees with the NodeClaim."""
++        requirements = {
++            r.get("key"): r for r in claim.get("spec", {}).get("requirements") or []
++        }
++        labels = claim.get("metadata", {}).get("labels") or {}
++        for key, value in selector.items():
++            requirement = requirements.get(key)
++            if requirement is not None:
++                operator = requirement.get("operator")
++                values = requirement.get("values") or []
++                if operator == "In" and value in values:
++                    continue
++                if operator == "NotIn" and value not in values:
++                    continue
++                if operator == "Exists":
++                    continue
++                return False
++            if labels.get(key) != value:
++                return False
++        return True
 +
      @staticmethod
      def _is_running(pod) -> bool:
          """Convert pod state to Ray NodeStatus
 diff --git a/python/ray/autoscaler/v2/instance_manager/config.py b/python/ray/autoscaler/v2/instance_manager/config.py
-index 48dd8bf..e5c6d8b 100644
+index 48dd8bf..ffa0dbc 100644
 --- a/python/ray/autoscaler/v2/instance_manager/config.py
 +++ b/python/ray/autoscaler/v2/instance_manager/config.py
 @@ -90,6 +90,22 @@ class InstanceReconcileConfig:
@@ -79,11 +211,11 @@ index 48dd8bf..e5c6d8b 100644
 +    unschedulable_status_timeout_s: int = env_integer(
 +        "RAY_AUTOSCALER_RECONCILE_UNSCHEDULABLE_TIMEOUT_S", 2 * 60
 +    )
-+    # The timeout for waiting for an ALLOCATED instance that the cloud provider
-+    # reports as unplaceable, but is not held back by a queue, to be RAY_RUNNING.
-+    # A new host can take several minutes to boot and register its devices while
-+    # the instance is reported unplaceable, so this is longer than
-+    # unschedulable_status_timeout_s and still shorter than allocate_status_timeout_s.
++    # The timeout for waiting for an unschedulable ALLOCATED instance to be
++    # RAY_RUNNING while the cloud provider is bringing up a host for it. A new
++    # host can take several minutes to boot and register its devices while the
++    # instance is still reported unplaceable, so this is longer than
++    # unschedulable_status_timeout_s and still capped by allocate_status_timeout_s.
 +    provisioning_status_timeout_s: int = env_integer(
 +        "RAY_AUTOSCALER_RECONCILE_PROVISIONING_TIMEOUT_S", 10 * 60
 +    )
@@ -91,27 +223,26 @@ index 48dd8bf..e5c6d8b 100644
      ray_install_status_timeout_s: int = env_integer(
          "RAY_AUTOSCALER_RECONCILE_RAY_INSTALL_STATUS_TIMEOUT_S", 30 * 60
 diff --git a/python/ray/autoscaler/v2/instance_manager/node_provider.py b/python/ray/autoscaler/v2/instance_manager/node_provider.py
-index 61e870e..e29401f 100644
+index 61e870e..496afda 100644
 --- a/python/ray/autoscaler/v2/instance_manager/node_provider.py
 +++ b/python/ray/autoscaler/v2/instance_manager/node_provider.py
-@@ -64,6 +64,15 @@ class CloudInstance:
+@@ -64,6 +64,14 @@ class CloudInstance:
      # to handle cloud instances w/o request ids.
      # TODO: make this a required field.
      request_id: Optional[str] = None
 +    # If the cloud provider can't place the cloud instance on a host yet, e.g. a
 +    # Kubernetes pod that is gated or unschedulable. Such an instance is timed out
-+    # sooner than allocate_status_timeout_s: after unschedulable_status_timeout_s
-+    # when it is gated, and after provisioning_status_timeout_s otherwise.
++    # after unschedulable_status_timeout_s rather than allocate_status_timeout_s.
 +    is_unschedulable: bool = False
-+    # If the cloud instance is unschedulable because a queue holds it back (a
-+    # Kubernetes pod that still has scheduling gates), as opposed to waiting for
-+    # a host to be provisioned or to become ready.
-+    is_gated: bool = False
++    # If the cloud provider is bringing up a host that can take the unschedulable
++    # cloud instance, e.g. a Karpenter NodeClaim that is not initialized yet. Such
++    # an instance is timed out after provisioning_status_timeout_s instead.
++    host_provisioning: bool = False
  
  
  class CloudInstanceProviderError(Exception):
 diff --git a/python/ray/autoscaler/v2/instance_manager/reconciler.py b/python/ray/autoscaler/v2/instance_manager/reconciler.py
-index 92ee0a3..01fe666 100644
+index 92ee0a3..03d9133 100644
 --- a/python/ray/autoscaler/v2/instance_manager/reconciler.py
 +++ b/python/ray/autoscaler/v2/instance_manager/reconciler.py
 @@ -302,6 +302,7 @@ class Reconciler:
@@ -146,7 +277,7 @@ index 92ee0a3..01fe666 100644
  
          instances_by_status = defaultdict(list)
          for instance in instances:
-@@ -1056,9 +1064,25 @@ class Reconciler:
+@@ -1056,9 +1064,24 @@ class Reconciler:
              assert (
                  instance.cloud_instance_id
              ), "cloud instance id should be set on ALLOCATED instance"
@@ -157,14 +288,13 @@ index 92ee0a3..01fe666 100644
 +                instance.cloud_instance_id
 +            )
 +            if cloud_instance and cloud_instance.is_unschedulable:
-+                # A gated pod waits for a queue and gives up sooner. One the
-+                # scheduler rejected may only wait for a new host to register
-+                # its devices, so it gets time to provision.
++                # An instance the provider is bringing a host up for gets time to
++                # provision; any other unplaceable one gives up sooner.
 +                timeout_s = min(
 +                    timeout_s,
-+                    reconcile_config.unschedulable_status_timeout_s
-+                    if cloud_instance.is_gated
-+                    else reconcile_config.provisioning_status_timeout_s,
++                    reconcile_config.provisioning_status_timeout_s
++                    if cloud_instance.host_provisioning
++                    else reconcile_config.unschedulable_status_timeout_s,
 +                )
              update = Reconciler._handle_stuck_instance(
                  instance,

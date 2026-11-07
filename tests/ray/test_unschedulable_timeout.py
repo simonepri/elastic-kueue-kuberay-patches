@@ -57,6 +57,7 @@ GATED_POD = worker_pod(
 )
 UNSCHEDULABLE_POD = worker_pod(
     "unschedulable",
+    spec={"nodeSelector": {"gpu-class": "t4", "capacity-provider": "cell"}},
     status={
         "phase": "Pending",
         "conditions": [
@@ -64,6 +65,30 @@ UNSCHEDULABLE_POD = worker_pod(
         ],
     },
 )
+
+
+def node_claim(initialized=False, deleting=False, gpu_class="t4", provider="cell"):
+    """A Karpenter NodeClaim whose requirements name a GPU class and a provider."""
+    claim = {
+        "metadata": {"name": "claim", "labels": {"capacity-provider": provider}},
+        "spec": {
+            "requirements": [
+                {"key": "gpu-class", "operator": "In", "values": [gpu_class]},
+                {"key": "karpenter.sh/capacity-type", "operator": "In", "values": ["spot"]},
+            ]
+        },
+        "status": {
+            "conditions": [
+                {"type": "Launched", "status": "True"},
+                {"type": "Initialized", "status": "True" if initialized else "False"},
+            ]
+        },
+    }
+    if deleting:
+        claim["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z"
+    return claim
+
+
 PULLING_POD = worker_pod(
     "pulling",
     spec={"nodeName": "node-1"},
@@ -126,7 +151,9 @@ class MockAutoscalingConfig:
 
 
 class UnschedulableTimeoutTest(unittest.TestCase):
-    def reconcile(self, pod, allocated_for_s, pending_idle_timeout_s=None):
+    def reconcile(
+        self, pod, allocated_for_s, pending_idle_timeout_s=None, node_claims=None
+    ):
         """Reconcile one ALLOCATED instance backed by pod and return its status history."""
         storage = InstanceStorage(cluster_id="test", storage=InMemoryStorage())
         instance_manager = InstanceManager(
@@ -148,7 +175,7 @@ class UnschedulableTimeoutTest(unittest.TestCase):
         )
         ok, _ = storage.upsert_instance(instance)
         self.assertTrue(ok)
-        cloud_instance = KubeRayProvider._cloud_instance_from_pod(pod)
+        cloud_instance = KubeRayProvider._cloud_instance_from_pod(pod, node_claims)
         with mock.patch.object(time, "time_ns", return_value=now_s * s_to_ns):
             Reconciler.reconcile(
                 instance_manager=instance_manager,
@@ -179,10 +206,44 @@ class UnschedulableTimeoutTest(unittest.TestCase):
     def test_default_provisioning_timeout_is_ten_minutes(self):
         self.assertEqual(InstanceReconcileConfig().provisioning_status_timeout_s, 600)
 
-    def test_only_pods_without_a_node_behind_scheduling_gates_are_gated(self):
-        self.assertTrue(KubeRayProvider._is_gated(GATED_POD))
-        self.assertFalse(KubeRayProvider._is_gated(UNSCHEDULABLE_POD))
-        self.assertFalse(KubeRayProvider._is_gated(PULLING_POD))
+    def test_only_a_rejected_pod_can_have_a_host_provisioning(self):
+        claims = [node_claim()]
+        host = KubeRayProvider._is_host_provisioning
+        self.assertTrue(host(UNSCHEDULABLE_POD, claims))
+        self.assertFalse(host(GATED_POD, claims))
+        self.assertFalse(host(PULLING_POD, claims))
+
+    def test_node_claim_must_be_uninitialized_alive_and_match_the_selector(self):
+        host = KubeRayProvider._is_host_provisioning
+        self.assertFalse(host(UNSCHEDULABLE_POD, None))
+        self.assertFalse(host(UNSCHEDULABLE_POD, []))
+        self.assertFalse(host(UNSCHEDULABLE_POD, [node_claim(initialized=True)]))
+        self.assertFalse(host(UNSCHEDULABLE_POD, [node_claim(deleting=True)]))
+        self.assertFalse(host(UNSCHEDULABLE_POD, [node_claim(gpu_class="l4")]))
+        self.assertFalse(host(UNSCHEDULABLE_POD, [node_claim(provider="cloudvm")]))
+        self.assertTrue(
+            host(UNSCHEDULABLE_POD, [node_claim(gpu_class="l4"), node_claim()])
+        )
+
+    def test_pod_without_a_node_selector_never_has_a_host_provisioning(self):
+        pod = worker_pod(
+            "plain",
+            status=UNSCHEDULABLE_POD["status"],
+        )
+        self.assertFalse(KubeRayProvider._is_host_provisioning(pod, [node_claim()]))
+
+    def test_failed_node_claim_lookup_means_no_host_provisioning(self):
+        provider = KubeRayProvider.__new__(KubeRayProvider)
+        provider._get = mock.MagicMock(side_effect=RuntimeError("forbidden"))
+        self.assertEqual(provider._list_node_claims([UNSCHEDULABLE_POD]), [])
+        provider._get.assert_called_once_with("nodeclaims")
+
+    def test_node_claims_are_only_listed_for_a_rejected_pod(self):
+        provider = KubeRayProvider.__new__(KubeRayProvider)
+        provider._get = mock.MagicMock(return_value={"items": [node_claim()]})
+        self.assertEqual(provider._list_node_claims([GATED_POD, PULLING_POD]), [])
+        provider._get.assert_not_called()
+        self.assertEqual(len(provider._list_node_claims([UNSCHEDULABLE_POD])), 1)
 
     def test_pods_without_a_node_are_unschedulable_when_gated_or_rejected(self):
         self.assertTrue(KubeRayProvider._is_unschedulable(GATED_POD))
@@ -196,14 +257,35 @@ class UnschedulableTimeoutTest(unittest.TestCase):
         after = self.reconcile(GATED_POD, UNSCHEDULABLE_TIMEOUT_S + 1)
         self.assertIn(Instance.ALLOCATION_TIMEOUT, after)
 
-    def test_rejected_pod_waits_for_its_node_to_be_provisioned(self):
+    def test_rejected_pod_with_a_host_coming_waits_for_it(self):
         # The scheduler rejects the pod while its new node boots and its GPU device
-        # plugin registers; that takes longer than the gated pod's timeout.
-        history = self.reconcile(UNSCHEDULABLE_POD, PROVISIONING_TIMEOUT_S - 1)
+        # plugin registers; that takes longer than the unschedulable timeout.
+        history = self.reconcile(
+            UNSCHEDULABLE_POD, PROVISIONING_TIMEOUT_S - 1, node_claims=[node_claim()]
+        )
         self.assertEqual(history, [Instance.ALLOCATED])
 
-    def test_rejected_pod_times_out_at_the_provisioning_timeout(self):
-        history = self.reconcile(UNSCHEDULABLE_POD, PROVISIONING_TIMEOUT_S + 1)
+    def test_rejected_pod_with_a_host_coming_times_out_at_the_provisioning_timeout(
+        self,
+    ):
+        history = self.reconcile(
+            UNSCHEDULABLE_POD, PROVISIONING_TIMEOUT_S + 1, node_claims=[node_claim()]
+        )
+        self.assertIn(Instance.ALLOCATION_TIMEOUT, history)
+
+    def test_rejected_pod_with_no_host_coming_times_out_at_the_unschedulable_timeout(
+        self,
+    ):
+        for claims in (None, [], [node_claim(gpu_class="l4")]):
+            history = self.reconcile(
+                UNSCHEDULABLE_POD, UNSCHEDULABLE_TIMEOUT_S + 1, node_claims=claims
+            )
+            self.assertIn(Instance.ALLOCATION_TIMEOUT, history)
+
+    def test_gated_pod_ignores_a_matching_node_claim(self):
+        history = self.reconcile(
+            GATED_POD, UNSCHEDULABLE_TIMEOUT_S + 1, node_claims=[node_claim()]
+        )
         self.assertIn(Instance.ALLOCATION_TIMEOUT, history)
 
     def test_scheduled_pod_pulling_its_image_outlives_the_unschedulable_timeout(self):
@@ -217,7 +299,7 @@ class UnschedulableTimeoutTest(unittest.TestCase):
     def test_unschedulable_pod_times_out_with_pending_idle_timeout_configured(self):
         history = self.reconcile(
             UNSCHEDULABLE_POD,
-            PROVISIONING_TIMEOUT_S + 1,
+            UNSCHEDULABLE_TIMEOUT_S + 1,
             pending_idle_timeout_s=600.0,
         )
         self.assertIn(Instance.ALLOCATION_TIMEOUT, history)

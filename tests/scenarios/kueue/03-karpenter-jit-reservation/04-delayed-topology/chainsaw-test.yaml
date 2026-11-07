@@ -40,3 +40,11 @@ spec:
               - name: NS
                 value: ($namespace)
             content: ./fallback-and-assert.sh
+    - name: registered-nodes-too-small-fall-back-to-reserved-tas
+      try:
+        - script:
+            timeout: 150s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: ./small-nodes-fall-back.sh

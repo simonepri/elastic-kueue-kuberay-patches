@@ -312,7 +312,7 @@ new file mode 100644
 index 0000000..2a1b15a
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
-@@ -0,0 +1,1130 @@
+@@ -0,0 +1,1132 @@
 +// Package karpenter implements an AdmissionCheck that provisions Karpenter NodeClaims sized for the admitted pods
 +// in the flavor's NodePool, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
 +package karpenter
@@ -795,7 +795,7 @@ index 0000000..2a1b15a
 +				return ctrl.Result{}, err
 +			}
 +		}
-+		patch := client.MergeFrom(wl.DeepCopy())
++		patch := client.MergeFromWithOptions(wl.DeepCopy(), client.MergeFromWithOptimisticLock{})
 +		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, ProvisionedAttemptAnnotation, attempt)
 +		if err := c.Patch(ctx, wl, patch); err != nil {
 +			return ctrl.Result{}, err
@@ -896,7 +896,9 @@ index 0000000..2a1b15a
 +// writeExclusions stores the exclusions and derives the allowed-flavors annotation from them: every flavor
 +// of the ClusterQueue that is not excluded. With no exclusions left, it removes both annotations.
 +func (c *Controller) writeExclusions(ctx context.Context, wl *kueue.Workload, excluded map[string]time.Time) error {
-+	patch := client.MergeFrom(wl.DeepCopy())
++	// The patch response replaces wl, so without the lock a stale wl would come back as the current
++	// reservation and the Retry that follows would evict a reservation this reconcile never saw.
++	patch := client.MergeFromWithOptions(wl.DeepCopy(), client.MergeFromWithOptimisticLock{})
 +	if len(excluded) == 0 {
 +		delete(wl.Annotations, ExcludedFlavorsAnnotation)
 +		delete(wl.Annotations, controllerconstants.WorkloadAllowedResourceFlavorAnnotation)
@@ -2457,7 +2459,7 @@ new file mode 100644
 index 0000000..4daaaff
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/topology_test.go
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,209 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2622,6 +2624,24 @@ index 0000000..4daaaff
 +		if claim.GetAnnotations()[DoNotDisruptAnnotationKey] != "" {
 +			t.Fatalf("hold remains after placement on %s", claim.GetName())
 +		}
++	}
++}
++
++func TestFailOnStaleWorkloadWritesNothing(t *testing.T) {
++	f := newFixture(t, delayedWorkload(), nil)
++	stale := f.workload()
++	live := f.workload()
++	metav1.SetMetaDataAnnotation(&live.ObjectMeta, "example.com/newer", "true")
++	if err := f.c.Update(f.ctx, live); err != nil {
++		t.Fatal(err)
++	}
++	err := f.ctrl.fail(f.ctx, stale, checkRef, config{flavorCooldown: DefaultFlavorCooldown}, nil, "stale timeout")
++	if !apierrors.IsConflict(err) {
++		t.Fatalf("fail on a stale Workload returned %v, want conflict", err)
++	}
++	got := f.workload()
++	if got.Annotations[ExcludedFlavorsAnnotation] != "" || f.check().State != kueue.CheckStatePending {
++		t.Fatalf("stale fail wrote exclusions %q or check %s", got.Annotations[ExcludedFlavorsAnnotation], f.check().State)
 +	}
 +}
 +

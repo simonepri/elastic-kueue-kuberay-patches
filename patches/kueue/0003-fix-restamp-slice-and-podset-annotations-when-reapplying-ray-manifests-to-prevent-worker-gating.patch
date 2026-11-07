@@ -1,0 +1,1145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simone Primarosa <simone.primarosa@gmail.com>
+Date: Sat, 7 Nov 2026 12:00:00 +01:00
+Subject: [PATCH] fix: restamp slice and podset annotations when reapplying ray manifests to prevent worker gating
+
+Re-applying declarative manifests for running elastic RayClusters strips workload slice annotations and podset labels that were stamped at start time by the reconciler, leaving newly created workers permanently gated.
+
+Kueue's RayCluster defaulting webhook stamps the kueue.x-k8s.io/podset label, workload slice annotations, and scheduling gates only during CREATE operations. When external configuration management tools re-apply the original RayCluster manifest, the webhook does not intercept the UPDATE, resulting in unstamped pod templates that fail Kueue scheduling gate validation.
+
+Register the RayCluster mutating webhook for UPDATE operations and re-stamp required slice annotations, podset labels, queue labels, scheduling gates, and flavor placement on each modification. Preserve existing slice assignments and first-slice workload annotations so template re-stamping operates idempotently across repeated manifest applications.
+---
+diff --git a/charts/kueue/templates/webhook/manifests.yaml b/charts/kueue/templates/webhook/manifests.yaml
+index a78cb5c..a7815cf 100644
+--- a/charts/kueue/templates/webhook/manifests.yaml
++++ b/charts/kueue/templates/webhook/manifests.yaml
+@@ -397,6 +397,7 @@ webhooks:
+           - v1
+         operations:
+           - CREATE
++          - UPDATE
+         resources:
+           - rayclusters
+     sideEffects: None
+diff --git a/config/components/webhook/manifests.yaml b/config/components/webhook/manifests.yaml
+index 4852a10..3861674 100644
+--- a/config/components/webhook/manifests.yaml
++++ b/config/components/webhook/manifests.yaml
+@@ -231,6 +231,7 @@ webhooks:
+     - v1
+     operations:
+     - CREATE
++    - UPDATE
+     resources:
+     - rayclusters
+   sideEffects: None
+diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
+index 0f26736..adc4963 100644
+--- a/pkg/controller/jobframework/reconciler.go
++++ b/pkg/controller/jobframework/reconciler.go
+@@ -2184,7 +2184,7 @@ func getPodSetsInfoFromStatus(ctx context.Context, c client.Client, w *kueue.Wor
+ 		}
+ 
+ 		if features.Enabled(features.AssignQueueLabelsForPods) {
+-			assignQueueLabels(ctx, info.Labels, w)
++			AssignQueueLabels(ctx, info.Labels, w)
+ 		}
+ 
+ 		for _, admissionCheck := range w.Status.AdmissionChecks {
+@@ -2218,9 +2218,14 @@ func podSetAssignmentsInSpecOrder(wl *kueue.Workload) ([]kueue.PodSetAssignment,
+ 	return ordered, nil
+ }
+ 
+-func assignQueueLabels(ctx context.Context, labels map[string]string, wl *kueue.Workload) {
++// AssignQueueLabels sets the local-queue-name and cluster-queue-name labels on the
++// given map for the provided workload when the admission status is available.
++func AssignQueueLabels(ctx context.Context, labels map[string]string, wl *kueue.Workload) {
+ 	labels[constants.LocalQueueLabel] = string(wl.Spec.QueueName)
+ 
++	if wl.Status.Admission == nil {
++		return
++	}
+ 	clusterQueueName := string(wl.Status.Admission.ClusterQueue)
+ 	labelValidationErrors := validation.IsDNS1123Label(clusterQueueName)
+ 	if len(labelValidationErrors) == 0 {
+diff --git a/pkg/controller/jobs/raycluster/elastic_template_restamp.go b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
+new file mode 100644
+index 0000000..b0515e7
+--- /dev/null
++++ b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
+@@ -0,0 +1,161 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package raycluster
++
++import (
++	"context"
++	"slices"
++
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/podset"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// restampElasticTemplates is the defaulting of an elastic RayCluster on update. The
++// ElasticJobUngater ungates a Pod only when its template carries the scheduling gate,
++// the PodSet label, and the slice name annotation, and the job reconciler stamps the
++// last two once, when it starts the cluster. Replacing a worker group, as a re-apply
++// of the original manifest does with the atomic workerGroupSpecs list, drops them, and
++// every Pod KubeRay creates afterwards would stay gated or unmanaged forever. So every
++// write puts them back, derived from the cluster's active workload slice: the webhook
++// answers the write itself, so no second writer ever races the user's, and a later
++// re-apply meets the same webhook.
++//
++// A cluster that is not elastic is left alone. One that is suspended, or has no active slice, only gets the gate.
++//
++// Besides the label and the slice name, it puts back what the job reconciler stamped from the
++// admission when it started the cluster: the Workload annotation when Pod scheduling is tracked,
++// the queue labels when AssignQueueLabelsForPods is enabled, the topology scheduling gate and
++// annotation of a PodSet with a topology assignment, and the flavors' node labels and tolerations.
++// Stamps from MultiKueue and admission-check PodSetUpdates are not restored.
++func (w *RayClusterWebhook) restampElasticTemplates(ctx context.Context, obj *rayv1.RayCluster) error {
++	if !isAnElasticJob(obj) {
++		return nil
++	}
++	job := fromObject(obj)
++	utilpod.GateTemplate(&job.Spec.HeadGroupSpec.Template, kueue.ElasticJobSchedulingGate)
++	for i := range job.Spec.WorkerGroupSpecs {
++		utilpod.GateTemplate(&job.Spec.WorkerGroupSpecs[i].Template, kueue.ElasticJobSchedulingGate)
++	}
++	if job.IsSuspended() {
++		return nil
++	}
++	active, err := workloadslicing.FindLatestActiveWorkload(ctx, w.client, job.Object(), job.GVK())
++	if err != nil {
++		return err
++	}
++	if active == nil || !workloadslicing.IsElasticWorkload(active) {
++		return nil
++	}
++	sliceName := workloadslicing.SliceName(active)
++	templates := map[kueue.PodSetReference]*corev1.PodTemplateSpec{
++		headGroupPodSetName: &job.Spec.HeadGroupSpec.Template,
++	}
++	for i := range job.Spec.WorkerGroupSpecs {
++		wgs := &job.Spec.WorkerGroupSpecs[i]
++		templates[kueue.NewPodSetReference(wgs.GroupName)] = &wgs.Template
++	}
++	for podSet, template := range templates {
++		stampPodSet(ctx, template, podSet, active)
++		// The name of the slice that started the cluster stays: changing it would change the
++		// template of a running cluster, and with upgradeStrategy Recreate KubeRay deletes every
++		// Pod when the template changes. It only fills a gap that a re-apply left.
++		if _, found := template.Annotations[kueue.WorkloadAnnotation]; !found && podsScheduledTracking() {
++			startingWorkload := job.Spec.HeadGroupSpec.Template.Annotations[kueue.WorkloadAnnotation]
++			if startingWorkload == "" {
++				startingWorkload = sliceName
++			}
++			template.Annotations[kueue.WorkloadAnnotation] = startingWorkload
++		}
++		if err := w.stampAdmission(ctx, active, podSet, template); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// podsScheduledTracking reports whether the job reconciler stamps the Workload annotation
++// on the templates, as getPodSetsInfoFromStatus does.
++func podsScheduledTracking() bool {
++	return features.Enabled(features.WaitForPodsReadyUnscheduledTimeout) ||
++		features.Enabled(features.TopologyAwareScheduling) ||
++		features.Enabled(features.SchedulerLibraryIntegration)
++}
++
++// stampAdmission puts back what the job reconciler took from the admission when it started
++// the cluster: the topology scheduling gate and annotation of a PodSet with a topology
++// assignment, which keep its Pods from running outside their domains, and the flavors' node
++// labels and tolerations. It keeps a value the template already sets.
++func (w *RayClusterWebhook) stampAdmission(ctx context.Context, active *kueue.Workload, podSetName kueue.PodSetReference, template *corev1.PodTemplateSpec) error {
++	if active.Status.Admission == nil {
++		return nil
++	}
++	psIdx := slices.IndexFunc(active.Spec.PodSets, func(ps kueue.PodSet) bool { return ps.Name == podSetName })
++	psaIdx := slices.IndexFunc(active.Status.Admission.PodSetAssignments, func(psa kueue.PodSetAssignment) bool { return psa.Name == podSetName })
++	if psIdx == -1 || psaIdx == -1 {
++		return nil
++	}
++	info, err := podset.FromAssignment(ctx, w.client, &active.Status.Admission.PodSetAssignments[psaIdx], &active.Spec.PodSets[psIdx])
++	if err != nil {
++		return err
++	}
++	for _, gate := range info.SchedulingGates {
++		utilpod.GateTemplate(template, gate.Name)
++	}
++	for key, value := range info.Annotations {
++		if key == kueue.PodSetUnconstrainedTopologyAnnotation {
++			if _, found := template.Annotations[key]; !found {
++				template.Annotations[key] = value
++			}
++		}
++	}
++	for key, value := range info.NodeSelector {
++		if _, found := template.Spec.NodeSelector[key]; !found {
++			if template.Spec.NodeSelector == nil {
++				template.Spec.NodeSelector = make(map[string]string, len(info.NodeSelector))
++			}
++			template.Spec.NodeSelector[key] = value
++		}
++	}
++	for _, toleration := range info.Tolerations {
++		if !slices.ContainsFunc(template.Spec.Tolerations, func(t corev1.Toleration) bool { return toleration.MatchToleration(&t) }) {
++			template.Spec.Tolerations = append(template.Spec.Tolerations, toleration)
++		}
++	}
++	return nil
++}
++
++func stampPodSet(ctx context.Context, template *corev1.PodTemplateSpec, podSet kueue.PodSetReference, active *kueue.Workload) {
++	if template.Labels == nil {
++		template.Labels = make(map[string]string, 3)
++	}
++	template.Labels[constants.PodSetLabel] = string(podSet)
++	if features.Enabled(features.AssignQueueLabelsForPods) {
++		jobframework.AssignQueueLabels(ctx, template.Labels, active)
++	}
++	if template.Annotations == nil {
++		template.Annotations = make(map[string]string, 1)
++	}
++	template.Annotations[kueue.WorkloadSliceNameAnnotation] = workloadslicing.SliceName(active)
++}
+diff --git a/pkg/controller/jobs/raycluster/raycluster_webhook.go b/pkg/controller/jobs/raycluster/raycluster_webhook.go
+index 7dbb9ac..31836b8 100644
+--- a/pkg/controller/jobs/raycluster/raycluster_webhook.go
++++ b/pkg/controller/jobs/raycluster/raycluster_webhook.go
+@@ -21,6 +21,7 @@ import (
+ 	"slices"
+ 
+ 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	admissionv1 "k8s.io/api/admission/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/labels"
+@@ -81,7 +82,7 @@ func SetupRayClusterWebhook(mgr ctrl.Manager, opts ...jobframework.Option) error
+ 		Complete()
+ }
+ 
+-// +kubebuilder:webhook:path=/mutate-ray-io-v1-raycluster,mutating=true,failurePolicy=fail,sideEffects=None,groups=ray.io,resources=rayclusters,verbs=create,versions=v1,name=mraycluster.kb.io,admissionReviewVersions=v1
++// +kubebuilder:webhook:path=/mutate-ray-io-v1-raycluster,mutating=true,failurePolicy=fail,sideEffects=None,groups=ray.io,resources=rayclusters,verbs=create;update,versions=v1,name=mraycluster.kb.io,admissionReviewVersions=v1
+ 
+ var _ admission.Defaulter[*rayv1.RayCluster] = &RayClusterWebhook{}
+ 
+@@ -90,6 +91,9 @@ func (w *RayClusterWebhook) Default(ctx context.Context, obj *rayv1.RayCluster)
+ 	job := fromObject(obj)
+ 	log := ctrl.LoggerFrom(ctx).WithName("raycluster-webhook")
+ 	log.V(10).Info("Applying defaults")
++	if req, err := admission.RequestFromContext(ctx); err == nil && req.Operation == admissionv1.Update {
++		return w.restampElasticTemplates(ctx, obj)
++	}
+ 	if err := w.integrationManager.ApplyDefaultLocalQueue(ctx, w.client, job.Object(), w.queues.DefaultLocalQueueExist, w.managedJobsNamespaceSelector); err != nil {
+ 		return err
+ 	}
+diff --git a/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go b/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go
+new file mode 100644
+index 0000000..7cdb160
+--- /dev/null
++++ b/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go
+@@ -0,0 +1,268 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package raycluster
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	admissionv1 "k8s.io/api/admission/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/component-base/featuregate"
++	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingrayutil "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func TestRestampElasticTemplatesOnUpdate(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	updateCtx := func(ctx context.Context) context.Context {
++		return admission.NewContextWithRequest(ctx, admission.Request{
++			AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Update},
++		})
++	}
++	// The manifest a user applies: no gate, no PodSet label, no slice name.
++	original := func(elastic, suspended bool) *rayv1.RayCluster {
++		cluster := testingrayutil.MakeCluster("job", "ns").UID("job-uid").Suspend(suspended)
++		if elastic {
++			cluster = cluster.SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)
++		}
++		return cluster.Obj()
++	}
++	assignment := utiltestingapi.MakeAdmission("cq").
++		PodSets(
++			utiltestingapi.MakePodSetAssignment("head").Assignment(corev1.ResourceCPU, "remote", "1").Obj(),
++			utiltestingapi.MakePodSetAssignment("workers-group-0").Assignment(corev1.ResourceCPU, "remote", "1").Obj(),
++		).Obj()
++	// slice is a Workload of an elastic chain.
++	slice := func(name, chain string, finished bool) kueue.Workload {
++		wl := utiltestingapi.MakeWorkload(name, "ns").
++			Queue("lq").
++			Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			PodSets(*utiltestingapi.MakePodSet("head", 1).Obj(), *utiltestingapi.MakePodSet("workers-group-0", 2).Obj()).
++			ControllerReference(gvk, "job", "job-uid").
++			ReserveQuotaAt(assignment, now)
++		if chain != "" {
++			wl = wl.Annotation(kueue.WorkloadSliceNameAnnotation, chain)
++		}
++		if finished {
++			wl = wl.Condition(metav1.Condition{Type: kueue.WorkloadFinished, Status: metav1.ConditionTrue, Reason: "Succeeded"})
++		}
++		return *wl.Obj()
++	}
++	stamped := func(chain string) func(*rayv1.RayCluster) {
++		return func(c *rayv1.RayCluster) {
++			stamp := func(t *corev1.PodTemplateSpec, podSet string) {
++				t.Labels = map[string]string{
++					constants.PodSetLabel:       podSet,
++					constants.LocalQueueLabel:   "lq",
++					constants.ClusterQueueLabel: "cq",
++				}
++				t.Annotations = map[string]string{kueue.WorkloadSliceNameAnnotation: chain}
++			}
++			stamp(&c.Spec.HeadGroupSpec.Template, "head")
++			stamp(&c.Spec.WorkerGroupSpecs[0].Template, "workers-group-0")
++		}
++	}
++	unqueuedStamped := func(chain string) func(*rayv1.RayCluster) {
++		return func(c *rayv1.RayCluster) {
++			stamp := func(t *corev1.PodTemplateSpec, podSet string) {
++				t.Labels = map[string]string{constants.PodSetLabel: podSet}
++				t.Annotations = map[string]string{kueue.WorkloadSliceNameAnnotation: chain}
++			}
++			stamp(&c.Spec.HeadGroupSpec.Template, "head")
++			stamp(&c.Spec.WorkerGroupSpecs[0].Template, "workers-group-0")
++		}
++	}
++	gated := func(c *rayv1.RayCluster) {
++		c.Spec.HeadGroupSpec.Template.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: kueue.ElasticJobSchedulingGate}}
++		c.Spec.WorkerGroupSpecs[0].Template.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: kueue.ElasticJobSchedulingGate}}
++	}
++	placementOnTemplates := func() kueue.Workload {
++		return slice("origin", "", false)
++	}
++	toleration := corev1.Toleration{Key: "example.com/provider", Operator: corev1.TolerationOpExists}
++	placed := func(c *rayv1.RayCluster) {
++		for _, t := range []*corev1.PodTemplateSpec{&c.Spec.HeadGroupSpec.Template, &c.Spec.WorkerGroupSpecs[0].Template} {
++			t.Spec.NodeSelector = map[string]string{"example.com/class": "test"}
++			t.Spec.Tolerations = []corev1.Toleration{toleration}
++		}
++	}
++	tracked := func(c *rayv1.RayCluster) {
++		c.Spec.HeadGroupSpec.Template.Annotations[kueue.WorkloadAnnotation] = "origin"
++		c.Spec.WorkerGroupSpecs[0].Template.Annotations[kueue.WorkloadAnnotation] = "origin"
++	}
++	with := func(c *rayv1.RayCluster, mutations ...func(*rayv1.RayCluster)) *rayv1.RayCluster {
++		c = c.DeepCopy()
++		for _, mutate := range mutations {
++			mutate(c)
++		}
++		return c
++	}
++
++	// topologyOnTemplates is a Workload whose worker PodSet has a topology assignment.
++	topologyOnTemplates := func() kueue.Workload {
++		wl := slice("origin", "", false)
++		wl.Status.Admission.PodSetAssignments[1].TopologyAssignment = utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
++			Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{"node-a"}, 2).Obj()).
++			Obj()
++		return wl
++	}
++	topologyGated := func(c *rayv1.RayCluster) {
++		t := &c.Spec.WorkerGroupSpecs[0].Template
++		t.Spec.SchedulingGates = append(t.Spec.SchedulingGates, corev1.PodSchedulingGate{Name: kueue.TopologySchedulingGate})
++		t.Annotations[kueue.PodSetUnconstrainedTopologyAnnotation] = "true"
++		t.Annotations[kueue.WorkloadAnnotation] = "origin"
++	}
++	withAnnotation := func(c *rayv1.RayCluster) {
++		c.Spec.HeadGroupSpec.Template.Annotations = map[string]string{kueue.WorkloadAnnotation: "first-slice"}
++	}
++
++	cases := map[string]struct {
++		cluster   *rayv1.RayCluster
++		workloads []kueue.Workload
++		gates     map[featuregate.Feature]bool
++		want      *rayv1.RayCluster
++	}{
++		"put the flavor placement back on the templates": {
++			cluster:   original(true, false),
++			workloads: []kueue.Workload{placementOnTemplates()},
++			want:      with(original(true, false), gated, stamped("origin"), placed),
++		},
++		"keep a node selector value the template sets": {
++			cluster: with(original(true, false), func(c *rayv1.RayCluster) {
++				c.Spec.WorkerGroupSpecs[0].Template.Spec.NodeSelector = map[string]string{"example.com/class": "mine"}
++			}),
++			workloads: []kueue.Workload{placementOnTemplates()},
++			want: with(original(true, false), gated, stamped("origin"), placed, func(c *rayv1.RayCluster) {
++				c.Spec.WorkerGroupSpecs[0].Template.Spec.NodeSelector = map[string]string{"example.com/class": "mine"}
++			}),
++		},
++		"restore the topology gate and annotation of a PodSet with a topology assignment": {
++			cluster:   original(true, false),
++			workloads: []kueue.Workload{topologyOnTemplates()},
++			gates:     map[featuregate.Feature]bool{features.TopologyAwareScheduling: true},
++			want: with(original(true, false), gated, stamped("origin"), placed, topologyGated, func(c *rayv1.RayCluster) {
++				c.Spec.HeadGroupSpec.Template.Annotations[kueue.WorkloadAnnotation] = "origin"
++			}),
++		},
++		"never overwrite the Workload annotation of the slice that started the cluster": {
++			cluster:   with(original(true, false), withAnnotation),
++			workloads: []kueue.Workload{slice("origin", "", false)},
++			gates:     map[featuregate.Feature]bool{features.WaitForPodsReadyUnscheduledTimeout: true},
++			want: with(original(true, false), gated, stamped("origin"), placed, func(c *rayv1.RayCluster) {
++				c.Spec.HeadGroupSpec.Template.Annotations[kueue.WorkloadAnnotation] = "first-slice"
++				c.Spec.WorkerGroupSpecs[0].Template.Annotations[kueue.WorkloadAnnotation] = "first-slice"
++			}),
++		},
++		"stamp the Workload annotation with the active slice when Pod scheduling is tracked": {
++			cluster:   original(true, false),
++			workloads: []kueue.Workload{slice("origin", "", false)},
++			gates:     map[featuregate.Feature]bool{features.WaitForPodsReadyUnscheduledTimeout: true},
++			want:      with(original(true, false), gated, stamped("origin"), placed, tracked),
++		},
++		"stamp the gate, the PodSet labels, and the chain's slice name on a running elastic cluster": {
++			cluster:   original(true, false),
++			workloads: []kueue.Workload{slice("origin", "", false)},
++			want:      with(original(true, false), gated, stamped("origin"), placed),
++		},
++		"use the active slice's chain, not a finished slice of an earlier chain": {
++			cluster: original(true, false),
++			workloads: []kueue.Workload{
++				slice("earlier", "", true),
++				slice("current-slice", "current", false),
++			},
++			want: with(original(true, false), gated, stamped("current"), placed),
++		},
++		"stamp only the gate while the cluster is suspended": {
++			cluster:   original(true, true),
++			workloads: []kueue.Workload{slice("origin", "", false)},
++			want:      with(original(true, true), gated),
++		},
++		"stamp only the gate while no slice is active": {
++			cluster:   original(true, false),
++			workloads: []kueue.Workload{slice("origin", "", true)},
++			want:      with(original(true, false), gated),
++		},
++		"leave a cluster that is not elastic alone": {
++			cluster:   original(false, false),
++			workloads: []kueue.Workload{slice("origin", "", false)},
++			want:      original(false, false),
++		},
++		"change nothing when the templates are already stamped": {
++			cluster:   with(original(true, false), gated, stamped("origin"), placed),
++			workloads: []kueue.Workload{slice("origin", "", false)},
++			want:      with(original(true, false), gated, stamped("origin"), placed),
++		},
++		"replace a stale slice name": {
++			cluster:   with(original(true, false), gated, stamped("stale"), placed),
++			workloads: []kueue.Workload{slice("origin", "", false)},
++			want:      with(original(true, false), gated, stamped("origin"), placed),
++		},
++		"omit queue labels when AssignQueueLabelsForPods is disabled": {
++			cluster:   original(true, false),
++			workloads: []kueue.Workload{slice("origin", "", false)},
++			gates:     map[featuregate.Feature]bool{features.AssignQueueLabelsForPods: false},
++			want:      with(original(true, false), gated, unqueuedStamped("origin"), placed),
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++			// Topology-aware scheduling is on by default and tracks Pod scheduling, which has a case of its own.
++			features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, false)
++			for gate, enabled := range tc.gates {
++				features.SetFeatureGateDuringTest(t, gate, enabled)
++			}
++			ctx, _ := utiltesting.ContextWithLog(t)
++			builder := utiltesting.NewClientBuilder().
++				WithObjects(utiltestingapi.MakeResourceFlavor("remote").NodeLabel("example.com/class", "test").Toleration(toleration).Obj()).
++				WithIndex(&kueue.Workload{}, coreindexer.OwnerReferenceIndexKey(gvk), coreindexer.WorkloadOwnerIndexFunc(gvk))
++			for i := range tc.workloads {
++				builder = builder.WithObjects(&tc.workloads[i])
++			}
++			wh := &RayClusterWebhook{client: builder.Build()}
++
++			got := tc.cluster.DeepCopy()
++			if err := wh.Default(updateCtx(ctx), got); err != nil {
++				t.Fatalf("Default() error: %v", err)
++			}
++			if diff := cmp.Diff(tc.want, got); diff != "" {
++				t.Errorf("Default() mismatch (-want +got):\n%s", diff)
++			}
++			// Defaulting its own output changes nothing, so a tool that applies the result again sees no drift.
++			again := got.DeepCopy()
++			if err := wh.Default(updateCtx(ctx), again); err != nil {
++				t.Fatalf("second Default() error: %v", err)
++			}
++			if diff := cmp.Diff(got, again); diff != "" {
++				t.Errorf("second Default() changed the object (-first +second):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_tas_test.go b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_tas_test.go
+new file mode 100644
+index 0000000..64217d7
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_tas_test.go
+@@ -0,0 +1,126 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package reapply
++
++import (
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++	"sigs.k8s.io/kueue/test/util/behavioral/integration"
++)
++
++// A PodSet with a topology assignment has the topology scheduling gate on its template, which
++// keeps its Pods off nodes outside their domains until Kueue places them. A re-apply drops it.
++var _ = ginkgo.Describe("RayCluster elastic template re-apply with topology-aware scheduling", ginkgo.Label("job:ray", "area:jobs", "feature:tas"), ginkgo.Ordered, func() {
++	const nodeGroupLabel = "node-group"
++	var (
++		ns           *corev1.Namespace
++		topology     *kueue.Topology
++		flavor       *kueue.ResourceFlavor
++		clusterQueue *kueue.ClusterQueue
++		localQueue   *kueue.LocalQueue
++	)
++
++	ginkgo.BeforeAll(func() {
++		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ElasticJobsViaWorkloadSlices, true)
++		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.TopologyAwareScheduling, true)
++		fwk.StartManager(ctx, cfg, managerAndSchedulerWithTASSetup())
++	})
++	ginkgo.AfterAll(func() {
++		fwk.StopManager(ctx)
++	})
++
++	ginkgo.BeforeEach(func() {
++		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "tas-reapply-")
++		integration.CreateNodesWithStatus(ctx, k8sClient, []corev1.Node{
++			*testingnode.MakeNode("b1r1").
++				Label(nodeGroupLabel, "tas").
++				Label(utiltesting.DefaultBlockTopologyLevel, "b1").
++				Label(utiltesting.DefaultRackTopologyLevel, "r1").
++				StatusAllocatable(corev1.ResourceList{
++					corev1.ResourceCPU:    resource.MustParse("2"),
++					corev1.ResourceMemory: resource.MustParse("2Gi"),
++					corev1.ResourcePods:   resource.MustParse("10"),
++				}).
++				Ready().
++				Obj(),
++		})
++		topology = utiltestingapi.MakeDefaultTwoLevelTopology("default")
++		behavioral.MustCreate(ctx, k8sClient, topology)
++		flavor = utiltestingapi.MakeResourceFlavor("tas-flavor").NodeLabel(nodeGroupLabel, "tas").TopologyName("default").Obj()
++		behavioral.MustCreate(ctx, k8sClient, flavor)
++		clusterQueue = utiltestingapi.MakeClusterQueue("cluster-queue").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas(flavor.Name).Resource(corev1.ResourceCPU, "5").Obj()).
++			Obj()
++		behavioral.CreateClusterQueuesAndWaitForActive(ctx, k8sClient, clusterQueue)
++		localQueue = utiltestingapi.MakeLocalQueue("local-queue", ns.Name).ClusterQueue(clusterQueue.Name).Obj()
++		behavioral.CreateLocalQueuesAndWaitForActive(ctx, k8sClient, localQueue)
++	})
++	ginkgo.AfterEach(func() {
++		gomega.Expect(k8sClient.DeleteAllOf(ctx, &rayv1.RayCluster{}, client.InNamespace(ns.Name))).To(gomega.Succeed())
++		gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, localQueue, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, flavor, true)
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, topology, true)
++		gomega.Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "b1r1"}}))).To(gomega.Succeed())
++	})
++
++	ginkgo.It("Should put the topology scheduling gate back on a re-applied worker group", func() {
++		manifest := testingraycluster.MakeCluster("foo", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue(localQueue.Name).
++			Request(rayv1.HeadNode, corev1.ResourceCPU, "250m").
++			RequestWorkerGroup(corev1.ResourceCPU, "250m").
++			FirstWorkerGroupReplicas(2, 0, 8).
++			SchedulingGate(kueue.ElasticJobSchedulingGate).
++			Obj()
++		topologyGate := corev1.PodSchedulingGate{Name: kueue.TopologySchedulingGate}
++
++		ginkgo.By("starting the cluster with the topology gate on its worker template")
++		behavioral.MustCreate(ctx, k8sClient, manifest.DeepCopy())
++		rayCluster := &rayv1.RayCluster{}
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(manifest), rayCluster)).Should(gomega.Succeed())
++			g.Expect(rayCluster.Spec.Suspend).Should(gomega.Equal(new(false)))
++			g.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Template.Spec.SchedulingGates).Should(gomega.ContainElement(topologyGate))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("re-applying the original manifest as a JSON merge patch")
++		gomega.Expect(k8sClient.Patch(ctx, rayCluster, client.RawPatch(types.MergePatchType, reapplyPatch(manifest)))).Should(gomega.Succeed())
++
++		ginkgo.By("keeping the topology gate on the replaced worker group")
++		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(manifest), rayCluster)).Should(gomega.Succeed())
++		template := rayCluster.Spec.WorkerGroupSpecs[0].Template
++		gomega.Expect(template.Spec.SchedulingGates).Should(gomega.ContainElement(topologyGate))
++		gomega.Expect(template.Annotations).Should(gomega.HaveKeyWithValue(kueue.PodSetUnconstrainedTopologyAnnotation, "true"))
++	})
++})
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go
+new file mode 100644
+index 0000000..b51c828
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go
+@@ -0,0 +1,254 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package reapply
++
++import (
++	"encoding/json"
++	"fmt"
++
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/utils/ptr"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++// Re-applying the manifest replaces the atomic workerGroupSpecs list, which drops what Kueue
++// stamped on the templates, and every worker KubeRay creates from them afterwards must still
++// be ungated: up to the admitted count, and never beyond it.
++var _ = reapplySpecs("RayCluster elastic template re-apply")
++
++const (
++	workerGroup = "workers-group-0"
++	classLabel  = "example.com/class"
++)
++
++var classToleration = corev1.Toleration{Key: classLabel, Operator: corev1.TolerationOpEqual, Value: "test", Effect: corev1.TaintEffectNoSchedule}
++
++func reapplySpecs(name string) bool {
++	return ginkgo.Describe(name, ginkgo.Label("job:ray", "area:jobs"), ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
++		var (
++			ns             *corev1.Namespace
++			resourceFlavor *kueue.ResourceFlavor
++			clusterQueue   *kueue.ClusterQueue
++			localQueue     *kueue.LocalQueue
++		)
++
++		ginkgo.BeforeAll(func() {
++			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ElasticJobsViaWorkloadSlices, true)
++			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero, false)
++			fwk.StartManager(ctx, cfg, managerAndSchedulerSetup())
++		})
++		ginkgo.AfterAll(func() {
++			fwk.StopManager(ctx)
++		})
++
++		ginkgo.BeforeEach(func() {
++			ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "reapply-")
++			resourceFlavor = utiltestingapi.MakeResourceFlavor("default").NodeLabel(classLabel, "test").Toleration(classToleration).Obj()
++			behavioral.MustCreate(ctx, k8sClient, resourceFlavor)
++			clusterQueue = utiltestingapi.MakeClusterQueue("default").
++				ResourceGroup(*utiltestingapi.MakeFlavorQuotas(resourceFlavor.Name).Resource(corev1.ResourceCPU, "10").Obj()).
++				Obj()
++			behavioral.MustCreate(ctx, k8sClient, clusterQueue)
++			localQueue = utiltestingapi.MakeLocalQueue("default", ns.Name).ClusterQueue(clusterQueue.Name).Obj()
++			behavioral.MustCreate(ctx, k8sClient, localQueue)
++		})
++		ginkgo.AfterEach(func() {
++			gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, localQueue, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, resourceFlavor, true)
++		})
++
++		// newManifest is what a user keeps in Git: the elastic gate in every template, which the
++		// RayCluster validation requires, and nothing Kueue stamps when it starts the cluster.
++		newManifest := func() *rayv1.RayCluster {
++			return testingraycluster.MakeCluster("foo", ns.Name).
++				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++				Queue(localQueue.Name).
++				Request(rayv1.HeadNode, corev1.ResourceCPU, "1").
++				RequestWorkerGroup(corev1.ResourceCPU, "1").
++				FirstWorkerGroupReplicas(2, 0, 8).
++				SchedulingGate(kueue.ElasticJobSchedulingGate).
++				Obj()
++		}
++
++		ginkgo.It("Should accept a re-applied manifest that has no elastic gate and put the gate back", func() {
++			manifest := newManifest()
++			behavioral.MustCreate(ctx, k8sClient, manifest.DeepCopy())
++			gomega.Eventually(func(g gomega.Gomega) {
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(manifest), manifest)).Should(gomega.Succeed())
++				g.Expect(manifest.Spec.Suspend).Should(gomega.Equal(new(false)))
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++			ginkgo.By("re-applying a manifest without the gate")
++			ungatedManifest := newManifest()
++			ungatedManifest.Spec.HeadGroupSpec.Template.Spec.SchedulingGates = nil
++			ungatedManifest.Spec.WorkerGroupSpecs[0].Template.Spec.SchedulingGates = nil
++			gomega.Expect(k8sClient.Patch(ctx, manifest, client.RawPatch(types.MergePatchType, reapplyPatch(ungatedManifest)))).Should(gomega.Succeed())
++
++			gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(manifest), manifest)).Should(gomega.Succeed())
++			gate := corev1.PodSchedulingGate{Name: kueue.ElasticJobSchedulingGate}
++			gomega.Expect(manifest.Spec.HeadGroupSpec.Template.Spec.SchedulingGates).Should(gomega.ContainElement(gate))
++			gomega.Expect(manifest.Spec.WorkerGroupSpecs[0].Template.Spec.SchedulingGates).Should(gomega.ContainElement(gate))
++		})
++
++		ginkgo.It("Should ungate the workers of a re-applied cluster up to the admitted count and never beyond", func() {
++			manifest := newManifest()
++
++			ginkgo.By("creating the cluster and starting it with two admitted workers")
++			behavioral.MustCreate(ctx, k8sClient, manifest.DeepCopy())
++			rayCluster := &rayv1.RayCluster{}
++			gomega.Eventually(func(g gomega.Gomega) {
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(manifest), rayCluster)).Should(gomega.Succeed())
++				g.Expect(rayCluster.Spec.Suspend).Should(gomega.Equal(new(false)))
++				g.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Template.Labels).Should(gomega.HaveKeyWithValue(constants.PodSetLabel, workerGroup))
++				g.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Template.Labels).Should(gomega.HaveKeyWithValue(constants.LocalQueueLabel, localQueue.Name))
++				g.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Template.Labels).Should(gomega.HaveKeyWithValue(constants.ClusterQueueLabel, clusterQueue.Name))
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++			sliceName := rayCluster.Spec.WorkerGroupSpecs[0].Template.Annotations[kueue.WorkloadSliceNameAnnotation]
++			gomega.Expect(sliceName).ShouldNot(gomega.BeEmpty())
++
++			// worker creates a gated Pod the way KubeRay does: from the worker group's current template.
++			worker := func(name string) *corev1.Pod {
++				template := rayCluster.Spec.WorkerGroupSpecs[0].Template
++				pod := testingpod.MakePod(name, ns.Name).Obj()
++				pod.Labels = template.Labels
++				pod.Annotations = template.Annotations
++				pod.Spec.SchedulingGates = template.Spec.SchedulingGates
++				pod.Spec.NodeSelector = template.Spec.NodeSelector
++				pod.Spec.Tolerations = template.Spec.Tolerations
++				return pod
++			}
++			ungated := func() []string {
++				pods := &corev1.PodList{}
++				gomega.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name))).Should(gomega.Succeed())
++				var names []string
++				for _, pod := range pods.Items {
++					if len(pod.Spec.SchedulingGates) == 0 {
++						names = append(names, pod.Name)
++					}
++				}
++				return names
++			}
++			refresh := func() {
++				ginkgo.GinkgoHelper()
++				gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(manifest), rayCluster)).Should(gomega.Succeed())
++			}
++			for _, name := range []string{"first-0", "first-1"} {
++				behavioral.MustCreate(ctx, k8sClient, worker(name))
++			}
++			gomega.Eventually(ungated, behavioral.Timeout, behavioral.Interval).Should(gomega.ConsistOf("first-0", "first-1"))
++
++			ginkgo.By("re-applying the original manifest as a JSON merge patch")
++			patch := reapplyPatch(manifest)
++			gomega.Expect(k8sClient.Patch(ctx, rayCluster, client.RawPatch(types.MergePatchType, patch))).Should(gomega.Succeed())
++
++			ginkgo.By("keeping the gate, the PodSet label, and the slice name on the replaced worker group")
++			refresh()
++			template := rayCluster.Spec.WorkerGroupSpecs[0].Template
++			gomega.Expect(template.Spec.SchedulingGates).Should(gomega.ContainElement(corev1.PodSchedulingGate{Name: kueue.ElasticJobSchedulingGate}))
++			gomega.Expect(template.Labels).Should(gomega.HaveKeyWithValue(constants.PodSetLabel, workerGroup))
++			gomega.Expect(template.Labels).Should(gomega.HaveKeyWithValue(constants.LocalQueueLabel, localQueue.Name))
++			gomega.Expect(template.Labels).Should(gomega.HaveKeyWithValue(constants.ClusterQueueLabel, clusterQueue.Name))
++			gomega.Expect(template.Annotations).Should(gomega.HaveKeyWithValue(kueue.WorkloadSliceNameAnnotation, sliceName))
++
++			ginkgo.By("keeping the flavor placement on the template, which nothing else adds to the workers")
++			gomega.Expect(template.Spec.NodeSelector).Should(gomega.HaveKeyWithValue(classLabel, "test"))
++			gomega.Expect(template.Spec.Tolerations).Should(gomega.ContainElement(classToleration))
++
++			ginkgo.By("ungating the replacements of two lost workers, and no third worker")
++			for _, name := range []string{"first-0", "first-1"} {
++				gomega.Expect(k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns.Name}})).Should(gomega.Succeed())
++			}
++			for _, name := range []string{"replacement-0", "replacement-1", "extra"} {
++				behavioral.MustCreate(ctx, k8sClient, worker(name))
++			}
++			gomega.Eventually(ungated, behavioral.Timeout, behavioral.Interval).Should(gomega.HaveLen(2))
++			gomega.Consistently(ungated, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.HaveLen(2))
++
++			ginkgo.By("placing every ungated worker on the flavor")
++			pods := &corev1.PodList{}
++			gomega.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name))).Should(gomega.Succeed())
++			for _, pod := range pods.Items {
++				if len(pod.Spec.SchedulingGates) == 0 {
++					gomega.Expect(pod.Spec.NodeSelector).Should(gomega.HaveKeyWithValue(classLabel, "test"), pod.Name)
++					gomega.Expect(pod.Spec.Tolerations).Should(gomega.ContainElement(classToleration), pod.Name)
++				}
++			}
++
++			ginkgo.By("scaling up to four workers after a second re-apply")
++			gomega.Expect(k8sClient.Patch(ctx, rayCluster, client.RawPatch(types.MergePatchType, patch))).Should(gomega.Succeed())
++			gomega.Eventually(func(g gomega.Gomega) {
++				refresh()
++				rayCluster.Spec.WorkerGroupSpecs[0].Replicas = new(int32(4))
++				g.Expect(k8sClient.Update(ctx, rayCluster)).Should(gomega.Succeed())
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++			gomega.Eventually(func(g gomega.Gomega) {
++				workloads := &kueue.WorkloadList{}
++				g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name))).Should(gomega.Succeed())
++				admitted := 0
++				for _, wl := range workloads.Items {
++					if wl.Status.Admission == nil {
++						continue
++					}
++					for _, psa := range wl.Status.Admission.PodSetAssignments {
++						if psa.Name == workerGroup && ptr.Deref(psa.Count, 0) == 4 {
++							admitted++
++						}
++					}
++				}
++				g.Expect(admitted).Should(gomega.BeNumerically(">=", 1))
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++			refresh()
++			for i := range 2 {
++				behavioral.MustCreate(ctx, k8sClient, worker(fmt.Sprintf("scale-up-%d", i)))
++			}
++			gomega.Eventually(ungated, behavioral.Timeout, behavioral.Interval).Should(gomega.HaveLen(4))
++			gomega.Consistently(ungated, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.HaveLen(4))
++		})
++	})
++}
++
++// reapplyPatch returns the JSON merge patch that applies the manifest again: the whole
++// object, as a GitOps tool or kubectl apply sends it, without the fields a user does not
++// write.
++func reapplyPatch(manifest *rayv1.RayCluster) []byte {
++	ginkgo.GinkgoHelper()
++	raw, err := json.Marshal(manifest)
++	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
++	var obj map[string]any
++	gomega.Expect(json.Unmarshal(raw, &obj)).Should(gomega.Succeed())
++	delete(obj, "status")
++	delete(obj["spec"].(map[string]any), "suspend")
++	patch, err := json.Marshal(obj)
++	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
++	return patch
++}
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/reapply/suite_test.go b/test/integration/singlecluster/controller/jobs/raycluster/reapply/suite_test.go
+new file mode 100644
+index 0000000..6731027
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/reapply/suite_test.go
+@@ -0,0 +1,124 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package reapply
++
++import (
++	"context"
++	"testing"
++
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	"k8s.io/client-go/rest"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/manager"
++
++	config "sigs.k8s.io/kueue/apis/config/v1beta2"
++	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/controller/elasticjobs"
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	jobcontrollers "sigs.k8s.io/kueue/pkg/controller/jobs"
++	"sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/controller/tas"
++	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
++	"sigs.k8s.io/kueue/pkg/scheduler"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	"sigs.k8s.io/kueue/pkg/webhooks"
++	"sigs.k8s.io/kueue/test/integration/framework"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++	"sigs.k8s.io/kueue/test/util/behavioral/integration"
++)
++
++var (
++	cfg       *rest.Config
++	k8sClient client.Client
++	ctx       context.Context
++	fwk       *framework.Framework
++)
++
++func TestAPIs(t *testing.T) {
++	behavioral.RunSuite(t, "RayCluster Elastic Template Re-apply Suite")
++}
++
++// This suite installs the RayCluster webhooks, which the sibling RayCluster suite leaves out,
++// because a re-applied manifest reaches the templates through them.
++var _ = ginkgo.BeforeSuite(func() {
++	fwk = &framework.Framework{
++		DepCRDPaths: []string{behavioral.RayOperatorCrds},
++		WebhookPath: rayClusterWebhookPath(),
++	}
++	cfg = fwk.Init()
++	ctx, k8sClient = fwk.SetupClient(cfg)
++})
++
++var _ = ginkgo.AfterSuite(func() {
++	fwk.Teardown()
++})
++
++func managerAndSchedulerSetup() framework.ManagerSetup {
++	ginkgo.GinkgoHelper()
++	return managerSetup(false)
++}
++
++func managerAndSchedulerWithTASSetup() framework.ManagerSetup {
++	ginkgo.GinkgoHelper()
++	return managerSetup(true)
++}
++
++func managerSetup(withTAS bool) framework.ManagerSetup {
++	ginkgo.GinkgoHelper()
++	return func(ctx context.Context, mgr manager.Manager) {
++		configuration := &config.Configuration{}
++		mgr.GetScheme().Default(configuration)
++		err := indexer.Setup(ctx, mgr.GetFieldIndexer())
++		gomega.Expect(err).NotTo(gomega.HaveOccurred())
++
++		cCache := schdcache.New(mgr.GetClient())
++		preemptionExpectations := preemptexpectations.New()
++		queues := integration.NewManager(ctx, mgr.GetClient(), cCache, qcache.WithPreemptionExpectations(preemptionExpectations))
++		opts := []jobframework.Option{
++			jobframework.WithIntegrationManager(jobcontrollers.NewIntegrationManager()),
++			jobframework.WithQueues(queues),
++			jobframework.WithCache(cCache),
++		}
++
++		failedCtrl, err := core.SetupControllers(mgr, queues, cCache, configuration, core.SetupControllersOpts{PreemptionExpectations: preemptionExpectations})
++		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "controller", failedCtrl)
++		if withTAS {
++			failedCtrl, err = tas.SetupControllers(mgr, queues, cCache, configuration, nil)
++			gomega.Expect(err).ToNot(gomega.HaveOccurred(), "TAS controller", failedCtrl)
++			gomega.Expect(tasindexer.SetupIndexes(ctx, mgr.GetFieldIndexer())).To(gomega.Succeed())
++		}
++		failedWebhook, err := webhooks.Setup(mgr, nil)
++		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "webhook", failedWebhook)
++
++		gomega.Expect(raycluster.SetupIndexes(ctx, mgr.GetFieldIndexer())).To(gomega.Succeed())
++		reconciler, err := raycluster.NewReconciler(ctx, mgr.GetClient(), mgr.GetFieldIndexer(), mgr.GetEventRecorder(constants.JobControllerName), opts...)
++		gomega.Expect(err).NotTo(gomega.HaveOccurred())
++		gomega.Expect(reconciler.SetupWithManager(mgr)).To(gomega.Succeed())
++		gomega.Expect(raycluster.SetupRayClusterWebhook(mgr, opts...)).To(gomega.Succeed())
++
++		failedCtrl, err = elasticjobs.SetupWithManager(mgr, &config.Configuration{}, nil, nil)
++		gomega.Expect(err).ToNot(gomega.HaveOccurred(), "controller", failedCtrl)
++
++		sched := scheduler.New(queues, cCache, mgr.GetClient(), mgr.GetEventRecorder(constants.AdmissionName), scheduler.WithPreemptionExpectations(preemptionExpectations))
++		gomega.Expect(mgr.Add(sched)).To(gomega.Succeed())
++	}
++}
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/reapply/webhook_manifests_test.go b/test/integration/singlecluster/controller/jobs/raycluster/reapply/webhook_manifests_test.go
+new file mode 100644
+index 0000000..fff4495
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/reapply/webhook_manifests_test.go
+@@ -0,0 +1,79 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package reapply
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
++	"sigs.k8s.io/yaml"
++
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++// rayClusterWebhookPath writes the generated webhook manifests reduced to the RayCluster
++// webhooks, which are the only ones the suite's manager serves, and returns the directory.
++func rayClusterWebhookPath() string {
++	ginkgo.GinkgoHelper()
++	raw, err := os.ReadFile(filepath.Join(behavioral.WebhookPath, "manifests.yaml"))
++	gomega.Expect(err).NotTo(gomega.HaveOccurred())
++	dir := ginkgo.GinkgoT().TempDir()
++	var out []string
++	for _, doc := range strings.Split(string(raw), "\n---\n") {
++		var meta struct {
++			Kind string `json:"kind"`
++		}
++		gomega.Expect(yaml.Unmarshal([]byte(doc), &meta)).To(gomega.Succeed())
++		switch meta.Kind {
++		case "MutatingWebhookConfiguration":
++			cfg := &admissionregistrationv1.MutatingWebhookConfiguration{}
++			gomega.Expect(yaml.Unmarshal([]byte(doc), cfg)).To(gomega.Succeed())
++			kept := cfg.Webhooks[:0]
++			for _, wh := range cfg.Webhooks {
++				if wh.Name == "mraycluster.kb.io" {
++					kept = append(kept, wh)
++				}
++			}
++			cfg.Webhooks = kept
++			out = append(out, marshalWebhookConfig(cfg))
++		case "ValidatingWebhookConfiguration":
++			cfg := &admissionregistrationv1.ValidatingWebhookConfiguration{}
++			gomega.Expect(yaml.Unmarshal([]byte(doc), cfg)).To(gomega.Succeed())
++			kept := cfg.Webhooks[:0]
++			for _, wh := range cfg.Webhooks {
++				if wh.Name == "vraycluster.kb.io" {
++					kept = append(kept, wh)
++				}
++			}
++			cfg.Webhooks = kept
++			out = append(out, marshalWebhookConfig(cfg))
++		}
++	}
++	gomega.Expect(os.WriteFile(filepath.Join(dir, "manifests.yaml"), []byte(strings.Join(out, "\n---\n")), 0o600)).To(gomega.Succeed())
++	return dir
++}
++
++func marshalWebhookConfig(obj any) string {
++	ginkgo.GinkgoHelper()
++	raw, err := yaml.Marshal(obj)
++	gomega.Expect(err).NotTo(gomega.HaveOccurred())
++	return string(raw)
++}
+-- 
+2.48.1

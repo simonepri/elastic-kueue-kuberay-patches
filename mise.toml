@@ -13,7 +13,7 @@ CLUSTER_NAME = "elastic-scale-lab"
 
 # Upstream versions
 # renovate: datasource=github-releases depName=kubernetes-sigs/kueue
-KUEUE_UPSTREAM = "v0.20.4"
+KUEUE_UPSTREAM = "v0.20.5"
 # renovate: datasource=github-releases depName=ray-project/kuberay
 KUBERAY_UPSTREAM = "v1.7.2"
 # renovate: datasource=github-releases depName=kubernetes-sigs/karpenter

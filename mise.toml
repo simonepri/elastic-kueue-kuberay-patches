@@ -39,3 +39,80 @@ RAY_WHEEL_BASE_URL = "https://github.com/simonepri/elastic-kueue-kuberay-patches
 RAY_INSTALL_WHEEL = "{{ get_env(name='RAY_INSTALL_WHEEL', default='0') }}"
 RAY_WHEEL_DIR = "{{ get_env(name='RAY_WHEEL_DIR', default='') }}"
 KUEUE_FEATURE_GATES = "{{ get_env(name='KUEUE_FEATURE_GATES', default='ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true,ElasticJobsViaWorkloadSlicesFlavorSplit=true') }}"
+
+[tasks."patch:kueue"]
+description = "Apply patches to third_party/kueue"
+run = "build/kueue/patch.sh"
+
+[tasks."patch:kuberay"]
+description = "Apply patches to third_party/kuberay"
+run = "build/kuberay/patch.sh"
+
+[tasks."patch:interlink"]
+description = "Apply patches to third_party/interlink"
+run = "build/interlink/patch.sh"
+
+[tasks."patch:ray"]
+description = "Apply patches to third_party/ray"
+run = "build/ray/patch.sh"
+
+[tasks.patch]
+description = "Apply all patches to third_party upstreams"
+depends = ["patch:kueue", "patch:kuberay", "patch:interlink", "patch:ray"]
+
+[tasks."build:kueue"]
+description = "Build patched Kueue image"
+depends = ["patch:kueue"]
+run = "build/kueue/build.sh"
+
+[tasks."build:kuberay"]
+description = "Build patched KubeRay image"
+depends = ["patch:kuberay"]
+run = "build/kuberay/build.sh"
+
+[tasks."build:interlink"]
+description = "Build patched interLink virtual kubelet image"
+depends = ["patch:interlink"]
+run = "build/interlink/build.sh"
+
+[tasks."build:ray"]
+description = "Build patched Ray images"
+depends = ["patch:ray"]
+run = "build/ray/build.sh"
+
+[tasks."build:ray-wheel"]
+description = "Build Ray wheel with patched C++ binaries"
+depends = ["patch:ray"]
+run = "build/ray/build-wheel.sh"
+
+[tasks.build]
+description = "Build all patched images"
+depends = ["build:kueue", "build:kuberay", "build:interlink", "build:ray"]
+
+[tasks."publish:kueue"]
+description = "Publish patched Kueue image to GHCR"
+run = "build/kueue/publish.sh"
+
+[tasks."publish:kuberay"]
+description = "Publish patched KubeRay image to GHCR"
+run = "build/kuberay/publish.sh"
+
+[tasks."publish:interlink"]
+description = "Publish patched interLink image to GHCR"
+run = "build/interlink/publish.sh"
+
+[tasks."publish:ray"]
+description = "Publish patched Ray images and wheel to GitHub Release"
+run = "build/ray/publish.sh"
+
+[tasks.publish]
+description = "Publish all patched images"
+depends = ["publish:kueue", "publish:kuberay", "publish:interlink", "publish:ray"]
+
+[tasks."cluster:up"]
+description = "Spin up Kind cluster, install CRDs, and deploy patched controllers"
+run = "build/cluster/up.sh"
+
+[tasks."cluster:down"]
+description = "Tear down local Kind cluster"
+run = "kind delete cluster --name {{env.CLUSTER_NAME}}"

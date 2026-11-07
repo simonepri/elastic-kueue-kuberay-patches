@@ -417,7 +417,7 @@ index 0000000..1b1f026
 +	}
 +}
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index 069957c..e9e47fc 100644
+index 069957c..4228567 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -26,6 +26,7 @@ import (
@@ -468,7 +468,18 @@ index 069957c..e9e47fc 100644
  }
  
  func admissionUpdateForPodSet(wl *kueue.Workload, podSetName kueue.PodSetReference) (podAdmissionUpdate, error) {
-@@ -255,6 +259,9 @@ func refreshPodAdmission(pod *corev1.Pod, update podAdmissionUpdate) (bool, erro
+@@ -220,6 +224,10 @@ func admissionUpdateForPodSet(wl *kueue.Workload, podSetName kueue.PodSetReferen
+ 				}
+ 				update.nodeSelector[key] = value
+ 			}
++			// A gated pod may gain tolerations. A Karpenter check publishes the
++			// claimed-by toleration of the nodes of the slice it provisioned, which
++			// the pod needs to land on them.
++			update.tolerations = append(update.tolerations, psUpdate.Tolerations...)
+ 		}
+ 	}
+ 	return update, nil
+@@ -255,6 +263,9 @@ func refreshPodAdmission(pod *corev1.Pod, update podAdmissionUpdate) (bool, erro
  		utilmaps.Copy(&pod.Annotations, update.annotations)
  		utilmaps.Copy(&pod.Spec.NodeSelector, update.nodeSelector)
  	}
@@ -478,7 +489,7 @@ index 069957c..e9e47fc 100644
  	return changed, nil
  }
  
-@@ -284,13 +291,18 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
+@@ -284,13 +295,18 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
  			update, found := admissionUpdates[ps]
  			if !found {
  				var err error
@@ -498,8 +509,80 @@ index 069957c..e9e47fc 100644
  				ctrl.LoggerFrom(ctx).Info("leaving elastic pod gated because immutable admission metadata is stale; recycle the pod after its template refreshes",
  					"pod", klog.KObj(p), "podSet", ps)
  				continue
+diff --git a/pkg/controller/elasticjobs/elastic_job_ungater_test.go b/pkg/controller/elasticjobs/elastic_job_ungater_test.go
+index ac3cff1..937c315 100644
+--- a/pkg/controller/elasticjobs/elastic_job_ungater_test.go
++++ b/pkg/controller/elasticjobs/elastic_job_ungater_test.go
+@@ -95,6 +95,10 @@ func makeElasticPodForPodSet(name string, podSet kueue.PodSetReference) *testing
+ 		Label(constants.PodSetLabel, string(podSet))
+ }
+ 
++func claimedBy(workload string) corev1.Toleration {
++	return corev1.Toleration{Key: "example.com/claimed-by", Operator: corev1.TolerationOpEqual, Value: workload, Effect: corev1.TaintEffectNoSchedule}
++}
++
+ func TestReconcile(t *testing.T) {
+ 	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
+ 	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesForProvisioningRequests, true)
+@@ -745,6 +749,56 @@ func TestReconcile(t *testing.T) {
+ 					Obj(),
+ 			},
+ 		},
++		"gated pods gain the tolerations that an admission check publishes": {
++			workloads: []kueue.Workload{
++				*utiltestingapi.MakeWorkload("wl", "ns").
++					Finalizers(kueue.ResourceInUseFinalizerName).
++					Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++					ControllerReference(rayClusterGVK, "ray", "ray-uid").
++					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).Request(corev1.ResourceCPU, "1").Obj()).
++					ReserveQuotaAt(
++						utiltestingapi.MakeAdmission("cq").
++							PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
++								Assignment(corev1.ResourceCPU, "flavor", "1").
++								Obj()).
++							Obj(), now,
++					).
++					AdmittedAt(true, now).
++					AdmissionChecks(kueue.AdmissionCheckState{
++						Name:  "karpenter",
++						State: kueue.CheckStateReady,
++						PodSetUpdates: []kueue.PodSetUpdate{{
++							Name:         kueue.DefaultPodSetName,
++							NodeSelector: map[string]string{"example.com/attempt": "attempt-2"},
++							Tolerations:  []corev1.Toleration{claimedBy("wl")},
++						}},
++					}).
++					Obj(),
++			},
++			pods: []corev1.Pod{
++				// A pod created before this slice carries the previous slice's toleration.
++				func() corev1.Pod {
++					pod := testingpod.MakePod("pod", "ns").
++						Annotation(kueue.WorkloadAnnotation, "wl").
++						Annotation(kueue.WorkloadSliceNameAnnotation, "wl").
++						Gate(kueue.ElasticJobSchedulingGate).
++						Obj()
++					pod.Spec.Tolerations = []corev1.Toleration{claimedBy("previous")}
++					return *pod
++				}(),
++			},
++			wantPods: []corev1.Pod{
++				func() corev1.Pod {
++					pod := testingpod.MakePod("pod", "ns").
++						Annotation(kueue.WorkloadAnnotation, "wl").
++						Annotation(kueue.WorkloadSliceNameAnnotation, "wl").
++						NodeSelector("example.com/attempt", "attempt-2").
++						Obj()
++					pod.Spec.Tolerations = []corev1.Toleration{claimedBy("previous"), claimedBy("wl")}
++					return *pod
++				}(),
++			},
++		},
+ 		"ungates when active slice has no provisioning admission check": {
+ 			// Leftover consume annotations must not permanently gate pods when
+ 			// the active slice has no ProvisioningRequest PodSetUpdates.
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index 31ef492..9896b68 100644
+index 01fac78..a524b38 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
 @@ -1698,6 +1698,9 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
@@ -512,7 +595,7 @@ index 31ef492..9896b68 100644
  	infoMap := slices.ToRefMap(info, func(psi *podset.PodSetInfo) kueue.PodSetReference { return psi.Name })
  	runningPodSets := wl.Spec.DeepCopy().PodSets
  	canBePartiallyAdmitted := workload.CanBePartiallyAdmitted(wl)
-@@ -1807,6 +1810,20 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
+@@ -1809,6 +1812,20 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
  			return err
  		}
  	}
@@ -533,7 +616,7 @@ index 31ef492..9896b68 100644
  	msg := fmt.Sprintf("Admitted by clusterQueue %v", wl.Status.Admission.ClusterQueue)
  
  	log := ctrl.LoggerFrom(ctx)
-@@ -1857,18 +1874,10 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
+@@ -1859,18 +1876,10 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
  	for i := range info {
  		infoByName[info[i].Name] = &info[i]
  	}
@@ -553,7 +636,7 @@ index 31ef492..9896b68 100644
  	for _, check := range wl.Status.AdmissionChecks {
  		for _, update := range check.PodSetUpdates {
  			podSetInfo := infoByName[update.Name]
-@@ -1887,6 +1896,100 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
+@@ -1889,6 +1898,100 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
  	return nil
  }
  
@@ -654,7 +737,7 @@ index 31ef492..9896b68 100644
  // stopJob will suspend the job, and also restore node affinity, reset job status if needed.
  // Returns whether any operation was done to stop the job or an error.
  func (r *JobReconciler) stopJob(ctx context.Context, job GenericJob, wl *kueue.Workload, stopReason StopReason, eventMsg string) error {
-@@ -2067,6 +2170,7 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
+@@ -2069,6 +2172,7 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
  	// associated Job object. This is particularly useful in contexts such as the
  	// MultiKueue workload controller, where the Job may not be immediately available.
  	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)
@@ -662,7 +745,7 @@ index 31ef492..9896b68 100644
  
  	// Lookup existing slice for a given job.
  	workloadSlices, err := workloadslicing.FindNotFinishedWorkloads(ctx, clnt, job.Object(), job.GVK())
-@@ -2088,6 +2192,9 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
+@@ -2090,6 +2194,9 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
  			originName = oldSlice.Name
  		}
  		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, kueue.WorkloadSliceNameAnnotation, originName)
@@ -915,6 +998,125 @@ index 0000000..c521877
 +	return features.Enabled(features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero) ||
 +		wl.Annotations[FlavorPlacementOnPodsAnnotation] == "true"
 +}
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go
+new file mode 100644
+index 0000000..c63a4f2
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go
+@@ -0,0 +1,113 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Verifies that a gated elastic worker gains the node selector and tolerations that an admission check publishes before it starts.
++
++package raycluster
++
++import (
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/component-base/featuregate"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	workloadpatching "sigs.k8s.io/kueue/pkg/workload/patching"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++var _ = ginkgo.Describe("RayCluster elastic workers and admission check pod set updates", ginkgo.Label("job:ray", "area:jobs"), func() {
++	ginkgo.It("gives a gated worker the node selector and tolerations of the check before it starts", func() {
++		features.SetFeatureGatesDuringTest(ginkgo.GinkgoTB(), map[featuregate.Feature]bool{
++			features.ElasticJobsViaWorkloadSlices: true,
++		})
++		fwk.StartManager(ctx, cfg, managerAndSchedulerSetup())
++		ginkgo.DeferCleanup(func() { fwk.StopManager(ctx) })
++		ns := behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "check-tolerations-")
++		flavor := utiltestingapi.MakeResourceFlavor("default").Obj()
++		check := utiltestingapi.MakeAdmissionCheck("check").ControllerName("example.com/check").Obj()
++		behavioral.MustCreate(ctx, k8sClient, flavor)
++		behavioral.MustCreate(ctx, k8sClient, check)
++		behavioral.SetAdmissionCheckActive(ctx, k8sClient, check, metav1.ConditionTrue)
++		cq := utiltestingapi.MakeClusterQueue("check-tolerations").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas(flavor.Name).Resource(corev1.ResourceCPU, "10").Obj()).
++			AdmissionChecks("check").Obj()
++		behavioral.MustCreate(ctx, k8sClient, cq)
++		lq := utiltestingapi.MakeLocalQueue("queue", ns.Name).ClusterQueue(cq.Name).Obj()
++		behavioral.MustCreate(ctx, k8sClient, lq)
++		ginkgo.DeferCleanup(func() {
++			gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, cq, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, lq, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, check, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, flavor, true)
++		})
++
++		rc := testingraycluster.MakeCluster("checked", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue(lq.Name).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			FirstWorkerGroupReplicas(2, 0, 4).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, rc)
++		wl := &behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 1)[0]
++
++		toleration := corev1.Toleration{Key: "example.com/claimed-by", Operator: corev1.TolerationOpEqual, Value: wl.Name, Effect: corev1.TaintEffectNoSchedule}
++		pod := testingpod.MakePod("worker", ns.Name).
++			Annotation(kueue.WorkloadAnnotation, wl.Name).
++			Annotation(kueue.WorkloadSliceNameAnnotation, workloadslicing.SliceName(wl)).
++			Label(constants.PodSetLabel, workersGroupName).
++			Gate(kueue.ElasticJobSchedulingGate).
++			Obj()
++		pod.OwnerReferences = []metav1.OwnerReference{{
++			APIVersion: rayv1.SchemeGroupVersion.String(), Kind: "RayCluster", Name: rc.Name, UID: rc.UID, Controller: new(true),
++		}}
++		behavioral.MustCreate(ctx, k8sClient, pod)
++
++		gomega.Eventually(func(g gomega.Gomega) {
++			var latest kueue.Workload
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &latest)).To(gomega.Succeed())
++			workloadpatching.SetAdmissionCheckState(&latest.Status.AdmissionChecks, kueue.AdmissionCheckState{
++				Name:  "check",
++				State: kueue.CheckStateReady,
++				PodSetUpdates: []kueue.PodSetUpdate{{
++					Name:         workersGroupName,
++					NodeSelector: map[string]string{"example.com/attempt": "attempt-1"},
++					Tolerations:  []corev1.Toleration{toleration},
++				}},
++			}, behavioral.RealClock)
++			g.Expect(k8sClient.Status().Update(ctx, &latest)).To(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		gomega.Eventually(func(g gomega.Gomega) {
++			var got corev1.Pod
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), &got)).To(gomega.Succeed())
++			g.Expect(utilpod.HasGate(&got, kueue.ElasticJobSchedulingGate)).To(gomega.BeFalse())
++			g.Expect(got.Spec.NodeSelector).To(gomega.HaveKeyWithValue("example.com/attempt", "attempt-1"))
++			g.Expect(got.Spec.Tolerations).To(gomega.ContainElement(toleration))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	})
++})
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_elastic_flavor_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_elastic_flavor_test.go
 new file mode 100644
 index 0000000..49c74cd

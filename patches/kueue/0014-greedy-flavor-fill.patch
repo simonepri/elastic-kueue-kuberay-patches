@@ -1601,3 +1601,209 @@ index 0000000..6d2e18f
 +		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 +	}, ginkgo.Entry("atomic", false, false), ginkgo.Entry("partial", true, false), ginkgo.Entry("initial nonzero", false, true))
 +})
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_split_scaleup_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_split_scaleup_test.go
+new file mode 100644
+index 0000000..65bf532
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_split_scaleup_test.go
+@@ -0,0 +1,200 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Verifies that a scale-up slice of a RayCluster whose worker group is split over two flavors keeps the flavor of the running pods.
++
++package raycluster
++
++import (
++	"fmt"
++
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/component-base/featuregate"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++const gpu = corev1.ResourceName("example.com/gpu")
++
++var _ = ginkgo.Describe("RayCluster scale-up of a worker group split over two flavors", ginkgo.Label("job:ray", "area:jobs"), func() {
++	ginkgo.DescribeTable("keeps the flavor of the running workers", func(partial, borrow bool) {
++		features.SetFeatureGatesDuringTest(ginkgo.GinkgoTB(), map[featuregate.Feature]bool{
++			features.ElasticJobsViaWorkloadSlices:                          true,
++			features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++			features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero:      true,
++			features.ElasticJobsViaWorkloadSlicesFlavorSplit:               true,
++			features.PartialPreemption:                                     true,
++		})
++		fwk.StartManager(ctx, cfg, managerAndSchedulerSetup())
++		ginkgo.DeferCleanup(func() { fwk.StopManager(ctx) })
++		ns := behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "split-scale-up-")
++		cell := utiltestingapi.MakeResourceFlavor("cell").NodeLabel("pool", "cell").Obj()
++		cloud := utiltestingapi.MakeResourceFlavor("cloud").NodeLabel("pool", "cloud").Obj()
++		cqw := utiltestingapi.MakeClusterQueue("split-scale-up")
++		cellNominal, cloudNominal := "2", "30"
++		var cohort *kueue.Cohort
++		if borrow {
++			cohort = utiltestingapi.MakeCohort("pool").ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas(cell.Name).Resource(gpu, "2").Resource(corev1.ResourceCPU, "100").Obj(),
++				*utiltestingapi.MakeFlavorQuotas(cloud.Name).Resource(gpu, "30").Resource(corev1.ResourceCPU, "100").Obj()).Obj()
++			behavioral.MustCreate(ctx, k8sClient, cohort)
++			ginkgo.DeferCleanup(func() { behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, cohort, true) })
++			cellNominal, cloudNominal = "0", "0"
++			cqw = cqw.Cohort("pool")
++		}
++		cq := cqw.ResourceGroup(
++			*utiltestingapi.MakeFlavorQuotas(cell.Name).Resource(gpu, cellNominal).Resource(corev1.ResourceCPU, "100").Obj(),
++			*utiltestingapi.MakeFlavorQuotas(cloud.Name).Resource(gpu, cloudNominal).Resource(corev1.ResourceCPU, "100").Obj()).Obj()
++		ginkgo.DeferCleanup(func() {
++			gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, cq, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, cell, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, cloud, true)
++		})
++		for _, obj := range []client.Object{cell, cloud, cq, utiltestingapi.MakeLocalQueue("queue", ns.Name).ClusterQueue(cq.Name).Obj()} {
++			behavioral.MustCreate(ctx, k8sClient, obj)
++		}
++		rc := testingraycluster.MakeCluster("split", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue("queue").
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			RequestWorkerGroup(gpu, "1").
++			FirstWorkerGroupReplicas(0, 0, 20).
++			Obj()
++		if partial {
++			rc.Annotations[constants.ElasticJobScaleUpStrategyAnnotationKey] = constants.ElasticJobScaleUpStrategyPartial
++		}
++		behavioral.MustCreate(ctx, k8sClient, rc)
++
++		flavors := func(g gomega.Gomega) map[string]string {
++			var list kueue.WorkloadList
++			g.Expect(k8sClient.List(ctx, &list, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			out := map[string]string{}
++			for i := range list.Items {
++				wl := &list.Items[i]
++				if apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadFinished) || wl.Status.Admission == nil {
++					continue
++				}
++				for _, psa := range wl.Status.Admission.PodSetAssignments {
++					if psa.Name == "head" {
++						continue
++					}
++					out[string(psa.Name)] = fmt.Sprintf("%s=%d", psa.Flavors[gpu], ptrCount(psa.Count))
++				}
++			}
++			return out
++		}
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(flavors(g)).To(gomega.HaveKey(workersGroupName))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		scaleFirstWorkerGroupTo(rc, 3)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(flavors(g)).To(gomega.Equal(map[string]string{
++				workersGroupName: "cell=2", workersGroupName + "--2": "cloud=1",
++			}))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		// KubeRay creates the workers gated, from the template of the admitted slice.
++		var admitted kueue.Workload
++		gomega.Eventually(func(g gomega.Gomega) {
++			var list kueue.WorkloadList
++			g.Expect(k8sClient.List(ctx, &list, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			for i := range list.Items {
++				if !apimeta.IsStatusConditionTrue(list.Items[i].Status.Conditions, kueue.WorkloadFinished) && list.Items[i].Status.Admission != nil {
++					admitted = list.Items[i]
++				}
++			}
++			g.Expect(admitted.Name).NotTo(gomega.BeEmpty())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		createWorker := func(name string) {
++			pod := testingpod.MakePod(name, ns.Name).
++				Annotation(kueue.WorkloadAnnotation, admitted.Name).
++				Annotation(kueue.WorkloadSliceNameAnnotation, workloadslicing.SliceName(&admitted)).
++				Label(constants.PodSetLabel, workersGroupName).
++				Gate(kueue.ElasticJobSchedulingGate).
++				Obj()
++			pod.OwnerReferences = []metav1.OwnerReference{{
++				APIVersion: rayv1.SchemeGroupVersion.String(), Kind: "RayCluster", Name: rc.Name, UID: rc.UID, Controller: new(true),
++			}}
++			behavioral.MustCreate(ctx, k8sClient, pod)
++		}
++		for _, name := range []string{"w1", "w2", "w3"} {
++			createWorker(name)
++		}
++		podSetOfPods := func(g gomega.Gomega) map[string]string {
++			var pods corev1.PodList
++			g.Expect(k8sClient.List(ctx, &pods, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			out := map[string]string{}
++			for i := range pods.Items {
++				p := &pods.Items[i]
++				out[p.Name] = p.Labels[constants.PodSetLabel] + "/" + p.Spec.NodeSelector["pool"]
++				if utilpod.HasGate(p, kueue.ElasticJobSchedulingGate) {
++					out[p.Name] += "/gated"
++				}
++			}
++			return out
++		}
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(podSetOfPods(g)).To(gomega.Equal(map[string]string{
++				"w1": workersGroupName + "/cell", "w2": workersGroupName + "/cell", "w3": workersGroupName + "--2/cloud",
++			}))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		scaleFirstWorkerGroupTo(rc, 6)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(flavors(g)).To(gomega.Equal(map[string]string{
++				workersGroupName: "cell=2", workersGroupName + "--2": "cloud=4",
++			}))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		gomega.Consistently(func(g gomega.Gomega) {
++			g.Expect(flavors(g)).To(gomega.HaveKeyWithValue(workersGroupName, "cell=2"))
++			got := podSetOfPods(g)
++			g.Expect(got).To(gomega.HaveKeyWithValue("w1", workersGroupName+"/cell"))
++			g.Expect(got).To(gomega.HaveKeyWithValue("w2", workersGroupName+"/cell"))
++			g.Expect(got).To(gomega.HaveKeyWithValue("w3", workersGroupName+"--2/cloud"))
++		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
++	}, ginkgo.Entry("atomic", false, false), ginkgo.Entry("partial", true, false),
++		ginkgo.Entry("atomic, borrowing", false, true), ginkgo.Entry("partial, borrowing", true, true))
++})
++
++func ptrCount(c *int32) int32 {
++	if c == nil {
++		return 0
++	}
++	return *c
++}
++
++func scaleFirstWorkerGroupTo(rc *rayv1.RayCluster, replicas int32) {
++	gomega.Eventually(func(g gomega.Gomega) {
++		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rc), rc)).Should(gomega.Succeed())
++		rc.Spec.WorkerGroupSpecs[0].Replicas = &replicas
++		g.Expect(k8sClient.Update(ctx, rc)).Should(gomega.Succeed())
++	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++}

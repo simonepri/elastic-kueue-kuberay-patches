@@ -93,7 +93,7 @@ jobs:
   image:
     name: Test Wheel In Ray Image
     needs: [build]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       RAY_INSTALL_WHEEL: "1"
     steps:
@@ -128,7 +128,7 @@ jobs:
     name: Attach Wheels And Publish The Release
     if: ${{ inputs.release-tag != '' }}
     needs: [build, image]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     env:

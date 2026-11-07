@@ -34,6 +34,7 @@ from ray.core.generated.instance_manager_pb2 import Instance, NodeKind
 s_to_ns = 1_000_000_000
 ALLOCATE_TIMEOUT_S = 900
 UNSCHEDULABLE_TIMEOUT_S = 120
+PROVISIONING_TIMEOUT_S = 600
 
 
 def worker_pod(name, spec=None, status=None):
@@ -164,6 +165,7 @@ class UnschedulableTimeoutTest(unittest.TestCase):
                     InstanceReconcileConfig(
                         allocate_status_timeout_s=ALLOCATE_TIMEOUT_S,
                         unschedulable_status_timeout_s=UNSCHEDULABLE_TIMEOUT_S,
+                        provisioning_status_timeout_s=PROVISIONING_TIMEOUT_S,
                     ),
                     pending_idle_timeout_s=pending_idle_timeout_s,
                 ),
@@ -173,6 +175,14 @@ class UnschedulableTimeoutTest(unittest.TestCase):
 
     def test_default_unschedulable_timeout_is_two_minutes(self):
         self.assertEqual(InstanceReconcileConfig().unschedulable_status_timeout_s, 120)
+
+    def test_default_provisioning_timeout_is_ten_minutes(self):
+        self.assertEqual(InstanceReconcileConfig().provisioning_status_timeout_s, 600)
+
+    def test_only_pods_without_a_node_behind_scheduling_gates_are_gated(self):
+        self.assertTrue(KubeRayProvider._is_gated(GATED_POD))
+        self.assertFalse(KubeRayProvider._is_gated(UNSCHEDULABLE_POD))
+        self.assertFalse(KubeRayProvider._is_gated(PULLING_POD))
 
     def test_pods_without_a_node_are_unschedulable_when_gated_or_rejected(self):
         self.assertTrue(KubeRayProvider._is_unschedulable(GATED_POD))
@@ -186,8 +196,14 @@ class UnschedulableTimeoutTest(unittest.TestCase):
         after = self.reconcile(GATED_POD, UNSCHEDULABLE_TIMEOUT_S + 1)
         self.assertIn(Instance.ALLOCATION_TIMEOUT, after)
 
-    def test_unschedulable_pod_times_out_at_the_unschedulable_timeout(self):
-        history = self.reconcile(UNSCHEDULABLE_POD, UNSCHEDULABLE_TIMEOUT_S + 1)
+    def test_rejected_pod_waits_for_its_node_to_be_provisioned(self):
+        # The scheduler rejects the pod while its new node boots and its GPU device
+        # plugin registers; that takes longer than the gated pod's timeout.
+        history = self.reconcile(UNSCHEDULABLE_POD, PROVISIONING_TIMEOUT_S - 1)
+        self.assertEqual(history, [Instance.ALLOCATED])
+
+    def test_rejected_pod_times_out_at_the_provisioning_timeout(self):
+        history = self.reconcile(UNSCHEDULABLE_POD, PROVISIONING_TIMEOUT_S + 1)
         self.assertIn(Instance.ALLOCATION_TIMEOUT, history)
 
     def test_scheduled_pod_pulling_its_image_outlives_the_unschedulable_timeout(self):
@@ -201,7 +217,7 @@ class UnschedulableTimeoutTest(unittest.TestCase):
     def test_unschedulable_pod_times_out_with_pending_idle_timeout_configured(self):
         history = self.reconcile(
             UNSCHEDULABLE_POD,
-            UNSCHEDULABLE_TIMEOUT_S + 1,
+            PROVISIONING_TIMEOUT_S + 1,
             pending_idle_timeout_s=600.0,
         )
         self.assertIn(Instance.ALLOCATION_TIMEOUT, history)

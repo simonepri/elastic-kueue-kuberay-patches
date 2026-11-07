@@ -309,10 +309,10 @@ index 0000000..f678d98
 +)
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
 new file mode 100644
-index 0000000..2a1b15a
+index 0000000..4a1ec07
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
-@@ -0,0 +1,1132 @@
+@@ -0,0 +1,1182 @@
 +// Package karpenter implements an AdmissionCheck that provisions Karpenter NodeClaims sized for the admitted pods
 +// in the flavor's NodePool, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
 +package karpenter
@@ -604,7 +604,14 @@ index 0000000..2a1b15a
 +		if check.State == kueue.CheckStatePending {
 +			result, err = c.reconcileCheck(ctx, wl, check.Name, cfg)
 +		} else {
-+			result, err = c.releaseDisruptionHolds(ctx, wl)
++			var remaining time.Duration
++			var failed bool
++			if remaining, failed, err = c.expireUnplacedTopology(ctx, wl, check.Name, cfg); err == nil && !failed {
++				result, err = c.releaseDisruptionHolds(ctx, wl)
++				if remaining > 0 && (result.RequeueAfter == 0 || remaining < result.RequeueAfter) {
++					result.RequeueAfter = remaining
++				}
++			}
 +		}
 +		if expiry > 0 && (result.RequeueAfter == 0 || expiry < result.RequeueAfter) {
 +			result.RequeueAfter = expiry
@@ -837,6 +844,49 @@ index 0000000..2a1b15a
 +		return ctrl.Result{}, err
 +	}
 +	return ctrl.Result{RequeueAfter: min(pollInterval, cfg.launchTimeout-elapsed)}, nil
++}
++
++// expireUnplacedTopology keeps the launch deadline running after registration for a delayed topology request
++// on a guarded flavor, until the scheduler's second pass assigns the topology. Packing estimates capacity from
++// pod requests while TAS places against the registered nodes' real allocatable capacity, so the gang can fail
++// to fit them. Kueue never times out such a Workload, since waitForPodsReady starts only at admission, and the
++// scheduler does not retry it, so the check fails the attempt once the deadline passes. It returns the time left
++// before the deadline and whether it failed the attempt.
++func (c *Controller) expireUnplacedTopology(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, cfg config) (time.Duration, bool, error) {
++	reservedAt := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadQuotaReserved).LastTransitionTime.Time
++	attempt := attemptID(wl, reservedAt)
++	if wl.Annotations[ProvisionedAttemptAnnotation] != attempt || workload.IsAdmitted(wl) {
++		return 0, false, nil
++	}
++	guarded, err := c.guardedFlavors(ctx, wl, checkName, cfg)
++	if err != nil {
++		return 0, false, err
++	}
++	waiting := slices.ContainsFunc(wl.Status.Admission.PodSetAssignments, func(psa kueue.PodSetAssignment) bool {
++		return psa.DelayedTopologyRequest != nil && *psa.DelayedTopologyRequest == kueue.DelayedTopologyRequestStatePending &&
++			slices.ContainsFunc(guarded, func(flavor string) bool {
++				return slices.Contains(slices.Collect(maps.Values(psa.Flavors)), kueue.ResourceFlavorReference(flavor))
++			})
++	})
++	if !waiting {
++		return 0, false, nil
++	}
++	if remaining := cfg.launchTimeout - c.Clock.Since(reservedAt); remaining > 0 {
++		return remaining, false, nil
++	}
++	claims, err := c.listNodeClaims(ctx, wl.Namespace, wl.Name)
++	if err != nil {
++		return 0, false, err
++	}
++	current := make(map[string]*unstructured.Unstructured, len(claims))
++	for i := range claims {
++		if claims[i].GetLabels()[AttemptLabelKey] == attempt {
++			current[claims[i].GetName()] = &claims[i]
++		}
++	}
++	reason := fmt.Sprintf("the topology was not assigned within %s of the quota reservation", cfg.launchTimeout)
++	log.FromContext(ctx).Info("The registered nodes did not fit the delayed topology, retrying on another flavor", "check", checkName, "reason", reason)
++	return 0, true, c.fail(ctx, wl, checkName, cfg, current, reason)
 +}
 +
 +// fail releases the attempt's NodeClaims, excludes the flavors the check guards, and sets the check to Retry
@@ -2456,10 +2506,10 @@ index 0000000..6543643
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/topology_test.go b/pkg/controller/admissionchecks/karpenter/topology_test.go
 new file mode 100644
-index 0000000..4daaaff
+index 0000000..e549faa
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/topology_test.go
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,266 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2667,6 +2717,63 @@ index 0000000..4daaaff
 +				t.Fatal("check write undid eviction")
 +			}
 +		})
++	}
++}
++
++// registeredDelayedFixture returns a delayed-topology Workload whose claims are all Registered and whose
++// check is Ready, the state in which the scheduler's second pass cannot fit the pods on the nodes.
++func registeredDelayedFixture(t *testing.T) *fixture {
++	t.Helper()
++	f := newFixture(t, delayedWorkload(), map[string]string{LaunchTimeoutAnnotation: "1m"})
++	f.reconcile()
++	claims := f.claims()
++	for i := range claims {
++		f.setCondition(&claims[i], conditionRegistered)
++	}
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStateReady {
++		t.Fatalf("check state = %s, want Ready", got)
++	}
++	return f
++}
++
++func TestDelayedTopologyPendingPastDeadlineRetriesAfterRegistration(t *testing.T) {
++	f := registeredDelayedFixture(t)
++
++	f.clk.SetTime(reservedAt.Add(59 * time.Second))
++	res := f.reconcile()
++	if got := f.check().State; got != kueue.CheckStateReady {
++		t.Fatalf("check state before the deadline = %s, want Ready", got)
++	}
++	if n := len(f.claims()); n != 2 {
++		t.Fatalf("got %d NodeClaims before the deadline, want 2", n)
++	}
++	if res.RequeueAfter <= 0 || res.RequeueAfter > time.Second {
++		t.Fatalf("RequeueAfter = %s, want the time left until the deadline", res.RequeueAfter)
++	}
++	if got := f.workload().Annotations[ExcludedFlavorsAnnotation]; got != "" {
++		t.Fatalf("excluded flavors before the deadline = %q, want none", got)
++	}
++
++	f.clk.SetTime(reservedAt.Add(time.Minute))
++	f.reconcile()
++	assertRetriedWithExclusion(t, f, reservedAt.Add(time.Minute+DefaultFlavorCooldown))
++}
++
++func TestDelayedTopologyAssignedStopsTheDeadline(t *testing.T) {
++	f := registeredDelayedFixture(t)
++	wl := f.workload()
++	wl.Status.Admission.PodSetAssignments[0].DelayedTopologyRequest = new(kueue.DelayedTopologyRequestStateReady)
++	if err := f.c.Status().Update(f.ctx, wl); err != nil {
++		t.Fatal(err)
++	}
++	f.clk.SetTime(reservedAt.Add(time.Hour))
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStateReady {
++		t.Errorf("check state = %s, want Ready", got)
++	}
++	if n := len(f.claims()); n != 2 {
++		t.Errorf("got %d NodeClaims, want 2", n)
 +	}
 +}
 diff --git a/pkg/controller/jobframework/karpenter_placement.go b/pkg/controller/jobframework/karpenter_placement.go

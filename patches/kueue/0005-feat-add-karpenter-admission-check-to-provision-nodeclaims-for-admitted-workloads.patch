@@ -1,0 +1,4426 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simone Primarosa <simone.primarosa@gmail.com>
+Date: Sat, 7 Nov 2026 12:00:00 +01:00
+Subject: [PATCH] feat: add karpenter admission check to provision nodeclaims for admitted workloads
+
+Admitted workloads scheduled onto dynamic cloud capacity experience prolonged scheduling delays and pod startup timeouts while waiting for generic node autoscalers to detect unschedulable pods. Standard cloud autoscalers reactively provision nodes only after pods fail scheduling and emit events. When Kueue admits high-priority distributed workloads, it knows the exact resource flavors, node pools, and capacity requirements before ungating pods, but lacks a mechanism to trigger just-in-time node provisioning directly.
+
+Implement a Karpenter AdmissionCheck controller in Kueue that reconciles admitted Workloads against Karpenter NodePool and NodeClaim custom resources. Provision dedicated NodeClaim objects matching the workload's admitted flavor and pod count, holding workload admission checks in a pending state until NodeClaims become Launched (or Registered when configured), and inject anti-theft taints, tolerations, and node selectors to isolate provisioned capacity.
+---
+diff --git a/charts/kueue/templates/rbac/role.yaml b/charts/kueue/templates/rbac/role.yaml
+index 28a86f9..ad8691f 100644
+--- a/charts/kueue/templates/rbac/role.yaml
++++ b/charts/kueue/templates/rbac/role.yaml
+@@ -32,6 +32,7 @@ rules:
+     verbs:
+       - get
+       - list
++      - patch
+       - watch
+   - apiGroups:
+       - ""
+@@ -123,6 +124,13 @@ rules:
+     verbs:
+       - get
+       - update
++  - apiGroups:
++      - apps
++    resources:
++      - daemonsets
++    verbs:
++      - get
++      - list
+   - apiGroups:
+       - apps
+     resources:
+@@ -133,6 +141,22 @@ rules:
+       - get
+       - list
+       - watch
++  - apiGroups:
++      - karpenter.sh
++    resources:
++      - nodeclaims
++    verbs:
++      - create
++      - delete
++      - get
++      - list
++      - patch
++  - apiGroups:
++      - karpenter.sh
++    resources:
++      - nodepools
++    verbs:
++      - get
+   - apiGroups:
+       - autoscaling.x-k8s.io
+     resources:
+diff --git a/cmd/kueue/main.go b/cmd/kueue/main.go
+index 69e2eb5..8f3d159 100644
+--- a/cmd/kueue/main.go
++++ b/cmd/kueue/main.go
+@@ -54,6 +54,7 @@ import (
+ 	"sigs.k8s.io/kueue/pkg/cache/scheduler/was"
+ 	"sigs.k8s.io/kueue/pkg/config"
+ 	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/karpenter"
+ 	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/multikueue"
+ 	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/multikueue/externalframeworks"
+ 	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/provisioning"
+@@ -563,6 +564,12 @@ func setupControllers(
+ 		}
+ 	}
+ 
++	if features.Enabled(features.KarpenterAdmissionCheck) {
++		if err := karpenter.SetupWithManager(mgr); err != nil {
++			return fmt.Errorf("could not setup karpenter admission check controller: %w", err)
++		}
++	}
++
+ 	if features.Enabled(features.MultiKueue) {
+ 		adapters, err := integrationManager.GetMultiKueueAdapters(sets.New(cfg.Integrations.Frameworks...))
+ 		if err != nil {
+diff --git a/config/components/rbac/role.yaml b/config/components/rbac/role.yaml
+index 7db4025..24a2891 100644
+--- a/config/components/rbac/role.yaml
++++ b/config/components/rbac/role.yaml
+@@ -13,6 +13,7 @@ rules:
+   verbs:
+   - get
+   - list
++  - patch
+   - watch
+ - apiGroups:
+   - ""
+@@ -104,6 +105,29 @@ rules:
+   verbs:
+   - get
+   - update
++- apiGroups:
++  - apps
++  resources:
++  - daemonsets
++  verbs:
++  - get
++  - list
++- apiGroups:
++  - karpenter.sh
++  resources:
++  - nodeclaims
++  verbs:
++  - create
++  - delete
++  - get
++  - list
++  - patch
++- apiGroups:
++  - karpenter.sh
++  resources:
++  - nodepools
++  verbs:
++  - get
+ - apiGroups:
+   - apps
+   resources:
+diff --git a/pkg/cache/queue/cluster_queue.go b/pkg/cache/queue/cluster_queue.go
+index 3db5d8f..e9ddb5f 100644
+--- a/pkg/cache/queue/cluster_queue.go
++++ b/pkg/cache/queue/cluster_queue.go
+@@ -397,6 +397,9 @@ func (c *ClusterQueue) PushOrUpdate(wInfo *workload.Info) {
+ 		if !specChangedSinceEval &&
+ 			equality.Semantic.DeepEqual(oldInfo.Obj.Spec, wInfo.Obj.Spec) &&
+ 			!priorityBoostAnnotationChanged(oldInfo, wInfo) &&
++			// The Karpenter admission check widens the allowed flavors of a waiting Workload when a flavor exclusion
++			// expires; the change bumps no generation, so without this check the Workload would wait for an unrelated event.
++			oldInfo.Obj.Annotations[controllerconstants.WorkloadAllowedResourceFlavorAnnotation] == wInfo.Obj.Annotations[controllerconstants.WorkloadAllowedResourceFlavorAnnotation] &&
+ 			equality.Semantic.DeepEqual(oldInfo.Obj.Status.ReclaimablePods, wInfo.Obj.Status.ReclaimablePods) &&
+ 			equality.Semantic.DeepEqual(oldInfo.Obj.Status.RequeueState, wInfo.Obj.Status.RequeueState) &&
+ 			equality.Semantic.DeepEqual(apimeta.FindStatusCondition(oldInfo.Obj.Status.Conditions, kueue.WorkloadEvicted),
+diff --git a/pkg/constants/karpenter.go b/pkg/constants/karpenter.go
+new file mode 100644
+index 0000000..f678d98
+--- /dev/null
++++ b/pkg/constants/karpenter.go
+@@ -0,0 +1,25 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package constants
++
++const (
++	KarpenterAntiTheftTaintKey   = "karpenter.sh/claimed-by"
++	KarpenterAttemptLabel        = "kueue.x-k8s.io/karpenter-attempt"
++	KarpenterControllerName      = "kueue.x-k8s.io/karpenter"
++	KarpenterNodePoolLabel       = "karpenter.sh/nodepool"
++	KarpenterNodeClassAnnotation = "kueue.x-k8s.io/karpenter-node-class"
++)
+diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/controller.go
+@@ -0,0 +1,1440 @@
++// Package karpenter implements an AdmissionCheck that provisions Karpenter NodeClaims sized for the admitted pods
++// in the flavor's NodePool, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
++package karpenter
++
++import (
++	"context"
++	"crypto/sha256"
++	"fmt"
++	"maps"
++	"math"
++	"slices"
++	"sort"
++	"strconv"
++	"strings"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/equality"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/klog/v2"
++	"k8s.io/utils/clock"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/builder"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/log"
++	"sigs.k8s.io/controller-runtime/pkg/manager"
++	"sigs.k8s.io/controller-runtime/pkg/predicate"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/resources"
++	"sigs.k8s.io/kueue/pkg/util/admissioncheck"
++	"sigs.k8s.io/kueue/pkg/util/csv"
++	utilqueue "sigs.k8s.io/kueue/pkg/util/queue"
++	"sigs.k8s.io/kueue/pkg/util/resourcegroups"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
++	workloadpatching "sigs.k8s.io/kueue/pkg/workload/patching"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++const (
++	ControllerName     = constants.KarpenterControllerName
++	AdmissionCheckName = "karpenter-provision"
++	AntiTheftTaintKey  = constants.KarpenterAntiTheftTaintKey
++	GangIDLabelKey     = "kueue.x-k8s.io/gang-id"
++	ManagedLabelKey    = "kueue.x-k8s.io/managed-by"
++	WorkloadLabelKey      = "kueue.x-k8s.io/workload"
++	WorkloadAnnotation    = kueue.WorkloadAnnotation
++	ClaimSuffixAnnotation = "kueue.x-k8s.io/karpenter-claim-suffix"
++
++	// AdoptedFrom annotations record predecessor Workload identity on adopted NodeClaims
++	// so that original labels can be restored if the successor's scale-up attempt fails.
++	AdoptedFromWorkloadAnnotation  = "kueue.x-k8s.io/karpenter-adopted-from-workload"
++	AdoptedFromUIDAnnotation       = "kueue.x-k8s.io/karpenter-adopted-from-uid"
++	AdoptedFromNamespaceAnnotation = "kueue.x-k8s.io/karpenter-adopted-from-namespace"
++
++	// WorkloadNamespaceLabelKey and AttemptLabelKey identify the quota reservation a NodeClaim serves.
++	WorkloadNamespaceLabelKey = "kueue.x-k8s.io/workload-namespace"
++	AttemptLabelKey           = constants.KarpenterAttemptLabel
++
++	// LaunchTimeoutAnnotation on the AdmissionCheck bounds how long the check waits for its NodeClaims.
++	LaunchTimeoutAnnotation = "kueue.x-k8s.io/karpenter-launch-timeout"
++	// WaitForAnnotation on the AdmissionCheck names the NodeClaim condition that makes it Ready: Launched or Registered.
++	WaitForAnnotation = "kueue.x-k8s.io/karpenter-wait-for"
++	// FlavorCooldownAnnotation on the AdmissionCheck sets how long a failed flavor stays excluded.
++	FlavorCooldownAnnotation = "kueue.x-k8s.io/karpenter-flavor-cooldown"
++	// NodeClassAnnotation on the AdmissionCheck names the node class, as "group/Kind/name", of NodeClaims for
++	// flavors whose node labels name no NodePool. Flavors that name a NodePool use the NodePool's nodeClassRef.
++	NodeClassAnnotation = constants.KarpenterNodeClassAnnotation
++	// NodeFillFractionAnnotation on the AdmissionCheck sets the share of the largest instance the NodePool allows
++	// that the pods packed onto one NodeClaim may request, between 0 (exclusive) and 1.
++	NodeFillFractionAnnotation = "kueue.x-k8s.io/karpenter-node-fill-fraction"
++	// MaxNodeClaimsAnnotation on the AdmissionCheck caps the NodeClaims of one quota reservation; a reservation
++	// that needs more fails like one Karpenter cannot launch.
++	MaxNodeClaimsAnnotation = "kueue.x-k8s.io/karpenter-max-nodeclaims"
++
++	// ExcludedFlavorsAnnotation on the Workload records each excluded flavor with the time its exclusion expires,
++	// as "flavor=RFC3339,...". The controller owns the allowed-flavors annotation only while this one is present.
++	ExcludedFlavorsAnnotation = "kueue.x-k8s.io/karpenter-excluded-flavors"
++	// ProvisionedAttemptAnnotation on the Workload records the attempt whose NodeClaims were all created,
++	// so a NodeClaim that is missing afterwards was deleted rather than not yet created.
++	ProvisionedAttemptAnnotation = "kueue.x-k8s.io/karpenter-provisioned-attempt"
++	// HoldsReleasedAnnotation on the Workload records the attempt whose NodeClaims no longer block disruption.
++	HoldsReleasedAnnotation = "kueue.x-k8s.io/karpenter-holds-released"
++
++	// DisruptionHoldAnnotation on a NodeClaim marks a do-not-disrupt annotation that the check set and removes
++	// once the NodeClaim's Node runs the pods the NodeClaim was sized for.
++	DisruptionHoldAnnotation = "kueue.x-k8s.io/karpenter-disruption-hold"
++	// PodsAnnotation on a NodeClaim records how many pods of its pod set the NodeClaim was sized for.
++	PodsAnnotation = "kueue.x-k8s.io/karpenter-pods"
++
++	// Karpenter's well-known label and annotations.
++	NodePoolLabelKey                 = constants.KarpenterNodePoolLabel
++	DoNotDisruptAnnotationKey        = "karpenter.sh/do-not-disrupt"
++	nodePoolHashAnnotationKey        = "karpenter.sh/nodepool-hash"
++	nodePoolHashVersionAnnotationKey = "karpenter.sh/nodepool-hash-version"
++
++	DefaultLaunchTimeout    = 5 * time.Minute
++	DefaultFlavorCooldown   = 10 * time.Minute
++	DefaultNodeFillFraction = 0.5
++	DefaultMaxNodeClaims    = 100
++	pollInterval            = 10 * time.Second
++	sweepInterval           = 5 * time.Minute
++	sweepGracePeriod        = 2 * time.Minute
++
++	conditionLaunched   = "Launched"
++	conditionRegistered = "Registered"
++)
++
++var (
++	nodeClaimGVK = schema.GroupVersionKind{Group: "karpenter.sh", Version: "v1", Kind: "NodeClaim"}
++	nodePoolGVK  = schema.GroupVersionKind{Group: "karpenter.sh", Version: "v1", Kind: "NodePool"}
++)
++
++// instanceCapacityLabels maps a resource to the instance label that states how much of it an instance has, and
++// the quantity of one label unit. They are the labels the Karpenter AWS provider puts on its instance types.
++var instanceCapacityLabels = map[corev1.ResourceName]struct {
++	key  string
++	unit resource.Quantity
++}{
++	corev1.ResourceCPU:    {"karpenter.k8s.aws/instance-cpu", resource.MustParse("1")},
++	corev1.ResourceMemory: {"karpenter.k8s.aws/instance-memory", resource.MustParse("1Mi")},
++	"nvidia.com/gpu":      {"karpenter.k8s.aws/instance-gpu-count", resource.MustParse("1")},
++}
++
++func isOwnController(name string) bool {
++	return name == ControllerName || name == AdmissionCheckName
++}
++
++type ACReconciler struct {
++	client.Client
++}
++
++func (a *ACReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
++	ac := &kueue.AdmissionCheck{}
++	if err := a.Get(ctx, req.NamespacedName, ac); err != nil {
++		return ctrl.Result{}, client.IgnoreNotFound(err)
++	}
++	if !isOwnController(ac.Spec.ControllerName) {
++		return ctrl.Result{}, nil
++	}
++	if !features.Enabled(features.ConcurrentAdmission) {
++		return ctrl.Result{}, a.setActive(ctx, ac, metav1.ConditionFalse, "FeatureGateDisabled",
++			"The karpenter admission check requires the ConcurrentAdmission feature gate, because Kueue honors the "+
++				controllerconstants.WorkloadAllowedResourceFlavorAnnotation+" annotation that moves Workloads to another flavor only with it; "+
++				"start Kueue with --feature-gates=ConcurrentAdmission=true")
++	}
++	if _, err := parseConfig(ac); err != nil {
++		return ctrl.Result{}, a.setActive(ctx, ac, metav1.ConditionFalse, "BadParameters", err.Error())
++	}
++	return ctrl.Result{}, a.setActive(ctx, ac, metav1.ConditionTrue, "Active", "The karpenter admission check is active")
++}
++
++func (a *ACReconciler) setActive(ctx context.Context, ac *kueue.AdmissionCheck, status metav1.ConditionStatus, reason, message string) error {
++	changed := apimeta.SetStatusCondition(&ac.Status.Conditions, metav1.Condition{
++		Type:               kueue.AdmissionCheckActive,
++		Status:             status,
++		Reason:             reason,
++		Message:            message,
++		ObservedGeneration: ac.Generation,
++	})
++	if !changed {
++		return nil
++	}
++	return a.Status().Update(ctx, ac)
++}
++
++// config holds the per-AdmissionCheck settings read from its annotations.
++type config struct {
++	launchTimeout    time.Duration
++	waitFor          string
++	flavorCooldown   time.Duration
++	nodeClass        nodeClassRef
++	nodeFillFraction float64
++	maxNodeClaims    int
++}
++
++// nodeClassRef is a NodeClaim's spec.nodeClassRef; the zero value means none is configured.
++type nodeClassRef struct {
++	group, kind, name string
++}
++
++func (r nodeClassRef) object() map[string]any {
++	return map[string]any{"group": r.group, "kind": r.kind, "name": r.name}
++}
++
++func parseConfig(ac *kueue.AdmissionCheck) (config, error) {
++	cfg := config{
++		launchTimeout:    DefaultLaunchTimeout,
++		waitFor:          conditionLaunched,
++		flavorCooldown:   DefaultFlavorCooldown,
++		nodeFillFraction: DefaultNodeFillFraction,
++		maxNodeClaims:    DefaultMaxNodeClaims,
++	}
++	for key, target := range map[string]*time.Duration{LaunchTimeoutAnnotation: &cfg.launchTimeout, FlavorCooldownAnnotation: &cfg.flavorCooldown} {
++		if v, ok := ac.Annotations[key]; ok {
++			d, err := time.ParseDuration(v)
++			if err != nil || d <= 0 {
++				return cfg, fmt.Errorf("annotation %s must be a positive duration, got %q", key, v)
++			}
++			*target = d
++		}
++	}
++	if v, ok := ac.Annotations[WaitForAnnotation]; ok {
++		if v != conditionLaunched && v != conditionRegistered {
++			return cfg, fmt.Errorf("annotation %s must be %s or %s, got %q", WaitForAnnotation, conditionLaunched, conditionRegistered, v)
++		}
++		cfg.waitFor = v
++	}
++	if v, ok := ac.Annotations[NodeClassAnnotation]; ok {
++		parts := strings.Split(v, "/")
++		if len(parts) != 3 || slices.Contains(parts, "") {
++			return cfg, fmt.Errorf("annotation %s must be group/Kind/name, got %q", NodeClassAnnotation, v)
++		}
++		cfg.nodeClass = nodeClassRef{group: parts[0], kind: parts[1], name: parts[2]}
++	}
++	if v, ok := ac.Annotations[NodeFillFractionAnnotation]; ok {
++		f, err := strconv.ParseFloat(v, 64)
++		if err != nil || f <= 0 || f > 1 {
++			return cfg, fmt.Errorf("annotation %s must be a number greater than 0 and at most 1, got %q", NodeFillFractionAnnotation, v)
++		}
++		cfg.nodeFillFraction = f
++	}
++	if v, ok := ac.Annotations[MaxNodeClaimsAnnotation]; ok {
++		n, err := strconv.Atoi(v)
++		if err != nil || n <= 0 {
++			return cfg, fmt.Errorf("annotation %s must be a positive integer, got %q", MaxNodeClaimsAnnotation, v)
++		}
++		cfg.maxNodeClaims = n
++	}
++	return cfg, nil
++}
++
++type Controller struct {
++	client.Client
++	// APIReader lists the Pods on a Node from the API server, which needs no Pod index in the cache.
++	APIReader client.Reader
++	Clock     clock.Clock
++}
++
++func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
++	wl := &kueue.Workload{}
++	if err := c.Get(ctx, req.NamespacedName, wl); err != nil {
++		if apierrors.IsNotFound(err) {
++			return ctrl.Result{}, c.deleteNodeClaims(ctx, req.Namespace, req.Name, "")
++		}
++		return ctrl.Result{}, err
++	}
++
++	var expiry time.Duration
++	if _, owned := wl.Annotations[ExcludedFlavorsAnnotation]; owned {
++		var err error
++		if expiry, err = c.syncExclusions(ctx, wl); err != nil {
++			return ctrl.Result{}, err
++		}
++	}
++
++	if !holdsReservation(wl) {
++		if workloadslicing.IsReplaced(wl.Status) {
++			return ctrl.Result{RequeueAfter: expiry}, nil
++		}
++		if _, provisioned := wl.Annotations[ProvisionedAttemptAnnotation]; provisioned {
++			if err := c.releaseNodeClaims(ctx, wl); err != nil {
++				return ctrl.Result{}, err
++			}
++		}
++		return ctrl.Result{RequeueAfter: expiry}, nil
++	}
++
++	var checks []kueue.AdmissionCheckState
++	for _, check := range wl.Status.AdmissionChecks {
++		if check.State == kueue.CheckStatePending || check.State == kueue.CheckStateReady {
++			checks = append(checks, check)
++		}
++	}
++	for _, check := range checks {
++		ac := &kueue.AdmissionCheck{}
++		if err := c.Get(ctx, types.NamespacedName{Name: string(check.Name)}, ac); err != nil {
++			if apierrors.IsNotFound(err) {
++				continue
++			}
++			return ctrl.Result{}, err
++		}
++		if !isOwnController(ac.Spec.ControllerName) {
++			continue
++		}
++		cfg, err := parseConfig(ac)
++		if err != nil || !features.Enabled(features.ConcurrentAdmission) {
++			// The AdmissionCheck reconciler reports bad parameters and a disabled feature gate as Active=False.
++			return ctrl.Result{RequeueAfter: expiry}, nil
++		}
++		var result ctrl.Result
++		if check.State == kueue.CheckStatePending {
++			result, err = c.reconcileCheck(ctx, wl, check.Name, cfg)
++		} else {
++			result, err = c.releaseDisruptionHolds(ctx, wl)
++		}
++		if expiry > 0 && (result.RequeueAfter == 0 || expiry < result.RequeueAfter) {
++			result.RequeueAfter = expiry
++		}
++		return result, err
++	}
++	return ctrl.Result{RequeueAfter: expiry}, nil
++}
++
++// holdsReservation reports whether the Workload still uses the quota its current NodeClaims were created for.
++// A finished, deleted, deactivated, or evicted Workload, or one without quota, needs no NodeClaims.
++func holdsReservation(wl *kueue.Workload) bool {
++	return wl.DeletionTimestamp == nil && workload.IsActive(wl) && workload.HasQuotaReservation(wl) && wl.Status.Admission != nil &&
++		!apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadEvicted) &&
++		!apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadFinished)
++}
++
++// releaseNodeClaims deletes every NodeClaim of a Workload that no longer holds a reservation, then forgets the attempt.
++func (c *Controller) releaseNodeClaims(ctx context.Context, wl *kueue.Workload) error {
++	if err := c.deleteNodeClaims(ctx, wl.Namespace, workloadClaimLabel(wl.Namespace, wl.Name, wl.UID), ""); err != nil {
++		return err
++	}
++	patch := client.MergeFrom(wl.DeepCopy())
++	delete(wl.Annotations, ProvisionedAttemptAnnotation)
++	delete(wl.Annotations, HoldsReleasedAnnotation)
++	log.FromContext(ctx).Info("Released NodeClaims of a Workload without a reservation")
++	return client.IgnoreNotFound(c.Patch(ctx, wl, patch))
++}
++
++// deleteNodeClaims deletes the Workload's NodeClaims except those of the given attempt.
++func (c *Controller) deleteNodeClaims(ctx context.Context, namespace, name, keepAttempt string) error {
++	claims, err := c.listNodeClaims(ctx, namespace, name)
++	if err != nil {
++		if apimeta.IsNoMatchError(err) {
++			return nil
++		}
++		return err
++	}
++	for i := range claims {
++		if keepAttempt != "" && claims[i].GetLabels()[AttemptLabelKey] == keepAttempt {
++			continue
++		}
++		if err := c.Delete(ctx, &claims[i]); client.IgnoreNotFound(err) != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// Sweep deletes NodeClaims whose Workload no longer exists or no longer holds the reservation they were created for.
++// It catches what the Workload reconciler missed, such as a deletion while Kueue was down. NodeClaims younger than
++// sweepGracePeriod are skipped, so a Workload the informer cache has not caught up with keeps its new NodeClaims.
++func (c *Controller) Sweep(ctx context.Context) error {
++	list := &unstructured.UnstructuredList{}
++	list.SetGroupVersionKind(nodeClaimGVK.GroupVersion().WithKind("NodeClaimList"))
++	if err := c.List(ctx, list, client.MatchingLabels{ManagedLabelKey: "kueue"}); err != nil {
++		if apimeta.IsNoMatchError(err) {
++			return nil
++		}
++		return err
++	}
++	for i := range list.Items {
++		claim := &list.Items[i]
++		labels := claim.GetLabels()
++		namespace, name, attempt := labels[WorkloadNamespaceLabelKey], labels[WorkloadLabelKey], labels[AttemptLabelKey]
++		// NodeClaims created before the namespace and attempt labels cannot be matched to a Workload.
++		if namespace == "" || name == "" || attempt == "" || claim.GetDeletionTimestamp() != nil ||
++			c.Clock.Since(claim.GetCreationTimestamp().Time) < sweepGracePeriod {
++			continue
++		}
++		workloadName := claim.GetAnnotations()[WorkloadAnnotation]
++		if workloadName == "" {
++			workloadName = name
++		}
++		wl := &kueue.Workload{}
++		err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: workloadName}, wl)
++		if client.IgnoreNotFound(err) != nil {
++			return err
++		}
++		if err == nil {
++			if workloadslicing.IsReplaced(wl.Status) {
++				continue
++			}
++			if holdsReservation(wl) &&
++				attemptID(wl, apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadQuotaReserved).LastTransitionTime.Time) == attempt {
++				continue
++			}
++		}
++		log.FromContext(ctx).Info("Deleting orphaned NodeClaim", "nodeClaim", claim.GetName(), "workload", klog.KRef(namespace, name))
++		if err := c.Delete(ctx, claim); client.IgnoreNotFound(err) != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// syncExclusions drops the flavor exclusions once the Workload is admitted, since they have done their job, and
++// otherwise drops those whose cooldown has passed; it returns when the next remaining exclusion expires.
++func (c *Controller) syncExclusions(ctx context.Context, wl *kueue.Workload) (time.Duration, error) {
++	now := c.Clock.Now()
++	excluded := parseExclusions(wl.Annotations[ExcludedFlavorsAnnotation])
++	var next time.Duration
++	for flavor, expiry := range excluded {
++		if workload.IsAdmitted(wl) || !expiry.After(now) {
++			delete(excluded, flavor)
++		} else if left := expiry.Sub(now); next == 0 || left < next {
++			next = left
++		}
++	}
++	if len(excluded) == len(parseExclusions(wl.Annotations[ExcludedFlavorsAnnotation])) {
++		return next, nil
++	}
++	return next, c.writeExclusions(ctx, wl, excluded)
++}
++
++func (c *Controller) reconcileCheck(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, cfg config) (ctrl.Result, error) {
++	logger := log.FromContext(ctx).WithValues("check", checkName)
++	reservedAt := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadQuotaReserved).LastTransitionTime.Time
++	attempt := attemptID(wl, reservedAt)
++
++	// Right after a reservation on a flavor the check does not guard, the check is still Pending
++	// until Kueue drops it from the Workload; it needs no NodeClaims.
++	guarded, err := c.guardedFlavors(ctx, wl, checkName, cfg)
++	if err != nil {
++		return ctrl.Result{}, err
++	}
++	if len(guarded) == 0 {
++		return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady, "No pods require NodeClaims")
++	}
++
++	workloadID := workloadClaimLabel(wl.Namespace, wl.Name, wl.UID)
++	claims, err := c.listNodeClaims(ctx, wl.Namespace, workloadID)
++	if err != nil {
++		return ctrl.Result{}, err
++	}
++
++	var previousCounts workload.PodSetsCounts
++	if wl.Annotations[ProvisionedAttemptAnnotation] != attempt {
++		if sliceName := wl.Annotations[kueue.WorkloadSliceNameAnnotation]; sliceName != "" {
++			prev, err := workloadslicing.FindLatestAdmittedWorkloadForSlice(ctx, c.Client, wl.Namespace, sliceName, workloadslicing.WithFinishedWorkloads())
++			if err == nil && prev != nil && prev.Name != wl.Name {
++				if !workloadslicing.IsReplaced(prev.Status) {
++					if !workloadfinish.IsFinished(prev) {
++						// Only adopt once predecessor is finished with WorkloadSliceReplaced.
++						return ctrl.Result{RequeueAfter: 100 * time.Millisecond}, nil
++					}
++				} else {
++					previousCounts, _ = workloadslicing.PreviousAdmittedPodSetCounts(ctx, c.Client, wl)
++					prevClaims, err := c.listNodeClaims(ctx, prev.Namespace, workloadClaimLabel(prev.Namespace, prev.Name, prev.UID))
++					if err == nil && len(prevClaims) > 0 {
++						sort.Slice(prevClaims, func(i, j int) bool {
++							return prevClaims[i].GetName() < prevClaims[j].GetName()
++						})
++						adoptedCounts := map[string]int{}
++						adoptedPods := map[string]int32{}
++						for i := range claims {
++							cObj := &claims[i]
++							if cObj.GetLabels()[AttemptLabelKey] == attempt && cObj.GetAnnotations()[ClaimSuffixAnnotation] != "" {
++								podSet := cObj.GetLabels()[constants.PodSetLabel]
++								adoptedCounts[podSet]++
++								claimPods := int32(1)
++								if n, err := strconv.ParseInt(cObj.GetAnnotations()[PodsAnnotation], 10, 32); err == nil && n > 0 {
++									claimPods = int32(n)
++								}
++								adoptedPods[podSet] += claimPods
++							}
++						}
++						for i := range prevClaims {
++							pClaim := &prevClaims[i]
++							if pClaim.GetDeletionTimestamp() != nil {
++								continue
++							}
++							podSet := pClaim.GetLabels()[constants.PodSetLabel]
++							claimPods := int32(1)
++							if n, err := strconv.ParseInt(pClaim.GetAnnotations()[PodsAnnotation], 10, 32); err == nil && n > 0 {
++								claimPods = int32(n)
++							}
++							limitPods := int32(math.MaxInt32)
++							if previousCounts != nil {
++								if limit, ok := previousCounts[kueue.PodSetReference(podSet)]; ok {
++									limitPods = limit
++								}
++							}
++							if adoptedPods[podSet]+claimPods > limitPods {
++								_ = c.Delete(ctx, pClaim)
++								continue
++							}
++							suffix := fmt.Sprintf("%s-%d", podSet, adoptedCounts[podSet])
++							adoptedCounts[podSet]++
++							adoptedPods[podSet] += claimPods
++							if pClaim.GetLabels()[WorkloadLabelKey] != workloadID {
++								patch := client.MergeFrom(pClaim.DeepCopy())
++								pLabels := pClaim.GetLabels()
++								pLabels[WorkloadNamespaceLabelKey] = wl.Namespace
++								pLabels[WorkloadLabelKey] = workloadID
++								pLabels[AttemptLabelKey] = attempt
++								pClaim.SetLabels(pLabels)
++								pAnnotations := pClaim.GetAnnotations()
++								if pAnnotations == nil {
++									pAnnotations = map[string]string{}
++								}
++								pAnnotations[WorkloadAnnotation] = wl.Name
++								pAnnotations[ClaimSuffixAnnotation] = suffix
++								pAnnotations[AdoptedFromWorkloadAnnotation] = prev.Name
++								pAnnotations[AdoptedFromUIDAnnotation] = string(prev.UID)
++								pAnnotations[AdoptedFromNamespaceAnnotation] = prev.Namespace
++								pClaim.SetAnnotations(pAnnotations)
++								if err := c.Patch(ctx, pClaim, patch); err == nil {
++									claims = append(claims, *pClaim)
++								}
++							}
++						}
++					}
++				}
++			}
++		}
++	}
++
++	expected, problem, err := c.desiredNodeClaims(ctx, wl, attempt, cfg, guarded, claims, previousCounts)
++	if err != nil {
++		return ctrl.Result{}, err
++	}
++	if problem != "" {
++		claims, err := c.listNodeClaims(ctx, wl.Namespace, workloadID)
++		if err != nil {
++			return ctrl.Result{}, err
++		}
++		current := make(map[string]*unstructured.Unstructured, len(claims))
++		for i := range claims {
++			current[claims[i].GetName()] = &claims[i]
++		}
++		logger.Info("Cannot provision NodeClaims on this flavor, retrying on another flavor", "reason", problem)
++		return ctrl.Result{}, c.fail(ctx, wl, checkName, cfg, current, problem)
++	}
++	if len(expected) == 0 {
++		if len(claims) == 0 {
++			return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady, "No pods require NodeClaims")
++		}
++		if wl.Annotations[ProvisionedAttemptAnnotation] != attempt {
++			patch := client.MergeFromWithOptions(wl.DeepCopy(), client.MergeFromWithOptimisticLock{})
++			metav1.SetMetaDataAnnotation(&wl.ObjectMeta, ProvisionedAttemptAnnotation, attempt)
++			if err := c.Patch(ctx, wl, patch); err != nil {
++				return ctrl.Result{}, err
++			}
++		}
++		updates := podSetUpdatesForWorkload(wl, attempt, guarded)
++		return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady, "All pods covered by existing NodeClaims", updates...)
++	}
++
++	current := make(map[string]*unstructured.Unstructured, len(claims))
++	for i := range claims {
++		claim := &claims[i]
++		if claim.GetLabels()[AttemptLabelKey] == attempt {
++			current[claim.GetName()] = claim
++			continue
++		}
++		// NodeClaims of an earlier quota reservation hold no pods, because eviction removed them.
++		if err := c.Delete(ctx, claim); client.IgnoreNotFound(err) != nil {
++			return ctrl.Result{}, err
++		}
++	}
++
++	if wl.Annotations[ProvisionedAttemptAnnotation] != attempt {
++		var missing []*unstructured.Unstructured
++		for _, nc := range expected {
++			if _, ok := current[nc.GetName()]; !ok {
++				missing = append(missing, nc)
++			}
++		}
++		problem, err := c.exceedsNodePoolLimits(ctx, missing)
++		if err != nil {
++			return ctrl.Result{}, err
++		}
++		if problem != "" {
++			logger.Info("Cannot provision NodeClaims on this flavor, retrying on another flavor", "reason", problem)
++			return ctrl.Result{}, c.fail(ctx, wl, checkName, cfg, current, problem)
++		}
++		for _, nc := range missing {
++			if _, ok := nc.GetLabels()[NodePoolLabelKey]; !ok {
++				logger.Info("Warning: the flavor names no NodePool in node label "+NodePoolLabelKey+
++					", so Karpenter does not apply NodePool limits, drift, or repair to the NodeClaim", "nodeClaim", nc.GetName())
++			}
++			if err := c.Create(ctx, nc); client.IgnoreAlreadyExists(err) != nil {
++				return ctrl.Result{}, err
++			}
++		}
++		patch := client.MergeFromWithOptions(wl.DeepCopy(), client.MergeFromWithOptimisticLock{})
++		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, ProvisionedAttemptAnnotation, attempt)
++		if err := c.Patch(ctx, wl, patch); err != nil {
++			return ctrl.Result{}, err
++		}
++		logger.Info("Created NodeClaims", "count", len(expected), "attempt", attempt)
++		return ctrl.Result{RequeueAfter: min(pollInterval, cfg.launchTimeout)}, nil
++	}
++
++	ready := 0
++	var failure string
++	for _, nc := range expected {
++		claim, ok := current[nc.GetName()]
++		switch {
++		case !ok:
++			failure = fmt.Sprintf("NodeClaim %s was deleted before it became %s", nc.GetName(), cfg.waitFor)
++		case claim.GetDeletionTimestamp() != nil && !conditionTrue(claim, cfg.waitFor):
++			failure = fmt.Sprintf("NodeClaim %s is being deleted before it became %s", nc.GetName(), cfg.waitFor)
++		case conditionTrue(claim, cfg.waitFor):
++			ready++
++		}
++		if failure != "" {
++			break
++		}
++	}
++	if failure == "" && ready == len(expected) {
++		updates := podSetUpdatesForWorkload(wl, attempt, guarded)
++		return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady,
++			fmt.Sprintf("All %d NodeClaims are %s", ready, cfg.waitFor), updates...)
++	}
++	elapsed := c.Clock.Since(reservedAt)
++	if failure == "" && elapsed >= cfg.launchTimeout {
++		failure = fmt.Sprintf("%d of %d NodeClaims became %s within %s", ready, len(expected), cfg.waitFor, cfg.launchTimeout)
++	}
++	if failure != "" {
++		logger.Info("Karpenter could not provide capacity, retrying on another flavor", "reason", failure)
++		return ctrl.Result{}, c.fail(ctx, wl, checkName, cfg, current, failure)
++	}
++	if err := c.setCheck(ctx, wl, checkName, kueue.CheckStatePending,
++		fmt.Sprintf("%d of %d NodeClaims are %s", ready, len(expected), cfg.waitFor)); err != nil {
++		return ctrl.Result{}, err
++	}
++	return ctrl.Result{RequeueAfter: min(pollInterval, cfg.launchTimeout-elapsed)}, nil
++}
++
++// fail releases the attempt's NodeClaims, excludes the flavors the check guards, and sets the check to Retry
++// so that Kueue evicts the Workload and assigns it a flavor that is still allowed.
++func (c *Controller) fail(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, cfg config, claims map[string]*unstructured.Unstructured, reason string) error {
++	for _, claim := range claims {
++		if prevUID, ok := claim.GetAnnotations()[AdoptedFromUIDAnnotation]; ok && prevUID != "" {
++			// Restore labels on failure instead of deleting adopted predecessor claims
++			patch := client.MergeFrom(claim.DeepCopy())
++			labels := claim.GetLabels()
++			prevNs := claim.GetAnnotations()[AdoptedFromNamespaceAnnotation]
++			prevName := claim.GetAnnotations()[AdoptedFromWorkloadAnnotation]
++			labels[WorkloadNamespaceLabelKey] = prevNs
++			labels[WorkloadLabelKey] = workloadClaimLabel(prevNs, prevName, types.UID(prevUID))
++			delete(labels, AttemptLabelKey)
++			claim.SetLabels(labels)
++			annotations := claim.GetAnnotations()
++			annotations[WorkloadAnnotation] = prevName
++			delete(annotations, ClaimSuffixAnnotation)
++			delete(annotations, AdoptedFromWorkloadAnnotation)
++			delete(annotations, AdoptedFromUIDAnnotation)
++			delete(annotations, AdoptedFromNamespaceAnnotation)
++			claim.SetAnnotations(annotations)
++			if err := c.Patch(ctx, claim, patch); err != nil {
++				return err
++			}
++			continue
++		}
++		if err := c.Delete(ctx, claim); client.IgnoreNotFound(err) != nil {
++			return err
++		}
++	}
++	_, owned := wl.Annotations[ExcludedFlavorsAnnotation]
++	if _, foreign := wl.Annotations[controllerconstants.WorkloadAllowedResourceFlavorAnnotation]; foreign && !owned {
++		log.FromContext(ctx).Info("Not excluding flavors because another controller set the allowed flavors", "check", checkName)
++	} else {
++		flavors, err := c.guardedFlavors(ctx, wl, checkName, cfg)
++		if err != nil {
++			return err
++		}
++		excluded := parseExclusions(wl.Annotations[ExcludedFlavorsAnnotation])
++		expiry := c.Clock.Now().Add(cfg.flavorCooldown)
++		for _, f := range flavors {
++			excluded[f] = expiry
++		}
++		if err := c.writeExclusions(ctx, wl, excluded); err != nil {
++			return err
++		}
++		reason = fmt.Sprintf("%s; excluded flavors %s until %s", reason, strings.Join(flavors, ","), expiry.UTC().Format(time.RFC3339))
++	}
++	return c.setCheck(ctx, wl, checkName, kueue.CheckStateRetry, reason)
++}
++
++// guardedFlavors returns the flavors of the Workload's admission that the ClusterQueue runs the check for.
++func (c *Controller) guardedFlavors(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, cfg config) ([]string, error) {
++	cq := &kueue.ClusterQueue{}
++	if err := c.Get(ctx, types.NamespacedName{Name: string(wl.Status.Admission.ClusterQueue)}, cq); err != nil {
++		return nil, err
++	}
++	onFlavors := admissioncheck.NewAdmissionChecks(cq)[checkName]
++	var flavors []string
++	for _, psa := range wl.Status.Admission.PodSetAssignments {
++		for _, f := range psa.Flavors {
++			if onFlavors.Has(f) && !slices.Contains(flavors, string(f)) {
++				rf := &kueue.ResourceFlavor{}
++				if err := c.Get(ctx, types.NamespacedName{Name: string(f)}, rf); err != nil {
++					return nil, err
++				}
++				if rf.Spec.NodeLabels[NodePoolLabelKey] != "" || cfg.nodeClass.name != "" {
++					flavors = append(flavors, string(f))
++				}
++			}
++		}
++	}
++	sort.Strings(flavors)
++	return flavors, nil
++}
++
++// writeExclusions stores the exclusions and derives the allowed-flavors annotation from them: every flavor
++// of the ClusterQueue that is not excluded. With no exclusions left, it removes both annotations.
++func (c *Controller) writeExclusions(ctx context.Context, wl *kueue.Workload, excluded map[string]time.Time) error {
++	// The patch response replaces wl, so without the lock a stale wl would come back as the current
++	// reservation and the Retry that follows would evict a reservation this reconcile never saw.
++	patch := client.MergeFromWithOptions(wl.DeepCopy(), client.MergeFromWithOptimisticLock{})
++	if len(excluded) == 0 {
++		delete(wl.Annotations, ExcludedFlavorsAnnotation)
++		delete(wl.Annotations, controllerconstants.WorkloadAllowedResourceFlavorAnnotation)
++		return c.Patch(ctx, wl, patch)
++	}
++	cqName := wl.Spec.QueueName
++	lq := &kueue.LocalQueue{}
++	if err := c.Get(ctx, types.NamespacedName{Namespace: wl.Namespace, Name: string(cqName)}, lq); err != nil {
++		return err
++	}
++	cq := &kueue.ClusterQueue{}
++	if err := c.Get(ctx, types.NamespacedName{Name: string(lq.Spec.ClusterQueue)}, cq); err != nil {
++		return err
++	}
++	var allowed []string
++	for f := range utilqueue.AllFlavors(resourcegroups.EffectiveResourceGroups(cq)) {
++		if _, ok := excluded[string(f)]; !ok {
++			allowed = append(allowed, string(f))
++		}
++	}
++	sort.Strings(allowed)
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, ExcludedFlavorsAnnotation, formatExclusions(excluded))
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, controllerconstants.WorkloadAllowedResourceFlavorAnnotation, csv.Serialize(allowed))
++	return c.Patch(ctx, wl, patch)
++}
++
++func (c *Controller) setCheck(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, state kueue.CheckState, message string, updates ...kueue.PodSetUpdate) error {
++	// Eviction resets the checks. Never resurrect Retry or Ready from a stale
++	// reservation; strict status patches below also reject concurrent eviction.
++	if !holdsReservation(wl) {
++		return nil
++	}
++	if current := admissioncheck.FindAdmissionCheck(wl.Status.AdmissionChecks, checkName); current != nil &&
++		current.State == state && current.Message == message && equality.Semantic.DeepEqual(current.PodSetUpdates, updates) {
++		return nil
++	}
++	return workloadpatching.PatchAdmissionStatus(ctx, c.Client, wl, c.Clock, func(wl *kueue.Workload) (bool, error) {
++		return workloadpatching.SetAdmissionCheckState(&wl.Status.AdmissionChecks, kueue.AdmissionCheckState{
++			Name:          checkName,
++			State:         state,
++			Message:       message,
++			PodSetUpdates: updates,
++		}, c.Clock), nil
++	})
++}
++
++// desiredNodeClaims returns the NodeClaims for the admitted pods. A pod set's NodeClaims are restricted to the
++// node labels of its flavors, use the NodePool those labels name, and each requests the resources of the pods
++// packed onto it. A non-empty problem means the check cannot provision this reservation on its flavors.
++func (c *Controller) desiredNodeClaims(
++	ctx context.Context,
++	wl *kueue.Workload,
++	attempt string,
++	cfg config,
++	guarded []string,
++	existing []unstructured.Unstructured,
++	previousCounts ...workload.PodSetsCounts,
++) ([]*unstructured.Unstructured, string, error) {
++	var prevCounts workload.PodSetsCounts
++	if len(previousCounts) > 0 {
++		prevCounts = previousCounts[0]
++	}
++	podSets := make(map[kueue.PodSetReference]kueue.PodSet, len(wl.Spec.PodSets))
++	for _, ps := range wl.Spec.PodSets {
++		podSets[ps.Name] = ps
++	}
++	nodeLabels := map[kueue.ResourceFlavorReference]map[string]string{}
++	overheadCache := map[string]corev1.ResourceList{}
++	var claims []*unstructured.Unstructured
++	for _, psa := range wl.Status.Admission.PodSetAssignments {
++		provision := false
++		for _, flavor := range psa.Flavors {
++			provision = provision || slices.Contains(guarded, string(flavor))
++		}
++		if !provision {
++			continue
++		}
++		labels := map[string]string{}
++		for _, f := range psa.Flavors {
++			if _, ok := nodeLabels[f]; !ok {
++				rf := &kueue.ResourceFlavor{}
++				if err := c.Get(ctx, types.NamespacedName{Name: string(f)}, rf); err != nil {
++					return nil, "", err
++				}
++				nodeLabels[f] = rf.Spec.NodeLabels
++			}
++			for k, v := range nodeLabels[f] {
++				if previous, found := labels[k]; found && previous != v {
++					values := []string{previous, v}
++					slices.Sort(values)
++					return nil, fmt.Sprintf("pod set %s has conflicting flavor node labels for %s: %q and %q", psa.Name, k, values[0], values[1]), nil
++				}
++				labels[k] = v
++			}
++		}
++		ps := podSets[psa.Name]
++		count := ps.Count
++		if psa.Count != nil {
++			count = *psa.Count
++		}
++		isProvisioned := wl.Annotations[ProvisionedAttemptAnnotation] == attempt
++		var offset int32
++		if !isProvisioned {
++			var adoptedPods int32
++			for i := range existing {
++				if prevCounts != nil &&
++					existing[i].GetLabels()[AttemptLabelKey] == attempt &&
++					existing[i].GetLabels()[constants.PodSetLabel] == string(psa.Name) &&
++					existing[i].GetAnnotations()[ClaimSuffixAnnotation] != "" {
++					offset++
++					pods := int32(1)
++					if n, err := strconv.ParseInt(existing[i].GetAnnotations()[PodsAnnotation], 10, 32); err == nil && n > 0 {
++						pods = int32(n)
++					}
++					adoptedPods += pods
++				}
++			}
++			if prevCounts != nil {
++				count -= adoptedPods
++			}
++		}
++		if count <= 0 {
++			continue
++		}
++		if isProvisioned && len(existing) > 0 {
++			preserved, problem := provisionedPodSetClaims(wl, attempt, psa.Name, count, labels, existing)
++			if problem != "" {
++				return nil, problem, nil
++			}
++			claims = append(claims, preserved...)
++			continue
++		}
++		tmpl, problem, err := c.nodeClaimTemplate(ctx, labels, cfg)
++		if err != nil || problem != "" {
++			return nil, problem, err
++		}
++		tmpl.requirements, err = podPlacementRequirements(tmpl, &ps.Template.Spec)
++		if err != nil {
++			return nil, fmt.Sprintf("pod set %s cannot be provisioned: %s", ps.Name, err), nil
++		}
++		tmplKey := ""
++		if tmpl.nodePool != nil {
++			tmplKey = tmpl.nodePool.GetName()
++		}
++		overhead, ok := overheadCache[tmplKey]
++		if !ok {
++			overhead, err = c.daemonSetOverhead(ctx, tmpl)
++			if err != nil {
++				return nil, "", err
++			}
++			overheadCache[tmplKey] = overhead
++		}
++		perPod := resources.PodRequests(&ps.Template.Spec)
++		perClaim := min(podsPerNodeClaim(perPod, tmpl.requirements, cfg.nodeFillFraction, overhead), count)
++		for i := int32(0); i*perClaim < count; i++ {
++			pods := min(perClaim, count-i*perClaim)
++			suffix := fmt.Sprintf("%s-%d", psa.Name, offset+i)
++			claim := tmpl.nodeClaim(wl, attempt, suffix, pods, perPod, overhead)
++			labels := claim.GetLabels()
++			labels[constants.PodSetLabel] = string(psa.Name)
++			claim.SetLabels(labels)
++			claims = append(claims, claim)
++		}
++	}
++	if wl.Annotations[ProvisionedAttemptAnnotation] == attempt && len(existing) > 0 {
++		current := 0
++		for i := range existing {
++			if existing[i].GetLabels()[AttemptLabelKey] == attempt {
++				current++
++			}
++		}
++		if current != len(claims) {
++			return nil, "the provisioned attempt has unexpected NodeClaims", nil
++		}
++	} else if len(claims) > cfg.maxNodeClaims {
++		return nil, fmt.Sprintf("the reservation needs %d NodeClaims, more than the %d that annotation %s allows",
++			len(claims), cfg.maxNodeClaims, MaxNodeClaimsAnnotation), nil
++	}
++	return claims, "", nil
++}
++
++// nodeClaimTemplate holds what the NodeClaims of one pod set share.
++type nodeClaimTemplate struct {
++	// nodePool is the NodePool the flavor names, or nil when it names none.
++	nodePool     *unstructured.Unstructured
++	nodeClassRef map[string]any
++	requirements []any
++	// spec holds the NodePool template's taints, startup taints, expiry, and termination grace period.
++	spec        map[string]any
++	labels      map[string]string
++	annotations map[string]string
++}
++
++// nodeClaimTemplate builds the template from the NodePool that the flavor node labels name in karpenter.sh/nodepool,
++// as Karpenter builds its own NodeClaims, or from the node class annotation of the AdmissionCheck when they name none.
++func (c *Controller) nodeClaimTemplate(ctx context.Context, flavorLabels map[string]string, cfg config) (*nodeClaimTemplate, string, error) {
++	tmpl := &nodeClaimTemplate{spec: map[string]any{}, labels: map[string]string{}, annotations: map[string]string{}}
++	if name, ok := flavorLabels[NodePoolLabelKey]; ok {
++		pool := &unstructured.Unstructured{}
++		pool.SetGroupVersionKind(nodePoolGVK)
++		if err := c.Get(ctx, types.NamespacedName{Name: name}, pool); err != nil {
++			if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
++				return nil, fmt.Sprintf("NodePool %s that the flavor names in node label %s does not exist", name, NodePoolLabelKey), nil
++			}
++			return nil, "", err
++		}
++		if _, static, _ := unstructured.NestedFieldNoCopy(pool.Object, "spec", "replicas"); static {
++			return nil, fmt.Sprintf("NodePool %s sets spec.replicas, and Karpenter removes NodeClaims beyond the replicas of a static NodePool", name), nil
++		}
++		ref, _, _ := unstructured.NestedMap(pool.Object, "spec", "template", "spec", "nodeClassRef")
++		if len(ref) == 0 {
++			return nil, fmt.Sprintf("NodePool %s has no spec.template.spec.nodeClassRef", name), nil
++		}
++		tmpl.nodePool = pool
++		tmpl.nodeClassRef = ref
++		tmpl.requirements, _, _ = unstructured.NestedSlice(pool.Object, "spec", "template", "spec", "requirements")
++		for _, field := range []string{"taints", "startupTaints", "expireAfter", "terminationGracePeriod"} {
++			if v, ok, _ := unstructured.NestedFieldCopy(pool.Object, "spec", "template", "spec", field); ok {
++				tmpl.spec[field] = v
++			}
++		}
++		if labels, _, _ := unstructured.NestedStringMap(pool.Object, "spec", "template", "metadata", "labels"); labels != nil {
++			tmpl.labels = labels
++		}
++		if annotations, _, _ := unstructured.NestedStringMap(pool.Object, "spec", "template", "metadata", "annotations"); annotations != nil {
++			tmpl.annotations = annotations
++		}
++	} else {
++		if cfg.nodeClass == (nodeClassRef{}) {
++			return nil, fmt.Sprintf("the flavor names no NodePool in node label %s and the AdmissionCheck has no %s annotation",
++				NodePoolLabelKey, NodeClassAnnotation), nil
++		}
++		tmpl.nodeClassRef = cfg.nodeClass.object()
++		tmpl.requirements = []any{requirement(corev1.LabelOSStable, string(corev1.Linux))}
++	}
++	keys := make([]string, 0, len(flavorLabels))
++	for k := range flavorLabels {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	for _, k := range keys {
++		tmpl.requirements = append(tmpl.requirements, requirement(k, flavorLabels[k]))
++	}
++	return tmpl, "", nil
++}
++
++// nodeClaim returns a NodeClaim for the given number of pods of a pod set.
++func (t *nodeClaimTemplate) nodeClaim(wl *kueue.Workload, attempt, suffix string, pods int32, perPod, overhead corev1.ResourceList) *unstructured.Unstructured {
++	totals := corev1.ResourceList{}
++	for name, q := range perPod {
++		total := q.DeepCopy()
++		total.Mul(int64(pods))
++		totals[name] = total
++	}
++	totals[corev1.ResourcePods] = *resource.NewQuantity(int64(pods), resource.DecimalSI)
++	for name, q := range overhead {
++		total := totals[name]
++		total.Add(q)
++		totals[name] = total
++	}
++	requests := map[string]any{}
++	for name, q := range totals {
++		if !q.IsZero() {
++			requests[string(name)] = q.String()
++		}
++	}
++	spec := map[string]any{}
++	maps.Copy(spec, runtime.DeepCopyJSON(t.spec))
++	spec["nodeClassRef"] = runtime.DeepCopyJSON(t.nodeClassRef)
++	spec["requirements"] = runtime.DeepCopyJSONValue(t.requirements)
++	spec["resources"] = map[string]any{"requests": requests}
++	taintVal := workloadTaintValue(wl)
++	poolTaints, _ := spec["taints"].([]any)
++	spec["taints"] = append([]any{map[string]any{
++		"key":    AntiTheftTaintKey,
++		"value":  taintVal,
++		"effect": string(corev1.TaintEffectNoSchedule),
++	}}, poolTaints...)
++
++	nc := &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
++	nc.SetGroupVersionKind(nodeClaimGVK)
++	identity := fmt.Sprintf("%s/%s/%s", wl.Namespace, wl.Name, wl.UID)
++	nc.SetName(nodeClaimName(wl, attempt, suffix))
++	labels := map[string]string{}
++	maps.Copy(labels, t.labels)
++	maps.Copy(labels, map[string]string{
++		ManagedLabelKey:           "kueue",
++		GangIDLabelKey:            boundedClaimIdentity("gang-"+wl.Name, identity),
++		WorkloadLabelKey:          workloadClaimLabel(wl.Namespace, wl.Name, wl.UID),
++		WorkloadNamespaceLabelKey: wl.Namespace,
++		AttemptLabelKey:           attempt,
++	})
++	annotations := map[string]string{}
++	maps.Copy(annotations, t.annotations)
++	annotations[WorkloadAnnotation] = wl.Name
++	annotations[PodsAnnotation] = strconv.Itoa(int(pods))
++	if t.nodePool != nil {
++		// Karpenter applies a NodePool's limits accounting, drift, repair, and expiry to the NodeClaims labeled with it.
++		labels[NodePoolLabelKey] = t.nodePool.GetName()
++		if group, kind := t.nodeClassRef["group"], t.nodeClassRef["kind"]; group != nil && kind != nil {
++			labels[fmt.Sprintf("%v/%s", group, strings.ToLower(fmt.Sprint(kind)))] = fmt.Sprint(t.nodeClassRef["name"])
++		}
++		for _, key := range []string{nodePoolHashAnnotationKey, nodePoolHashVersionAnnotationKey} {
++			if v, ok := t.nodePool.GetAnnotations()[key]; ok {
++				annotations[key] = v
++			}
++		}
++		nc.SetOwnerReferences([]metav1.OwnerReference{{
++			APIVersion: nodePoolGVK.GroupVersion().String(),
++			Kind:       nodePoolGVK.Kind,
++			Name:       t.nodePool.GetName(),
++			UID:        t.nodePool.GetUID(),
++		}})
++		// Consolidation would remove a launched node before the pods it was made for are bound to it.
++		if annotations[DoNotDisruptAnnotationKey] != "true" {
++			annotations[DoNotDisruptAnnotationKey] = "true"
++			annotations[DisruptionHoldAnnotation] = "true"
++		}
++	}
++	nc.SetLabels(labels)
++	nc.SetAnnotations(annotations)
++	return nc
++}
++
++// nodeClaimName includes the workload UID when bounding a complete claim identity.
++func nodeClaimName(wl *kueue.Workload, attempt, suffix string) string {
++	name := strings.ToLower(fmt.Sprintf("%s-%s-%s", wl.Name, attempt, suffix))
++	identity := fmt.Sprintf("%s/%s/%s/%s/%s", wl.Namespace, wl.Name, wl.UID, attempt, suffix)
++	return boundedClaimIdentity(name, identity)
++}
++
++// boundedClaimIdentity keeps identities within Kubernetes label values, including providers' name-valued labels.
++func boundedClaimIdentity(value, identity string) string {
++	if len(value) <= 63 {
++		return value
++	}
++	sum := sha256.Sum256([]byte(identity))
++	return fmt.Sprintf("%s-%x", strings.TrimRight(value[:30], "-."), sum[:16])
++}
++
++// legacyNodeClaimName identifies claims created before complete names were label-compatible.
++func legacyNodeClaimName(workloadName, attempt, suffix string) string {
++	if len(workloadName) > 200 {
++		workloadName = workloadName[:200]
++	}
++	return strings.ToLower(fmt.Sprintf("%s-%s-%s", workloadName, attempt, suffix))
++}
++
++func matchesNodeClaimLabels(actual, expected map[string]string) bool {
++	for key, value := range expected {
++		if actual[key] != value {
++			return false
++		}
++	}
++	return true
++}
++
++func requirement(key, value string) map[string]any {
++	return map[string]any{"key": key, "operator": "In", "values": []any{value}}
++}
++
++// podsPerNodeClaim returns how many pods with the given requests one NodeClaim holds: as many as fit in the
++// fill fraction of the largest instance the requirements allow. It is 1 when the requirements do not bound
++// the instance size of a requested resource through the instance capacity labels.
++func podsPerNodeClaim(perPod corev1.ResourceList, requirements []any, fillFraction float64, overhead corev1.ResourceList) int32 {
++	pods := int64(math.MaxInt32)
++	for name, q := range perPod {
++		if q.IsZero() {
++			continue
++		}
++		capacityLabel, ok := instanceCapacityLabels[name]
++		if !ok {
++			return 1
++		}
++		units, ok := upperBound(requirements, capacityLabel.key)
++		if !ok {
++			return 1
++		}
++		capacity := float64(units) * float64(capacityLabel.unit.MilliValue())
++		reserved := overhead[name]
++		pods = min(pods, int64(math.Floor((fillFraction*capacity-float64(reserved.MilliValue()))/float64(q.MilliValue()))))
++	}
++	if pods == math.MaxInt32 {
++		return 1
++	}
++	return int32(max(pods, 1))
++}
++
++// upperBound returns the largest integer value that the requirements allow for the label, if they bound it.
++func upperBound(requirements []any, key string) (int64, bool) {
++	bound, found := int64(math.MaxInt64), false
++	for _, raw := range requirements {
++		req, ok := raw.(map[string]any)
++		if !ok || req["key"] != key {
++			continue
++		}
++		values, _ := req["values"].([]any)
++		switch req["operator"] {
++		case string(corev1.NodeSelectorOpIn):
++			largest := int64(math.MinInt64)
++			for _, v := range values {
++				n, err := strconv.ParseInt(fmt.Sprint(v), 10, 64)
++				if err != nil {
++					return 0, false
++				}
++				largest = max(largest, n)
++			}
++			if len(values) > 0 {
++				bound, found = min(bound, largest), true
++			}
++		case string(corev1.NodeSelectorOpLt):
++			if len(values) != 1 {
++				return 0, false
++			}
++			n, err := strconv.ParseInt(fmt.Sprint(values[0]), 10, 64)
++			if err != nil {
++				return 0, false
++			}
++			bound, found = min(bound, n-1), true
++		}
++	}
++	return bound, found && bound > 0
++}
++
++// exceedsNodePoolLimits reports a NodePool whose spec.limits the NodeClaims would exceed on top of its
++// status.resources. Karpenter enforces limits only on the NodeClaims it creates itself, so the check enforces
++// them on its own; instances usually have more than the requested resources, so this bounds usage from below.
++func (c *Controller) exceedsNodePoolLimits(ctx context.Context, claims []*unstructured.Unstructured) (string, error) {
++	added := map[string]corev1.ResourceList{}
++	for _, nc := range claims {
++		pool, ok := nc.GetLabels()[NodePoolLabelKey]
++		if !ok {
++			continue
++		}
++		if added[pool] == nil {
++			added[pool] = corev1.ResourceList{}
++		}
++		requests, _, _ := unstructured.NestedStringMap(nc.Object, "spec", "resources", "requests")
++		if requests == nil {
++			requests = map[string]string{}
++		}
++		requests["nodes"] = "1"
++		for name, v := range requests {
++			total := added[pool][corev1.ResourceName(name)]
++			total.Add(resource.MustParse(v))
++			added[pool][corev1.ResourceName(name)] = total
++		}
++	}
++	pools := slices.Sorted(maps.Keys(added))
++	for _, name := range pools {
++		pool := &unstructured.Unstructured{}
++		pool.SetGroupVersionKind(nodePoolGVK)
++		if err := c.Get(ctx, types.NamespacedName{Name: name}, pool); err != nil {
++			return "", err
++		}
++		limits, _, _ := unstructured.NestedStringMap(pool.Object, "spec", "limits")
++		used, _, _ := unstructured.NestedStringMap(pool.Object, "status", "resources")
++		for _, r := range slices.Sorted(maps.Keys(limits)) {
++			limit, err := resource.ParseQuantity(limits[r])
++			if err != nil {
++				continue
++			}
++			total := added[name][corev1.ResourceName(r)]
++			if v, err := resource.ParseQuantity(used[r]); err == nil {
++				total.Add(v)
++			}
++			if total.Cmp(limit) > 0 {
++				return fmt.Sprintf("the NodeClaims would take NodePool %s to %s %s, over its limit of %s", name, total.String(), r, limit.String()), nil
++			}
++		}
++	}
++	return "", nil
++}
++
++// releaseDisruptionHolds removes the do-not-disrupt annotation that the check set on a NodeClaim and its Node
++// once the Node runs as many pods, other than DaemonSet pods, as the NodeClaim was sized for. It polls while
++// a hold remains and records on the Workload when none does.
++func (c *Controller) releaseDisruptionHolds(ctx context.Context, wl *kueue.Workload) (ctrl.Result, error) {
++	attempt := wl.Annotations[ProvisionedAttemptAnnotation]
++	if attempt == "" || wl.Annotations[HoldsReleasedAnnotation] == attempt {
++		return ctrl.Result{}, nil
++	}
++	workloadID := workloadClaimLabel(wl.Namespace, wl.Name, wl.UID)
++	claims, err := c.listNodeClaims(ctx, wl.Namespace, workloadID)
++	if err != nil {
++		return ctrl.Result{}, err
++	}
++	held := 0
++	for i := range claims {
++		claim := &claims[i]
++		if claim.GetLabels()[AttemptLabelKey] != attempt || claim.GetAnnotations()[DisruptionHoldAnnotation] != "true" {
++			continue
++		}
++		nodeName, _, _ := unstructured.NestedString(claim.Object, "status", "nodeName")
++		bound, err := c.boundPods(ctx, nodeName)
++		if err != nil {
++			return ctrl.Result{}, err
++		}
++		want, err := strconv.Atoi(claim.GetAnnotations()[PodsAnnotation])
++		if err != nil {
++			want = 1
++		}
++		if bound < want {
++			held++
++			continue
++		}
++		release := client.RawPatch(types.MergePatchType, fmt.Appendf(nil, `{"metadata":{"annotations":{%q:null,%q:null}}}`,
++			DoNotDisruptAnnotationKey, DisruptionHoldAnnotation))
++		// Karpenter copies NodeClaim annotations to the Node when it registers, and reads them from the Node afterwards.
++		if err := c.Patch(ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}, release); client.IgnoreNotFound(err) != nil {
++			return ctrl.Result{}, err
++		}
++		if err := c.Patch(ctx, claim, release); client.IgnoreNotFound(err) != nil {
++			return ctrl.Result{}, err
++		}
++		log.FromContext(ctx).V(2).Info("Released the disruption hold of a NodeClaim", "nodeClaim", claim.GetName(), "node", nodeName)
++	}
++	if held > 0 {
++		return ctrl.Result{RequeueAfter: pollInterval}, nil
++	}
++	patch := client.MergeFrom(wl.DeepCopy())
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, HoldsReleasedAnnotation, attempt)
++	return ctrl.Result{}, client.IgnoreNotFound(c.Patch(ctx, wl, patch))
++}
++
++// boundPods counts the running or pending Pods bound to the Node that no DaemonSet owns.
++func (c *Controller) boundPods(ctx context.Context, nodeName string) (int, error) {
++	if nodeName == "" {
++		return 0, nil
++	}
++	pods := &corev1.PodList{}
++	if err := c.APIReader.List(ctx, pods, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
++		return 0, err
++	}
++	bound := 0
++	for _, pod := range pods.Items {
++		owner := metav1.GetControllerOf(&pod)
++		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed || (owner != nil && owner.Kind == "DaemonSet") {
++			continue
++		}
++		bound++
++	}
++	return bound, nil
++}
++
++func (c *Controller) listNodeClaims(ctx context.Context, namespace, identity string) ([]unstructured.Unstructured, error) {
++	list := &unstructured.UnstructuredList{}
++	list.SetGroupVersionKind(nodeClaimGVK.GroupVersion().WithKind("NodeClaimList"))
++	if err := c.List(ctx, list, client.MatchingLabels{WorkloadLabelKey: identity, WorkloadNamespaceLabelKey: namespace}); err != nil {
++		return nil, err
++	}
++	if len(list.Items) > 0 {
++		return list.Items, nil
++	}
++	all := &unstructured.UnstructuredList{}
++	all.SetGroupVersionKind(nodeClaimGVK.GroupVersion().WithKind("NodeClaimList"))
++	if err := c.List(ctx, all, client.MatchingLabels{WorkloadNamespaceLabelKey: namespace}); err != nil {
++		return nil, err
++	}
++	var matched []unstructured.Unstructured
++	for _, item := range all.Items {
++		if item.GetAnnotations()[WorkloadAnnotation] == identity || item.GetLabels()[WorkloadLabelKey] == identity {
++			matched = append(matched, item)
++		}
++	}
++	return matched, nil
++}
++
++func workloadClaimLabel(namespace, name string, uid types.UID) string {
++	if uid != "" {
++		return string(uid)
++	}
++	identity := fmt.Sprintf("%s/%s", namespace, name)
++	return boundedClaimIdentity(name, identity)
++}
++
++func workloadTaintValue(wl *kueue.Workload) string {
++	if wl.UID != "" {
++		return string(wl.UID)
++	}
++	return workloadClaimLabel(wl.Namespace, wl.Name, wl.UID)
++}
++
++func podSetUpdatesForWorkload(wl *kueue.Workload, attempt string, guarded []string) []kueue.PodSetUpdate {
++	taintValue := workloadTaintValue(wl)
++	var updates []kueue.PodSetUpdate
++	for _, psa := range wl.Status.Admission.PodSetAssignments {
++		hasGuarded := false
++		for _, flavor := range psa.Flavors {
++			if slices.Contains(guarded, string(flavor)) {
++				hasGuarded = true
++				break
++			}
++		}
++		if !hasGuarded {
++			continue
++		}
++		updates = append(updates, kueue.PodSetUpdate{
++			Name: psa.Name,
++			NodeSelector: map[string]string{
++				AttemptLabelKey: attempt,
++			},
++			Tolerations: []corev1.Toleration{
++				{
++					Key:      AntiTheftTaintKey,
++					Operator: corev1.TolerationOpEqual,
++					Value:    taintValue,
++					Effect:   corev1.TaintEffectNoSchedule,
++				},
++			},
++		})
++	}
++	return updates
++}
++
++// attemptID identifies one quota reservation of the Workload by its time and flavors,
++// so each reservation gets its own NodeClaims.
++func attemptID(wl *kueue.Workload, reservedAt time.Time) string {
++	key := fmt.Sprintf("%s/%s/%s/%d", wl.Namespace, wl.Name, wl.UID, reservedAt.Unix())
++	for _, psa := range wl.Status.Admission.PodSetAssignments {
++		resources := make([]string, 0, len(psa.Flavors))
++		for r := range psa.Flavors {
++			resources = append(resources, string(r))
++		}
++		sort.Strings(resources)
++		for _, r := range resources {
++			key += fmt.Sprintf("/%s=%s", r, psa.Flavors[corev1.ResourceName(r)])
++		}
++	}
++	sum := sha256.Sum256([]byte(key))
++	return fmt.Sprintf("%x", sum[:5])
++}
++
++func conditionTrue(claim *unstructured.Unstructured, condType string) bool {
++	conditions, _, _ := unstructured.NestedSlice(claim.Object, "status", "conditions")
++	for _, raw := range conditions {
++		cond, ok := raw.(map[string]any)
++		if ok && cond["type"] == condType {
++			return cond["status"] == string(metav1.ConditionTrue)
++		}
++	}
++	return false
++}
++
++func parseExclusions(value string) map[string]time.Time {
++	excluded := map[string]time.Time{}
++	for _, entry := range csv.Parse(value) {
++		flavor, expiry, ok := strings.Cut(entry, "=")
++		if !ok {
++			continue
++		}
++		t, err := time.Parse(time.RFC3339, expiry)
++		if err != nil {
++			continue
++		}
++		excluded[flavor] = t
++	}
++	return excluded
++}
++
++func formatExclusions(excluded map[string]time.Time) string {
++	entries := make([]string, 0, len(excluded))
++	for flavor, expiry := range excluded {
++		entries = append(entries, flavor+"="+expiry.UTC().Format(time.RFC3339))
++	}
++	sort.Strings(entries)
++	return csv.Serialize(entries)
++}
++
++func SetupWithManager(mgr ctrl.Manager) error {
++	if err := ctrl.NewControllerManagedBy(mgr).
++		Named("karpenter_admission_check_ac").
++		For(&kueue.AdmissionCheck{}).
++		Complete(&ACReconciler{Client: mgr.GetClient()}); err != nil {
++		return err
++	}
++	c := &Controller{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Clock: clock.RealClock{}}
++	clnt := mgr.GetClient()
++	workloadPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
++		wl, ok := obj.(*kueue.Workload)
++		if !ok {
++			return false
++		}
++		if _, ok := wl.Annotations[ProvisionedAttemptAnnotation]; ok {
++			return true
++		}
++		if _, ok := wl.Annotations[ExcludedFlavorsAnnotation]; ok {
++			return true
++		}
++		for _, check := range wl.Status.AdmissionChecks {
++			if check.Name == AdmissionCheckName {
++				return true
++			}
++			ac := &kueue.AdmissionCheck{}
++			if err := clnt.Get(context.Background(), types.NamespacedName{Name: string(check.Name)}, ac); err == nil {
++				if isOwnController(ac.Spec.ControllerName) {
++					return true
++				}
++			}
++		}
++		return false
++	})
++	// NodeClaims are polled rather than watched, so Kueue starts on clusters without the Karpenter CRDs.
++	// Deleting a Workload also reconciles it, and the NotFound path deletes its NodeClaims.
++	if err := ctrl.NewControllerManagedBy(mgr).
++		Named("karpenter_admission_check").
++		For(&kueue.Workload{}, builder.WithPredicates(workloadPredicate)).
++		Complete(c); err != nil {
++		return err
++	}
++	// The sweep runs only on the leader, like every Runnable that does not opt out of leader election.
++	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
++		wait.UntilWithContext(ctx, func(ctx context.Context) {
++			if err := c.Sweep(ctx); err != nil {
++				log.FromContext(ctx).Error(err, "Sweeping orphaned NodeClaims")
++			}
++		}, sweepInterval)
++		return nil
++	}))
++}
+diff --git a/pkg/controller/admissionchecks/karpenter/overhead.go b/pkg/controller/admissionchecks/karpenter/overhead.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/overhead.go
+@@ -0,0 +1,340 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Size reserved NodeClaims for the DaemonSets that can share each node. Use admitted Pod requests while preserving the DaemonSet's placement constraints.
++package karpenter
++
++import (
++	"context"
++	"fmt"
++	"math"
++	"strconv"
++
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/labels"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/selection"
++	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
++	"k8s.io/klog/v2"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	"sigs.k8s.io/kueue/pkg/resources"
++)
++
++// +kubebuilder:rbac:groups="apps",resources=daemonsets,verbs=get;list
++// +kubebuilder:rbac:groups="karpenter.sh",resources=nodeclaims,verbs=get;list;create;patch;delete
++// +kubebuilder:rbac:groups="karpenter.sh",resources=nodepools,verbs=get
++// +kubebuilder:rbac:groups="",resources=nodes,verbs=patch
++
++// daemonSetOverhead returns one effective request, including a Pod slot, per compatible DaemonSet.
++func (c *Controller) daemonSetOverhead(ctx context.Context, tmpl *nodeClaimTemplate) (corev1.ResourceList, error) {
++	dsReader := c.APIReader
++	if dsReader == nil {
++		dsReader = c.Client
++	}
++	daemonSets := &appsv1.DaemonSetList{}
++	if err := dsReader.List(ctx, daemonSets); err != nil {
++		return nil, fmt.Errorf("listing DaemonSets for NodeClaim overhead: %w", err)
++	}
++	requests := corev1.ResourceList{}
++	if len(daemonSets.Items) == 0 {
++		return requests, nil
++	}
++	podReader := client.Reader(c.Client)
++	if podReader == nil {
++		podReader = c.APIReader
++	}
++	for i := range daemonSets.Items {
++		ds := &daemonSets.Items[i]
++		if ds.DeletionTimestamp != nil {
++			continue
++		}
++		var listOpts []client.ListOption
++		listOpts = append(listOpts, client.InNamespace(ds.Namespace))
++		if ds.Spec.Selector != nil {
++			selector, err := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
++			if err != nil {
++				return nil, fmt.Errorf("parsing selector for DaemonSet %s/%s: %w", ds.Namespace, ds.Name, err)
++			}
++			listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: selector})
++		}
++		dsPods := &corev1.PodList{}
++		if err := podReader.List(ctx, dsPods, listOpts...); err != nil {
++			return nil, fmt.Errorf("listing admitted DaemonSet Pods for NodeClaim overhead: %w", err)
++		}
++		daemonRequests := corev1.ResourceList{}
++		compatible := false
++		for _, pod := range daemonSetPods(ds, dsPods.Items) {
++			fits, err := daemonSetCompatible(tmpl, pod)
++			if err != nil {
++				return nil, fmt.Errorf("checking DaemonSet %s/%s for NodeClaim overhead: %w", ds.Namespace, ds.Name, err)
++			}
++			if !fits {
++				continue
++			}
++			compatible = true
++			// Replicas can have different admission/VPA requests during a rollout. Reserve their per-resource maximum once.
++			for name, quantity := range resources.PodRequests(&pod.Spec) {
++				if current := daemonRequests[name]; quantity.Cmp(current) > 0 {
++					daemonRequests[name] = quantity.DeepCopy()
++				}
++			}
++		}
++		if !compatible {
++			continue
++		}
++		for name, quantity := range daemonRequests {
++			total := requests[name]
++			total.Add(quantity)
++			requests[name] = total
++		}
++		count := requests[corev1.ResourcePods]
++		count.Add(resource.MustParse("1"))
++		requests[corev1.ResourcePods] = count
++	}
++	return requests, nil
++}
++
++// daemonSetPods preserves admission mutations without inheriting the controller's node-specific affinity.
++func daemonSetPods(ds *appsv1.DaemonSet, pods []corev1.Pod) []*corev1.Pod {
++	// The current template can request more than old replicas while its rollout is starting.
++	representatives := []*corev1.Pod{daemonSetSchedulingPod(ds, &corev1.Pod{Spec: *ds.Spec.Template.Spec.DeepCopy()})}
++	for i := range pods {
++		pod := &pods[i]
++		if pod.Namespace == ds.Namespace && metav1.IsControlledBy(pod, ds) &&
++			pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed && pod.DeletionTimestamp == nil {
++			representatives = append(representatives, daemonSetSchedulingPod(ds, pod))
++		}
++	}
++	return representatives
++}
++
++func daemonSetSchedulingPod(ds *appsv1.DaemonSet, admitted *corev1.Pod) *corev1.Pod {
++	pod := admitted.DeepCopy()
++	// The DaemonSet controller replaces required affinity with the selected node's name.
++	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
++		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
++	}
++	if affinity := ds.Spec.Template.Spec.Affinity; affinity != nil && affinity.NodeAffinity != nil &&
++		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		if pod.Spec.Affinity == nil {
++			pod.Spec.Affinity = &corev1.Affinity{}
++		}
++		if pod.Spec.Affinity.NodeAffinity == nil {
++			pod.Spec.Affinity.NodeAffinity = &corev1.NodeAffinity{}
++		}
++		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution =
++			affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.DeepCopy()
++	}
++	// Kubernetes adds these tolerations when creating DaemonSet Pods, including when no replica exists yet.
++	for _, key := range []string{corev1.TaintNodeNotReady, corev1.TaintNodeUnreachable} {
++		pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{Key: key, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute})
++	}
++	for _, key := range []string{corev1.TaintNodeDiskPressure, corev1.TaintNodeMemoryPressure, corev1.TaintNodePIDPressure, corev1.TaintNodeUnschedulable} {
++		pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{Key: key, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule})
++	}
++	if pod.Spec.HostNetwork {
++		pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{Key: corev1.TaintNodeNetworkUnavailable, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule})
++	}
++	return pod
++}
++
++func daemonSetCompatible(tmpl *nodeClaimTemplate, pod *corev1.Pod) (bool, error) {
++	if raw, ok := tmpl.spec["taints"]; ok {
++		taints := struct {
++			Taints []corev1.Taint `json:"taints"`
++		}{}
++		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(map[string]any{"taints": raw}, &taints); err != nil {
++			return false, fmt.Errorf("decoding NodePool taints: %w", err)
++		}
++		for _, taint := range taints.Taints {
++			if taint.Key == AntiTheftTaintKey || (taint.Effect != corev1.TaintEffectNoSchedule && taint.Effect != corev1.TaintEffectNoExecute) {
++				continue
++			}
++			tolerated := false
++			for _, toleration := range pod.Spec.Tolerations {
++				tolerated = tolerated || toleration.ToleratesTaint(klog.Background(), &taint, true)
++			}
++			if !tolerated {
++				return false, nil
++			}
++		}
++	}
++	base := []corev1.NodeSelectorRequirement{}
++	for _, raw := range tmpl.requirements {
++		object, ok := raw.(map[string]any)
++		if !ok {
++			return false, fmt.Errorf("invalid NodeClaim requirement %T", raw)
++		}
++		req := corev1.NodeSelectorRequirement{}
++		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object, &req); err != nil {
++			return false, fmt.Errorf("decoding NodeClaim requirement: %w", err)
++		}
++		base = append(base, req)
++	}
++	for key, value := range tmpl.labels {
++		base = append(base, corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{value}})
++	}
++	for key, value := range pod.Spec.NodeSelector {
++		base = append(base, corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{value}})
++	}
++	if affinity := pod.Spec.Affinity; affinity != nil && affinity.NodeAffinity != nil &&
++		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		for _, term := range affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
++			if len(term.MatchExpressions) == 0 && len(term.MatchFields) == 0 {
++				continue
++			}
++			compatible, err := selectorRequirementsCompatible(append(append([]corev1.NodeSelectorRequirement{}, base...), term.MatchExpressions...))
++			if err != nil {
++				return false, err
++			}
++			fieldsCompatible, err := daemonSetFieldsCompatible(term.MatchFields)
++			if err != nil {
++				return false, err
++			}
++			if compatible && fieldsCompatible {
++				return true, nil
++			}
++		}
++		return false, nil
++	}
++	return selectorRequirementsCompatible(base)
++}
++
++func daemonSetFieldsCompatible(requirements []corev1.NodeSelectorRequirement) (bool, error) {
++	if len(requirements) == 0 {
++		return true, nil
++	}
++	selector, err := nodeaffinity.NewNodeSelector(&corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchFields: requirements}}})
++	if err != nil {
++		return false, err
++	}
++	var names []string
++	for _, req := range requirements {
++		if req.Key == "metadata.name" && req.Operator == corev1.NodeSelectorOpIn {
++			names = req.Values
++			break
++		}
++	}
++	if names == nil {
++		// Without an exact name, one more candidate than exclusions guarantees a possible future node name.
++		for i := 0; i <= len(requirements); i++ {
++			names = append(names, "daemon-node-"+strconv.Itoa(i))
++		}
++	}
++	for _, name := range names {
++		if selector.Match(&corev1.Node{Name: name}) {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++// selectorRequirementsCompatible checks intersections without mistaking unknown future labels for absent labels.
++func selectorRequirementsCompatible(requirements []corev1.NodeSelectorRequirement) (bool, error) {
++	groups := map[string][]*labels.Requirement{}
++	for _, req := range requirements {
++		operators := map[corev1.NodeSelectorOperator]selection.Operator{
++			corev1.NodeSelectorOpIn: selection.In, corev1.NodeSelectorOpNotIn: selection.NotIn,
++			corev1.NodeSelectorOpExists: selection.Exists, corev1.NodeSelectorOpDoesNotExist: selection.DoesNotExist,
++			corev1.NodeSelectorOpGt: selection.GreaterThan, corev1.NodeSelectorOpLt: selection.LessThan,
++		}
++		op, ok := operators[req.Operator]
++		if !ok {
++			return false, fmt.Errorf("unsupported selector operator %q", req.Operator)
++		}
++		parsed, err := labels.NewRequirement(req.Key, op, req.Values)
++		if err != nil {
++			return false, err
++		}
++		groups[req.Key] = append(groups[req.Key], parsed)
++	}
++	for key, group := range groups {
++		matches := func(values labels.Set) bool {
++			for _, req := range group {
++				if !req.Matches(values) {
++					return false
++				}
++			}
++			return true
++		}
++		if matches(labels.Set{}) {
++			continue
++		}
++		var candidates []string
++		bounded := false
++		lower, upper := int64(0), int64(math.MaxInt64)
++		valuesCount := 0
++		for _, req := range group {
++			values := req.Values().List()
++			valuesCount += len(values)
++			if req.Operator() == selection.In {
++				candidates, bounded = values, true
++				break
++			}
++		}
++		if !bounded {
++			numeric := false
++			for _, req := range group {
++				if req.Operator() != selection.GreaterThan && req.Operator() != selection.LessThan {
++					continue
++				}
++				numeric = true
++				n, _ := strconv.ParseInt(req.Values().List()[0], 10, 64)
++				if req.Operator() == selection.GreaterThan {
++					if n == math.MaxInt64 {
++						return false, nil
++					}
++					lower = max(lower, n+1)
++				} else {
++					upper = min(upper, n-1)
++				}
++			}
++			if numeric {
++				for n, tried := lower, 0; n <= upper && tried <= valuesCount; tried++ {
++					value := strconv.FormatInt(n, 10)
++					// Leading zeros are valid label values, including when a narrow numeric range excludes the canonical spelling.
++					for len(value) <= 63 {
++						candidates = append(candidates, value)
++						value = "0" + value
++					}
++					if n == math.MaxInt64 {
++						break
++					}
++					n++
++				}
++			} else {
++				for i := 0; i <= valuesCount; i++ {
++					candidates = append(candidates, "daemon-"+strconv.Itoa(i))
++				}
++			}
++		}
++		found := false
++		for _, value := range candidates {
++			if matches(labels.Set{key: value}) {
++				found = true
++				break
++			}
++		}
++		if !found {
++			return false, nil
++		}
++	}
++	return true, nil
++}
+diff --git a/pkg/controller/admissionchecks/karpenter/placement.go b/pkg/controller/admissionchecks/karpenter/placement.go
+new file mode 100644
+index 0000000..268bf7f
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/placement.go
+@@ -0,0 +1,97 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Project mandatory Pod placement into NodeClaim requirements without broadening the selected NodePool or flavors.
++package karpenter
++
++import (
++	"errors"
++	"fmt"
++	"slices"
++
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++)
++
++// podPlacementRequirements chooses one compatible required-affinity term for a new node.
++// NodeClaim requirements are a conjunction; combining different OR terms would change Pod semantics.
++func podPlacementRequirements(tmpl *nodeClaimTemplate, pod *corev1.PodSpec) ([]any, error) {
++	if pod.NodeName != "" {
++		return nil, errors.New("nodeName cannot select a newly provisioned node")
++	}
++	base := make([]any, 0, len(tmpl.requirements)+len(pod.NodeSelector))
++	for _, req := range tmpl.requirements {
++		base = append(base, runtime.DeepCopyJSONValue(req))
++	}
++	keys := make([]string, 0, len(pod.NodeSelector))
++	for key := range pod.NodeSelector {
++		keys = append(keys, key)
++	}
++	slices.Sort(keys)
++	for _, key := range keys {
++		base = append(base, requirement(key, pod.NodeSelector[key]))
++	}
++	decoded := struct {
++		Requirements []corev1.NodeSelectorRequirement `json:"requirements"`
++	}{}
++	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(map[string]any{"requirements": base}, &decoded); err != nil {
++		return nil, fmt.Errorf("decoding node requirements: %w", err)
++	}
++	constraints := decoded.Requirements
++	for key, value := range tmpl.labels {
++		constraints = append(constraints, corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{value}})
++	}
++	compatible, err := selectorRequirementsCompatible(constraints)
++	if err != nil {
++		return nil, fmt.Errorf("validating node requirements: %w", err)
++	}
++	if !compatible {
++		return nil, errors.New("node selectors conflict with the NodePool or assigned flavors")
++	}
++	if pod.Affinity == nil || pod.Affinity.NodeAffinity == nil || pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
++		return base, nil
++	}
++	unsupported := false
++	for _, term := range pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
++		if len(term.MatchFields) > 0 {
++			unsupported = true
++			continue
++		}
++		if len(term.MatchExpressions) == 0 {
++			continue
++		}
++		candidate := append(append([]corev1.NodeSelectorRequirement{}, constraints...), term.MatchExpressions...)
++		compatible, err := selectorRequirementsCompatible(candidate)
++		if err != nil {
++			return nil, fmt.Errorf("validating required node affinity: %w", err)
++		}
++		if !compatible {
++			continue
++		}
++		for i := range term.MatchExpressions {
++			req, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&term.MatchExpressions[i])
++			if err != nil {
++				return nil, fmt.Errorf("encoding required node affinity: %w", err)
++			}
++			base = append(base, req)
++		}
++		return base, nil
++	}
++	if unsupported {
++		return nil, errors.New("no compatible required-affinity term can be expressed as NodeClaim label requirements; node fields are unsupported")
++	}
++	return nil, errors.New("no required node-affinity term matches the NodePool, assigned flavors, and node selectors")
++}
+diff --git a/pkg/controller/admissionchecks/karpenter/provisioned.go b/pkg/controller/admissionchecks/karpenter/provisioned.go
+new file mode 100644
+index 0000000..1568bf6
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/provisioned.go
+@@ -0,0 +1,101 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Preserve the identities and pod counts of immutable NodeClaims from an already provisioned reservation.
++package karpenter
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++// provisionedPodSetClaims retains immutable capacity across changes to placement, overhead, or packing.
++func provisionedPodSetClaims(
++	wl *kueue.Workload,
++	attempt string,
++	podSet kueue.PodSetReference,
++	count int32,
++	flavorLabels map[string]string,
++	existing []unstructured.Unstructured,
++) ([]*unstructured.Unstructured, string) {
++	labels := map[string]string{
++		ManagedLabelKey:           "kueue",
++		WorkloadNamespaceLabelKey: wl.Namespace,
++		WorkloadLabelKey:          workloadClaimLabel(wl.Namespace, wl.Name, wl.UID),
++		AttemptLabelKey:           attempt,
++		constants.PodSetLabel:     string(podSet),
++		NodePoolLabelKey:          flavorLabels[NodePoolLabelKey],
++	}
++	var claims []*unstructured.Unstructured
++	var pods int64
++	for i := range existing {
++		claim := &existing[i]
++		actual := claim.GetLabels()
++		if actual[AttemptLabelKey] != attempt || actual[constants.PodSetLabel] != string(podSet) {
++			continue
++		}
++		expected := labels
++		if actual[WorkloadLabelKey] == wl.Name && labels[WorkloadLabelKey] != wl.Name {
++			expected = make(map[string]string, len(labels))
++			for k, v := range labels {
++				expected[k] = v
++			}
++			expected[WorkloadLabelKey] = wl.Name
++		}
++		if !matchesNodeClaimLabels(actual, expected) {
++			return nil, fmt.Sprintf("NodeClaim %s has inconsistent provisioned ownership or NodePool", claim.GetName())
++		}
++		n, err := strconv.ParseInt(claim.GetAnnotations()[PodsAnnotation], 10, 32)
++		if err != nil || n <= 0 {
++			return nil, fmt.Sprintf("NodeClaim %s has an invalid provisioned pod count", claim.GetName())
++		}
++		pods += n
++		claims = append(claims, claim.DeepCopy())
++	}
++	if pods != int64(count) {
++		return nil, fmt.Sprintf("pod set %s has %d provisioned pods, expected %d", podSet, pods, count)
++	}
++	ordered := make([]*unstructured.Unstructured, len(claims))
++	for i := range ordered {
++		suffix := fmt.Sprintf("%s-%d", podSet, i)
++		for _, claim := range claims {
++			var matches bool
++			if ann := claim.GetAnnotations()[ClaimSuffixAnnotation]; ann != "" {
++				matches = ann == suffix
++			} else {
++				matches = claim.GetName() == nodeClaimName(wl, attempt, suffix) ||
++					claim.GetName() == legacyNodeClaimName(wl.Name, attempt, suffix) ||
++					strings.HasSuffix(claim.GetName(), "-"+suffix)
++			}
++			if matches {
++				if ordered[i] != nil {
++					return nil, fmt.Sprintf("pod set %s has duplicate provisioned claim ordinal %d", podSet, i)
++				}
++				ordered[i] = claim
++			}
++		}
++		if ordered[i] == nil {
++			return nil, fmt.Sprintf("pod set %s is missing provisioned claim ordinal %d", podSet, i)
++		}
++	}
++	return ordered, ""
++}
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index a47b406..90f5e30 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -930,6 +930,10 @@ const (
+ 	// Enables updating queue and priority on running Deployments by relaxing
+ 	// immutability checks in the Deployment validation webhook.
+ 	MutableDeploymentQueue featuregate.Feature = "MutableDeploymentQueue"
++
++	// Enables the Karpenter AdmissionCheck controller to provision NodeClaims
++	// for admitted Workloads.
++	KarpenterAdmissionCheck featuregate.Feature = "KarpenterAdmissionCheck"
+ )
+ 
+ func init() {
+@@ -1366,6 +1370,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+ 	MutableDeploymentQueue: {
+ 		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
+ 	},
++
++	KarpenterAdmissionCheck: {
++		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
++	},
+ 
+ 	RecomputeAssignmentUponPreemptionTargetsOverlap: {
+ 		{Version: version.MustParse("0.20"), Default: true, PreRelease: featuregate.Beta},
+ 	},
+diff --git a/pkg/cache/queue/cluster_queue_test.go b/pkg/cache/queue/cluster_queue_test.go
+index ff3e6fb..8070848 100644
+--- a/pkg/cache/queue/cluster_queue_test.go
++++ b/pkg/cache/queue/cluster_queue_test.go
+@@ -37,6 +37,7 @@ import (
+ 	config "sigs.k8s.io/kueue/apis/config/v1beta2"
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+ 	queueafs "sigs.k8s.io/kueue/pkg/cache/queue/afs"
++	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
+ 	"sigs.k8s.io/kueue/pkg/features"
+ 	"sigs.k8s.io/kueue/pkg/metrics"
+ 	"sigs.k8s.io/kueue/pkg/resources"
+@@ -337,6 +338,33 @@ func TestPushOrUpdateGenerationChanged(t *testing.T) {
+ 	}
+ }
+ 
++func TestPushOrUpdateAllowedFlavorsChanged(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, true)
++	now := time.Now()
++	ctx, log := utiltesting.ContextWithLog(t)
++	cq := newClusterQueueImpl(ctx, nil, defaultOrdering, testingclock.NewFakeClock(now))
++
++	wl := utiltestingapi.MakeWorkload("workload-1", defaultNamespace).
++		Creation(now).Generation(1).AllowedFlavors("remote").Obj()
++	cq.PushOrUpdate(workload.NewInfo(log, wl))
++	head := cq.Pop()
++	if head == nil {
++		t.Fatal("expected to pop workload")
++	}
++	cq.requeueIfNotPresent(log, head, false, RequeueReasonGeneric, "")
++	if inadmissible, _ := cq.DumpInadmissible(); len(inadmissible) != 1 {
++		t.Fatalf("got %d inadmissible workloads, want 1", len(inadmissible))
++	}
++
++	widened := wl.DeepCopy()
++	widened.Annotations[controllerconstants.WorkloadAllowedResourceFlavorAnnotation] = "karpenter,remote"
++	cq.PushOrUpdate(workload.NewInfo(log, widened))
++
++	if active, _ := cq.Dump(); len(active) != 1 {
++		t.Errorf("got %d active workloads after the allowed flavors changed, want 1", len(active))
++	}
++}
++
+ func Test_Delete(t *testing.T) {
+ 	ctx, log := utiltesting.ContextWithLog(t)
+ 	cq := newClusterQueueImpl(ctx, nil, defaultOrdering, testingclock.NewFakeClock(time.Now()))
+diff --git a/pkg/controller/admissionchecks/karpenter/controller_test.go b/pkg/controller/admissionchecks/karpenter/controller_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/controller_test.go
+@@ -0,0 +1,1486 @@
++// Tests for the Karpenter AdmissionCheck: the feature gate, NodeClaims built from the NodePool and sized for packed pods,
++// readiness, failures, flavor exclusion and its expiry, disruption holds, and NodeClaim cleanup.
++package karpenter
++
++import (
++	"context"
++	"fmt"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	"k8s.io/apimachinery/pkg/api/resource"
++	apivalidation "k8s.io/apimachinery/pkg/api/validation"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/validation"
++	"k8s.io/apimachinery/pkg/util/validation/field"
++	testingclock "k8s.io/utils/clock/testing"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++)
++
++const (
++	ns       = "ns"
++	wlName   = "wl"
++	checkRef = kueue.AdmissionCheckReference("karpenter-provision")
++)
++
++var reservedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
++
++type fixture struct {
++	t     *testing.T
++	ctx   context.Context
++	clk   *testingclock.FakeClock
++	c     client.Client
++	ctrl  *Controller
++	wlKey types.NamespacedName
++}
++
++// nodePool returns a NodePool whose template sets a label, a requirement, a taint, and an expiry.
++func nodePool(name string) *unstructured.Unstructured {
++	pool := &unstructured.Unstructured{Object: map[string]any{
++		"spec": map[string]any{
++			"template": map[string]any{
++				"metadata": map[string]any{"labels": map[string]any{"team": "ml"}},
++				"spec": map[string]any{
++					"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "gpu"},
++					"requirements": []any{
++						map[string]any{"key": "karpenter.sh/capacity-type", "operator": "In", "values": []any{"on-demand"}},
++					},
++					"taints":      []any{map[string]any{"key": "nvidia.com/gpu", "effect": "NoSchedule"}},
++					"expireAfter": "168h",
++				},
++			},
++		},
++	}}
++	pool.SetGroupVersionKind(nodePoolGVK)
++	pool.SetName(name)
++	pool.SetUID("pool-uid")
++	pool.SetAnnotations(map[string]string{nodePoolHashAnnotationKey: "123", nodePoolHashVersionAnnotationKey: "v3"})
++	return pool
++}
++
++// setPoolField sets a field of the karpenter-a flavor's NodePool.
++func (f *fixture) setPoolField(value any, fields ...string) {
++	f.t.Helper()
++	pool := &unstructured.Unstructured{}
++	pool.SetGroupVersionKind(nodePoolGVK)
++	if err := f.c.Get(f.ctx, types.NamespacedName{Name: "pool-a"}, pool); err != nil {
++		f.t.Fatal(err)
++	}
++	if err := unstructured.SetNestedField(pool.Object, value, fields...); err != nil {
++		f.t.Fatal(err)
++	}
++	if err := f.c.Update(f.ctx, pool); err != nil {
++		f.t.Fatal(err)
++	}
++}
++
++func baseObjects(acAnnotations map[string]string) []client.Object {
++	ac := utiltestingapi.MakeAdmissionCheck(string(checkRef)).ControllerName(ControllerName).Obj()
++	ac.Annotations = acAnnotations
++	return []client.Object{
++		ac,
++		utiltestingapi.MakeAdmissionCheck("other").ControllerName("example.com/other").Obj(),
++		utiltestingapi.MakeResourceFlavor("karpenter-a").NodeLabel(NodePoolLabelKey, "pool-a").Obj(),
++		utiltestingapi.MakeResourceFlavor("karpenter-b").NodeLabel("pool", "b").Obj(),
++		nodePool("pool-a"),
++		utiltestingapi.MakeResourceFlavor("remote").Obj(),
++		utiltestingapi.MakeClusterQueue("cq").
++			ResourceGroup(
++				*utiltestingapi.MakeFlavorQuotas("karpenter-a").Resource(corev1.ResourceCPU, "10").Obj(),
++				*utiltestingapi.MakeFlavorQuotas("karpenter-b").Resource(corev1.ResourceCPU, "10").Obj(),
++				*utiltestingapi.MakeFlavorQuotas("remote").Resource(corev1.ResourceCPU, "10").Obj(),
++			).
++			AdmissionCheckStrategy(*utiltestingapi.MakeAdmissionCheckStrategyRule(checkRef, "karpenter-a", "karpenter-b").Obj()).
++			Obj(),
++		utiltestingapi.MakeLocalQueue("lq", ns).ClusterQueue("cq").Obj(),
++	}
++}
++
++// reservedWorkload returns a Workload with 2 pods holding quota on the flavor and a Pending check.
++func reservedWorkload(flavor kueue.ResourceFlavorReference) *utiltestingapi.WorkloadWrapper {
++	return utiltestingapi.MakeWorkload(wlName, ns).
++		UID("uid").
++		Queue("lq").
++		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 2).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).Flavor(corev1.ResourceCPU, flavor).Count(2).Obj(),
++		).Obj(), reservedAt).
++		AdmissionCheck(kueue.AdmissionCheckState{Name: checkRef, State: kueue.CheckStatePending, LastTransitionTime: metav1.NewTime(reservedAt)})
++}
++
++func newFixture(t *testing.T, wl *kueue.Workload, acAnnotations map[string]string, extra ...client.Object) *fixture {
++	t.Helper()
++	features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, true)
++	objs := append(baseObjects(acAnnotations), extra...)
++	objs = append(objs, wl)
++	c := utiltesting.NewClientBuilder().
++		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
++			pod, ok := obj.(*corev1.Pod)
++			if !ok || pod.Spec.NodeName == "" {
++				return nil
++			}
++			return []string{pod.Spec.NodeName}
++		}).
++		WithIndex(&kueue.Workload{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexWorkloadSliceName).
++		WithObjects(objs...).WithStatusSubresource(wl).
++		Build()
++	clk := testingclock.NewFakeClock(reservedAt.Add(time.Second))
++	return &fixture{
++		t: t, ctx: t.Context(), clk: clk, c: c,
++		ctrl:  &Controller{Client: c, APIReader: c, Clock: clk},
++		wlKey: types.NamespacedName{Namespace: ns, Name: wlName},
++	}
++}
++
++func (f *fixture) reconcile() reconcile.Result {
++	f.t.Helper()
++	res, err := f.ctrl.Reconcile(f.ctx, reconcile.Request{NamespacedName: f.wlKey})
++	if err != nil {
++		f.t.Fatalf("Reconcile: %v", err)
++	}
++	return res
++}
++
++func (f *fixture) workload() *kueue.Workload {
++	f.t.Helper()
++	wl := &kueue.Workload{}
++	if err := f.c.Get(f.ctx, f.wlKey, wl); err != nil {
++		f.t.Fatalf("Get workload: %v", err)
++	}
++	return wl
++}
++
++func (f *fixture) check() kueue.AdmissionCheckState {
++	f.t.Helper()
++	for _, ac := range f.workload().Status.AdmissionChecks {
++		if ac.Name == checkRef {
++			return ac
++		}
++	}
++	f.t.Fatalf("check %s not found", checkRef)
++	return kueue.AdmissionCheckState{}
++}
++
++func (f *fixture) claims() []unstructured.Unstructured {
++	f.t.Helper()
++	list := &unstructured.UnstructuredList{}
++	list.SetGroupVersionKind(nodeClaimGVK.GroupVersion().WithKind("NodeClaimList"))
++	if err := f.c.List(f.ctx, list); err != nil {
++		f.t.Fatalf("List NodeClaims: %v", err)
++	}
++	sort.Slice(list.Items, func(i, j int) bool { return list.Items[i].GetName() < list.Items[j].GetName() })
++	return list.Items
++}
++
++func (f *fixture) setCondition(claim *unstructured.Unstructured, condType string) {
++	f.t.Helper()
++	conditions, _, _ := unstructured.NestedSlice(claim.Object, "status", "conditions")
++	conditions = append(conditions, map[string]any{"type": condType, "status": "True"})
++	if err := unstructured.SetNestedSlice(claim.Object, conditions, "status", "conditions"); err != nil {
++		f.t.Fatal(err)
++	}
++	if err := f.c.Update(f.ctx, claim); err != nil {
++		f.t.Fatalf("Update NodeClaim: %v", err)
++	}
++}
++
++func TestCreatesNodeClaimsForAdmittedPods(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	if res := f.reconcile(); res.RequeueAfter == 0 {
++		t.Error("expected a requeue to poll the NodeClaims")
++	}
++
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d NodeClaims, want 2", len(claims))
++	}
++	attempt := attemptID(f.workload(), reservedAt)
++	for _, claim := range claims {
++		wantLabels := map[string]string{
++			ManagedLabelKey:                  "kueue",
++			"kueue.x-k8s.io/podset":          string(kueue.DefaultPodSetName),
++			GangIDLabelKey:                   "gang-" + wlName,
++			WorkloadLabelKey:                 "uid",
++			WorkloadNamespaceLabelKey:        ns,
++			AttemptLabelKey:                  attempt,
++			NodePoolLabelKey:                 "pool-a",
++			"karpenter.k8s.aws/ec2nodeclass": "gpu",
++			"team":                           "ml",
++		}
++		if diff := cmp.Diff(wantLabels, claim.GetLabels()); diff != "" {
++			t.Errorf("labels (-want +got):\n%s", diff)
++		}
++		wantAnnotations := map[string]string{
++			PodsAnnotation:                   "1",
++			DoNotDisruptAnnotationKey:        "true",
++			DisruptionHoldAnnotation:         "true",
++			nodePoolHashAnnotationKey:        "123",
++			nodePoolHashVersionAnnotationKey: "v3",
++			WorkloadAnnotation:               wlName,
++		}
++		if diff := cmp.Diff(wantAnnotations, claim.GetAnnotations()); diff != "" {
++			t.Errorf("annotations (-want +got):\n%s", diff)
++		}
++		if refs := claim.GetOwnerReferences(); len(refs) != 1 || refs[0].Kind != "NodePool" || refs[0].Name != "pool-a" {
++			t.Errorf("owner references = %v, want the NodePool", refs)
++		}
++		wantSpec := map[string]any{
++			"nodeClassRef": map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "gpu"},
++			"requirements": []any{
++				map[string]any{"key": "karpenter.sh/capacity-type", "operator": "In", "values": []any{"on-demand"}},
++				requirement(NodePoolLabelKey, "pool-a"),
++			},
++			"taints": []any{
++				map[string]any{"key": AntiTheftTaintKey, "value": "uid", "effect": "NoSchedule"},
++				map[string]any{"key": "nvidia.com/gpu", "effect": "NoSchedule"},
++			},
++			"resources":   map[string]any{"requests": map[string]any{"cpu": "1", "pods": "1"}},
++			"expireAfter": "168h",
++		}
++		if diff := cmp.Diff(wantSpec, claim.Object["spec"]); diff != "" {
++			t.Errorf("spec (-want +got):\n%s", diff)
++		}
++	}
++	if got := f.workload().Annotations[ProvisionedAttemptAnnotation]; got != attempt {
++		t.Errorf("provisioned attempt = %q, want %q", got, attempt)
++	}
++	if got := f.check().State; got != kueue.CheckStatePending {
++		t.Errorf("check state = %s, want Pending", got)
++	}
++}
++
++func TestReadyOnceEveryNodeClaimLaunched(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	claims := f.claims()
++
++	f.setCondition(&claims[0], conditionLaunched)
++	f.reconcile()
++	if got := f.check(); got.State != kueue.CheckStatePending || got.Message != "1 of 2 NodeClaims are Launched" {
++		t.Errorf("check = %s %q, want Pending with progress", got.State, got.Message)
++	}
++
++	f.setCondition(&claims[1], conditionLaunched)
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStateReady {
++		t.Errorf("check state = %s, want Ready", got)
++	}
++	updates := f.check().PodSetUpdates
++	if len(updates) != 1 {
++		t.Fatalf("got %d PodSetUpdates, want 1", len(updates))
++	}
++	wantToleration := corev1.Toleration{
++		Key:      AntiTheftTaintKey,
++		Operator: corev1.TolerationOpEqual,
++		Value:    "uid",
++		Effect:   corev1.TaintEffectNoSchedule,
++	}
++	if diff := cmp.Diff([]corev1.Toleration{wantToleration}, updates[0].Tolerations); diff != "" {
++		t.Errorf("tolerations (-want +got):\n%s", diff)
++	}
++	wantNodeSelector := map[string]string{
++		AttemptLabelKey: attemptID(f.workload(), reservedAt),
++	}
++	if diff := cmp.Diff(wantNodeSelector, updates[0].NodeSelector); diff != "" {
++		t.Errorf("nodeSelector (-want +got):\n%s", diff)
++	}
++}
++
++func TestWaitsForRegisteredWhenConfigured(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), map[string]string{WaitForAnnotation: conditionRegistered})
++	f.reconcile()
++	claims := f.claims()
++	for i := range claims {
++		f.setCondition(&claims[i], conditionLaunched)
++	}
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStatePending {
++		t.Fatalf("check state = %s, want Pending until Registered", got)
++	}
++	claims = f.claims()
++	for i := range claims {
++		f.setCondition(&claims[i], conditionRegistered)
++	}
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStateReady {
++		t.Errorf("check state = %s, want Ready", got)
++	}
++}
++
++func assertRetriedWithExclusion(t *testing.T, f *fixture, wantExpiry time.Time) {
++	t.Helper()
++	if got := f.check().State; got != kueue.CheckStateRetry {
++		t.Errorf("check state = %s, want Retry", got)
++	}
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims after failure, want 0", n)
++	}
++	wl := f.workload()
++	if got := wl.Annotations[controllerconstants.WorkloadAllowedResourceFlavorAnnotation]; got != "karpenter-b,remote" {
++		t.Errorf("allowed flavors = %q, want %q", got, "karpenter-b,remote")
++	}
++	want := "karpenter-a=" + wantExpiry.UTC().Format(time.RFC3339)
++	if got := wl.Annotations[ExcludedFlavorsAnnotation]; got != want {
++		t.Errorf("excluded flavors = %q, want %q", got, want)
++	}
++}
++
++func TestTimeoutDeletesClaimsAndExcludesFlavor(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), map[string]string{LaunchTimeoutAnnotation: "1m"})
++	f.reconcile()
++	claims := f.claims()
++	f.setCondition(&claims[0], conditionLaunched)
++
++	f.clk.SetTime(reservedAt.Add(59 * time.Second))
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStatePending {
++		t.Fatalf("check state before timeout = %s, want Pending", got)
++	}
++
++	f.clk.SetTime(reservedAt.Add(time.Minute))
++	f.reconcile()
++	assertRetriedWithExclusion(t, f, reservedAt.Add(time.Minute+DefaultFlavorCooldown))
++}
++
++func TestDeletedNodeClaimFailsBeforeTimeout(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	claims := f.claims()
++	// Karpenter deletes a NodeClaim it cannot launch, for example on insufficient capacity.
++	if err := f.c.Delete(f.ctx, &claims[1]); err != nil {
++		t.Fatal(err)
++	}
++	f.reconcile()
++	assertRetriedWithExclusion(t, f, f.clk.Now().Add(DefaultFlavorCooldown))
++}
++
++func TestTerminatingNodeClaimFailsBeforeTimeout(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	claims := f.claims()
++	claims[0].SetFinalizers([]string{"karpenter.sh/termination"})
++	if err := f.c.Update(f.ctx, &claims[0]); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.c.Delete(f.ctx, &claims[0]); err != nil {
++		t.Fatal(err)
++	}
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStateRetry {
++		t.Errorf("check state = %s, want Retry", got)
++	}
++}
++
++func TestSecondFailureKeepsEarlierExclusion(t *testing.T) {
++	earlier := reservedAt.Add(5 * time.Minute)
++	wl := reservedWorkload("karpenter-b").
++		Annotation(ExcludedFlavorsAnnotation, "karpenter-a="+earlier.Format(time.RFC3339)).
++		Annotation(controllerconstants.WorkloadAllowedResourceFlavorAnnotation, "karpenter-b,remote").
++		Obj()
++	f := newFixture(t, wl, map[string]string{LaunchTimeoutAnnotation: "1m", NodeClassAnnotation: "karpenter.k8s.aws/EC2NodeClass/default"})
++	f.reconcile()
++	f.clk.SetTime(reservedAt.Add(time.Minute))
++	f.reconcile()
++
++	got := f.workload().Annotations
++	if allowed := got[controllerconstants.WorkloadAllowedResourceFlavorAnnotation]; allowed != "remote" {
++		t.Errorf("allowed flavors = %q, want %q", allowed, "remote")
++	}
++	wantExcluded := "karpenter-a=" + earlier.Format(time.RFC3339) + ",karpenter-b=" + reservedAt.Add(time.Minute+DefaultFlavorCooldown).Format(time.RFC3339)
++	if excluded := got[ExcludedFlavorsAnnotation]; excluded != wantExcluded {
++		t.Errorf("excluded flavors = %q, want %q", excluded, wantExcluded)
++	}
++}
++
++func TestForeignAllowedFlavorsAreKept(t *testing.T) {
++	wl := reservedWorkload("karpenter-a").
++		Annotation(controllerconstants.WorkloadAllowedResourceFlavorAnnotation, "karpenter-a").
++		Obj()
++	f := newFixture(t, wl, map[string]string{LaunchTimeoutAnnotation: "1m"})
++	f.reconcile()
++	f.clk.SetTime(reservedAt.Add(time.Minute))
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStateRetry {
++		t.Errorf("check state = %s, want Retry", got)
++	}
++	got := f.workload().Annotations
++	if allowed := got[controllerconstants.WorkloadAllowedResourceFlavorAnnotation]; allowed != "karpenter-a" {
++		t.Errorf("allowed flavors = %q, want the foreign value kept", allowed)
++	}
++	if _, ok := got[ExcludedFlavorsAnnotation]; ok {
++		t.Error("excluded flavors annotation set although another controller owns the allowed flavors")
++	}
++}
++
++func TestAdmissionClearsExclusions(t *testing.T) {
++	wl := reservedWorkload("remote").
++		AdmittedAt(true, reservedAt).
++		Annotation(ExcludedFlavorsAnnotation, "karpenter-a="+reservedAt.Add(time.Hour).Format(time.RFC3339)).
++		Annotation(controllerconstants.WorkloadAllowedResourceFlavorAnnotation, "karpenter-b,remote").
++		Obj()
++	wl.Status.AdmissionChecks = nil
++	f := newFixture(t, wl, nil)
++	f.reconcile()
++	got := f.workload().Annotations
++	for _, key := range []string{ExcludedFlavorsAnnotation, controllerconstants.WorkloadAllowedResourceFlavorAnnotation} {
++		if _, ok := got[key]; ok {
++			t.Errorf("annotation %s kept after admission", key)
++		}
++	}
++}
++
++func TestCooldownExpiresExclusions(t *testing.T) {
++	wl := utiltestingapi.MakeWorkload(wlName, ns).Queue("lq").
++		Annotation(ExcludedFlavorsAnnotation, strings.Join([]string{
++			"karpenter-a=" + reservedAt.Format(time.RFC3339),
++			"karpenter-b=" + reservedAt.Add(time.Minute).Format(time.RFC3339),
++		}, ",")).
++		Annotation(controllerconstants.WorkloadAllowedResourceFlavorAnnotation, "remote").
++		Obj()
++	f := newFixture(t, wl, nil)
++
++	if res := f.reconcile(); res.RequeueAfter != time.Minute-time.Second {
++		t.Errorf("RequeueAfter = %s, want the time until the next expiry", res.RequeueAfter)
++	}
++	got := f.workload().Annotations
++	if allowed := got[controllerconstants.WorkloadAllowedResourceFlavorAnnotation]; allowed != "karpenter-a,remote" {
++		t.Errorf("allowed flavors = %q, want the expired flavor allowed again", allowed)
++	}
++
++	f.clk.SetTime(reservedAt.Add(time.Minute))
++	f.reconcile()
++	got = f.workload().Annotations
++	for _, key := range []string{ExcludedFlavorsAnnotation, controllerconstants.WorkloadAllowedResourceFlavorAnnotation} {
++		if _, ok := got[key]; ok {
++			t.Errorf("annotation %s kept after every exclusion expired", key)
++		}
++	}
++}
++
++func TestDeletesNodeClaimsOfEarlierReservation(t *testing.T) {
++	stale := (&nodeClaimTemplate{}).nodeClaim(reservedWorkload("karpenter-a").Obj(), "stale", "main-0", 1, nil, nil)
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil, stale)
++	f.reconcile()
++	for _, claim := range f.claims() {
++		if claim.GetLabels()[AttemptLabelKey] == "stale" {
++			t.Errorf("NodeClaim %s of an earlier reservation was kept", claim.GetName())
++		}
++	}
++}
++
++func TestIgnoresCheckOnUnguardedFlavor(t *testing.T) {
++	// Kueue reserved quota on a flavor without the check before it removed the reset Pending check.
++	f := newFixture(t, reservedWorkload("remote").Obj(), nil)
++	f.reconcile()
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims for a flavor the check does not guard, want 0", n)
++	}
++}
++
++func TestIgnoresChecksOfOtherControllers(t *testing.T) {
++	wl := reservedWorkload("karpenter-a").Obj()
++	wl.Status.AdmissionChecks = []kueue.AdmissionCheckState{{Name: "other", State: kueue.CheckStatePending, LastTransitionTime: metav1.NewTime(reservedAt)}}
++	f := newFixture(t, wl, nil)
++	f.reconcile()
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims for a check of another controller, want 0", n)
++	}
++}
++
++func TestParseConfig(t *testing.T) {
++	cases := map[string]struct {
++		annotations map[string]string
++		want        config
++		wantErr     bool
++	}{
++		"defaults": {
++			want: config{launchTimeout: DefaultLaunchTimeout, waitFor: conditionLaunched, flavorCooldown: DefaultFlavorCooldown,
++				nodeFillFraction: DefaultNodeFillFraction, maxNodeClaims: DefaultMaxNodeClaims},
++		},
++		"overrides": {
++			annotations: map[string]string{
++				LaunchTimeoutAnnotation: "90s", WaitForAnnotation: conditionRegistered, FlavorCooldownAnnotation: "1h",
++				NodeClassAnnotation: "karpenter.k8s.aws/EC2NodeClass/default", NodeFillFractionAnnotation: "0.8", MaxNodeClaimsAnnotation: "8",
++			},
++			want: config{launchTimeout: 90 * time.Second, waitFor: conditionRegistered, flavorCooldown: time.Hour,
++				nodeClass:        nodeClassRef{group: "karpenter.k8s.aws", kind: "EC2NodeClass", name: "default"},
++				nodeFillFraction: 0.8, maxNodeClaims: 8},
++		},
++		"bad duration":        {annotations: map[string]string{LaunchTimeoutAnnotation: "soon"}, wantErr: true},
++		"zero cooldown":       {annotations: map[string]string{FlavorCooldownAnnotation: "0s"}, wantErr: true},
++		"bad wait-for":        {annotations: map[string]string{WaitForAnnotation: "Ready"}, wantErr: true},
++		"bad node class":      {annotations: map[string]string{NodeClassAnnotation: "default"}, wantErr: true},
++		"fill fraction above": {annotations: map[string]string{NodeFillFractionAnnotation: "1.5"}, wantErr: true},
++		"zero max claims":     {annotations: map[string]string{MaxNodeClaimsAnnotation: "0"}, wantErr: true},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			ac := utiltestingapi.MakeAdmissionCheck("ac").Obj()
++			ac.Annotations = tc.annotations
++			got, err := parseConfig(ac)
++			if (err != nil) != tc.wantErr {
++				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
++			}
++			if !tc.wantErr && got != tc.want {
++				t.Errorf("config = %+v, want %+v", got, tc.want)
++			}
++		})
++	}
++}
++
++// provisionedFixture returns a fixture whose Workload has its NodeClaims created and then gets mutate applied.
++func provisionedFixture(t *testing.T, mutate func(*kueue.Workload)) *fixture {
++	t.Helper()
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	if n := len(f.claims()); n != 2 {
++		t.Fatalf("got %d NodeClaims, want 2", n)
++	}
++	wl := f.workload()
++	mutate(wl)
++	if err := f.c.Status().Update(f.ctx, wl); err != nil {
++		t.Fatalf("Update workload status: %v", err)
++	}
++	return f
++}
++
++func TestReleasesNodeClaimsWhenWorkloadStopsHoldingReservation(t *testing.T) {
++	cases := map[string]func(*kueue.Workload){
++		"finished": func(wl *kueue.Workload) {
++			apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadFinished, Status: metav1.ConditionTrue, Reason: "Succeeded"})
++		},
++		"evicted": func(wl *kueue.Workload) {
++			apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadEvicted, Status: metav1.ConditionTrue, Reason: kueue.WorkloadEvictedByPreemption})
++		},
++		"quota released": func(wl *kueue.Workload) {
++			apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse, Reason: "Pending"})
++		},
++	}
++	for name, mutate := range cases {
++		t.Run(name, func(t *testing.T) {
++			f := provisionedFixture(t, mutate)
++			f.reconcile()
++			if n := len(f.claims()); n != 0 {
++				t.Errorf("got %d NodeClaims, want 0", n)
++			}
++			if _, ok := f.workload().Annotations[ProvisionedAttemptAnnotation]; ok {
++				t.Error("provisioned attempt annotation kept after releasing the NodeClaims")
++			}
++		})
++	}
++}
++
++func TestDeletedWorkloadReleasesNodeClaims(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	if err := f.c.Delete(f.ctx, f.workload()); err != nil {
++		t.Fatal(err)
++	}
++	f.reconcile()
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims after the Workload was deleted, want 0", n)
++	}
++}
++
++func TestDeletingWorkloadReleasesNodeClaims(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	wl := f.workload()
++	wl.Finalizers = []string{"example.com/hold"}
++	if err := f.c.Update(f.ctx, wl); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.c.Delete(f.ctx, wl); err != nil {
++		t.Fatal(err)
++	}
++	f.reconcile()
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims while the Workload is being deleted, want 0", n)
++	}
++}
++
++func TestSweepDeletesOrphanedNodeClaims(t *testing.T) {
++	live := reservedWorkload("karpenter-a").Obj()
++	attempt := attemptID(live, reservedAt)
++	old := metav1.NewTime(reservedAt.Add(-time.Hour))
++	claim := func(name, namespace, wlName, attempt string, created metav1.Time) *unstructured.Unstructured {
++		nc := (&nodeClaimTemplate{}).nodeClaim(utiltestingapi.MakeWorkload(wlName, namespace).Obj(), attempt, "main-0", 1, nil, nil)
++		nc.SetName(name)
++		nc.SetCreationTimestamp(created)
++		if namespace == "" {
++			labels := nc.GetLabels()
++			delete(labels, WorkloadNamespaceLabelKey)
++			delete(labels, AttemptLabelKey)
++			nc.SetLabels(labels)
++		}
++		return nc
++	}
++	f := newFixture(t, live, nil,
++		claim("current", ns, wlName, attempt, old),
++		claim("stale-attempt", ns, wlName, "stale", old),
++		claim("gone-workload", ns, "gone", "x", old),
++		claim("young", ns, "gone", "x", metav1.NewTime(reservedAt)),
++		claim("legacy", "", "gone", "", old),
++	)
++	if err := f.ctrl.Sweep(f.ctx); err != nil {
++		t.Fatalf("Sweep: %v", err)
++	}
++	var got []string
++	for _, c := range f.claims() {
++		got = append(got, c.GetName())
++	}
++	if diff := cmp.Diff([]string{"current", "legacy", "young"}, got); diff != "" {
++		t.Errorf("NodeClaims after sweep (-want +got):\n%s", diff)
++	}
++}
++
++func TestACInactiveWithoutConcurrentAdmission(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("ConcurrentAdmission=%t", enabled), func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, enabled)
++			ac := utiltestingapi.MakeAdmissionCheck(string(checkRef)).ControllerName(ControllerName).Obj()
++			c := utiltesting.NewClientBuilder().WithObjects(ac).WithStatusSubresource(ac).Build()
++			r := &ACReconciler{Client: c}
++			if _, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Name: string(checkRef)}}); err != nil {
++				t.Fatal(err)
++			}
++			if err := c.Get(t.Context(), types.NamespacedName{Name: string(checkRef)}, ac); err != nil {
++				t.Fatal(err)
++			}
++			active := apimeta.FindStatusCondition(ac.Status.Conditions, kueue.AdmissionCheckActive)
++			wantStatus, wantReason := metav1.ConditionTrue, "Active"
++			if !enabled {
++				wantStatus, wantReason = metav1.ConditionFalse, "FeatureGateDisabled"
++			}
++			if active == nil || active.Status != wantStatus || active.Reason != wantReason {
++				t.Fatalf("Active condition = %v, want %s %s", active, wantStatus, wantReason)
++			}
++			if !enabled && !strings.Contains(active.Message, "--feature-gates=ConcurrentAdmission=true") {
++				t.Errorf("message %q does not say how to enable the feature gate", active.Message)
++			}
++		})
++	}
++}
++
++func TestNoNodeClaimsWithoutConcurrentAdmission(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	features.SetFeatureGateDuringTest(t, features.ConcurrentAdmission, false)
++	f.reconcile()
++	if n := len(f.claims()); n != 0 {
++		t.Errorf("got %d NodeClaims with the feature gate disabled, want 0", n)
++	}
++}
++
++// podSetWorkload returns a Workload holding quota on karpenter-a for one pod set of count pods.
++func podSetWorkload(ps *kueue.PodSet) *kueue.Workload {
++	return utiltestingapi.MakeWorkload(wlName, ns).
++		UID("uid").
++		Queue("lq").
++		PodSets(*ps).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(ps.Name).Flavor(corev1.ResourceCPU, "karpenter-a").Count(ps.Count).Obj(),
++		).Obj(), reservedAt).
++		AdmissionCheck(kueue.AdmissionCheckState{Name: checkRef, State: kueue.CheckStatePending, LastTransitionTime: metav1.NewTime(reservedAt)}).
++		Obj()
++}
++
++func requests(t *testing.T, claim unstructured.Unstructured) map[string]string {
++	t.Helper()
++	got, _, err := unstructured.NestedStringMap(claim.Object, "spec", "resources", "requests")
++	if err != nil {
++		t.Fatal(err)
++	}
++	return got
++}
++
++func TestNodeClaimRequestsEffectivePodRequests(t *testing.T) {
++	always := corev1.ContainerRestartPolicyAlways
++	ps := utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
++		InitContainers(
++			corev1.Container{Name: "sidecar", RestartPolicy: &always, Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++				corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi"),
++			}}},
++			corev1.Container{Name: "init", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++				corev1.ResourceCPU: resource.MustParse("3"),
++			}}},
++		).
++		Containers(corev1.Container{Name: "main", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++			corev1.ResourceCPU:              resource.MustParse("1"),
++			corev1.ResourceMemory:           resource.MustParse("2Gi"),
++			corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
++			"nvidia.com/gpu":                resource.MustParse("1"),
++		}}}).
++		Obj()
++	f := newFixture(t, podSetWorkload(ps), nil)
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 1 {
++		t.Fatalf("got %d NodeClaims, want 1", len(claims))
++	}
++	// The init container runs beside the sidecar (3+1 CPUs), and so does the main container (1+1 CPUs, 2+1Gi).
++	want := map[string]string{"cpu": "4", "memory": "3Gi", "ephemeral-storage": "10Gi", "nvidia.com/gpu": "1", "pods": "1"}
++	if diff := cmp.Diff(want, requests(t, claims[0])); diff != "" {
++		t.Errorf("requests (-want +got):\n%s", diff)
++	}
++}
++
++func TestPacksPodsWhenNodePoolBoundsInstanceSize(t *testing.T) {
++	ps := utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 5).
++		Request(corev1.ResourceCPU, "2").Request(corev1.ResourceMemory, "4Gi").Obj()
++	f := newFixture(t, podSetWorkload(ps), nil)
++	// The largest allowed instance has 16 CPUs and 64Gi, so half of it holds 4 pods by CPU and 8 by memory.
++	f.setPoolField([]any{
++		map[string]any{"key": "karpenter.k8s.aws/instance-cpu", "operator": "Lt", "values": []any{"17"}},
++		map[string]any{"key": "karpenter.k8s.aws/instance-memory", "operator": "In", "values": []any{"32768", "65536"}},
++	}, "spec", "template", "spec", "requirements")
++	f.reconcile()
++
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d NodeClaims, want 2", len(claims))
++	}
++	for i, want := range []struct {
++		pods     string
++		requests map[string]string
++	}{
++		{"4", map[string]string{"cpu": "8", "memory": "16Gi", "pods": "4"}},
++		{"1", map[string]string{"cpu": "2", "memory": "4Gi", "pods": "1"}},
++	} {
++		if got := claims[i].GetAnnotations()[PodsAnnotation]; got != want.pods {
++			t.Errorf("NodeClaim %s sized for %s pods, want %s", claims[i].GetName(), got, want.pods)
++		}
++		if diff := cmp.Diff(want.requests, requests(t, claims[i])); diff != "" {
++			t.Errorf("NodeClaim %s requests (-want +got):\n%s", claims[i].GetName(), diff)
++		}
++	}
++}
++
++func TestPodsPerNodeClaim(t *testing.T) {
++	cpu := func(v string) map[string]any {
++		return map[string]any{"key": "karpenter.k8s.aws/instance-cpu", "operator": "In", "values": []any{v}}
++	}
++	gpus := map[string]any{"key": "karpenter.k8s.aws/instance-gpu-count", "operator": "Lt", "values": []any{"9"}}
++	cases := map[string]struct {
++		requests     corev1.ResourceList
++		requirements []any
++		fraction     float64
++		want         int32
++	}{
++		"unbounded": {
++			requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
++			fraction: 0.5, want: 1,
++		},
++		"bounded cpu": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
++			requirements: []any{cpu("8")}, fraction: 0.5, want: 8,
++		},
++		"tightest of two bounds": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
++			requirements: []any{cpu("32"), cpu("8")}, fraction: 1, want: 8,
++		},
++		"gpus bound": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), "nvidia.com/gpu": resource.MustParse("1")},
++			requirements: []any{cpu("96"), gpus}, fraction: 0.5, want: 4,
++		},
++		"resource without capacity label": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceEphemeralStorage: resource.MustParse("1Gi")},
++			requirements: []any{cpu("96")}, fraction: 0.5, want: 1,
++		},
++		"pod larger than the fraction": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("6")},
++			requirements: []any{cpu("8")}, fraction: 0.5, want: 1,
++		},
++		"non-numeric value": {
++			requests:     corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
++			requirements: []any{cpu("large")}, fraction: 0.5, want: 1,
++		},
++		"no requests": {requirements: []any{cpu("8")}, fraction: 0.5, want: 1},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			if got := podsPerNodeClaim(tc.requests, tc.requirements, tc.fraction, nil); got != tc.want {
++				t.Errorf("podsPerNodeClaim = %d, want %d", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestFlavorWithoutNodePoolUsesNodeClassAnnotation(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-b").Obj(), map[string]string{NodeClassAnnotation: "karpenter.k8s.aws/EC2NodeClass/default"})
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d NodeClaims, want 2", len(claims))
++	}
++	ref, _, _ := unstructured.NestedMap(claims[0].Object, "spec", "nodeClassRef")
++	if diff := cmp.Diff(map[string]any{"group": "karpenter.k8s.aws", "kind": "EC2NodeClass", "name": "default"}, ref); diff != "" {
++		t.Errorf("nodeClassRef (-want +got):\n%s", diff)
++	}
++	requirements, _, _ := unstructured.NestedSlice(claims[0].Object, "spec", "requirements")
++	if diff := cmp.Diff([]any{requirement(corev1.LabelOSStable, "linux"), requirement("pool", "b")}, requirements); diff != "" {
++		t.Errorf("requirements (-want +got):\n%s", diff)
++	}
++	if _, ok := claims[0].GetLabels()[NodePoolLabelKey]; ok {
++		t.Error("NodeClaim labeled with a NodePool although the flavor names none")
++	}
++	if _, ok := claims[0].GetAnnotations()[DoNotDisruptAnnotationKey]; ok {
++		t.Error("NodeClaim without a NodePool got a disruption hold")
++	}
++}
++
++func TestProvisioningProblemsFailTheAttempt(t *testing.T) {
++	cases := map[string]struct {
++		flavor      kueue.ResourceFlavorReference
++		annotations map[string]string
++		mutatePool  func(f *fixture)
++		wantMessage string
++	}{
++		"missing NodePool": {
++			flavor: "karpenter-a",
++			mutatePool: func(f *fixture) {
++				pool := nodePool("pool-a")
++				if err := f.c.Delete(f.ctx, pool); err != nil {
++					f.t.Fatal(err)
++				}
++			},
++			wantMessage: "NodePool pool-a that the flavor names",
++		},
++		"static NodePool": {
++			flavor:      "karpenter-a",
++			mutatePool:  func(f *fixture) { f.setPoolField(int64(3), "spec", "replicas") },
++			wantMessage: "sets spec.replicas",
++		},
++		"too many NodeClaims": {
++			flavor:      "karpenter-a",
++			annotations: map[string]string{MaxNodeClaimsAnnotation: "1"},
++			wantMessage: "needs 2 NodeClaims, more than the 1",
++		},
++		"NodePool limit": {
++			flavor: "karpenter-a",
++			mutatePool: func(f *fixture) {
++				f.setPoolField(map[string]any{"cpu": "10"}, "spec", "limits")
++				f.setPoolField(map[string]any{"cpu": "9"}, "status", "resources")
++			},
++			wantMessage: "would take NodePool pool-a to 11 cpu, over its limit of 10",
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			f := newFixture(t, reservedWorkload(tc.flavor).Obj(), tc.annotations)
++			if tc.mutatePool != nil {
++				tc.mutatePool(f)
++			}
++			f.reconcile()
++			check := f.check()
++			if check.State != kueue.CheckStateRetry || !strings.Contains(check.Message, tc.wantMessage) {
++				t.Errorf("check = %s %q, want Retry containing %q", check.State, check.Message, tc.wantMessage)
++			}
++			if n := len(f.claims()); n != 0 {
++				t.Errorf("got %d NodeClaims, want 0", n)
++			}
++			if _, ok := f.workload().Annotations[ExcludedFlavorsAnnotation]; !ok {
++				t.Error("flavor not excluded")
++			}
++		})
++	}
++}
++
++func TestNodePoolDoNotDisruptIsNotAHold(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.setPoolField(map[string]any{DoNotDisruptAnnotationKey: "true"}, "spec", "template", "metadata", "annotations")
++	f.reconcile()
++	for _, claim := range f.claims() {
++		if claim.GetAnnotations()[DoNotDisruptAnnotationKey] != "true" {
++			t.Errorf("NodeClaim %s lost the NodePool's do-not-disrupt annotation", claim.GetName())
++		}
++		if _, ok := claim.GetAnnotations()[DisruptionHoldAnnotation]; ok {
++			t.Errorf("NodeClaim %s marks the NodePool's do-not-disrupt annotation as a hold the check removes", claim.GetName())
++		}
++	}
++}
++
++func TestReleasesDisruptionHoldOncePodsAreBound(t *testing.T) {
++	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil)
++	f.reconcile()
++	claims := f.claims()
++	for i := range claims {
++		nodeName := fmt.Sprintf("node-%d", i)
++		if err := unstructured.SetNestedField(claims[i].Object, nodeName, "status", "nodeName"); err != nil {
++			t.Fatal(err)
++		}
++		f.setCondition(&claims[i], conditionLaunched)
++		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName, Annotations: map[string]string{DoNotDisruptAnnotationKey: "true"}}}
++		if err := f.c.Create(f.ctx, node); err != nil {
++			t.Fatal(err)
++		}
++	}
++	f.reconcile()
++	if got := f.check().State; got != kueue.CheckStateReady {
++		t.Fatalf("check state = %s, want Ready", got)
++	}
++	daemon := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "daemon", Namespace: ns, OwnerReferences: []metav1.OwnerReference{{
++		APIVersion: "apps/v1", Kind: "DaemonSet", Name: "agent", UID: "ds", Controller: new(true),
++	}}}, Spec: corev1.PodSpec{NodeName: "node-0"}}
++	worker := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker-0", Namespace: ns}, Spec: corev1.PodSpec{NodeName: "node-0"}}
++	for _, pod := range []*corev1.Pod{daemon, worker} {
++		if err := f.c.Create(f.ctx, pod); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if res := f.reconcile(); res.RequeueAfter == 0 {
++		t.Error("expected a requeue while node-1 has no pods")
++	}
++	held := func() []string {
++		var names []string
++		for _, claim := range f.claims() {
++			node := &corev1.Node{}
++			if err := f.c.Get(f.ctx, types.NamespacedName{Name: claim.Object["status"].(map[string]any)["nodeName"].(string)}, node); err != nil {
++				t.Fatal(err)
++			}
++			_, claimHeld := claim.GetAnnotations()[DoNotDisruptAnnotationKey]
++			_, nodeHeld := node.Annotations[DoNotDisruptAnnotationKey]
++			if claimHeld != nodeHeld {
++				t.Errorf("NodeClaim %s held=%t but its Node held=%t", claim.GetName(), claimHeld, nodeHeld)
++			}
++			if claimHeld {
++				names = append(names, node.Name)
++			}
++		}
++		return names
++	}
++	if diff := cmp.Diff([]string{"node-1"}, held()); diff != "" {
++		t.Errorf("held nodes (-want +got):\n%s", diff)
++	}
++
++	if err := f.c.Create(f.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker-1", Namespace: ns}, Spec: corev1.PodSpec{NodeName: "node-1"}}); err != nil {
++		t.Fatal(err)
++	}
++	if res := f.reconcile(); res.RequeueAfter != 0 {
++		t.Errorf("RequeueAfter = %s, want no requeue once every hold is released", res.RequeueAfter)
++	}
++	if got := held(); len(got) != 0 {
++		t.Errorf("held nodes = %v, want none", got)
++	}
++	if got := f.workload().Annotations[HoldsReleasedAnnotation]; got != attemptID(f.workload(), reservedAt) {
++		t.Errorf("holds released annotation = %q, want the attempt", got)
++	}
++}
++
++func TestNodeClaimNamesFitProviderLabels(t *testing.T) {
++	for name, tc := range map[string]struct {
++		workload  string
++		suffix    string
++		unchanged bool
++	}{
++		"exactly 63 bytes":          {workload: strings.Repeat("a", 45), suffix: "main-0", unchanged: true},
++		"exactly 64 bytes":          {workload: strings.Repeat("a", 46), suffix: "main-0"},
++		"long workload and pod set": {workload: strings.Repeat("a", 58), suffix: strings.Repeat("b", 63) + "-99"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			wl := utiltestingapi.MakeWorkload(tc.workload, "example").UID("workload-uid").Obj()
++			claim := (&nodeClaimTemplate{}).nodeClaim(wl, "0123456789", tc.suffix, 1, nil, nil)
++			got := claim.GetName()
++			if errors := validation.IsValidLabelValue(got); len(errors) != 0 {
++				t.Fatalf("name cannot be used as a label: %v", errors)
++			}
++			legacy := legacyNodeClaimName(wl.Name, "0123456789", tc.suffix)
++			if (got == legacy) != tc.unchanged {
++				t.Errorf("name=%q legacy=%q unchanged=%t", got, legacy, tc.unchanged)
++			}
++			if !tc.unchanged {
++				meta := metav1.ObjectMeta{Name: legacy}
++				if errors := apivalidation.ValidateObjectMeta(&meta, false, apivalidation.NameIsDNSSubdomain, field.NewPath("metadata")); len(errors) != 0 {
++					t.Fatalf("legacy name itself should be valid: %v", errors)
++				}
++				meta.Labels = map[string]string{"provider.example.com/claim-name": legacy}
++				if errors := apivalidation.ValidateObjectMeta(&meta, false, apivalidation.NameIsDNSSubdomain, field.NewPath("metadata")); len(errors) == 0 {
++					t.Fatal("legacy provider label unexpectedly passed API validation")
++				}
++			}
++			labels := claim.GetLabels()
++			labels["provider.example.com/claim-name"] = got
++			meta := metav1.ObjectMeta{Name: got, Labels: labels}
++			if errors := apivalidation.ValidateObjectMeta(&meta, false, apivalidation.NameIsDNSSubdomain, field.NewPath("metadata")); len(errors) != 0 {
++				t.Fatalf("provider metadata violates API validation: %v", errors)
++			}
++		})
++	}
++}
++
++func TestNodeClaimNamesHashTheFullIdentity(t *testing.T) {
++	base := utiltestingapi.MakeWorkload(strings.Repeat("a", 201)+"x", "example").UID("workload-uid").Obj()
++	claimName := func(wl *kueue.Workload, attempt, suffix string) string {
++		return (&nodeClaimTemplate{}).nodeClaim(wl, attempt, suffix, 1, nil, nil).GetName()
++	}
++	want := claimName(base, "0123456789", "workers-0")
++	if got := claimName(base.DeepCopy(), "0123456789", "workers-0"); got != want {
++		t.Fatalf("same identity produced %q then %q", want, got)
++	}
++	seen := map[string]string{want: "base"}
++	for name, mutate := range map[string]func(*kueue.Workload) (string, string){
++		"untruncated workload tail": func(wl *kueue.Workload) (string, string) {
++			wl.Name = strings.Repeat("a", 201) + "y"
++			return "0123456789", "workers-0"
++		},
++		"namespace":    func(wl *kueue.Workload) (string, string) { wl.Namespace = "another"; return "0123456789", "workers-0" },
++		"workload UID": func(wl *kueue.Workload) (string, string) { wl.UID = "another-uid"; return "0123456789", "workers-0" },
++		"attempt":      func(wl *kueue.Workload) (string, string) { return "9876543210", "workers-0" },
++		"pod set":      func(wl *kueue.Workload) (string, string) { return "0123456789", "another-0" },
++		"ordinal":      func(wl *kueue.Workload) (string, string) { return "0123456789", "workers-1" },
++	} {
++		wl := base.DeepCopy()
++		attempt, suffix := mutate(wl)
++		got := claimName(wl, attempt, suffix)
++		if previous, exists := seen[got]; exists {
++			t.Errorf("%s and %s produced the same name %q", name, previous, got)
++		}
++		seen[got] = name
++		if errors := validation.IsValidLabelValue(got); len(errors) != 0 {
++			t.Errorf("%s: %v", name, errors)
++		}
++	}
++}
++
++func TestAdoptsAlreadyProvisionedLegacyNodeClaim(t *testing.T) {
++	for name, mutate := range map[string]func(*unstructured.Unstructured, *kueue.Workload){
++		"matching registered claim": func(*unstructured.Unstructured, *kueue.Workload) {},
++		"unrelated claim name":      func(nc *unstructured.Unstructured, _ *kueue.Workload) { nc.SetName(nc.GetName() + "-other") },
++		"unrelated attempt": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[AttemptLabelKey] = "another"
++			nc.SetLabels(labels)
++		},
++		"unrelated workload": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[WorkloadLabelKey] = "another"
++			nc.SetLabels(labels)
++		},
++		"unrelated namespace": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[WorkloadNamespaceLabelKey] = "another"
++			nc.SetLabels(labels)
++		},
++		"unrelated pod set": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[constants.PodSetLabel] = "another"
++			nc.SetLabels(labels)
++		},
++		"unrelated pool": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[NodePoolLabelKey] = "another"
++			nc.SetLabels(labels)
++		},
++		"not already provisioned": func(_ *unstructured.Unstructured, wl *kueue.Workload) {
++			delete(wl.Annotations, ProvisionedAttemptAnnotation)
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			wl := reservedWorkload("karpenter-a").Obj()
++			wl.Name = strings.Repeat("a", 46)
++			attempt := attemptID(wl, reservedAt)
++			wl.Annotations = map[string]string{ProvisionedAttemptAnnotation: attempt}
++			f := newFixture(t, wl, nil)
++			f.wlKey.Name = wl.Name
++			cfg, err := parseConfig(&kueue.AdmissionCheck{})
++			if err != nil {
++				t.Fatal(err)
++			}
++			expected, problem, err := f.ctrl.desiredNodeClaims(f.ctx, wl, attempt, cfg, []string{"karpenter-a"}, nil)
++			if err != nil || problem != "" || len(expected) != 2 {
++				t.Fatalf("desired claims: %d %q %v", len(expected), problem, err)
++			}
++			legacyNames := map[string]bool{}
++			for i, claim := range expected {
++				claim.SetName(legacyNodeClaimName(wl.Name, attempt, fmt.Sprintf("%s-%d", kueue.DefaultPodSetName, i)))
++				legacyNames[claim.GetName()] = true
++				mutate(claim, wl)
++				if err := f.c.Create(f.ctx, claim); err != nil {
++					t.Fatal(err)
++				}
++				f.setCondition(claim, conditionRegistered)
++				f.setCondition(claim, conditionLaunched)
++			}
++			if err := f.c.Update(f.ctx, wl); err != nil {
++				t.Fatal(err)
++			}
++			f.reconcile()
++			matching := name == "matching registered claim"
++			if got := f.check().State; (got == kueue.CheckStateReady) != matching {
++				t.Fatalf("check=%s, matching=%t", got, matching)
++			}
++			if matching {
++				claims := f.claims()
++				if len(claims) != 2 {
++					t.Fatalf("got %d claims after adoption", len(claims))
++				}
++				for _, claim := range claims {
++					if !legacyNames[claim.GetName()] {
++						t.Errorf("created replacement %s", claim.GetName())
++					}
++				}
++			}
++		})
++	}
++}
++
++func TestNodeClaimMetadataAllowsMaximumLengthWorkloadAndPodSet(t *testing.T) {
++	for _, size := range []int{58, 59, 63} {
++		t.Run(fmt.Sprintf("workload length %d", size), func(t *testing.T) {
++			wl := utiltestingapi.MakeWorkload(strings.Repeat("a", size), "example").UID("workload-uid").Obj()
++			podSet := strings.Repeat("b", 63)
++			claim := (&nodeClaimTemplate{}).nodeClaim(wl, "0123456789", podSet+"-0", 1, nil, nil)
++			labels := claim.GetLabels()
++			labels[constants.PodSetLabel] = podSet
++			labels["provider.example.com/claim-name"] = claim.GetName()
++			meta := metav1.ObjectMeta{Name: claim.GetName(), Labels: labels}
++			if errors := apivalidation.ValidateObjectMeta(&meta, false, apivalidation.NameIsDNSSubdomain, field.NewPath("metadata")); len(errors) != 0 {
++				t.Fatalf("generated metadata violates API validation: %v", errors)
++			}
++			if size == 58 && labels[GangIDLabelKey] != "gang-"+wl.Name {
++				t.Error("changed valid existing gang ID")
++			}
++		})
++	}
++}
++
++func controllerOverheadDaemonSet(cpu, memory string) *appsv1.DaemonSet {
++	return &appsv1.DaemonSet{
++		Name: "node-agent", Namespace: "system", UID: "daemon-uid",
++		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
++			Containers: []corev1.Container{{Name: "agent", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++				corev1.ResourceCPU: resource.MustParse(cpu), corev1.ResourceMemory: resource.MustParse(memory),
++			}}}},
++			Tolerations: []corev1.Toleration{{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists}},
++		}}},
++	}
++}
++
++func TestNodeClaimIncludesWorkerAndDaemonSetResources(t *testing.T) {
++	ps := utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
++		Request(corev1.ResourceCPU, "3").Request(corev1.ResourceMemory, "12Gi").Request("nvidia.com/gpu", "1").Obj()
++	f := newFixture(t, podSetWorkload(ps), nil, controllerOverheadDaemonSet("500m", "5Gi"))
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 1 {
++		t.Fatalf("got %d claims, want 1", len(claims))
++	}
++	want := map[string]string{"cpu": "3500m", "memory": "17Gi", "nvidia.com/gpu": "1", "pods": "2"}
++	if diff := cmp.Diff(want, requests(t, claims[0])); diff != "" {
++		t.Fatalf("claim requests (-want +got):\n%s", diff)
++	}
++	actual := resource.MustParse(requests(t, claims[0])["memory"])
++	if actual.Cmp(resource.MustParse("14Gi")) <= 0 {
++		t.Error("claim still fits the undersized candidate")
++	}
++	if got := ps.Template.Spec.Containers[0].Resources.Requests.Memory().String(); got != "12Gi" {
++		t.Errorf("worker memory changed to %s", got)
++	}
++}
++
++func TestPacksWorkersAfterReservingDaemonSetResources(t *testing.T) {
++	ps := utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 5).
++		Request(corev1.ResourceCPU, "2").Request(corev1.ResourceMemory, "4Gi").Obj()
++	f := newFixture(t, podSetWorkload(ps), nil, controllerOverheadDaemonSet("2", "5Gi"))
++	f.setPoolField([]any{
++		map[string]any{"key": "karpenter.k8s.aws/instance-cpu", "operator": "In", "values": []any{"16"}},
++		map[string]any{"key": "karpenter.k8s.aws/instance-memory", "operator": "In", "values": []any{"65536"}},
++	}, "spec", "template", "spec", "requirements")
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d claims, want 2", len(claims))
++	}
++	for i, want := range []map[string]string{
++		{"cpu": "8", "memory": "17Gi", "pods": "4"},
++		{"cpu": "6", "memory": "13Gi", "pods": "3"},
++	} {
++		if diff := cmp.Diff(want, requests(t, claims[i])); diff != "" {
++			t.Errorf("claim %d requests (-want +got):\n%s", i, diff)
++		}
++	}
++}
++
++func TestScaleUpSliceAdoptsClaimsAndReconciles(t *testing.T) {
++	sliceName := "my-slice"
++	prevWlName := "slice-0-with-a-very-long-name-exceeding-the-sixty-three-character-bound"
++	succWlName := "slice-1-with-a-very-long-name-exceeding-the-sixty-three-character-bound"
++
++	prevWl := utiltestingapi.MakeWorkload(prevWlName, ns).
++		UID("uid-prev").
++		Queue("lq").
++		Annotation(kueue.WorkloadSliceNameAnnotation, sliceName).
++		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).Flavor(corev1.ResourceCPU, "karpenter-a").Count(1).Obj(),
++		).Obj(), reservedAt).
++		AdmittedAt(true, reservedAt).
++		Condition(metav1.Condition{
++			Type:               kueue.WorkloadFinished,
++			Status:             metav1.ConditionTrue,
++			Reason:             kueue.WorkloadSliceReplaced,
++			LastTransitionTime: metav1.NewTime(reservedAt),
++		}).
++		Obj()
++
++	// Predecessor created claim for main-0
++	prevClaim := (&nodeClaimTemplate{}).nodeClaim(prevWl, "prev-attempt", "main-0", 1, nil, nil)
++	prevLabels := prevClaim.GetLabels()
++	prevLabels[constants.PodSetLabel] = string(kueue.DefaultPodSetName)
++	prevLabels[AttemptLabelKey] = "prev-attempt"
++	prevLabels[NodePoolLabelKey] = "pool-a"
++	prevLabels[ManagedLabelKey] = "kueue"
++	prevClaim.SetLabels(prevLabels)
++
++	succWl := utiltestingapi.MakeWorkload(succWlName, ns).
++		UID("uid-succ").
++		Queue("lq").
++		Annotation(kueue.WorkloadSliceNameAnnotation, sliceName).
++		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 2).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).Flavor(corev1.ResourceCPU, "karpenter-a").Count(2).Obj(),
++		).Obj(), reservedAt).
++		AdmissionCheck(kueue.AdmissionCheckState{Name: checkRef, State: kueue.CheckStatePending, LastTransitionTime: metav1.NewTime(reservedAt)}).
++		Obj()
++
++	f := newFixture(t, succWl, nil, prevWl, prevClaim)
++	f.wlKey = types.NamespacedName{Namespace: ns, Name: succWlName}
++
++	// First reconcile: adopts prev claim, creates delta claim (main-1), sets ProvisionedAttemptAnnotation
++	f.reconcile()
++
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d NodeClaims after first reconcile, want 2 (1 adopted + 1 delta)", len(claims))
++	}
++
++	attempt := attemptID(f.workload(), reservedAt)
++	for _, c := range claims {
++		if c.GetLabels()[AttemptLabelKey] != attempt {
++			t.Errorf("claim %s has attempt %s, want %s", c.GetName(), c.GetLabels()[AttemptLabelKey], attempt)
++		}
++	}
++
++	// Second reconcile: ProvisionedAttemptAnnotation is set, must validate existing + adopted claims successfully
++	f.reconcile()
++
++	claims = f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d NodeClaims after second reconcile, want 2 kept", len(claims))
++	}
++	if got := f.check().State; got != kueue.CheckStatePending {
++		t.Fatalf("check state = %s, want Pending", got)
++	}
++
++	// Set both claims to Launched
++	for i := range claims {
++		f.setCondition(&claims[i], conditionLaunched)
++	}
++	f.reconcile()
++
++	if got := f.check().State; got != kueue.CheckStateReady {
++		t.Errorf("check state = %s, want Ready after both Launched", got)
++	}
++}
++
++func TestScaleUpSliceFailureRestoresAdoptedClaims(t *testing.T) {
++	sliceName := "my-slice-fail"
++	prevWlName := "slice-0-prev"
++	succWlName := "slice-1-succ"
++
++	prevWl := utiltestingapi.MakeWorkload(prevWlName, ns).
++		UID("uid-prev").
++		Queue("lq").
++		Annotation(kueue.WorkloadSliceNameAnnotation, sliceName).
++		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).Flavor(corev1.ResourceCPU, "karpenter-a").Count(1).Obj(),
++		).Obj(), reservedAt).
++		AdmittedAt(true, reservedAt).
++		Condition(metav1.Condition{
++			Type:               kueue.WorkloadFinished,
++			Status:             metav1.ConditionTrue,
++			Reason:             kueue.WorkloadSliceReplaced,
++			LastTransitionTime: metav1.NewTime(reservedAt),
++		}).
++		Obj()
++
++	prevClaim := (&nodeClaimTemplate{}).nodeClaim(prevWl, "prev-attempt", "main-0", 1, nil, nil)
++	prevLabels := prevClaim.GetLabels()
++	prevLabels[constants.PodSetLabel] = string(kueue.DefaultPodSetName)
++	prevLabels[AttemptLabelKey] = "prev-attempt"
++	prevLabels[NodePoolLabelKey] = "pool-a"
++	prevLabels[ManagedLabelKey] = "kueue"
++	prevClaim.SetLabels(prevLabels)
++
++	succWl := utiltestingapi.MakeWorkload(succWlName, ns).
++		UID("uid-succ").
++		Queue("lq").
++		Annotation(kueue.WorkloadSliceNameAnnotation, sliceName).
++		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 2).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).Flavor(corev1.ResourceCPU, "karpenter-a").Count(2).Obj(),
++		).Obj(), reservedAt).
++		AdmissionCheck(kueue.AdmissionCheckState{Name: checkRef, State: kueue.CheckStatePending, LastTransitionTime: metav1.NewTime(reservedAt)}).
++		Obj()
++
++	f := newFixture(t, succWl, nil, prevWl, prevClaim)
++	f.wlKey = types.NamespacedName{Namespace: ns, Name: succWlName}
++
++	// First reconcile: adopts prev claim, creates delta claim
++	f.reconcile()
++	if len(f.claims()) != 2 {
++		t.Fatalf("got %d claims after first reconcile, want 2", len(f.claims()))
++	}
++
++	// Second reconcile: simulate launch timeout failure
++	f.clk.Step(6 * time.Minute)
++	f.reconcile()
++
++	if got := f.check().State; got != kueue.CheckStateRetry {
++		t.Fatalf("check state = %s, want Retry on timeout", got)
++	}
++
++	// Verify predecessor claim still exists and its labels are restored back to predecessor
++	claims := f.claims()
++	if len(claims) != 1 {
++		t.Fatalf("got %d claims after failure, want 1 restored predecessor claim", len(claims))
++	}
++	restored := &claims[0]
++	if got := restored.GetLabels()[WorkloadLabelKey]; got != workloadClaimLabel(prevWl.Namespace, prevWl.Name, prevWl.UID) {
++		t.Errorf("restored claim workload label = %s, want %s", got, workloadClaimLabel(prevWl.Namespace, prevWl.Name, prevWl.UID))
++	}
++	if got := restored.GetAnnotations()[WorkloadAnnotation]; got != prevWl.Name {
++		t.Errorf("restored claim workload annotation = %s, want %s", got, prevWl.Name)
++	}
++}
++
++func TestScaleUpSliceWaitsForPredecessorFinished(t *testing.T) {
++	sliceName := "my-slice-wait"
++	prevWlName := "slice-0-unreplaced"
++	succWlName := "slice-1-succ"
++
++	// Predecessor is NOT finished with WorkloadSliceReplaced yet
++	prevWl := utiltestingapi.MakeWorkload(prevWlName, ns).
++		UID("uid-prev").
++		Queue("lq").
++		Annotation(kueue.WorkloadSliceNameAnnotation, sliceName).
++		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).Flavor(corev1.ResourceCPU, "karpenter-a").Count(1).Obj(),
++		).Obj(), reservedAt).
++		AdmittedAt(true, reservedAt).
++		Obj()
++
++	succWl := utiltestingapi.MakeWorkload(succWlName, ns).
++		UID("uid-succ").
++		Queue("lq").
++		Annotation(kueue.WorkloadSliceNameAnnotation, sliceName).
++		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 2).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).Flavor(corev1.ResourceCPU, "karpenter-a").Count(2).Obj(),
++		).Obj(), reservedAt).
++		AdmissionCheck(kueue.AdmissionCheckState{Name: checkRef, State: kueue.CheckStatePending, LastTransitionTime: metav1.NewTime(reservedAt)}).
++		Obj()
++
++	f := newFixture(t, succWl, nil, prevWl)
++	f.wlKey = types.NamespacedName{Namespace: ns, Name: succWlName}
++
++	res := f.reconcile()
++	if res.RequeueAfter != 100*time.Millisecond {
++		t.Errorf("RequeueAfter = %v, want 100ms waiting for predecessor replaced status", res.RequeueAfter)
++	}
++}
++
++func TestRegrowSliceAfterPartialPreemptionAdoptsOnlyRemainingClaims(t *testing.T) {
++	sliceName := "partial-preempt-slice"
++	prevWlName := "slice-prev"
++	succWlName := "slice-succ"
++
++	prevWl := utiltestingapi.MakeWorkload(prevWlName, ns).
++		UID("uid-prev").
++		Queue("lq").
++		Annotation(kueue.WorkloadSliceNameAnnotation, sliceName).
++		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).Flavor(corev1.ResourceCPU, "karpenter-a").Count(4).Obj(),
++		).Obj(), reservedAt).
++		AdmittedAt(true, reservedAt).
++		ReclaimablePods(kueue.ReclaimablePod{Name: kueue.DefaultPodSetName, Count: 3}).
++		Condition(metav1.Condition{
++			Type:               kueue.WorkloadFinished,
++			Status:             metav1.ConditionTrue,
++			Reason:             kueue.WorkloadSliceReplaced,
++			LastTransitionTime: metav1.NewTime(reservedAt),
++		}).
++		Obj()
++
++	var prevClaims []client.Object
++	for i := 0; i < 4; i++ {
++		claim := (&nodeClaimTemplate{}).nodeClaim(prevWl, "prev-attempt", fmt.Sprintf("main-%d", i), 1, nil, nil)
++		labels := claim.GetLabels()
++		labels[constants.PodSetLabel] = string(kueue.DefaultPodSetName)
++		labels[AttemptLabelKey] = "prev-attempt"
++		labels[NodePoolLabelKey] = "pool-a"
++		labels[ManagedLabelKey] = "kueue"
++		claim.SetLabels(labels)
++		prevClaims = append(prevClaims, claim)
++	}
++
++	succWl := utiltestingapi.MakeWorkload(succWlName, ns).
++		UID("uid-succ").
++		Queue("lq").
++		Annotation(kueue.WorkloadSliceNameAnnotation, sliceName).
++		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 4).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).Flavor(corev1.ResourceCPU, "karpenter-a").Count(4).Obj(),
++		).Obj(), reservedAt).
++		AdmissionCheck(kueue.AdmissionCheckState{Name: checkRef, State: kueue.CheckStatePending, LastTransitionTime: metav1.NewTime(reservedAt)}).
++		Obj()
++
++	objs := append([]client.Object{prevWl}, prevClaims...)
++	f := newFixture(t, succWl, nil, objs...)
++	f.wlKey = types.NamespacedName{Namespace: ns, Name: succWlName}
++
++	f.reconcile()
++
++	claims := f.claims()
++	if len(claims) != 4 {
++		t.Fatalf("got %d NodeClaims after first reconcile, want 4 (1 adopted + 3 delta)", len(claims))
++	}
++
++	f.reconcile()
++
++	claims = f.claims()
++	if len(claims) != 4 {
++		t.Fatalf("got %d NodeClaims after second reconcile, want 4 kept", len(claims))
++	}
++	if got := f.check().State; got != kueue.CheckStatePending {
++		t.Fatalf("check state = %s, want Pending", got)
++	}
++
++	for i := range claims {
++		f.setCondition(&claims[i], conditionLaunched)
++	}
++	f.reconcile()
++
++	if got := f.check().State; got != kueue.CheckStateReady {
++		t.Errorf("check state = %s, want Ready after all Launched", got)
++	}
++}
+diff --git a/pkg/controller/admissionchecks/karpenter/overhead_test.go b/pkg/controller/admissionchecks/karpenter/overhead_test.go
+new file mode 100644
+index 0000000..1add32b
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/overhead_test.go
+@@ -0,0 +1,286 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Verify per-node DaemonSet budgets from public API objects, including admission mutations, placement constraints, and request aggregation.
++package karpenter
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"strings"
++	"testing"
++
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++)
++
++func overheadDaemonSet(name string) *appsv1.DaemonSet {
++	return &appsv1.DaemonSet{
++		Name: name, Namespace: "system", UID: types.UID(name),
++		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
++			Containers: []corev1.Container{{Name: "agent", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++				corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("1Gi"),
++			}}}},
++		}}},
++	}
++}
++
++func overheadPod(ds *appsv1.DaemonSet, name, cpu, memory string) *corev1.Pod {
++	return &corev1.Pod{
++		Name: name, Namespace: ds.Namespace, UID: types.UID(name), OwnerReferences: []metav1.OwnerReference{{
++			APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID, Controller: new(true),
++		}},
++		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++			corev1.ResourceCPU: resource.MustParse(cpu), corev1.ResourceMemory: resource.MustParse(memory),
++		}}}}},
++	}
++}
++
++func assertOverhead(t *testing.T, got corev1.ResourceList, want map[corev1.ResourceName]string) {
++	t.Helper()
++	if len(got) != len(want) {
++		t.Fatalf("resources = %v, want %v", got, want)
++	}
++	for name, text := range want {
++		quantity := got[name]
++		if quantity.Cmp(resource.MustParse(text)) != 0 {
++			t.Errorf("%s = %s, want %s", name, quantity.String(), text)
++		}
++	}
++}
++
++func TestDaemonSetOverheadAdmittedReplicas(t *testing.T) {
++	ds := overheadDaemonSet("agent")
++	ds.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
++		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
++			MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}}},
++		}}},
++	}}
++	pod := overheadPod(ds, "replica-a", "400m", "2Gi")
++	pod.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
++		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
++			MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"existing-node"}}},
++		}}},
++	}}
++	other := overheadPod(ds, "replica-b", "200m", "3Gi")
++	wrongOwner := overheadPod(ds, "old-daemonset-uid", "8", "64Gi")
++	wrongOwner.OwnerReferences[0].UID = "replaced-daemonset"
++	terminal := overheadPod(ds, "terminal", "8", "64Gi")
++	terminal.Status.Phase = corev1.PodSucceeded
++	client := utiltesting.NewClientBuilder().WithObjects(ds, pod, other, wrongOwner, terminal).Build()
++	c := &Controller{APIReader: client}
++	tmpl := &nodeClaimTemplate{requirements: []any{requirement(corev1.LabelArchStable, "amd64")}}
++	got, err := c.daemonSetOverhead(t.Context(), tmpl)
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{corev1.ResourceCPU: "400m", corev1.ResourceMemory: "3Gi", corev1.ResourcePods: "1"})
++	// The admitted resource changes survive; affinity comes from the template and both inputs stay intact.
++	beforeDS, beforePod := ds.DeepCopy(), pod.DeepCopy()
++	representatives := daemonSetPods(ds, []corev1.Pod{*pod})
++	if len(representatives) != 2 || !reflect.DeepEqual(representatives[1].Spec.Affinity, ds.Spec.Template.Spec.Affinity) {
++		t.Fatalf("required affinity = %v, want DaemonSet template affinity", representatives)
++	}
++	if !reflect.DeepEqual(ds, beforeDS) || !reflect.DeepEqual(pod, beforePod) {
++		t.Fatal("DaemonSet or admitted Pod mutated")
++	}
++	// Template affinity must also exclude this same live Pod from an ARM node.
++	got, err = c.daemonSetOverhead(t.Context(), &nodeClaimTemplate{requirements: []any{requirement(corev1.LabelArchStable, "arm64")}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{})
++	// A new template request must be reserved before the first updated replica exists.
++	ds.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("5Gi")
++	c = &Controller{APIReader: utiltesting.NewClientBuilder().WithObjects(ds, pod, other).Build()}
++	got, err = c.daemonSetOverhead(t.Context(), tmpl)
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{corev1.ResourceCPU: "400m", corev1.ResourceMemory: "5Gi", corev1.ResourcePods: "1"})
++}
++
++func TestDaemonSetOverheadResourceSemantics(t *testing.T) {
++	ds := overheadDaemonSet("agent")
++	ds.Spec.Template.Spec.InitContainers = []corev1.Container{
++		{Name: "sidecar", RestartPolicy: new(corev1.ContainerRestartPolicyAlways), Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++			corev1.ResourceCPU: resource.MustParse("50m"), corev1.ResourceMemory: resource.MustParse("128Mi"),
++		}}},
++		{Name: "init", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++			corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("4Gi"),
++		}}},
++	}
++	ds.Spec.Template.Spec.Overhead = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("25m"), corev1.ResourceMemory: resource.MustParse("64Mi")}
++	other := overheadDaemonSet("other")
++	c := &Controller{APIReader: utiltesting.NewClientBuilder().WithObjects(ds, other).Build()}
++	got, err := c.daemonSetOverhead(t.Context(), &nodeClaimTemplate{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{corev1.ResourceCPU: "675m", corev1.ResourceMemory: "5312Mi", corev1.ResourcePods: "2"})
++}
++
++func TestDaemonSetOverheadDeletingDaemonSet(t *testing.T) {
++	ds := overheadDaemonSet("agent")
++	now := metav1.Now()
++	ds.DeletionTimestamp = &now
++	ds.Finalizers = []string{"cleanup"}
++	c := &Controller{APIReader: utiltesting.NewClientBuilder().WithObjects(ds).Build()}
++	got, err := c.daemonSetOverhead(t.Context(), &nodeClaimTemplate{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{})
++}
++
++func TestDaemonSetOverheadPlacement(t *testing.T) {
++	for name, tc := range map[string]struct {
++		selector     map[string]string
++		affinity     []corev1.NodeSelectorTerm
++		requirements []any
++		labels       map[string]string
++		taints       []any
++		tolerations  []corev1.Toleration
++		want         bool
++	}{
++		"matching architecture":     {selector: map[string]string{corev1.LabelArchStable: "amd64"}, requirements: []any{requirement(corev1.LabelArchStable, "amd64")}, want: true},
++		"incompatible architecture": {selector: map[string]string{corev1.LabelArchStable: "arm64"}, requirements: []any{requirement(corev1.LabelArchStable, "amd64")}},
++		"future GPU label":          {selector: map[string]string{"nvidia.com/gpu.present": "true"}, want: true},
++		"template label":            {selector: map[string]string{"team": "ml"}, labels: map[string]string{"team": "other"}},
++		"affinity OR": {requirements: []any{requirement(corev1.LabelArchStable, "amd64")}, affinity: []corev1.NodeSelectorTerm{
++			{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"arm64"}}}},
++			{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"arm64"}}}},
++		}, want: true},
++		"empty required affinity":       {affinity: []corev1.NodeSelectorTerm{}},
++		"empty affinity term":           {affinity: []corev1.NodeSelectorTerm{{}}},
++		"untolerated permanent taint":   {taints: []any{map[string]any{"key": "nvidia.com/gpu", "effect": "NoSchedule"}}},
++		"permanent taint tolerated":     {taints: []any{map[string]any{"key": "nvidia.com/gpu", "effect": "NoSchedule"}}, tolerations: []corev1.Toleration{{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists}}, want: true},
++		"reservation taint":             {taints: []any{map[string]any{"key": AntiTheftTaintKey, "effect": "NoSchedule"}}, want: true},
++		"preference taint":              {taints: []any{map[string]any{"key": "preference", "effect": "PreferNoSchedule"}}, want: true},
++		"automatic pressure toleration": {taints: []any{map[string]any{"key": corev1.TaintNodeMemoryPressure, "effect": "NoSchedule"}}, want: true},
++	} {
++		t.Run(name, func(t *testing.T) {
++			ds := overheadDaemonSet("agent")
++			ds.Spec.Template.Spec.NodeSelector = tc.selector
++			ds.Spec.Template.Spec.Tolerations = tc.tolerations
++			if tc.affinity != nil {
++				ds.Spec.Template.Spec.Affinity = &corev1.Affinity{
++					NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: tc.affinity}},
++				}
++			}
++			tmpl := &nodeClaimTemplate{requirements: tc.requirements, labels: tc.labels, spec: map[string]any{
++				"taints":        tc.taints,
++				"startupTaints": []any{map[string]any{"key": "startup", "effect": "NoSchedule"}},
++			}}
++			c := &Controller{APIReader: utiltesting.NewClientBuilder().WithObjects(ds).Build()}
++			got, err := c.daemonSetOverhead(t.Context(), tmpl)
++			if err != nil {
++				t.Fatal(err)
++			}
++			want := map[corev1.ResourceName]string{}
++			if tc.want {
++				want = map[corev1.ResourceName]string{corev1.ResourceCPU: "100m", corev1.ResourceMemory: "1Gi", corev1.ResourcePods: "1"}
++			}
++			assertOverhead(t, got, want)
++		})
++	}
++}
++
++func TestDaemonSetConstraintIntersection(t *testing.T) {
++	for name, tc := range map[string]struct {
++		requirements []corev1.NodeSelectorRequirement
++		want         bool
++	}{
++		"numeric interval": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "size", Operator: corev1.NodeSelectorOpGt, Values: []string{"4"}}, {Key: "size", Operator: corev1.NodeSelectorOpLt, Values: []string{"8"}},
++		}, want: true},
++		"numeric contradiction": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "size", Operator: corev1.NodeSelectorOpGt, Values: []string{"8"}}, {Key: "size", Operator: corev1.NodeSelectorOpLt, Values: []string{"8"}},
++		}},
++		"numeric allowed values": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "size", Operator: corev1.NodeSelectorOpIn, Values: []string{"4", "8"}}, {Key: "size", Operator: corev1.NodeSelectorOpGt, Values: []string{"4"}},
++		}, want: true},
++		"excluded allowed values": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "arch", Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}}, {Key: "arch", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"amd64"}},
++		}},
++		"presence contradiction": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "gpu", Operator: corev1.NodeSelectorOpExists}, {Key: "gpu", Operator: corev1.NodeSelectorOpDoesNotExist},
++		}},
++		"absence permitted": {requirements: []corev1.NodeSelectorRequirement{{Key: "gpu", Operator: corev1.NodeSelectorOpDoesNotExist}}, want: true},
++		"canonical numeric spelling excluded": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "size", Operator: corev1.NodeSelectorOpGt, Values: []string{"4"}}, {Key: "size", Operator: corev1.NodeSelectorOpLt, Values: []string{"6"}},
++			{Key: "size", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"5"}},
++		}, want: true},
++	} {
++		t.Run(name, func(t *testing.T) {
++			got, err := selectorRequirementsCompatible(tc.requirements)
++			if err != nil || got != tc.want {
++				t.Fatalf("compatible = %v, %v; want %v", got, err, tc.want)
++			}
++		})
++	}
++	if _, err := selectorRequirementsCompatible([]corev1.NodeSelectorRequirement{{Key: "gpu", Operator: "unknown"}}); err == nil {
++		t.Fatal("invalid operator accepted")
++	}
++}
++
++func TestDaemonSetFieldConstraints(t *testing.T) {
++	name := strings.Repeat("node", 20) + ".example.com"
++	requirements := []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}
++	got, err := daemonSetFieldsCompatible(requirements)
++	if err != nil || !got {
++		t.Fatalf("valid long node name: compatible = %v, error = %v", got, err)
++	}
++	requirements = append(requirements, corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpNotIn, Values: []string{name}})
++	got, err = daemonSetFieldsCompatible(requirements)
++	if err != nil || got {
++		t.Fatalf("contradictory node names: compatible = %v, error = %v", got, err)
++	}
++	got, err = daemonSetFieldsCompatible(requirements[1:])
++	if err != nil || !got {
++		t.Fatalf("future node name: compatible = %v, error = %v", got, err)
++	}
++}
++
++type overheadFailingReader struct {
++	client.Reader
++	failPods bool
++}
++
++func (r overheadFailingReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
++	_, pods := list.(*corev1.PodList)
++	if pods == r.failPods {
++		return errors.New("public API unavailable")
++	}
++	return r.Reader.List(ctx, list, options...)
++}
++
++func TestDaemonSetOverheadReadFailure(t *testing.T) {
++	for _, failPods := range []bool{false, true} {
++		c := &Controller{APIReader: overheadFailingReader{Reader: utiltesting.NewClientBuilder().WithObjects(overheadDaemonSet("agent")).Build(), failPods: failPods}}
++		got, err := c.daemonSetOverhead(t.Context(), &nodeClaimTemplate{})
++		if err == nil || got != nil {
++			t.Fatalf("API failure returned requests %v, error %v", got, err)
++		}
++	}
++}
+diff --git a/pkg/controller/admissionchecks/karpenter/placement_test.go b/pkg/controller/admissionchecks/karpenter/placement_test.go
+new file mode 100644
+index 0000000..29f8d43
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/placement_test.go
+@@ -0,0 +1,254 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Verify that provisioned NodeClaims retain mandatory Pod placement, resource requests, and the NodePool/flavor intersection.
++package karpenter
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/resources"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++)
++
++const gpuMemoryLabel = "karpenter.k8s.aws/instance-gpu-memory"
++
++func mandatoryAffinity(terms ...corev1.NodeSelectorTerm) *corev1.Affinity {
++	return &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: terms}}}
++}
++
++func placementTerm(key string, op corev1.NodeSelectorOperator, values ...string) corev1.NodeSelectorTerm {
++	return corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: key, Operator: op, Values: values}}}
++}
++
++func TestNodeClaimsPreservePodPlacement(t *testing.T) {
++	ps := utiltestingapi.MakePodSet("gpu", 1).Request(corev1.ResourceCPU, "3").Request(corev1.ResourceMemory, "12Gi").Request("nvidia.com/gpu", "1").Obj()
++	ps.Template.Spec.NodeSelector = map[string]string{"gpu-class": "l4"}
++	ps.Template.Spec.Affinity = mandatoryAffinity(placementTerm(gpuMemoryLabel, corev1.NodeSelectorOpGt, "20000"))
++	wl := podSetWorkload(ps)
++	wantSpec := wl.Spec.DeepCopy()
++	f := newFixture(t, wl, nil)
++	pool := &unstructured.Unstructured{}
++	pool.SetGroupVersionKind(nodePoolGVK)
++	if err := f.c.Get(f.ctx, types.NamespacedName{Name: "pool-a"}, pool); err != nil {
++		t.Fatal(err)
++	}
++	wantPool := pool.DeepCopy()
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 1 {
++		t.Fatalf("claims = %d, want 1", len(claims))
++	}
++	got, _, err := unstructured.NestedSlice(claims[0].Object, "spec", "requirements")
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := []any{
++		requirement("karpenter.sh/capacity-type", "on-demand"), requirement(NodePoolLabelKey, "pool-a"), requirement("gpu-class", "l4"),
++		map[string]any{"key": gpuMemoryLabel, "operator": "Gt", "values": []any{"20000"}},
++	}
++	if diff := cmp.Diff(want, got); diff != "" {
++		t.Errorf("requirements (-want +got):\n%s", diff)
++	}
++	if diff := cmp.Diff(map[string]string{"cpu": "3", "memory": "12Gi", "nvidia.com/gpu": "1", "pods": "1"}, requests(t, claims[0])); diff != "" {
++		t.Errorf("resources (-want +got):\n%s", diff)
++	}
++	if diff := cmp.Diff(wantSpec, &f.workload().Spec); diff != "" {
++		t.Errorf("Workload spec mutated (-want +got):\n%s", diff)
++	}
++	if err := f.c.Get(f.ctx, types.NamespacedName{Name: "pool-a"}, pool); err != nil {
++		t.Fatal(err)
++	}
++	if diff := cmp.Diff(wantPool, pool); diff != "" {
++		t.Errorf("NodePool mutated (-want +got):\n%s", diff)
++	}
++}
++
++func TestNodeClaimMandatoryAffinityBranches(t *testing.T) {
++	for name, tc := range map[string]struct {
++		terms []corev1.NodeSelectorTerm
++		want  string
++	}{
++		"skip incompatible first branch": {terms: []corev1.NodeSelectorTerm{
++			placementTerm(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "arm64"), placementTerm("gpu-class", corev1.NodeSelectorOpIn, "l4"),
++		}, want: "l4"},
++		"choose first compatible alternative": {terms: []corev1.NodeSelectorTerm{
++			placementTerm("gpu-class", corev1.NodeSelectorOpIn, "l4"), placementTerm("gpu-class", corev1.NodeSelectorOpIn, "l40s"),
++		}, want: "l4"},
++		"skip unrepresentable alternative": {terms: []corev1.NodeSelectorTerm{
++			{MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"existing-node"}}}},
++			placementTerm("gpu-class", corev1.NodeSelectorOpIn, "l40s"),
++		}, want: "l40s"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			ps := utiltestingapi.MakePodSet("workers", 1).Request(corev1.ResourceCPU, "1").Obj()
++			ps.Template.Spec.NodeSelector = map[string]string{corev1.LabelArchStable: "amd64"}
++			ps.Template.Spec.Affinity = mandatoryAffinity(tc.terms...)
++			f := newFixture(t, podSetWorkload(ps), nil)
++			f.reconcile()
++			claims := f.claims()
++			if len(claims) != 1 {
++				t.Fatalf("claims = %d, want 1", len(claims))
++			}
++			raw, _, _ := unstructured.NestedSlice(claims[0].Object, "spec", "requirements")
++			decoded := struct {
++				Requirements []corev1.NodeSelectorRequirement `json:"requirements"`
++			}{}
++			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(map[string]any{"requirements": raw}, &decoded); err != nil {
++				t.Fatal(err)
++			}
++			selector, err := nodeaffinity.NewNodeSelector(&corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: decoded.Requirements}}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			for _, class := range []string{"l4", "l40s", "other"} {
++				node := &corev1.Node{Labels: map[string]string{
++					corev1.LabelArchStable: "amd64", "gpu-class": class, NodePoolLabelKey: "pool-a", "karpenter.sh/capacity-type": "on-demand",
++				}}
++				matches := selector.Match(node)
++				if matches != (class == tc.want) {
++					t.Errorf("claim accepts class %s = %v, want only %s", class, matches, tc.want)
++				}
++				original, err := nodeaffinity.GetRequiredNodeAffinity(&corev1.Pod{Spec: ps.Template.Spec}).Match(node)
++				if err != nil || (matches && !original) {
++					t.Errorf("claim broadened original affinity for %s: matches=%v original=%v error=%v", class, matches, original, err)
++				}
++			}
++		})
++	}
++}
++
++func TestNodeClaimsRejectImpossiblePodPlacement(t *testing.T) {
++	for name, tc := range map[string]struct {
++		selector map[string]string
++		affinity *corev1.Affinity
++		nodeName string
++		want     string
++	}{
++		"NodePool requirement conflict":      {selector: map[string]string{"karpenter.sh/capacity-type": "spot"}, want: "conflict"},
++		"NodePool metadata label conflict":   {selector: map[string]string{"team": "other"}, want: "conflict"},
++		"flavor conflict":                    {selector: map[string]string{NodePoolLabelKey: "other"}, want: "conflict"},
++		"all affinity branches incompatible": {selector: map[string]string{corev1.LabelArchStable: "amd64"}, affinity: mandatoryAffinity(placementTerm(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "arm64")), want: "no required"},
++		"empty required affinity":            {affinity: mandatoryAffinity(), want: "no required"},
++		"empty required term":                {affinity: mandatoryAffinity(corev1.NodeSelectorTerm{}), want: "no required"},
++		"node fields unsupported":            {affinity: mandatoryAffinity(corev1.NodeSelectorTerm{MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"existing-node"}}}}), want: "node fields are unsupported"},
++		"nodeName unsupported":               {nodeName: "existing-node", want: "nodeName"},
++		"invalid operator":                   {affinity: mandatoryAffinity(placementTerm("gpu-class", "invalid", "l4")), want: "validating required"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			ps := utiltestingapi.MakePodSet("workers", 1).Request(corev1.ResourceCPU, "1").Obj()
++			ps.Template.Spec.NodeSelector, ps.Template.Spec.Affinity, ps.Template.Spec.NodeName = tc.selector, tc.affinity, tc.nodeName
++			f := newFixture(t, podSetWorkload(ps), nil)
++			f.reconcile()
++			if len(f.claims()) != 0 {
++				t.Fatal("created claims despite impossible mandatory placement")
++			}
++			check := f.check()
++			if check.State != kueue.CheckStateRetry || !strings.Contains(check.Message, tc.want) {
++				t.Errorf("check = %v, want retry containing %q", check, tc.want)
++			}
++		})
++	}
++}
++
++func TestNodeClaimsRejectConflictingAssignedFlavorLabels(t *testing.T) {
++	wl := reservedWorkload("karpenter-a").Obj()
++	wl.Status.Admission.PodSetAssignments[0].Flavors[corev1.ResourceMemory] = "karpenter-b"
++	f := newFixture(t, wl, nil)
++	flavor := &kueue.ResourceFlavor{}
++	if err := f.c.Get(f.ctx, types.NamespacedName{Name: "karpenter-b"}, flavor); err != nil {
++		t.Fatal(err)
++	}
++	flavor.Spec.NodeLabels[NodePoolLabelKey] = "pool-b"
++	if err := f.c.Update(f.ctx, flavor); err != nil {
++		t.Fatal(err)
++	}
++	f.reconcile()
++	if len(f.claims()) != 0 || !strings.Contains(f.check().Message, "conflicting flavor node labels") {
++		t.Fatalf("claims = %v, check = %v", f.claims(), f.check())
++	}
++}
++
++func TestPodPlacementNarrowsDaemonOverheadAndPacking(t *testing.T) {
++	amd := controllerOverheadDaemonSet("2", "1Gi")
++	amd.Spec.Template.Spec.NodeSelector = map[string]string{corev1.LabelArchStable: "amd64"}
++	arm := controllerOverheadDaemonSet("8", "64Gi")
++	arm.Name, arm.UID = "arm-agent", "arm-agent"
++	arm.Spec.Template.Spec.NodeSelector = map[string]string{corev1.LabelArchStable: "arm64"}
++	ps := utiltestingapi.MakePodSet("workers", 4).Request(corev1.ResourceCPU, "1").Request(corev1.ResourceMemory, "1Gi").Obj()
++	ps.Template.Spec.Affinity = mandatoryAffinity(placementTerm(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"))
++	f := newFixture(t, podSetWorkload(ps), nil, amd, arm)
++	f.setPoolField([]any{requirement("karpenter.k8s.aws/instance-cpu", "8"), requirement("karpenter.k8s.aws/instance-memory", "65536")}, "spec", "template", "spec", "requirements")
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("claims = %d, want 2 with narrowed overhead and packing", len(claims))
++	}
++	for _, claim := range claims {
++		if diff := cmp.Diff(map[string]string{"cpu": "4", "memory": "3Gi", "pods": "3"}, requests(t, claim)); diff != "" {
++			t.Errorf("requests (-want +got):\n%s", diff)
++		}
++		if claim.GetAnnotations()[PodsAnnotation] != "2" {
++			t.Errorf("workload pods = %s, want 2", claim.GetAnnotations()[PodsAnnotation])
++		}
++	}
++}
++
++func TestPlacementUpgradePreservesProvisionedShape(t *testing.T) {
++	ps := utiltestingapi.MakePodSet("workers", 4).Request(corev1.ResourceCPU, "1").Obj()
++	ps.Template.Spec.Affinity = mandatoryAffinity(placementTerm("karpenter.k8s.aws/instance-cpu", corev1.NodeSelectorOpLt, "5"))
++	wl := podSetWorkload(ps)
++	attempt := attemptID(wl, reservedAt)
++	wl.Annotations = map[string]string{ProvisionedAttemptAnnotation: attempt}
++	f := newFixture(t, wl, map[string]string{WaitForAnnotation: conditionRegistered})
++	f.setPoolField([]any{map[string]any{"key": "karpenter.k8s.aws/instance-cpu", "operator": "Lt", "values": []any{"9"}}}, "spec", "template", "spec", "requirements")
++	tmpl, problem, err := f.ctrl.nodeClaimTemplate(f.ctx, map[string]string{NodePoolLabelKey: "pool-a"}, config{})
++	if err != nil || problem != "" {
++		t.Fatalf("template = %v, %s", err, problem)
++	}
++	// The former controller packed four workers using the pool's upper bound, before projecting the Pod's tighter bound.
++	claim := tmpl.nodeClaim(wl, attempt, "workers-0", 4, resources.PodRequests(&ps.Template.Spec), nil)
++	labels := claim.GetLabels()
++	labels[constants.PodSetLabel] = "workers"
++	claim.SetLabels(labels)
++	if err := f.c.Create(f.ctx, claim); err != nil {
++		t.Fatal(err)
++	}
++	f.setCondition(claim, conditionRegistered)
++	wantSpec := runtime.DeepCopyJSONValue(claim.Object["spec"])
++	wantName := claim.GetName()
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 1 || claims[0].GetName() != wantName {
++		t.Fatalf("registered capacity replaced during upgrade: claims=%v check=%v", claims, f.check())
++	}
++	if diff := cmp.Diff(wantSpec, claims[0].Object["spec"]); diff != "" {
++		t.Errorf("immutable claim changed (-want +got):\n%s", diff)
++	}
++	if check := f.check(); check.State != kueue.CheckStateReady {
++		t.Errorf("check = %v, want preserved registered claim Ready", check)
++	}
++}
+diff --git a/pkg/controller/admissionchecks/karpenter/provisioned_test.go b/pkg/controller/admissionchecks/karpenter/provisioned_test.go
+new file mode 100644
+index 0000000..3fb10ed
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/provisioned_test.go
+@@ -0,0 +1,134 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Verify that provisioned NodeClaims retain complete pod counts, ordinal identities, and assigned ownership.
++package karpenter
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++func TestProvisionedClaimsRejectIncompleteOrUnrelatedCapacity(t *testing.T) {
++	for name, mutate := range map[string]func([]unstructured.Unstructured) []unstructured.Unstructured{
++		"unchanged":    func(c []unstructured.Unstructured) []unstructured.Unstructured { return c },
++		"missing tail": func(c []unstructured.Unstructured) []unstructured.Unstructured { return c[:1] },
++		"ordinal gap":  func(c []unstructured.Unstructured) []unstructured.Unstructured { c[1].SetName("unexpected"); return c },
++		"zero count": func(c []unstructured.Unstructured) []unstructured.Unstructured {
++			c[0].SetAnnotations(map[string]string{PodsAnnotation: "0"})
++			return c
++		},
++		"invalid count": func(c []unstructured.Unstructured) []unstructured.Unstructured {
++			c[0].SetAnnotations(map[string]string{PodsAnnotation: "invalid"})
++			return c
++		},
++		"excess count": func(c []unstructured.Unstructured) []unstructured.Unstructured {
++			c[0].SetAnnotations(map[string]string{PodsAnnotation: "3"})
++			return c
++		},
++		"duplicate canonical and legacy ordinal": func(c []unstructured.Unstructured) []unstructured.Unstructured {
++			duplicate := *c[0].DeepCopy()
++			duplicate.SetName(legacyNodeClaimName(c[0].GetLabels()[WorkloadLabelKey], c[0].GetLabels()[AttemptLabelKey], fmt.Sprintf("%s-0", kueue.DefaultPodSetName)))
++			duplicate.SetAnnotations(map[string]string{PodsAnnotation: "1"})
++			c[0].SetAnnotations(map[string]string{PodsAnnotation: "1"})
++			return append(c, duplicate)
++		},
++		"wrong pool": func(c []unstructured.Unstructured) []unstructured.Unstructured {
++			l := c[0].GetLabels()
++			l[NodePoolLabelKey] = "different"
++			c[0].SetLabels(l)
++			return c
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			wl := reservedWorkload("karpenter-a").Obj()
++			wl.Name = strings.Repeat("a", 46)
++			attempt := attemptID(wl, reservedAt)
++			claims := make([]unstructured.Unstructured, 2)
++			for i := range claims {
++				suffix := fmt.Sprintf("%s-%d", kueue.DefaultPodSetName, i)
++				claims[i].SetName(nodeClaimName(wl, attempt, suffix))
++				claims[i].SetLabels(
++					map[string]string{
++						ManagedLabelKey:           "kueue",
++						WorkloadLabelKey:          wl.Name,
++						WorkloadNamespaceLabelKey: wl.Namespace,
++						AttemptLabelKey:           attempt,
++						constants.PodSetLabel:     string(kueue.DefaultPodSetName),
++						NodePoolLabelKey:          "pool-a",
++					},
++				)
++				claims[i].SetAnnotations(map[string]string{PodsAnnotation: "2"})
++			}
++			got, problem := provisionedPodSetClaims(wl, attempt, kueue.DefaultPodSetName, 4, map[string]string{NodePoolLabelKey: "pool-a"}, mutate(claims))
++			if name == "unchanged" {
++				if problem != "" || len(got) != 2 {
++					t.Fatalf("claims=%d problem=%s", len(got), problem)
++				}
++			} else if problem == "" {
++				t.Fatalf("invalid existing capacity accepted: %v", got)
++			}
++		})
++	}
++}
++
++func TestProvisionedClaimsAdoptedClaimAnnotationDoesNotMatchNameSuffix(t *testing.T) {
++	wl := reservedWorkload("karpenter-a").Obj()
++	wl.Name = strings.Repeat("a", 46)
++	attempt := attemptID(wl, reservedAt)
++	c0 := unstructured.Unstructured{}
++	c0.SetName("pred-attempt-main-1")
++	c0.SetLabels(map[string]string{
++		ManagedLabelKey:           "kueue",
++		WorkloadLabelKey:          wl.Name,
++		WorkloadNamespaceLabelKey: wl.Namespace,
++		AttemptLabelKey:           attempt,
++		constants.PodSetLabel:     string(kueue.DefaultPodSetName),
++		NodePoolLabelKey:          "pool-a",
++	})
++	c0.SetAnnotations(map[string]string{
++		PodsAnnotation:        "1",
++		ClaimSuffixAnnotation: fmt.Sprintf("%s-0", kueue.DefaultPodSetName),
++	})
++
++	c1 := unstructured.Unstructured{}
++	c1.SetName(nodeClaimName(wl, attempt, fmt.Sprintf("%s-1", kueue.DefaultPodSetName)))
++	c1.SetLabels(map[string]string{
++		ManagedLabelKey:           "kueue",
++		WorkloadLabelKey:          wl.Name,
++		WorkloadNamespaceLabelKey: wl.Namespace,
++		AttemptLabelKey:           attempt,
++		constants.PodSetLabel:     string(kueue.DefaultPodSetName),
++		NodePoolLabelKey:          "pool-a",
++	})
++	c1.SetAnnotations(map[string]string{
++		PodsAnnotation: "1",
++	})
++
++	got, problem := provisionedPodSetClaims(wl, attempt, kueue.DefaultPodSetName, 2, map[string]string{NodePoolLabelKey: "pool-a"}, []unstructured.Unstructured{c0, c1})
++	if problem != "" || len(got) != 2 {
++		t.Fatalf("expected 2 claims accepted, got %d problem=%s", len(got), problem)
++	}
++	if got[0].GetName() != c0.GetName() || got[1].GetName() != c1.GetName() {
++		t.Fatalf("unexpected order: %s, %s", got[0].GetName(), got[1].GetName())
++	}
++}

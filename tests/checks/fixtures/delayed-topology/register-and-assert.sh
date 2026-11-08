@@ -22,7 +22,8 @@ wait_for_count 3 get nodeclaims -l "$selector"
 claims=$(kubectl get nodeclaims -l "$selector" -o json)
 # Half of 1 CPU minus Kind's 100m daemon request fits one 250m pod per claim.
 echo "$claims" | jq -e '([.items[].metadata.annotations["kueue.x-k8s.io/karpenter-pods"]] | sort) == ["1","1","1"]'
-wl=$(echo "$claims" | jq -r '.items[0].metadata.labels["kueue.x-k8s.io/workload"]')
+wl=$(echo "$claims" | jq -r '.items[0].metadata.annotations["kueue.x-k8s.io/workload"] // .items[0].metadata.labels["kueue.x-k8s.io/workload"]')
+uid=$(echo "$claims" | jq -r '.items[0].metadata.labels["kueue.x-k8s.io/workload"]')
 attempt=$(echo "$claims" | jq -r '.items[0].metadata.labels["kueue.x-k8s.io/karpenter-attempt"]')
 assert_pending() {
   kubectl -n "$NS" get workload "$wl" -o json | jq -e '
@@ -62,15 +63,15 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
       (.items | length) == 3 and all(.items[]; (.spec.nodeName // "" | startswith("tas-")) and (.spec.schedulingGates | length) == 0)' >/dev/null; then break; fi
   sleep 1
 done
-kubectl -n "$NS" get workload "$wl" -o json | jq -L . -e --arg attempt "$attempt" --arg wl "$wl" '
+kubectl -n "$NS" get workload "$wl" -o json | jq -L . -e --arg attempt "$attempt" --arg wl "$wl" --arg uid "$uid" '
   include "topology"; with_domains |
   any(.status.conditions[]; .type == "Admitted" and .status == "True") and
   .status.admission.podSetAssignments[0].delayedTopologyRequest == "Ready" and
   (.status.admission.podSetAssignments[0].topologyAssignment.domains | map(.count) | add) == 3 and
   all(.status.admission.podSetAssignments[0].topologyAssignment.domains[]; .values[-1] | startswith("tas-")) and
-  any(.status.admissionChecks[].podSetUpdates[]; .nodeSelector["kueue.x-k8s.io/karpenter-attempt"] == $attempt and any(.tolerations[]; .key == "karpenter.sh/claimed-by" and .value == $wl and .operator == "Equal"))'
+  any(.status.admissionChecks[].podSetUpdates[]; .nodeSelector["kueue.x-k8s.io/karpenter-attempt"] == $attempt and any(.tolerations[]; .key == "karpenter.sh/claimed-by" and (.value == $wl or .value == $uid) and .operator == "Equal"))'
 kubectl -n "$NS" get pods -l job-name=delayed-tas-gang -o json | jq -e '(.items | length) == 3 and all(.items[]; (.spec.nodeName // "" | startswith("tas-")))'
-kubectl get nodes -l "example.com/delayed-tas-test=$NS" -o json | jq -e --arg wl "$wl" '(.items | length) == 3 and all(.items[]; any(.spec.taints[]; .key == "karpenter.sh/claimed-by" and .value == $wl and .effect == "NoSchedule"))'
+kubectl get nodes -l "example.com/delayed-tas-test=$NS" -o json | jq -e --arg wl "$wl" --arg uid "$uid" '(.items | length) == 3 and all(.items[]; any(.spec.taints[]; .key == "karpenter.sh/claimed-by" and (.value == $wl or .value == $uid) and .effect == "NoSchedule"))'
 kubectl -n "$NS" wait pod rogue --for=condition=PodScheduled=False --timeout=15s
 kubectl -n "$NS" get pod rogue -o json | jq -e '(.spec.nodeName // "") == "" and any(.status.conditions[]; .type == "PodScheduled" and .status == "False" and (.message | contains("untolerated taint")))'
 # Every bound pod is on one of the domains actually assigned by TAS.

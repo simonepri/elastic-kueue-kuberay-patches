@@ -9,7 +9,7 @@ CLUSTER_NAME="${CLUSTER_NAME:-elastic-scale-lab}"
 KUEUE_UPSTREAM="${KUEUE_UPSTREAM:-v0.20.5}"
 KUBERAY_UPSTREAM="${KUBERAY_UPSTREAM:-v1.7.2}"
 KARPENTER_UPSTREAM="${KARPENTER_UPSTREAM:-v1.15.1}"
-KUEUE_FEATURE_GATES="${KUEUE_FEATURE_GATES:-ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true,ElasticJobsViaWorkloadSlicesFlavorSplit=true}"
+KUEUE_FEATURE_GATES="${KUEUE_FEATURE_GATES:-ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true,ElasticJobsViaWorkloadSlicesFlavorSplit=true,KarpenterAdmissionCheck=true,MutableDeploymentQueue=true}"
 
 # 1. Ensure container runtime is running (starts Colima on macOS if docker daemon is inactive)
 if ! docker info >/dev/null 2>&1; then

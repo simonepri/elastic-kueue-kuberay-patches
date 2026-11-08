@@ -21,7 +21,7 @@ kubectl patch node delayed-tas-reserved --subresource=status --type=merge -p '{"
 # Reuse the same indexed gang on the fallback queue; Karpenter never launches these claims.
 sed -e 's/name: delayed-tas-gang/name: delayed-tas-fallback-gang/' -e 's/queue-name: delayed-tas$/queue-name: delayed-tas-fallback/' 01-job.yaml | kubectl -n "$NS" create -f -
 wait_for_count 3 get nodeclaims -l "$selector"
-wl=$(kubectl get nodeclaims -l "$selector" -o json | jq -r '.items[0].metadata.labels["kueue.x-k8s.io/workload"]')
+wl=$(kubectl get nodeclaims -l "$selector" -o json | jq -r '.items[0].metadata.annotations["kueue.x-k8s.io/workload"] // .items[0].metadata.labels["kueue.x-k8s.io/workload"]')
 deadline=$(($(date +%s) + 60))
 while [ "$(date +%s)" -lt "$deadline" ]; do
   kubectl patch node delayed-tas-reserved --subresource=status --type=merge -p "$(jq -nc --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{status:{conditions:[{type:"Ready",status:"True",reason:"KubeletReady",message:"simulated kubelet",lastHeartbeatTime:$now}]}}')" >/dev/null

@@ -1,0 +1,59 @@
+{
+  "apiVersion": "visibility.kueue.x-k8s.io/v1beta2",
+  "kind": "WorkloadSimulation",
+  "spec": {
+    "workload": {
+      "apiVersion": "kueue.x-k8s.io/v1beta2",
+      "kind": "Workload",
+      "metadata": {
+        "name": "simulated-raycluster"
+      },
+      "spec": {
+        "podSets": [
+          {
+            "name": "head",
+            "count": 1,
+            "template": {
+              "spec": {
+                "restartPolicy": "Never",
+                "containers": [
+                  {
+                    "name": "ray-head",
+                    "image": "kind.local/ray:latest",
+                    "resources": {
+                      "requests": {
+                        "cpu": "1",
+                        "memory": "1Gi"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "name": "workers",
+            "count": 3,
+            "template": {
+              "spec": {
+                "restartPolicy": "Never",
+                "containers": [
+                  {
+                    "name": "ray-worker",
+                    "image": "kind.local/ray:latest",
+                    "resources": {
+                      "requests": {
+                        "cpu": "1",
+                        "memory": "1Gi"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

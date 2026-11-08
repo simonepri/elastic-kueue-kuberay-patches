@@ -38,7 +38,7 @@ RAY_LOCAL_VERSION = "{{ get_env(name='RAY_LOCAL_VERSION', default='') }}"
 RAY_WHEEL_BASE_URL = "{{ get_env(name='RAY_WHEEL_BASE_URL', default='') }}"
 RAY_INSTALL_WHEEL = "{{ get_env(name='RAY_INSTALL_WHEEL', default='0') }}"
 RAY_WHEEL_DIR = "{{ get_env(name='RAY_WHEEL_DIR', default='') }}"
-KUEUE_FEATURE_GATES = "{{ get_env(name='KUEUE_FEATURE_GATES', default='ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true,ElasticJobsViaWorkloadSlicesFlavorSplit=true,KarpenterAdmissionCheck=true,MutableDeploymentQueue=true') }}"
+KUEUE_FEATURE_GATES = "{{ get_env(name='KUEUE_FEATURE_GATES', default='ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true,ElasticJobsViaWorkloadSlicesFlavorSplit=true,KarpenterAdmissionCheck=true,MutableDeploymentQueue=true,VisibilityOnDemand=true,PreSubmissionSimulator=true') }}"
 
 [tasks."patch:kueue"]
 description = "Apply patches to third_party/kueue"

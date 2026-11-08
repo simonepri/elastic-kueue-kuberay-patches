@@ -31,6 +31,7 @@ spec:
                   memory: "256Mi"
     workerGroupSpecs:
       - groupName: workers
+        rayStartParams: {}
         replicas: 3
         minReplicas: 1
         maxReplicas: 4

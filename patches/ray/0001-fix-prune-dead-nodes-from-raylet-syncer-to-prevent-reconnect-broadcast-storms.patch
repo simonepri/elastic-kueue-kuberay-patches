@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simone Primarosa <simone.primarosa@gmail.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] fix: prune dead nodes from raylet syncer to prevent reconnect broadcast storms
+
+Stop a reconnecting raylet from replaying dead nodes' state to the cluster.
+
+Each raylet keeps a syncer cluster view filled from GCS broadcasts about every
+node. NodeManager::NodeRemoved drops a dead node from the scheduler's resource
+manager but not from that view, and the syncer only forgets its direct peer. After
+a reconnect the raylet resends the whole view, so the GCS, which already removed
+those nodes, logs "received resource usage from unknown node id" and rebroadcasts
+the stale entries to every node. In a long-lived cluster with heavy node churn one
+reconnect replays every node that ever died, and the extra traffic breaks more
+connections.
+
+RaySyncer gains RemoveNode, which NodeRemoved now calls, so a dead node is never
+resent. It also gains SetDeadNodeFilter: the GCS installs a filter backed by its node
+manager's dead node set, and a message about a dead node is neither stored nor
+rebroadcast. Either change alone stops the replay.
+
+Upstream status: not yet reported to ray-project/ray.
+---
+ src/ray/gcs/gcs_server.cc                   |    4 +
+ src/ray/ray_syncer/ray_syncer.cc            |   15 ++++++
+ src/ray/ray_syncer/ray_syncer.h             |   19 +++++++
+ src/ray/raylet/node_manager.cc              |    4 +
+ src/ray/raylet/node_manager.h               |    1 
+ src/ray/ray_syncer/tests/ray_syncer_test.cc |   70 ++++++++++++++++++++++++++++
+ src/ray/raylet/tests/node_manager_test.cc   |   42 ++++++++++++++++
+ 7 files changed, 155 insertions(+)
+
+diff --git a/src/ray/gcs/gcs_server.cc b/src/ray/gcs/gcs_server.cc
+index b08a535..72587c6 100644
+--- a/src/ray/gcs/gcs_server.cc
++++ b/src/ray/gcs/gcs_server.cc
+@@ -975,6 +975,10 @@ void GcsServer::InitRaySyncer(const GcsInitData &gcs_init_data) {
+       [this](const NodeID &node_id) {
+         gcs_healthcheck_manager_->MarkNodeHealthy(node_id);
+       });
++  // Never store or rebroadcast what nodes report about nodes that already died.
++  ray_syncer_->SetDeadNodeFilter([this](const std::string &node_id) {
++    return gcs_node_manager_->IsNodeDead(NodeID::FromBinary(node_id));
++  });
+   ray_syncer_->Register(
+       syncer::MessageType::RESOURCE_VIEW, nullptr, gcs_resource_manager_.get());
+   ray_syncer_->Register(
+diff --git a/src/ray/ray_syncer/ray_syncer.cc b/src/ray/ray_syncer/ray_syncer.cc
+index 06c5c6a..bf9b1aa 100644
+--- a/src/ray/ray_syncer/ray_syncer.cc
++++ b/src/ray/ray_syncer/ray_syncer.cc
+@@ -166,6 +166,16 @@ void RaySyncer::Disconnect(const std::string &node_id) {
+   boost::asio::dispatch(io_context_.get_executor(), std::move(task)).get();
+ }
+ 
++void RaySyncer::RemoveNode(const std::string &node_id) {
++  io_context_.dispatch([this, node_id] { node_state_->RemoveNode(node_id); },
++                       "RaySyncer.RemoveNode");
++}
++
++void RaySyncer::SetDeadNodeFilter(
++    std::function<bool(const std::string &node_id)> is_node_dead) {
++  is_node_dead_ = std::move(is_node_dead);
++}
++
+ void RaySyncer::Register(MessageType message_type,
+                          const ReporterInterface *reporter,
+                          ReceiverInterface *receiver,
+@@ -210,6 +220,11 @@ bool RaySyncer::BroadcastMessageIfNewVersion(MessageType message_type) {
+ void RaySyncer::BroadcastMessage(std::shared_ptr<const RaySyncMessage> message) {
+   io_context_.dispatch(
+       [this, message] {
++        if (is_node_dead_ && is_node_dead_(message->node_id())) {
++          RAY_LOG(DEBUG).WithField(NodeID::FromBinary(message->node_id()))
++              << "Dropping sync message about a dead node.";
++          return;
++        }
+         // The message is stale. Just skip this one.
+         RAY_LOG(DEBUG) << "Receive message from: "
+                        << NodeID::FromBinary(message->node_id()) << " to "
+diff --git a/src/ray/ray_syncer/ray_syncer.h b/src/ray/ray_syncer/ray_syncer.h
+index 888b753..06da1f3 100644
+--- a/src/ray/ray_syncer/ray_syncer.h
++++ b/src/ray/ray_syncer/ray_syncer.h
+@@ -116,6 +116,20 @@ class RaySyncer {
+ 
+   void Disconnect(const std::string &node_id);
+ 
++  /// Forget everything this syncer knows about a node that left the cluster, so it is
++  /// never sent to peers again. Does not touch the connection to the node, if any.
++  ///
++  /// \param node_id The id of the node to forget.
++  void RemoveNode(const std::string &node_id);
++
++  /// Set a predicate that tells whether a node is known to be dead. A message about a
++  /// dead node is neither stored nor forwarded. Must be called before the syncer
++  /// receives its first message; the predicate runs on the syncer's io context and
++  /// must be thread-safe.
++  ///
++  /// \param is_node_dead Returns true if the node, given in binary form, is dead.
++  void SetDeadNodeFilter(std::function<bool(const std::string &node_id)> is_node_dead);
++
+   /// Get the latest sync message sent from a specific node.
+   ///
+   /// \param node_id The node id where the message comes from.
+@@ -194,6 +208,9 @@ class RaySyncer {
+   /// [RaySyncerBidiReactor], so should be passed to each of them.
+   RpcCompletionCallback on_rpc_completion_;
+ 
++  /// Tells whether a node is known to be dead; empty if the syncer has no such source.
++  std::function<bool(const std::string &)> is_node_dead_;
++
+   friend class RaySyncerService;
+   /// Test purpose
+   friend struct SyncerServerTest;
+@@ -203,6 +220,8 @@ class RaySyncer {
+   FRIEND_TEST(SyncerTest, Test1ToN);
+   FRIEND_TEST(SyncerTest, TestMToN);
+   FRIEND_TEST(SyncerTest, Reconnect);
++  FRIEND_TEST(SyncerTest, MessagesAboutDeadNodesAreNeitherStoredNorForwarded);
++  FRIEND_TEST(SyncerTest, RemovedNodeIsNotSentToNewPeers);
+ };
+ 
+ using SyncStreamReactor =
+diff --git a/src/ray/raylet/node_manager.cc b/src/ray/raylet/node_manager.cc
+index ad7f3e7..5dd06fd 100644
+--- a/src/ray/raylet/node_manager.cc
++++ b/src/ray/raylet/node_manager.cc
+@@ -1009,6 +1009,10 @@ void NodeManager::NodeRemoved(const NodeID &node_id) {
+         << "Received NodeRemoved callback for an unknown node.";
+   }
+ 
++  // Drop the node from the syncer's cluster view too, so a later reconnect does not
++  // replay its stale state to the GCS and from there to every other node.
++  ray_syncer_.RemoveNode(node_id.Binary());
++
+   // Remove the node manager address.
+   const auto node_entry = remote_node_manager_addresses_.find(node_id);
+   if (node_entry != remote_node_manager_addresses_.end()) {
+diff --git a/src/ray/raylet/node_manager.h b/src/ray/raylet/node_manager.h
+index 8da98ce..bc29554 100644
+--- a/src/ray/raylet/node_manager.h
++++ b/src/ray/raylet/node_manager.h
+@@ -356,6 +356,7 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
+   void FreeLocalObjects(const std::vector<ObjectID> &object_ids);
+ 
+   FRIEND_TEST(NodeManagerStaticTest, TestHandleReportWorkerBacklog);
++  FRIEND_TEST(NodeManagerTest, TestNodeRemovedDropsSyncerClusterView);
+ 
+   /// Handle an accepted client connection.
+   void HandleAccept(const boost::system::error_code &error);
+diff --git a/src/ray/ray_syncer/tests/ray_syncer_test.cc b/src/ray/ray_syncer/tests/ray_syncer_test.cc
+index b2c0fc2..88289fc 100644
+--- a/src/ray/ray_syncer/tests/ray_syncer_test.cc
++++ b/src/ray/ray_syncer/tests/ray_syncer_test.cc
+@@ -699,6 +699,76 @@ TEST_F(SyncerTest, Reconnect) {
+       5));
+ }
+ 
++TEST_F(SyncerTest, MessagesAboutDeadNodesAreNeitherStoredNorForwarded) {
++  auto &s1 = MakeServer("19982");
++  auto &s2 = MakeServer("19983");
++  const auto dead_node_id = NodeID::FromRandom();
++  const auto alive_node_id = NodeID::FromRandom();
++  s1.syncer->SetDeadNodeFilter([dead_node_id](const std::string &node_id) {
++    return node_id == dead_node_id.Binary();
++  });
++
++  s2.syncer->Connect(s1.syncer->GetLocalNodeID(), MakeChannel("19982"));
++  ASSERT_TRUE(s2.WaitUntil([&s2]() { return s2.syncer->sync_reactors_.size() == 1; }, 5));
++
++  // The stream keeps the order, so the live node's message arriving proves the dead
++  // node's earlier one was already handled.
++  s2.syncer->BroadcastMessage(
++      std::make_shared<RaySyncMessage>(MakeMessage(MessageType::RESOURCE_VIEW, 1, dead_node_id)));
++  s2.WaitSendingFlush();
++  s2.syncer->BroadcastMessage(std::make_shared<RaySyncMessage>(
++      MakeMessage(MessageType::RESOURCE_VIEW, 1, alive_node_id)));
++  ASSERT_TRUE(s1.WaitUntil(
++      [&s1, &alive_node_id]() {
++        return s1.received_versions.count(alive_node_id.Binary()) == 1;
++      },
++      5));
++
++  ASSERT_TRUE(s1.WaitUntil(
++      [&s1, &dead_node_id]() {
++        const auto &view = s1.syncer->node_state_->GetClusterView();
++        return view.count(dead_node_id.Binary()) == 0 &&
++               s1.received_versions.count(dead_node_id.Binary()) == 0;
++      },
++      5));
++}
++
++TEST_F(SyncerTest, RemovedNodeIsNotSentToNewPeers) {
++  auto &s1 = MakeServer("19984");
++  auto &s2 = MakeServer("19985");
++  auto &s3 = MakeServer("19986");
++  const auto gone_node_id = NodeID::FromRandom();
++
++  s2.syncer->Connect(s1.syncer->GetLocalNodeID(), MakeChannel("19984"));
++  s2.syncer->BroadcastMessage(std::make_shared<RaySyncMessage>(
++      MakeMessage(MessageType::RESOURCE_VIEW, 1, gone_node_id)));
++  ASSERT_TRUE(s1.WaitUntil(
++      [&s1, &gone_node_id]() {
++        return s1.syncer->node_state_->GetClusterView().count(gone_node_id.Binary()) == 1;
++      },
++      5));
++
++  // The node dies; s1 forgets it, then a new peer connects and must not learn about it.
++  s1.syncer->RemoveNode(gone_node_id.Binary());
++  ASSERT_TRUE(s1.WaitUntil(
++      [&s1, &gone_node_id]() {
++        return s1.syncer->node_state_->GetClusterView().count(gone_node_id.Binary()) == 0;
++      },
++      5));
++
++  s1.syncer->Connect(s3.syncer->GetLocalNodeID(), MakeChannel("19986"));
++  ASSERT_TRUE(s3.WaitUntil(
++      [&s3, &s1]() {
++        return s3.received_versions.count(s1.syncer->GetLocalNodeID()) == 1;
++      },
++      5));
++  ASSERT_TRUE(s3.WaitUntil(
++      [&s3, &gone_node_id]() {
++        return s3.received_versions.count(gone_node_id.Binary()) == 0;
++      },
++      2));
++}
++
+ TEST_F(SyncerTest, Broadcast) {
+   // This test covers the broadcast feature of ray syncer.
+   auto &s1 = MakeServer("19990");
+diff --git a/src/ray/raylet/tests/node_manager_test.cc b/src/ray/raylet/tests/node_manager_test.cc
+index 897029a..c9c909a 100644
+--- a/src/ray/raylet/tests/node_manager_test.cc
++++ b/src/ray/raylet/tests/node_manager_test.cc
+@@ -747,6 +747,48 @@ TEST_F(NodeManagerTest, TestDetachedWorkerIsKilledByFailedNode) {
+   EXPECT_FALSE(worker->IsKilled());
+ }
+ 
++TEST_F(NodeManagerTest, TestNodeRemovedDropsSyncerClusterView) {
++  const auto dead_node_id = NodeID::FromRandom();
++  const auto alive_node_id = NodeID::FromRandom();
++  EXPECT_CALL(*mock_object_directory_, HandleNodeRemoved(dead_node_id)).Times(1);
++  EXPECT_CALL(*mock_object_manager_, HandleNodeRemoved(dead_node_id)).Times(1);
++
++  // The syncer runs on io_service_, which no thread runs in this test.
++  auto drain = [this]() {
++    io_service_.restart();
++    io_service_.poll();
++  };
++  auto syncer_knows = [&](const NodeID &node_id) {
++    bool known = false;
++    io_service_.post(
++        [&]() {
++          known = node_manager_->ray_syncer_.GetSyncMessage(
++                      node_id.Binary(), syncer::MessageType::RESOURCE_VIEW) != nullptr;
++        },
++        "TEST");
++    drain();
++    return known;
++  };
++
++  for (const auto &node_id : {dead_node_id, alive_node_id}) {
++    syncer::RaySyncMessage msg;
++    msg.set_node_id(node_id.Binary());
++    msg.set_message_type(syncer::MessageType::RESOURCE_VIEW);
++    msg.set_version(1);
++    node_manager_->ray_syncer_.BroadcastMessage(
++        std::make_shared<syncer::RaySyncMessage>(msg));
++  }
++  drain();
++  ASSERT_TRUE(syncer_knows(dead_node_id));
++  ASSERT_TRUE(syncer_knows(alive_node_id));
++
++  node_manager_->NodeRemoved(dead_node_id);
++  drain();
++
++  EXPECT_FALSE(syncer_knows(dead_node_id));
++  EXPECT_TRUE(syncer_knows(alive_node_id));
++}
++
+ TEST_F(NodeManagerTest, TestPinningAnObjectPendingDeletionFails) {
+   // Object needs to be created in plasma before it can be pinned.
+   rpc::Address owner_addr;
+
+-- 
+2.56.0

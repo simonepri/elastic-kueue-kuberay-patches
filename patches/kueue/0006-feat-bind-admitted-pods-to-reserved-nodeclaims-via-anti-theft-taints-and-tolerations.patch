@@ -1,0 +1,438 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simone Primarosa <simone.primarosa@gmail.com>
+Date: Sat, 7 Nov 2026 12:00:00 +01:00
+Subject: [PATCH] feat: bind admitted pods to reserved nodeclaims via anti-theft taints and tolerations
+
+When Kueue admits multi-slice elastic workloads on dynamic capacity, long-lived job templates retain the first slice's Karpenter anti-theft attempt node selector and taints, causing subsequent slices to inherit stale node placement. Simultaneously, newly created pods held by the elastic scheduling gate do not receive admission check tolerations from ElasticJobUngater before ungating, preventing them from scheduling onto nodes guarded by anti-theft taints.
+
+Strip per-attempt Karpenter node selectors and anti-theft tolerations from elastic job pod templates via deferKarpenterPlacementToPods so subsequent slices do not inherit stale placement. In ElasticJobUngater, inject admission check tolerations onto gated elastic pods before releasing their scheduling gates when KarpenterAdmissionCheck is enabled.
+---
+diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
+index cecebf3..5a42ea9 100644
+--- a/pkg/controller/elasticjobs/elastic_job_ungater.go
++++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
+@@ -45,6 +45,7 @@ import (
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+ 	"sigs.k8s.io/kueue/pkg/constants"
+ 	"sigs.k8s.io/kueue/pkg/controller/core"
++	"sigs.k8s.io/kueue/pkg/features"
+ 	"sigs.k8s.io/kueue/pkg/metrics"
+ 	utilclient "sigs.k8s.io/kueue/pkg/util/client"
+ 	"sigs.k8s.io/kueue/pkg/util/expectations"
+@@ -191,6 +192,7 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
+ type podAdmissionUpdate struct {
+ 	annotations  map[string]string
+ 	nodeSelector map[string]string
++	tolerations  []corev1.Toleration
+ }
+ 
+ func admissionUpdateForPodSet(wl *kueue.Workload, podSetName kueue.PodSetReference) (podAdmissionUpdate, error) {
+@@ -224,6 +226,12 @@ func admissionUpdateForPodSet(wl *kueue.Workload, podSetName kueue.PodSetReferen
+ 				}
+ 				update.nodeSelector[key] = value
+ 			}
++			// A gated pod may gain tolerations. A Karpenter check publishes the
++			// claimed-by toleration of the nodes of the slice it provisioned, which
++			// the pod needs to land on them.
++			if features.Enabled(features.KarpenterAdmissionCheck) {
++				update.tolerations = append(update.tolerations, psUpdate.Tolerations...)
++			}
+ 		}
+ 	}
+ 	return update, nil
+@@ -259,9 +267,25 @@ func refreshPodAdmission(pod *corev1.Pod, update podAdmissionUpdate) (bool, erro
+ 		utilmaps.Copy(&pod.Annotations, update.annotations)
+ 		utilmaps.Copy(&pod.Spec.NodeSelector, update.nodeSelector)
+ 	}
++	if addTolerations(pod, update.tolerations) {
++		changed = true
++	}
+ 	return changed, nil
+ }
+ 
++// addTolerations adds the tolerations that the Pod does not have yet. The API
++// server accepts added tolerations on a gated Pod.
++func addTolerations(pod *corev1.Pod, tolerations []corev1.Toleration) bool {
++	changed := false
++	for _, toleration := range tolerations {
++		if !slices.ContainsFunc(pod.Spec.Tolerations, func(t corev1.Toleration) bool { return toleration.MatchToleration(&t) }) {
++			pod.Spec.Tolerations = append(pod.Spec.Tolerations, toleration)
++			changed = true
++		}
++	}
++	return changed
++}
++
+ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload) ([]*corev1.Pod, error) {
+ 	// All pods in the slice chain share the same WorkloadSliceNameAnnotation,
+ 	// so the index lookup returns every pod created on behalf of this job.
+diff --git a/pkg/controller/jobframework/karpenter_placement.go b/pkg/controller/jobframework/karpenter_placement.go
+new file mode 100644
+index 0000000..32e0585
+--- /dev/null
++++ b/pkg/controller/jobframework/karpenter_placement.go
+@@ -0,0 +1,68 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Defers Karpenter anti-theft placement to ungated pods so elastic job templates do not retain stale selectors.
++package jobframework
++
++import (
++	"slices"
++
++	corev1 "k8s.io/api/core/v1"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/podset"
++)
++
++// A long-lived elastic template must not retain the first slice's claim selector
++// or toleration. The ungater already applies Ready PodSetUpdates to each pod.
++// Keep user-supplied placement and ordinary, ungated PodSets on their normal path.
++func deferKarpenterPlacementToPods(wl *kueue.Workload, info []podset.PodSetInfo) {
++	if !features.Enabled(features.KarpenterAdmissionCheck) {
++		return
++	}
++	for _, ps := range wl.Spec.PodSets {
++		if !slices.ContainsFunc(ps.Template.Spec.SchedulingGates, func(g corev1.PodSchedulingGate) bool { return g.Name == kueue.ElasticJobSchedulingGate }) {
++			continue
++		}
++		for i := range info {
++			if info[i].Name != ps.Name {
++				continue
++			}
++			for _, check := range wl.Status.AdmissionChecks {
++				if check.State != kueue.CheckStateReady {
++					continue
++				}
++				for _, update := range check.PodSetUpdates {
++				if update.Name != ps.Name || update.NodeSelector[constants.KarpenterAttemptLabel] == "" {
++					continue
++				}
++				if _, supplied := ps.Template.Spec.NodeSelector[constants.KarpenterAttemptLabel]; !supplied {
++					delete(info[i].NodeSelector, constants.KarpenterAttemptLabel)
++				}
++				info[i].Tolerations = slices.DeleteFunc(info[i].Tolerations, func(t corev1.Toleration) bool {
++					if t.Key != constants.KarpenterAntiTheftTaintKey {
++						return false
++					}
++					supplied := slices.ContainsFunc(ps.Template.Spec.Tolerations, func(user corev1.Toleration) bool { return t.MatchToleration(&user) })
++					injected := slices.ContainsFunc(update.Tolerations, func(added corev1.Toleration) bool { return t.MatchToleration(&added) })
++					return injected && !supplied
++				})
++			}
++			}
++		}
++	}
++}
+diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
+index adc4963..6d33b7c 100644
+--- a/pkg/controller/jobframework/reconciler.go
++++ b/pkg/controller/jobframework/reconciler.go
+@@ -1674,6 +1674,7 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
+ 	infoMap := slices.ToRefMap(info, func(psi *podset.PodSetInfo) kueue.PodSetReference { return psi.Name })
+ 	runningPodSets := wl.Spec.DeepCopy().PodSets
+ 	canBePartiallyAdmitted := workload.CanBePartiallyAdmitted(wl)
++	deferKarpenterPlacementToPods(wl, info)
+ 	for i := range runningPodSets {
+ 		ps := &runningPodSets[i]
+ 		psi, found := infoMap[ps.Name]
+@@ -1775,6 +1776,7 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
+ 	if err != nil {
+ 		return err
+ 	}
++	deferKarpenterPlacementToPods(wl, info)
+ 	if workloadslicing.IsEnabledForProvisioningRequests(wl) {
+ 		if err := deferAdmissionCheckNodeSelectorsToPods(ctx, r.client, wl, info); err != nil {
+ 			return err
+diff --git a/pkg/controller/elasticjobs/elastic_job_ungater_test.go b/pkg/controller/elasticjobs/elastic_job_ungater_test.go
+index 9bc912d..cb087ca 100644
+--- a/pkg/controller/elasticjobs/elastic_job_ungater_test.go
++++ b/pkg/controller/elasticjobs/elastic_job_ungater_test.go
+@@ -97,9 +97,14 @@ func makeElasticPodForPodSet(name string, podSet kueue.PodSetReference) *testing
+ 		Label(constants.PodSetLabel, string(podSet))
+ }
+ 
++func claimedBy(workload string) corev1.Toleration {
++	return corev1.Toleration{Key: "example.com/claimed-by", Operator: corev1.TolerationOpEqual, Value: workload, Effect: corev1.TaintEffectNoSchedule}
++}
++
+ func TestReconcile(t *testing.T) {
+ 	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
+ 	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesForProvisioningRequests, true)
++	features.SetFeatureGateDuringTest(t, features.KarpenterAdmissionCheck, true)
+ 	now := time.Now().Truncate(time.Second)
+ 
+ 	testCases := map[string]struct {
+@@ -863,6 +868,56 @@ func TestReconcile(t *testing.T) {
+ 					NodeSelector("cloud.example.com/provisioning-request", "current-booking").
+ 					Obj(),
+ 			},
++		},
++				"gated pods gain the tolerations that an admission check publishes": {
++			workloads: []kueue.Workload{
++				*utiltestingapi.MakeWorkload("wl", "ns").
++					Finalizers(kueue.ResourceInUseFinalizerName).
++					Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++					ControllerReference(rayClusterGVK, "ray", "ray-uid").
++					PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).Request(corev1.ResourceCPU, "1").Obj()).
++					ReserveQuotaAt(
++						utiltestingapi.MakeAdmission("cq").
++							PodSets(utiltestingapi.MakePodSetAssignment(kueue.DefaultPodSetName).
++								Assignment(corev1.ResourceCPU, "flavor", "1").
++								Obj()).
++							Obj(), now,
++					).
++					AdmittedAt(true, now).
++					AdmissionChecks(kueue.AdmissionCheckState{
++						Name:  "karpenter",
++						State: kueue.CheckStateReady,
++						PodSetUpdates: []kueue.PodSetUpdate{{
++							Name:         kueue.DefaultPodSetName,
++							NodeSelector: map[string]string{"example.com/attempt": "attempt-2"},
++							Tolerations:  []corev1.Toleration{claimedBy("wl")},
++						}},
++					}).
++					Obj(),
++			},
++			pods: []corev1.Pod{
++				// A pod created before this slice carries the previous slice's toleration.
++				func() corev1.Pod {
++					pod := testingpod.MakePod("pod", "ns").
++						Annotation(kueue.WorkloadAnnotation, "wl").
++						Annotation(kueue.WorkloadSliceNameAnnotation, "wl").
++						Gate(kueue.ElasticJobSchedulingGate).
++						Obj()
++					pod.Spec.Tolerations = []corev1.Toleration{claimedBy("previous")}
++					return *pod
++				}(),
++			},
++			wantPods: []corev1.Pod{
++				func() corev1.Pod {
++					pod := testingpod.MakePod("pod", "ns").
++						Annotation(kueue.WorkloadAnnotation, "wl").
++						Annotation(kueue.WorkloadSliceNameAnnotation, "wl").
++						NodeSelector("example.com/attempt", "attempt-2").
++						Obj()
++					pod.Spec.Tolerations = []corev1.Toleration{claimedBy("previous"), claimedBy("wl")}
++					return *pod
++				}(),
++			},
+ 		},
+ 		"ungates when active slice has no provisioning admission check": {
+ 			// Leftover consume annotations must not permanently gate pods when
+diff --git a/pkg/controller/jobframework/karpenter_placement_test.go b/pkg/controller/jobframework/karpenter_placement_test.go
+new file mode 100644
+index 0000000..f3d9718
+--- /dev/null
++++ b/pkg/controller/jobframework/karpenter_placement_test.go
+@@ -0,0 +1,74 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests deferral of Karpenter anti-theft placement to ungated pods for elastic job templates.
++package jobframework
++
++import (
++	"testing"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/podset"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++)
++
++func TestKarpenterPlacementStaysOffElasticTemplates(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.KarpenterAdmissionCheck, true)
++	taint := corev1.Toleration{Key: constants.KarpenterAntiTheftTaintKey, Operator: corev1.TolerationOpEqual, Value: "slice-1", Effect: corev1.TaintEffectNoSchedule}
++	for name, tc := range map[string]struct {
++		gated, userPlacement bool
++		wantDeferred         bool
++	}{
++		"elastic workers":                      {gated: true, wantDeferred: true},
++		"ordinary head":                        {},
++		"explicit user placement is preserved": {gated: true, userPlacement: true},
++	} {
++		t.Run(name, func(t *testing.T) {
++			ps := utiltestingapi.MakePodSet("workers", 1).Request(corev1.ResourceCPU, "1").Obj()
++			if tc.gated {
++				ps.Template.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: kueue.ElasticJobSchedulingGate}}
++			}
++			if tc.userPlacement {
++				ps.Template.Spec.NodeSelector = map[string]string{constants.KarpenterAttemptLabel: "attempt-1"}
++				ps.Template.Spec.Tolerations = []corev1.Toleration{taint}
++			}
++			update := kueue.PodSetUpdate{Name: ps.Name, NodeSelector: map[string]string{constants.KarpenterAttemptLabel: "attempt-1"}, Tolerations: []corev1.Toleration{taint}}
++			wl := utiltestingapi.MakeWorkload("slice-1", "ns").PodSets(*ps).ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(utiltestingapi.MakePodSetAssignment(ps.Name).Flavor(corev1.ResourceCPU, "pool").Count(1).Obj()).Obj(), time.Now()).
++				AdmissionCheck(kueue.AdmissionCheckState{Name: "karpenter", State: kueue.CheckStateReady, PodSetUpdates: []kueue.PodSetUpdate{update}}).Obj()
++			info := []podset.PodSetInfo{{Name: ps.Name, NodeSelector: map[string]string{constants.KarpenterAttemptLabel: "attempt-1", "stable": "pool"}, Tolerations: []corev1.Toleration{taint}}}
++			deferKarpenterPlacementToPods(wl, info)
++			_, hasAttempt := info[0].NodeSelector[constants.KarpenterAttemptLabel]
++			if hasAttempt == tc.wantDeferred || (len(info[0].Tolerations) == 0) != tc.wantDeferred || info[0].NodeSelector["stable"] != "pool" {
++				t.Fatalf("unexpected template placement: %+v", info[0])
++			}
++			// Workload/job equivalence must expect the same placement startJob applies.
++			cl := utiltesting.NewClientBuilder().WithObjects(utiltestingapi.MakeResourceFlavor("pool").NodeLabel("stable", "pool").Obj()).Build()
++			expected := expectedRunningPodSets(t.Context(), cl, wl)
++			if len(expected) != 1 {
++				t.Fatalf("got %d expected PodSets, want 1", len(expected))
++			}
++			_, hasAttempt = expected[0].Template.Spec.NodeSelector[constants.KarpenterAttemptLabel]
++			if hasAttempt == tc.wantDeferred {
++				t.Fatalf("equivalence expects per-attempt placement: %+v", expected[0])
++			}
++		})
++	}
++}
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go
+new file mode 100644
+index 0000000..9d21bf6
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go
+@@ -0,0 +1,114 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Verifies that a gated elastic worker gains the node selector and tolerations that an admission check publishes before it starts.
++
++package raycluster
++
++import (
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/component-base/featuregate"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	workloadpatching "sigs.k8s.io/kueue/pkg/workload/patching"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++var _ = ginkgo.Describe("RayCluster elastic workers and admission check pod set updates", ginkgo.Label("job:ray", "area:jobs"), func() {
++	ginkgo.It("gives a gated worker the node selector and tolerations of the check before it starts", func() {
++		features.SetFeatureGatesDuringTest(ginkgo.GinkgoTB(), map[featuregate.Feature]bool{
++			features.ElasticJobsViaWorkloadSlices: true,
++			features.KarpenterAdmissionCheck:      true,
++		})
++		fwk.StartManager(ctx, cfg, managerAndSchedulerSetup())
++		ginkgo.DeferCleanup(func() { fwk.StopManager(ctx) })
++		ns := behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "check-tolerations-")
++		flavor := utiltestingapi.MakeResourceFlavor("default").Obj()
++		check := utiltestingapi.MakeAdmissionCheck("check").ControllerName("example.com/check").Obj()
++		behavioral.MustCreate(ctx, k8sClient, flavor)
++		behavioral.MustCreate(ctx, k8sClient, check)
++		behavioral.SetAdmissionCheckActive(ctx, k8sClient, check, metav1.ConditionTrue)
++		cq := utiltestingapi.MakeClusterQueue("check-tolerations").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas(flavor.Name).Resource(corev1.ResourceCPU, "10").Obj()).
++			AdmissionChecks("check").Obj()
++		behavioral.MustCreate(ctx, k8sClient, cq)
++		lq := utiltestingapi.MakeLocalQueue("queue", ns.Name).ClusterQueue(cq.Name).Obj()
++		behavioral.MustCreate(ctx, k8sClient, lq)
++		ginkgo.DeferCleanup(func() {
++			gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, cq, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, lq, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, check, true)
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, flavor, true)
++		})
++
++		rc := testingraycluster.MakeCluster("checked", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue(lq.Name).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			FirstWorkerGroupReplicas(2, 0, 4).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, rc)
++		wl := &behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 1)[0]
++
++		toleration := corev1.Toleration{Key: "example.com/claimed-by", Operator: corev1.TolerationOpEqual, Value: wl.Name, Effect: corev1.TaintEffectNoSchedule}
++		pod := testingpod.MakePod("worker", ns.Name).
++			Annotation(kueue.WorkloadAnnotation, wl.Name).
++			Annotation(kueue.WorkloadSliceNameAnnotation, workloadslicing.SliceName(wl)).
++			Label(constants.PodSetLabel, workersGroupName).
++			Gate(kueue.ElasticJobSchedulingGate).
++			Obj()
++		pod.OwnerReferences = []metav1.OwnerReference{{
++			APIVersion: rayv1.SchemeGroupVersion.String(), Kind: "RayCluster", Name: rc.Name, UID: rc.UID, Controller: new(true),
++		}}
++		behavioral.MustCreate(ctx, k8sClient, pod)
++
++		gomega.Eventually(func(g gomega.Gomega) {
++			var latest kueue.Workload
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &latest)).To(gomega.Succeed())
++			workloadpatching.SetAdmissionCheckState(&latest.Status.AdmissionChecks, kueue.AdmissionCheckState{
++				Name:  "check",
++				State: kueue.CheckStateReady,
++				PodSetUpdates: []kueue.PodSetUpdate{{
++					Name:         workersGroupName,
++					NodeSelector: map[string]string{"example.com/attempt": "attempt-1"},
++					Tolerations:  []corev1.Toleration{toleration},
++				}},
++			}, behavioral.RealClock)
++			g.Expect(k8sClient.Status().Update(ctx, &latest)).To(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		gomega.Eventually(func(g gomega.Gomega) {
++			var got corev1.Pod
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), &got)).To(gomega.Succeed())
++			g.Expect(utilpod.HasGate(&got, kueue.ElasticJobSchedulingGate)).To(gomega.BeFalse())
++			g.Expect(got.Spec.NodeSelector).To(gomega.HaveKeyWithValue("example.com/attempt", "attempt-1"))
++			g.Expect(got.Spec.Tolerations).To(gomega.ContainElement(toleration))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	})
++})

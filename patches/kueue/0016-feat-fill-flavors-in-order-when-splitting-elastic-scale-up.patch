@@ -1271,7 +1271,7 @@ new file mode 100644
 index 0000000..9991aac
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,82 @@
 +// Verifies that a first nonzero RayJob slice consumes a greedy proposal and reaches admission through the job reconciler.
 +
 +package rayjob
@@ -1339,10 +1339,16 @@ index 0000000..9991aac
 +			g.Expect(list.Items).To(gomega.HaveLen(1))
 +			wl := &list.Items[0]
 +			g.Expect(workload.IsAdmitted(wl)).To(gomega.BeTrue())
-+			g.Expect(workload.ExtractPodSetCountsFromWorkload(wl)).To(gomega.Equal(workload.PodSetsCounts{"head": 1, "workers-group-0": 6, "workers-group-0--2": 4}))
 +			g.Expect(wl.Status.Admission.PodSetAssignments).To(gomega.HaveLen(3))
 +			g.Expect(wl.Status.Admission.PodSetAssignments[1].Flavors[corev1.ResourcePods]).To(gomega.Equal(kueue.ResourceFlavorReference(a.Name)))
 +			g.Expect(wl.Status.Admission.PodSetAssignments[2].Flavors[corev1.ResourcePods]).To(gomega.Equal(kueue.ResourceFlavorReference(b.Name)))
++			counts := workload.ExtractPodSetCountsFromWorkload(wl)
++			g.Expect(counts["head"]).To(gomega.Equal(int32(1)))
++			if wl.Status.Admission.PodSetAssignments[0].Flavors[corev1.ResourcePods] == kueue.ResourceFlavorReference(a.Name) {
++				g.Expect(counts).To(gomega.Equal(workload.PodSetsCounts{"head": 1, "workers-group-0": 6, "workers-group-0--2": 4}))
++			} else {
++				g.Expect(counts).To(gomega.Equal(workload.PodSetsCounts{"head": 1, "workers-group-0": 7, "workers-group-0--2": 3}))
++			}
 +		}
 +		gomega.Eventually(check, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +		gomega.Consistently(check, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())

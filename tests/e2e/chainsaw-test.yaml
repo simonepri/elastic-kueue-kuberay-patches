@@ -8,11 +8,12 @@ spec:
   concurrent: false
   description: >
     Canonical End-to-End Integration Test for Patched Kueue, Patched KubeRay, and Patched Ray:
-    1. Karpenter JIT Reservation: NodeClaims provisioned with DaemonSet overhead & anti-theft taints.
-    2. ScaleGate Clamping: Excess worker scale-up clamped to ClusterQueue quota limit.
-    3. Collaborative Partial Preemption: High-priority job triggers worker drain down to minReplicas floor;
+    1. Pre-Submission Simulator: Dry-run admission verification via /simulate subresource.
+    2. Karpenter JIT Reservation: NodeClaims provisioned with DaemonSet overhead & anti-theft taints.
+    3. ScaleGate Clamping: Excess worker scale-up clamped to ClusterQueue quota limit.
+    4. Collaborative Partial Preemption: High-priority job triggers worker drain down to minReplicas floor;
        Ray Head pod stays alive; dynamic quota is released as stopped workers terminate.
-    4. Two-Way Elastic Regrow: When preemptor job finishes, scale-up probe detects freed quota and regrows
+    5. Two-Way Elastic Regrow: When preemptor job finishes, scale-up probe detects freed quota and regrows
        workers back to full requested capacity without dropping head state.
   catch:
     - events: {}
@@ -35,7 +36,18 @@ spec:
         - apply:
             file: manifests/queues.yaml
 
-    - name: 02-submit-elastic-raycluster
+    - name: 02-pre-submission-simulation
+      try:
+        - script:
+            timeout: 30s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: |
+              kubectl create --raw "/apis/visibility.kueue.x-k8s.io/v1beta2/namespaces/${NS}/localqueues/elastic-local-queue/simulate" \
+                -f manifests/simulate-request.json | jq -e '.status.admitted == true'
+
+    - name: 03-submit-elastic-raycluster
       try:
         - apply:
             file: manifests/raycluster.yaml

@@ -1271,7 +1271,7 @@ new file mode 100644
 index 0000000..9991aac
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,76 @@
 +// Verifies that a first nonzero RayJob slice consumes a greedy proposal and reaches admission through the job reconciler.
 +
 +package rayjob
@@ -1318,7 +1318,14 @@ index 0000000..9991aac
 +		for _, obj := range []client.Object{a, b, cq, api.MakeLocalQueue("queue", ns.Name).ClusterQueue(cq.Name).Obj()} {
 +			behavioral.MustCreate(ctx, k8sClient, obj)
 +		}
-+		job := testingrayjob.MakeJob("initial", ns.Name).Annotation(workloadslicing.EnabledAnnotationKey, "true").Queue("queue").WithSubmissionMode(rayv1.InteractiveMode).RequestWorkerGroup(corev1.ResourceCPU, "1").Obj()
++		behavioral.ExpectClusterQueuesToBeActive(ctx, k8sClient, cq)
++		job := testingrayjob.MakeJob("initial", ns.Name).
++			Annotation(workloadslicing.EnabledAnnotationKey, "true").
++			Queue("queue").
++			WithSubmissionMode(rayv1.InteractiveMode).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			RequestHead(corev1.ResourceCPU, "1").
++			Obj()
 +		job.Spec.RayClusterSpec.WorkerGroupSpecs[0].Replicas = new(int32(10))
 +		job.Spec.RayClusterSpec.WorkerGroupSpecs[0].MaxReplicas = new(int32(20))
 +		if partial {

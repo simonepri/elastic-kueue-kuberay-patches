@@ -170,9 +170,10 @@ index 0000000..f678d98
 +)
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
 new file mode 100644
+index 0000000..df8019a
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
-@@ -0,0 +1,1440 @@
+@@ -0,0 +1,1446 @@
 +// Package karpenter implements an AdmissionCheck that provisions Karpenter NodeClaims sized for the admitted pods
 +// in the flavor's NodePool, waits for Karpenter to launch them, and steers the Workload to another flavor when it cannot.
 +package karpenter
@@ -199,6 +200,7 @@ new file mode 100644
 +	"k8s.io/apimachinery/pkg/runtime"
 +	"k8s.io/apimachinery/pkg/runtime/schema"
 +	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/validation"
 +	"k8s.io/apimachinery/pkg/util/wait"
 +	"k8s.io/klog/v2"
 +	"k8s.io/utils/clock"
@@ -1439,22 +1441,27 @@ new file mode 100644
 +}
 +
 +func (c *Controller) listNodeClaims(ctx context.Context, namespace, identity string) ([]unstructured.Unstructured, error) {
-+	list := &unstructured.UnstructuredList{}
-+	list.SetGroupVersionKind(nodeClaimGVK.GroupVersion().WithKind("NodeClaimList"))
-+	if err := c.List(ctx, list, client.MatchingLabels{WorkloadLabelKey: identity, WorkloadNamespaceLabelKey: namespace}); err != nil {
-+		return nil, err
-+	}
-+	if len(list.Items) > 0 {
-+		return list.Items, nil
++	if len(validation.IsValidLabelValue(identity)) == 0 {
++		list := &unstructured.UnstructuredList{}
++		list.SetGroupVersionKind(nodeClaimGVK.GroupVersion().WithKind("NodeClaimList"))
++		if err := c.List(ctx, list, client.MatchingLabels{WorkloadLabelKey: identity, WorkloadNamespaceLabelKey: namespace}); err != nil {
++			return nil, err
++		}
++		if len(list.Items) > 0 {
++			return list.Items, nil
++		}
 +	}
 +	all := &unstructured.UnstructuredList{}
 +	all.SetGroupVersionKind(nodeClaimGVK.GroupVersion().WithKind("NodeClaimList"))
 +	if err := c.List(ctx, all, client.MatchingLabels{WorkloadNamespaceLabelKey: namespace}); err != nil {
 +		return nil, err
 +	}
++	bounded := boundedClaimIdentity(identity, fmt.Sprintf("%s/%s", namespace, identity))
 +	var matched []unstructured.Unstructured
 +	for _, item := range all.Items {
-+		if item.GetAnnotations()[WorkloadAnnotation] == identity || item.GetLabels()[WorkloadLabelKey] == identity {
++		if item.GetAnnotations()[WorkloadAnnotation] == identity ||
++			item.GetLabels()[WorkloadLabelKey] == identity ||
++			item.GetLabels()[WorkloadLabelKey] == bounded {
 +			matched = append(matched, item)
 +		}
 +	}
@@ -1615,6 +1622,7 @@ new file mode 100644
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/overhead.go b/pkg/controller/admissionchecks/karpenter/overhead.go
 new file mode 100644
+index 0000000..da8008a
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/overhead.go
 @@ -0,0 +1,340 @@
@@ -2172,7 +2180,7 @@ diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
 index a47b406..90f5e30 100644
 --- a/pkg/features/kube_features.go
 +++ b/pkg/features/kube_features.go
-@@ -930,6 +930,10 @@ const (
+@@ -931,6 +931,10 @@ const (
  	// Enables updating queue and priority on running Deployments by relaxing
  	// immutability checks in the Deployment validation webhook.
  	MutableDeploymentQueue featuregate.Feature = "MutableDeploymentQueue"
@@ -2183,15 +2191,14 @@ index a47b406..90f5e30 100644
  )
  
  func init() {
-@@ -1366,6 +1370,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
- 	MutableDeploymentQueue: {
+@@ -1367,6 +1371,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
  		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
  	},
-+
+ 
 +	KarpenterAdmissionCheck: {
 +		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
 +	},
- 
++
  	RecomputeAssignmentUponPreemptionTargetsOverlap: {
  		{Version: version.MustParse("0.20"), Default: true, PreRelease: featuregate.Beta},
  	},
@@ -2243,9 +2250,10 @@ index ff3e6fb..8070848 100644
  	cq := newClusterQueueImpl(ctx, nil, defaultOrdering, testingclock.NewFakeClock(time.Now()))
 diff --git a/pkg/controller/admissionchecks/karpenter/controller_test.go b/pkg/controller/admissionchecks/karpenter/controller_test.go
 new file mode 100644
+index 0000000..3b03896
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller_test.go
-@@ -0,0 +1,1486 @@
+@@ -0,0 +1,1513 @@
 +// Tests for the Karpenter AdmissionCheck: the feature gate, NodeClaims built from the NodePool and sized for packed pods,
 +// readiness, failures, flavor exclusion and its expiry, disruption holds, and NodeClaim cleanup.
 +package karpenter
@@ -3730,6 +3738,33 @@ new file mode 100644
 +
 +	if got := f.check().State; got != kueue.CheckStateReady {
 +		t.Errorf("check state = %s, want Ready after all Launched", got)
++	}
++}
++
++func TestDeleteNodeClaimsWithLongWorkloadName(t *testing.T) {
++	longWlName := "pod-coder-7ab00940-fa22-4f60-be53-77d1b284c806-769c668b46-k8njl-ec579"
++	wl := utiltestingapi.MakeWorkload(longWlName, ns).
++		UID("uid-long").
++		Obj()
++
++	claim := (&nodeClaimTemplate{}).nodeClaim(wl, "attempt-1", "main-0", 1, nil, nil)
++	labels := claim.GetLabels()
++	labels[ManagedLabelKey] = "kueue"
++	labels[WorkloadNamespaceLabelKey] = ns
++	claim.SetLabels(labels)
++
++	f := newFixture(t, wl, nil, claim)
++	f.wlKey = types.NamespacedName{Namespace: ns, Name: longWlName}
++
++	if err := f.c.Delete(f.ctx, wl); err != nil {
++		t.Fatalf("Delete workload: %v", err)
++	}
++
++	f.reconcile()
++
++	claims := f.claims()
++	if len(claims) != 0 {
++		t.Errorf("got %d NodeClaims remaining after deletion reconcile, want 0", len(claims))
 +	}
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/overhead_test.go b/pkg/controller/admissionchecks/karpenter/overhead_test.go

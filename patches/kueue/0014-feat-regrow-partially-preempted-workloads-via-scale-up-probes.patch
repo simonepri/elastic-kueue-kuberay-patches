@@ -1,0 +1,2337 @@
+diff --git a/pkg/cache/queue/cluster_queue.go b/pkg/cache/queue/cluster_queue.go
+index e9ddb5f..ec160f8 100644
+--- a/pkg/cache/queue/cluster_queue.go
++++ b/pkg/cache/queue/cluster_queue.go
+@@ -852,7 +852,7 @@ func (c *ClusterQueue) RequeueIfNotPresent(ctx context.Context, wInfo *workload.
+ 	log := ctrl.LoggerFrom(ctx)
+ 	var immediate bool
+ 	if c.queueingStrategy == kueue.StrictFIFO {
+-		immediate = reason != RequeueReasonNamespaceMismatch
++		immediate = reason != RequeueReasonNamespaceMismatch && reason != RequeueReasonRegrowthHeld
+ 	} else {
+ 		immediate = reason == RequeueReasonFailedAfterNomination ||
+ 			reason == RequeueReasonSnapshotFailed ||
+diff --git a/pkg/cache/queue/regrow_after_reclaim.go b/pkg/cache/queue/regrow_after_reclaim.go
+new file mode 100644
+index 0000000..f9ea8bb
+--- /dev/null
++++ b/pkg/cache/queue/regrow_after_reclaim.go
+@@ -0,0 +1,24 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// The requeue reason of a workload slice that the scheduler holds back after a partial
++// preemption reclaim.
++
++package queue
++
++// RequeueReasonRegrowthHeld requeues a held workload slice as inadmissible, in StrictFIFO
++// queues too, so it does not block the workloads behind it while it waits.
++const RequeueReasonRegrowthHeld RequeueReason = "RegrowthHeld"
+diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
+index 75c6aac..dc39c64 100644
+--- a/pkg/controller/jobframework/partial_stop.go
++++ b/pkg/controller/jobframework/partial_stop.go
+@@ -26,7 +26,6 @@ import (
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+-	"sigs.k8s.io/kueue/pkg/features"
+ 	"sigs.k8s.io/kueue/pkg/workload"
+ 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
+ 	"sigs.k8s.io/kueue/pkg/workloadslicing"
+@@ -55,7 +54,7 @@ const partialStopRequeueAfter = 5 * time.Second
+ // the reconcile ends here and is requeued until the ElasticJobUngater releases the quota.
+ func (r *JobReconciler) stopJobPartially(ctx context.Context, job GenericJob, wl *kueue.Workload) (ctrl.Result, bool, error) {
+ 	partialJob, ok := job.(JobWithPartialStop)
+-	if !ok || !features.Enabled(features.PartialPreemption) || job.IsSuspended() || workloadevict.IsEvicted(wl) {
++	if !ok || job.IsSuspended() || workloadevict.IsEvicted(wl) {
+ 		return ctrl.Result{}, false, nil
+ 	}
+ 	targetWl, err := r.podsReadyWorkload(ctx, job, wl)
+diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
+index 8857237..55338aa 100644
+--- a/pkg/controller/jobframework/reconciler.go
++++ b/pkg/controller/jobframework/reconciler.go
+@@ -1223,7 +1223,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
+ 					return nil, err
+ 				}
+ 			}
+-			return wl, nil
++			return sliceToReconcile(ctx, r.client, job.IsSuspended(), wl)
+ 		}
+ 		// Fallback.
+ 	}
+@@ -2119,7 +2119,7 @@ func prepareWorkloadSliceForScaleUp(ctx context.Context, c client.Client, job Ge
+ 			// Matched by name, not position: predecessor PodSets can be reordered, added,
+ 			// or removed, so index-aligned comparison (including a same-length check) would misfire.
+ 			prevPodSet := prevPodSets[podSets[i].Name]
+-			if prevPodSet != nil && prevPodSet.Count != podSets[i].Count {
++			if prevPodSet != nil && prevPodSet.Count < podSets[i].Count {
+ 				extra = ""
+ 			}
+ 			// The baseline is copied forward from the matching predecessor's own floor, not
+@@ -2129,14 +2129,16 @@ func prepareWorkloadSliceForScaleUp(ctx context.Context, c client.Client, job Ge
+ 			// predecessor's live grant while it's still around (see getInitialAssignments).
+ 			// Capped at the new Count in case this PodSet shrank while another grew.
+ 			if prevPodSet != nil && prevPodSet.MinCount != nil {
+-				podSets[i].MinCount = new(min(*prevPodSet.MinCount, podSets[i].Count))
++				minCount := min(*prevPodSet.MinCount, podSets[i].Count)
++				minCount = afterReclaimMinCount(prevWl, podSets[i].Name, minCount)
++				podSets[i].MinCount = &minCount
+ 			}
+ 		}
+ 		if extra != "" {
+ 			// The admitted level the probe is issued against. It grows with every partial
+ 			// admission, so successive probes within one scale event get distinct names,
+ 			// while a retry against an unchanged level reuses the same one.
+-			extra = fmt.Sprintf("%s-%d", extra, admitted)
++			extra = scaleUpProbeName(extra, admitted, prevWl)
+ 		}
+ 	}
+ 	return extra, nil
+diff --git a/pkg/controller/jobframework/regrow_after_reclaim.go b/pkg/controller/jobframework/regrow_after_reclaim.go
+new file mode 100644
+index 0000000..017515a
+--- /dev/null
++++ b/pkg/controller/jobframework/regrow_after_reclaim.go
+@@ -0,0 +1,97 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// The job reconciler's part of regrowth after a partial preemption reclaim:
++// probe names, the after-reclaim baseline, and starting a job whose admitted slice has a
++// pending probe.
++
++package jobframework
++
++import (
++	"context"
++	"fmt"
++	"strings"
++
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
++	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// scaleUpProbeName returns the name part of a scale-up probe for predecessor prevWl. While
++// PartialPreemption is on, or prevWl carries a reclaim target, it is the predecessor's UID,
++// which no other slice shares: a reclaim lowers a slice chain's admitted level, so a later
++// probe can reach a level an earlier probe of the chain was named after. Otherwise it is
++// upstream's admitted level.
++func scaleUpProbeName(prefix string, admitted int32, prevWl *kueue.Workload) string {
++	if features.Enabled(features.PartialPreemption) || workload.IsPartiallyPreempted(prevWl) {
++		return fmt.Sprintf("%s-%s", prefix, prevWl.UID)
++	}
++	return fmt.Sprintf("%s-%d", prefix, admitted)
++}
++
++// afterReclaimMinCount caps a scale-up slice's minCount for podSet at the count its
++// predecessor prevWl runs after a partial preemption reclaim, so the slice may be admitted
++// with fewer pods than the predecessor was granted, as long as it grows past what it runs.
++func afterReclaimMinCount(prevWl *kueue.Workload, podSet kueue.PodSetReference, minCount int32) int32 {
++	if !workload.IsPartiallyPreempted(prevWl) {
++		return minCount
++	}
++	if running, found := workloadslicing.AfterReclaimBaseline(prevWl)[podSet]; found {
++		return min(minCount, running)
++	}
++	return minCount
++}
++
++// sliceToReconcile returns the admitted slice that the pending slice wl replaces while the job
++// is suspended or that admitted slice's reclaim target is pending, and wl otherwise. A suspended
++// job whose slice was admitted with fewer pods than it asks for then starts with that slice
++// instead of waiting, suspended and holding the quota, for its scale-up probe; and the job
++// reconciler stops the pods above a pending reclaim target on the slice that holds the quota.
++// Neither depends on PartialPreemption: a Workload admitted by an older release keeps a
++// minCount that allows a partial readmission, and a target outlives the gate being turned off.
++func sliceToReconcile(ctx context.Context, c client.Client, suspended bool, wl *kueue.Workload) (*kueue.Workload, error) {
++	if wl == nil || workload.HasQuotaReservation(wl) {
++		return wl, nil
++	}
++	key := workloadslicing.ReplacementForKey(wl)
++	if key == nil {
++		return wl, nil
++	}
++	namespace, name, found := strings.Cut(string(*key), "/")
++	if !found || namespace != wl.Namespace {
++		return wl, nil
++	}
++	replaced := &kueue.Workload{}
++	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, replaced); err != nil {
++		if apierrors.IsNotFound(err) {
++			return wl, nil
++		}
++		return nil, err
++	}
++	if !workload.IsAdmitted(replaced) || workloadevict.IsEvicted(replaced) || workloadfinish.IsFinished(replaced) {
++		return wl, nil
++	}
++	if !suspended && len(workload.PendingReclaimTargetCounts(replaced)) == 0 {
++		return wl, nil
++	}
++	return replaced, nil
++}
+diff --git a/pkg/scheduler/regrow_after_reclaim.go b/pkg/scheduler/regrow_after_reclaim.go
+new file mode 100644
+index 0000000..446af4b
+--- /dev/null
++++ b/pkg/scheduler/regrow_after_reclaim.go
+@@ -0,0 +1,180 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// The scheduler's part of regrowth after a partial preemption reclaim:
++// a replacement slice waits while its predecessor's reclaim target is pending or the preemptor
++// that set it is, so it cannot take the reclaimed quota.
++
++package scheduler
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"time"
++
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/klog/v2"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++const (
++	// regrowthHoldRecheck is how often a held slice is requeued, so the hold ends even when
++	// the preemptor leaves through an event in another cohort, such as its deletion.
++	regrowthHoldRecheck = 5 * time.Second
++)
++
++// afterFunc is time.AfterFunc; tests replace it to observe the rechecks.
++var afterFunc = time.AfterFunc
++
++// regrowthHolds tracks the workload slices held back after a partial preemption reclaim.
++type regrowthHolds struct {
++	mu sync.Mutex
++	// held are the slices held since the last admission.
++	held sets.Set[workload.Reference]
++	// rechecks are the timers that requeue a held slice.
++	rechecks map[workload.Reference]*time.Timer
++}
++
++// regrowthHoldReason returns why the pending slice wl may not be admitted yet, or "" when it
++// may: wl replaces a slice whose reclaim target is still pending, so admitting wl would hand
++// back the quota the target is releasing, or whose recorded preemptor is still waiting for
++// that quota, so wl would race it. A held slice is requeued as inadmissible and retried after
++// the next admission and every regrowthHoldRecheck.
++//
++// Partial preemption records only the latest preemptor of a target. An earlier preemptor
++// that is still pending is not waited for, so a probe admitted ahead of it may cost it
++// another reclaim round.
++//
++// The hold follows the reclaim annotations rather than the PartialPreemption gate, so a
++// target written before the gate was turned off is still respected.
++func (s *Scheduler) regrowthHoldReason(ctx context.Context, wl *workload.Info, snapshot *schdcache.Snapshot) string {
++	_, replaced := workloadslicing.ReplacedWorkloadSlice(wl, snapshot)
++	if replaced == nil {
++		return ""
++	}
++	var msg string
++	recheck := regrowthHoldRecheck
++	if len(workload.PendingReclaimTargetCounts(replaced.Obj)) > 0 {
++		msg = fmt.Sprintf("Workload slice waits until partial preemption releases the quota of %s", workload.Key(replaced.Obj))
++	} else if preemptor, requestedAt, found := reclaimRequest(replaced.Obj); found {
++		// After the reclaim timeout, partial preemption evicts a victim whose target is still
++		// pending whole, so a preemptor still pending by then waits for other quota.
++		deadline := requestedAt.Add(policy.ReclaimTimeout)
++		if now := s.clock.Now(); now.Before(deadline) && s.reclaimPreemptorPending(ctx, preemptor, requestedAt, snapshot) {
++			msg = fmt.Sprintf("Workload slice waits until the reclaim preemptor %s of %s is admitted", preemptor, workload.Key(replaced.Obj))
++			recheck = min(recheck, deadline.Sub(now))
++		}
++	}
++	if msg == "" {
++		return ""
++	}
++	ctrl.LoggerFrom(ctx).V(3).Info("Holding back a workload slice after a partial preemption reclaim", "workload", klog.KObj(wl.Obj), "replaced", workload.Key(replaced.Obj), "reason", msg)
++	s.regrowth.hold(ctx, s.queues, workload.Key(wl.Obj), recheck)
++	return msg
++}
++
++// reclaimRequest returns the preemptor and request time recorded with the reclaim target of
++// wl; found is false when either is missing or malformed.
++func reclaimRequest(wl *kueue.Workload) (workload.Reference, time.Time, bool) {
++	preemptor := wl.Annotations[constants.ReclaimPreemptorAnnotation]
++	requestedAt, err := time.Parse(time.RFC3339, wl.Annotations[constants.ReclaimRequestedAtAnnotation])
++	if preemptor == "" || err != nil {
++		return "", time.Time{}, false
++	}
++	return workload.Reference(preemptor), requestedAt, true
++}
++
++// reclaimPreemptorPending reports whether the preemptor still waits for the quota reclaimed at
++// requestedAt: it exists, is active and unfinished, holds no quota, neither in the snapshot,
++// which includes the workloads this scheduler assumed, nor in the API, and was not evicted
++// since, which shows it was admitted after the request and went back to pending later.
++// Deactivation also marks a workload evicted, even one that never held quota, so it does not count.
++func (s *Scheduler) reclaimPreemptorPending(ctx context.Context, preemptor workload.Reference, requestedAt time.Time, snapshot *schdcache.Snapshot) bool {
++	for _, cq := range snapshot.ClusterQueues() {
++		if _, found := cq.Workloads[preemptor]; found {
++			return false
++		}
++	}
++	namespace, name, found := strings.Cut(string(preemptor), "/")
++	if !found {
++		return false
++	}
++	wl := &kueue.Workload{}
++	if err := s.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, wl); err != nil {
++		if !apierrors.IsNotFound(err) {
++			ctrl.LoggerFrom(ctx).Error(err, "Could not read the reclaim preemptor; holding back the workload slice", "preemptor", preemptor)
++			return true
++		}
++		return false
++	}
++	if evicted := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadEvicted); evicted != nil &&
++		evicted.Status == metav1.ConditionTrue && evicted.LastTransitionTime.After(requestedAt) &&
++		!strings.HasPrefix(evicted.Reason, kueue.WorkloadDeactivated) {
++		return false
++	}
++	return workload.IsActive(wl) && !workloadfinish.IsFinished(wl) && !workload.HasQuotaReservation(wl)
++}
++
++// hold records the held slice key and arms a timer that requeues it after recheck.
++func (h *regrowthHolds) hold(ctx context.Context, queues *qcache.Manager, key workload.Reference, recheck time.Duration) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	if h.held == nil {
++		h.held = sets.New[workload.Reference]()
++		h.rechecks = make(map[workload.Reference]*time.Timer)
++	}
++	h.held.Insert(key)
++	if _, armed := h.rechecks[key]; armed {
++		return
++	}
++	h.rechecks[key] = afterFunc(recheck, func() {
++		h.mu.Lock()
++		delete(h.rechecks, key)
++		h.mu.Unlock()
++		queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, key, nil)
++	})
++}
++
++// retry requeues the slices held since the last admission, once this cycle admitted a
++// workload: admitting a pending preemptor frees no quota, so no cluster event would requeue
++// the slices that waited for it.
++func (h *regrowthHolds) retry(ctx context.Context, queues *qcache.Manager, admitted bool) {
++	if !admitted {
++		return
++	}
++	h.mu.Lock()
++	keys := h.held.UnsortedList()
++	clear(h.held)
++	h.mu.Unlock()
++	for _, key := range keys {
++		queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, key, nil)
++	}
++}
+diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
+index c586a62..a194232 100644
+--- a/pkg/scheduler/scheduler.go
++++ b/pkg/scheduler/scheduler.go
+@@ -104,6 +104,9 @@ type Scheduler struct {
+ 	// schedulingCycle identifies the number of scheduling
+ 	// attempts since the last restart.
+ 	schedulingCycle int64
++
++	// regrowth tracks the workload slices held back after a partial preemption reclaim.
++	regrowth regrowthHolds
+ }
+ 
+ type options struct {
+@@ -412,6 +415,7 @@ func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
+ 	for _, e := range refill.refilledInadmissible() {
+ 		s.finishEntry(ctx, log, e)
+ 	}
++	s.regrowth.retry(ctx, s.queues, result == metrics.AdmissionResultSuccess)
+ 
+ 	log.V(logLevelForSchedulerMainLoop()).Info("Workload processing done", "duration", s.clock.Since(phaseStartTime))
+ 	s.reportSkippedPreemptions(skippedPreemptions)
+@@ -859,6 +863,10 @@ func (s *Scheduler) nominateWorkload(ctx context.Context, log logr.Logger, h qca
+ 				e.requeueReason = qcache.RequeueReasonNamespaceMismatch
+ 			}
+ 		}
++	} else if msg := s.regrowthHoldReason(ctx, &h.Info, snap); msg != "" {
++		e.inadmissibleMsg = msg
++		e.quotaReservedReason = kueue.WorkloadQuotaReservedReasonWaitingForQuota
++		e.requeueReason = qcache.RequeueReasonRegrowthHeld
+ 	} else {
+ 		assignment, targets := s.getAssignments(ctx, &e.Info, snap)
+ 		e.recordAssignment(assignment, targets)
+@@ -1629,7 +1637,7 @@ func effectiveReducerPodSets(podSets []kueue.PodSet, replaceableWorkloadSlice *w
+ 	if !mustGrow {
+ 		return podSets
+ 	}
+-	liveGrants := workload.ExtractGrantedPodSetCounts(replaceableWorkloadSlice.Obj)
++	liveGrants := workloadslicing.AfterReclaimBaseline(replaceableWorkloadSlice.Obj)
+ 	if len(liveGrants) == 0 {
+ 		return podSets
+ 	}
+diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
+index dee3b24..eea2259 100644
+--- a/pkg/workloadslicing/manager.go
++++ b/pkg/workloadslicing/manager.go
+@@ -113,32 +113,16 @@ func (r *Manager) EnsureWorkloadSlices(
+ 			return nil, false, nil
+ 		}
+ 
+-		isScaleDown := !jobPodSetsCounts.EqualTo(wlPodSetsCounts) && (!workload.HasQuotaReservation(wl) || ScaledDown(wlPodSetsCounts, jobPodSetsCounts))
+-		if !isScaleDown {
+-			if err := r.refreshFloors(ctx, workloads, options); err != nil {
+-				return nil, true, err
+-			}
+-		}
+-
+-		// If counts match, return the existing workload slice or nil if the workload was partially admitted.
+-		if jobPodSetsCounts.EqualTo(wlPodSetsCounts) {
+-			if workload.IsAdmitted(wl) {
+-				for _, psa := range wl.Status.Admission.PodSetAssignments {
+-					if wlPodSetsCounts[psa.Name] > *psa.Count {
+-						// The workload was partially admitted, create the full scale up probe
+-						return nil, true, nil
+-					}
+-				}
+-			}
+-			return wl, true, nil
+-		}
+-
+ 		// Allow updating the existing slice if:
+ 		// a. It hasn't been admitted (no quota reserved), or
+ 		// b. It's a scale-down event.
++		isScaleDown := !jobPodSetsCounts.EqualTo(wlPodSetsCounts) && (!workload.HasQuotaReservation(wl) || ScaledDown(wlPodSetsCounts, jobPodSetsCounts))
+ 		if isScaleDown {
+ 			reclaim := newReclaimScaleDown(wl, jobPodSetsCounts)
+ 			if reclaim.keepsSlice(wlPodSetsCounts, jobPodSetsCounts) {
++				if regrowsAfterReclaim(jobObject, wl, jobPodSetsCounts) {
++					return nil, true, nil
++				}
+ 				if options.apply(wl) {
+ 					if err := r.Client.Update(ctx, wl); err != nil {
+ 						return nil, true, fmt.Errorf("failed to update workload slice steps: %w", err)
+@@ -158,6 +142,27 @@ func (r *Manager) EnsureWorkloadSlices(
+ 			return wl, true, nil
+ 		}
+ 
++		if regrowsAfterReclaim(jobObject, wl, jobPodSetsCounts) {
++			return nil, true, nil
++		}
++
++		if err := r.refreshFloors(ctx, workloads, options); err != nil {
++			return nil, true, err
++		}
++
++		// If counts match, return the existing workload slice or nil if the workload was partially admitted.
++		if jobPodSetsCounts.EqualTo(wlPodSetsCounts) {
++			if workload.IsAdmitted(wl) {
++				for _, psa := range wl.Status.Admission.PodSetAssignments {
++					if wlPodSetsCounts[psa.Name] > *psa.Count {
++						// The workload was partially admitted, create the full scale up probe
++						return nil, true, nil
++					}
++				}
++			}
++			return wl, true, nil
++		}
++
+ 		// Scale-up on admitted workload → create a new slice.
+ 		return nil, true, nil
+ 
+@@ -169,20 +174,18 @@ func (r *Manager) EnsureWorkloadSlices(
+ 		if selectedWorkload == nil {
+ 			return nil, true, nil
+ 		}
++		selectedWorkload, err = r.dropProbeAfterScaleDown(ctx, workloads, selectedWorkload, jobObject, jobPodSetsCounts)
++		if err != nil {
++			return nil, true, err
++		}
+ 
+ 		selectedCounts := workload.ExtractPodSetCountsFromWorkload(selectedWorkload)
+ 		if !jobPodSetsCounts.HasSamePodSetKeys(selectedCounts) {
+ 			return nil, false, nil
+ 		}
+ 
+-		latestWithQuotaReservation, pendingReplacement, _, _ := ClassifySlices(workloads)
+ 		var scaleDownTarget *kueue.Workload
+-		if latestWithQuotaReservation != nil && workload.IsPartiallyPreempted(latestWithQuotaReservation) {
+-			targetCounts := workload.ExtractPodSetCountsFromWorkload(latestWithQuotaReservation)
+-			if ScaledDown(targetCounts, jobPodSetsCounts) {
+-				scaleDownTarget = latestWithQuotaReservation
+-			}
+-		} else if !jobPodSetsCounts.EqualTo(selectedCounts) && (!workload.HasQuotaReservation(selectedWorkload) || ScaledDown(selectedCounts, jobPodSetsCounts)) {
++		if !jobPodSetsCounts.EqualTo(selectedCounts) && (!workload.HasQuotaReservation(selectedWorkload) || ScaledDown(selectedCounts, jobPodSetsCounts)) {
+ 			scaleDownTarget = selectedWorkload
+ 		}
+ 
+@@ -190,39 +193,8 @@ func (r *Manager) EnsureWorkloadSlices(
+ 			return nil, true, err
+ 		}
+ 
+-		if latestWithQuotaReservation != nil && workload.IsPartiallyPreempted(latestWithQuotaReservation) {
+-			targetWorkload := latestWithQuotaReservation
+-			targetCounts := workload.ExtractPodSetCountsFromWorkload(targetWorkload)
+-			if !jobPodSetsCounts.HasSamePodSetKeys(targetCounts) {
+-				return nil, false, nil
+-			}
+-			if ScaledDown(targetCounts, jobPodSetsCounts) {
+-				admittedCounts := workload.AdmittedPodSetCounts(targetWorkload)
+-				if pendingReplacement != nil && !admittedCounts.HasFewerReplicasThan(jobPodSetsCounts) {
+-					if err := workloadfinish.Finish(ctx, r.Client, pendingReplacement, kueue.WorkloadSliceReplaced, "Replaced to accommodate a new workload slice", r.Clock); err != nil {
+-						return nil, true, fmt.Errorf("failed to finish pending replacement slice: %w", err)
+-					}
+-				}
+-				reclaim := newReclaimScaleDown(targetWorkload, jobPodSetsCounts)
+-				if reclaim.keepsSlice(targetCounts, jobPodSetsCounts) {
+-					if options.apply(targetWorkload) {
+-						if err := r.Client.Update(ctx, targetWorkload); err != nil {
+-							return nil, true, fmt.Errorf("failed to update workload pod set counts: %w", err)
+-						}
+-					}
+-					return targetWorkload, true, nil
+-				}
+-				applyPodSetCounts(targetWorkload)
+-				options.apply(targetWorkload)
+-				reclaim.apply(targetWorkload)
+-				if err := r.Client.Update(ctx, targetWorkload); err != nil {
+-					return nil, true, fmt.Errorf("failed to update workload pod set counts: %w", err)
+-				}
+-				if err := UpdateReclaimablePodsAfterScaleDown(ctx, r.Client, targetWorkload); err != nil {
+-					return nil, true, fmt.Errorf("failed to update workload's reclaimable pods: %w", err)
+-				}
+-				return targetWorkload, true, nil
+-			}
++		if regrowsAfterReclaim(jobObject, selectedWorkload, jobPodSetsCounts) {
++			return nil, true, nil
+ 		}
+ 
+ 		if jobPodSetsCounts.EqualTo(selectedCounts) {
+diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
+index e19bbc8..76e2395 100644
+--- a/pkg/workloadslicing/partial_preemption.go
++++ b/pkg/workloadslicing/partial_preemption.go
+@@ -34,7 +34,6 @@ import (
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+ 	"sigs.k8s.io/kueue/pkg/constants"
+ 	indexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
+-	"sigs.k8s.io/kueue/pkg/features"
+ 	clientutil "sigs.k8s.io/kueue/pkg/util/client"
+ 	"sigs.k8s.io/kueue/pkg/util/parallelize"
+ 	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
+@@ -442,7 +441,7 @@ type reclaimScaleDown struct {
+ // newReclaimScaleDown returns the reclaim changes for scaling wl down to jobCounts,
+ // or nil when wl has no reclaim target to keep right.
+ func newReclaimScaleDown(wl *kueue.Workload, jobCounts workload.PodSetsCounts) *reclaimScaleDown {
+-	if !features.Enabled(features.PartialPreemption) || !workload.HasQuotaReservation(wl) {
++	if !workload.HasQuotaReservation(wl) {
+ 		return nil
+ 	}
+ 	targets := workload.ReclaimTargetCounts(wl)
+diff --git a/pkg/workloadslicing/regrow_after_reclaim.go b/pkg/workloadslicing/regrow_after_reclaim.go
+new file mode 100644
+index 0000000..192b689
+--- /dev/null
++++ b/pkg/workloadslicing/regrow_after_reclaim.go
+@@ -0,0 +1,128 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Regrowth of an elastic job after a partial preemption reclaim: when a slice
++// needs a scale-up probe, which pending probe a scale-down drops, and the after-reclaim baseline.
++
++package workloadslicing
++
++import (
++	"context"
++	"slices"
++
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
++	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
++)
++
++// regrowsAfterReclaim reports whether the admitted slice wl needs a scale-up probe because
++// partial preemption released its quota down to a reclaim target that the job still exceeds.
++// It compares the job's count with the target, not with the slice's spec count, which a
++// scale-down after the reclaim may leave above the job's count. Only jobs that take the
++// partial scale-up path regrow, since only their probes may be admitted below the full count.
++// It follows the reclaim target rather than the PartialPreemption gate, so a slice shrunk
++// before the gate was turned off still regrows.
++func regrowsAfterReclaim(jobObject client.Object, wl *kueue.Workload, jobCounts workload.PodSetsCounts) bool {
++	if !partialScaleUpEnabled(jobObject) ||
++		!workload.IsAdmitted(wl) || workloadevict.IsEvicted(wl) {
++		return false
++	}
++	targets := workload.ReclaimTargetCounts(wl)
++	if len(targets) == 0 || len(workload.PendingReclaimTargetCounts(wl)) > 0 {
++		return false
++	}
++	for name, target := range targets {
++		if count, found := jobCounts[name]; found && count > target {
++			return true
++		}
++	}
++	return false
++}
++
++func partialScaleUpEnabled(jobObject client.Object) bool {
++	return features.Enabled(features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp) &&
++		jobObject.GetAnnotations()[constants.ElasticJobScaleUpStrategyAnnotationKey] == constants.ElasticJobScaleUpStrategyPartial
++}
++
++// dropProbeAfterScaleDown finishes the pending replacement selected for the job when the job
++// no longer asks for more pods than the admitted slice it replaces runs, and returns that
++// admitted slice, so the scale-down lowers the slice holding the quota instead of a probe that
++// can never grow past it. Otherwise it returns selected unchanged. With PartialPreemption off,
++// it acts only on a slice that partial preemption shrank before the gate was turned off.
++func (r *Manager) dropProbeAfterScaleDown(ctx context.Context, workloads []kueue.Workload, selected *kueue.Workload, jobObject client.Object, jobCounts workload.PodSetsCounts) (*kueue.Workload, error) {
++	if workload.HasQuotaReservation(selected) {
++		return selected, nil
++	}
++	replaced := admittedPredecessor(workloads, selected)
++	if replaced == nil || !features.Enabled(features.PartialPreemption) && !workload.IsPartiallyPreempted(replaced) ||
++		growsPast(jobObject, jobCounts, replaced) {
++		return selected, nil
++	}
++	ctrl.LoggerFrom(ctx).V(2).Info("Finishing the pending workload slice after a scale-down",
++		"workload", workload.Key(selected), "replaced", workload.Key(replaced))
++	if err := workloadfinish.Finish(ctx, r.Client, selected, kueue.WorkloadFinishedReasonOutOfSync,
++		"The job scaled down to at most the replaced workload slice's admitted count", r.Clock); err != nil {
++		return nil, err
++	}
++	return replaced, nil
++}
++
++// growsPast reports whether the job asks for more pods in some PodSet than wl runs after reclaim.
++func growsPast(jobObject client.Object, jobCounts workload.PodSetsCounts, wl *kueue.Workload) bool {
++	var running workload.PodSetsCounts
++	if partialScaleUpEnabled(jobObject) {
++		running = AfterReclaimBaseline(wl)
++	} else {
++		running = workload.ExtractGrantedPodSetCounts(wl)
++	}
++	for name, count := range jobCounts {
++		if granted, found := running[name]; found && count > granted {
++			return true
++		}
++	}
++	return false
++}
++
++// admittedPredecessor returns the admitted, not evicted slice among workloads that wl replaces.
++func admittedPredecessor(workloads []kueue.Workload, wl *kueue.Workload) *kueue.Workload {
++	key := ReplacementForKey(wl)
++	if key == nil {
++		return nil
++	}
++	i := slices.IndexFunc(workloads, func(candidate kueue.Workload) bool {
++		return workload.Key(&candidate) == *key
++	})
++	if i < 0 || !workload.IsAdmitted(&workloads[i]) || workloadevict.IsEvicted(&workloads[i]) {
++		return nil
++	}
++	return &workloads[i]
++}
++
++// AfterReclaimBaseline returns the counts a scale-up of wl must start from: what wl runs once
++// partial preemption released its quota, when it carries a reclaim target, and its granted
++// counts otherwise, as upstream.
++func AfterReclaimBaseline(wl *kueue.Workload) workload.PodSetsCounts {
++	if workload.IsPartiallyPreempted(wl) {
++		return workload.ExtractGrantedPodSetCountsAfterReclaim(wl)
++	}
++	return workload.ExtractGrantedPodSetCounts(wl)
++}
+diff --git a/pkg/controller/jobframework/regrow_after_reclaim_external_test.go b/pkg/controller/jobframework/regrow_after_reclaim_external_test.go
+new file mode 100644
+index 0000000..9263993
+--- /dev/null
++++ b/pkg/controller/jobframework/regrow_after_reclaim_external_test.go
+@@ -0,0 +1,145 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests for the scale-up probe that ConstructWorkload builds after a partial preemption
++// reclaim: its name from the predecessor's UID and its after-reclaim baseline.
++
++package jobframework_test
++
++import (
++	"testing"
++	"time"
++
++	"go.uber.org/mock/gomock"
++	batchv1 "k8s.io/api/batch/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/component-base/featuregate"
++	"k8s.io/utils/ptr"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	mocks "sigs.k8s.io/kueue/internal/mocks/controller/jobframework"
++	kueueconstants "sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	. "sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func TestConstructWorkloadAfterReclaim(t *testing.T) {
++	gvk := batchv1.SchemeGroupVersion.WithKind("Job")
++	now := time.Now()
++	job := testingjob.MakeJob("job", "ns").
++		SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		SetAnnotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, kueueconstants.ElasticJobScaleUpStrategyPartial).
++		Queue("lq").
++		UID("job-uid").
++		Obj()
++	// predecessor is a slice of 8 workers, admitted with granted of them, that partial
++	// preemption shrank to 4 and released.
++	// unshrunk is such a slice that partial preemption never shrank.
++	unshrunk := func(name string, uid types.UID, granted int32) *kueue.Workload {
++		return utiltestingapi.MakeWorkload(name, "ns").
++			UID(uid).
++			PodSets(kueue.PodSet{Name: "workers", Count: 8, MinCount: new(int32(6))}).
++			ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++				utiltestingapi.MakePodSetAssignment("workers").Assignment(corev1.ResourceCPU, "default", "1").Count(granted).Obj()).Obj(), now).
++			ControllerReference(gvk, "job", "job-uid").
++			Obj()
++	}
++	predecessor := func(name string, uid types.UID, granted int32) *kueue.Workload {
++		wl := utiltestingapi.MakeWorkload(name, "ns").
++			UID(uid).
++			PodSets(kueue.PodSet{Name: "workers", Count: 8, MinCount: new(int32(6))}).
++			ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++				utiltestingapi.MakePodSetAssignment("workers").Assignment(corev1.ResourceCPU, "default", "1").Count(granted).Obj()).Obj(), now).
++			ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: 4}).
++			ControllerReference(gvk, "job", "job-uid").
++			Obj()
++		workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{"workers": 4})
++		return wl
++	}
++
++	cases := map[string]struct {
++		gate         bool
++		predecessor  *kueue.Workload
++		wantExtra    string
++		wantMinCount int32
++	}{
++		"the probe is named after the predecessor's UID and starts from what it runs": {
++			gate:         true,
++			predecessor:  predecessor("first", "first-uid", 8),
++			wantExtra:    "0-scale-up-probe-first-uid",
++			wantMinCount: 4,
++		},
++		"a predecessor at the same admitted level gets a different probe name": {
++			gate:         true,
++			predecessor:  predecessor("second", "second-uid", 8),
++			wantExtra:    "0-scale-up-probe-second-uid",
++			wantMinCount: 4,
++		},
++		"with the gate off the probe of an unshrunk slice is named after the admitted level and keeps its floor": {
++			predecessor:  unshrunk("first", "first-uid", 8),
++			wantExtra:    "0-scale-up-probe-8",
++			wantMinCount: 6,
++		},
++		"with the gate off two unshrunk predecessors at the same admitted level give the probe one name": {
++			predecessor:  unshrunk("second", "second-uid", 8),
++			wantExtra:    "0-scale-up-probe-8",
++			wantMinCount: 6,
++		},
++		"with the gate off the probe of a slice shrunk before is named after its UID and starts from what it runs": {
++			predecessor:  predecessor("first", "first-uid", 8),
++			wantExtra:    "0-scale-up-probe-first-uid",
++			wantMinCount: 4,
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlices:                          true,
++				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++				features.PartialPreemption:                                     tc.gate,
++			})
++			ctx, _ := utiltesting.ContextWithLog(t)
++			mockctrl := gomock.NewController(t)
++			mgj := mocks.NewMockGenericJob(mockctrl)
++			mgj.EXPECT().Object().Return(job).AnyTimes()
++			mgj.EXPECT().GVK().Return(gvk).AnyTimes()
++			mgj.EXPECT().PodSets(gomock.Any(), gomock.Any()).Return([]kueue.PodSet{{Name: "workers", Count: 8, MinCount: new(int32(8))}}, nil).AnyTimes()
++			cl := utiltesting.NewClientBuilder().
++				WithObjects([]client.Object{&corev1.Namespace{Name: "ns"}, job, tc.predecessor}...).
++				WithIndex(&kueue.Workload{}, indexer.OwnerReferenceIndexKey(gvk), indexer.WorkloadOwnerIndexFunc(gvk)).
++				Build()
++
++			wl, err := ConstructWorkload(ctx, cl, mgj, nil, nil)
++			if err != nil {
++				t.Fatalf("ConstructWorkload() error: %v", err)
++			}
++			if want := GenerateWorkloadNameWithExtra(job.GetName(), job.GetUID(), gvk, tc.wantExtra); wl.Name != want {
++				t.Errorf("ConstructWorkload() name = %q, want %q", wl.Name, want)
++			}
++			if got := ptr.Deref(wl.Spec.PodSets[0].MinCount, 0); got != tc.wantMinCount {
++				t.Errorf("ConstructWorkload() minCount = %d, want %d", got, tc.wantMinCount)
++			}
++		})
++	}
++}
+diff --git a/pkg/controller/jobframework/regrow_after_reclaim_test.go b/pkg/controller/jobframework/regrow_after_reclaim_test.go
+new file mode 100644
+index 0000000..51e898a
+--- /dev/null
++++ b/pkg/controller/jobframework/regrow_after_reclaim_test.go
+@@ -0,0 +1,129 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests for sliceToReconcile, which picks the admitted slice that a pending scale-up probe
++// replaces while the job is suspended or that slice's reclaim target is pending.
++
++package jobframework
++
++import (
++	"testing"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func TestSliceToReconcile(t *testing.T) {
++	now := time.Now()
++	slice := func() *utiltestingapi.WorkloadWrapper {
++		return utiltestingapi.MakeWorkload("slice", "ns").
++			PodSets(*utiltestingapi.MakePodSet("workers", 8).SetMinimumCount(4).Request(corev1.ResourceCPU, "1").Obj())
++	}
++	admitted := slice().
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment("workers").Count(6).Assignment(corev1.ResourceCPU, "default", "6").Obj()).Obj(), now).
++		AdmittedAt(true, now).Obj()
++	probe := utiltestingapi.MakeWorkload("probe", "ns").
++		Annotation(workloadslicing.WorkloadSliceReplacementFor, string(workload.Key(admitted))).
++		PodSets(*utiltestingapi.MakePodSet("workers", 8).SetMinimumCount(4).Request(corev1.ResourceCPU, "1").Obj()).
++		Obj()
++
++	// upgraded is a slice admitted by an older release, whose worker group kept
++	// minCount = minReplicas, readmitted after an eviction with 6 of its 8 workers.
++	upgraded := utiltestingapi.MakeWorkload("slice", "ns").
++		PodSets(*utiltestingapi.MakePodSet("workers", 8).SetMinimumCount(2).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment("workers").Count(6).Assignment(corev1.ResourceCPU, "default", "6").Obj()).Obj(), now).
++		AdmittedAt(true, now).Obj()
++
++	// withTarget returns wl with a reclaim target of 4 workers and reclaimable workers released.
++	withTarget := func(wl *kueue.Workload, reclaimable int32) *kueue.Workload {
++		wl = wl.DeepCopy()
++		workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{"workers": 4})
++		if reclaimable > 0 {
++			wl.Status.ReclaimablePods = []kueue.ReclaimablePod{{Name: "workers", Count: reclaimable}}
++		}
++		return wl
++	}
++	cases := map[string]struct {
++		gate      bool
++		suspended bool
++		replaced  *kueue.Workload
++		want      string
++	}{
++		"a suspended job starts with the admitted slice its probe replaces": {
++			gate: true, suspended: true, replaced: admitted, want: "slice",
++		},
++		"a running job keeps the probe": {
++			gate: true, replaced: admitted, want: "probe",
++		},
++		"a running job acts on the admitted slice while its reclaim target is pending": {
++			gate: true, replaced: withTarget(admitted, 0), want: "slice",
++		},
++		"a running job keeps the probe once the reclaim target is released": {
++			gate: true, replaced: withTarget(admitted, 4), want: "probe",
++		},
++		"with the gate off a running job acts on the admitted slice while a target written before is pending": {
++			replaced: withTarget(admitted, 0), want: "slice",
++		},
++		"with the gate off a running job keeps the probe": {
++			replaced: admitted, want: "probe",
++		},
++		"a slice that is only pending is not started": {
++			gate: true, suspended: true, replaced: slice().Obj(), want: "probe",
++		},
++		"an evicted slice is not started": {
++			gate: true, suspended: true, replaced: slice().
++				ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++					utiltestingapi.MakePodSetAssignment("workers").Count(6).Obj()).Obj(), now).
++				AdmittedAt(true, now).EvictedAt(now).Obj(),
++			want: "probe",
++		},
++		"a missing slice leaves the probe": {
++			gate: true, suspended: true, want: "probe",
++		},
++		"with the gate off a suspended job starts with the admitted slice its probe replaces": {
++			suspended: true, replaced: admitted, want: "slice",
++		},
++		"with the gate off a suspended job starts with an upgraded slice readmitted below its count": {
++			suspended: true, replaced: upgraded, want: "slice",
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.PartialPreemption, tc.gate)
++			ctx, _ := utiltesting.ContextWithLog(t)
++			builder := utiltesting.NewClientBuilder()
++			if tc.replaced != nil {
++				builder = builder.WithObjects(tc.replaced.DeepCopy())
++			}
++			got, err := sliceToReconcile(ctx, builder.Build(), tc.suspended, probe.DeepCopy())
++			if err != nil {
++				t.Fatalf("sliceToReconcile() error: %v", err)
++			}
++			if got.Name != tc.want {
++				t.Errorf("sliceToReconcile() = %s, want %s", got.Name, tc.want)
++			}
++		})
++	}
++}
+diff --git a/pkg/controller/jobs/raycluster/partial_stop_test.go b/pkg/controller/jobs/raycluster/partial_stop_test.go
+index ea15b98..5f6f2ad 100644
+--- a/pkg/controller/jobs/raycluster/partial_stop_test.go
++++ b/pkg/controller/jobs/raycluster/partial_stop_test.go
+@@ -54,9 +54,10 @@ func TestReconcileStopsWorkersAboveReclaimTargets(t *testing.T) {
+ 			wantPods:    []string{"w-0", "w-1"},
+ 			wantRequeue: true,
+ 		},
+-		"without the gate no worker is deleted": {
++		"with the gate off a target written before still deletes the workers above it": {
+ 			disablePartialPreemption: true,
+-			wantPods:                 []string{"w-0", "w-1", "w-2", "w-3"},
++			wantPods:                 []string{"w-0", "w-1"},
++			wantRequeue:              true,
+ 		},
+ 	}
+ 	for name, tc := range testCases {
+diff --git a/pkg/scheduler/regrow_after_reclaim_test.go b/pkg/scheduler/regrow_after_reclaim_test.go
+new file mode 100644
+index 0000000..34c2ffc
+--- /dev/null
++++ b/pkg/scheduler/regrow_after_reclaim_test.go
+@@ -0,0 +1,296 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests for the scheduler's part of regrowth after a partial preemption reclaim: the hold-back
++// of a replacement slice and the after-reclaim baseline of its partial admission.
++
++package scheduler
++
++import (
++	"testing"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/component-base/featuregate"
++	testingclock "k8s.io/utils/clock/testing"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// regrowFixture is a ClusterQueue "victim" with 8 CPUs holding an elastic slice of 8 one-CPU
++// workers, admitted in full, and a ClusterQueue "other" for the preemptor.
++type regrowFixture struct {
++	scheduler *Scheduler
++	snapshot  *schdcache.Snapshot
++	slice     *kueue.Workload
++	// recheck is the delay of the last recheck the scheduler armed.
++	recheck time.Duration
++}
++
++// newRegrowFixture builds the fixture at now with slice and objects in the API, and slice and
++// cached in the scheduler cache. It records the delay of the rechecks the scheduler arms.
++func newRegrowFixture(t *testing.T, now time.Time, slice *kueue.Workload, cached []client.Object, objects ...client.Object) *regrowFixture {
++	t.Helper()
++	ctx, log := utiltesting.ContextWithLog(t)
++	f := &regrowFixture{slice: slice}
++	previous := afterFunc
++	afterFunc = func(d time.Duration, fn func()) *time.Timer {
++		f.recheck = d
++		return time.AfterFunc(time.Hour, fn)
++	}
++	t.Cleanup(func() { afterFunc = previous })
++	clientBuilder := utiltesting.NewClientBuilder().
++		WithObjects(append([]client.Object{utiltesting.MakeNamespace("default"), slice}, objects...)...).
++		WithIndex(&corev1.LimitRange{}, indexer.LimitRangeHasContainerOrPodType, indexer.IndexLimitRangeHasContainerOrPodType).
++		WithStatusSubresource(&kueue.Workload{})
++	cl := clientBuilder.Build()
++	cqCache := schdcache.New(cl)
++	cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
++	for _, cq := range []*kueue.ClusterQueue{
++		utiltestingapi.MakeClusterQueue("victim").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "8").Obj()).Obj(),
++		utiltestingapi.MakeClusterQueue("other").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "8").Obj()).Obj(),
++	} {
++		if err := cqCache.AddClusterQueue(ctx, cq); err != nil {
++			t.Fatal(err)
++		}
++	}
++	for _, obj := range append([]client.Object{slice}, cached...) {
++		if wl, ok := obj.(*kueue.Workload); ok && workload.HasQuotaReservation(wl) {
++			cqCache.AddOrUpdateWorkload(ctx, log, wl)
++		}
++	}
++	fakeClock := testingclock.NewFakeClock(now)
++	qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
++	scheduler := New(qManager, cqCache, cl, &utiltesting.EventRecorder{}, WithClock(t, fakeClock), WithPreemptionExpectations(preemptexpectations.New()))
++	snapshot, err := cqCache.Snapshot(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	f.scheduler, f.snapshot = scheduler, snapshot
++	return f
++}
++
++// probe returns the scheduling entry of a pending probe of 8 workers that replaces f.slice.
++func (f *regrowFixture) probe(t *testing.T, minCount int32) *entry {
++	t.Helper()
++	_, log := utiltesting.ContextWithLog(t)
++	wl := utiltestingapi.MakeWorkload("probe", "default").
++		Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Annotation(workloadslicing.WorkloadSliceReplacementFor, string(workload.Key(f.slice))).
++		PodSets(*utiltestingapi.MakePodSet("workers", 8).SetMinimumCount(minCount).Request(corev1.ResourceCPU, "1").Obj()).
++		Obj()
++	info := workload.NewInfo(log, wl)
++	info.ClusterQueue = "victim"
++	return &entry{Head: qcache.Head{Info: *info}}
++}
++
++// shrunkSlice returns the victim's slice with a reclaim target of 4 workers, requested at
++// requestedAt by preemptor, and reclaimable reclaimable workers.
++func shrunkSlice(now time.Time, preemptor string, requestedAt time.Time, reclaimable int32) *kueue.Workload {
++	wl := utiltestingapi.MakeWorkload("slice", "default").
++		Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		PodSets(*utiltestingapi.MakePodSet("workers", 8).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("victim").PodSets(
++			utiltestingapi.MakePodSetAssignment("workers").Count(8).Assignment(corev1.ResourceCPU, "default", "8").Obj()).Obj(), now).
++		AdmittedAt(true, now).
++		Annotation(constants.ReclaimTargetCountsAnnotation, "workers=4")
++	if preemptor != "" {
++		wl.Annotation(constants.ReclaimPreemptorAnnotation, preemptor).
++			Annotation(constants.ReclaimRequestedAtAnnotation, requestedAt.UTC().Format(time.RFC3339))
++	}
++	if reclaimable > 0 {
++		wl.ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: reclaimable})
++	}
++	return wl.Obj()
++}
++
++func TestHoldBackRegrowth(t *testing.T) {
++	now := time.Now().Truncate(time.Second)
++	requested := now.Add(-time.Minute)
++	preemptor := func() *utiltestingapi.WorkloadWrapper {
++		return utiltestingapi.MakeWorkload("preemptor", "default").
++			PodSets(*utiltestingapi.MakePodSet("main", 4).Request(corev1.ResourceCPU, "1").Obj())
++	}
++	// reserved is the preemptor holding quota in cq; the cache loads it only for a known cq.
++	reserved := func(cq kueue.ClusterQueueReference) *utiltestingapi.WorkloadWrapper {
++		return preemptor().ReserveQuotaAt(utiltestingapi.MakeAdmission(cq).PodSets(
++			utiltestingapi.MakePodSetAssignment("main").Count(4).Assignment(corev1.ResourceCPU, "default", "4").Obj()).Obj(), now)
++	}
++	// evicted is a pending preemptor whose Evicted condition last changed at t.
++	evicted := func(t time.Time, status metav1.ConditionStatus, reason string) client.Object {
++		return preemptor().Condition(metav1.Condition{
++			Type: kueue.WorkloadEvicted, Status: status, Reason: reason,
++			LastTransitionTime: metav1.NewTime(t),
++		}).Obj()
++	}
++	evictedAt := func(t time.Time) client.Object {
++		return evicted(t, metav1.ConditionTrue, kueue.WorkloadEvictedByPreemption)
++	}
++	released := func(requestedAt time.Time) *kueue.Workload {
++		return shrunkSlice(now, "default/preemptor", requestedAt, 4)
++	}
++	cases := map[string]struct {
++		gate    bool
++		slice   *kueue.Workload
++		objects []client.Object
++		// cached are the objects the scheduler cache holds besides the slice.
++		cached      []client.Object
++		want        bool
++		wantRecheck time.Duration
++	}{
++		"a pending reclaim target holds the probe back": {
++			gate: true, slice: shrunkSlice(now, "", now, 0), want: true, wantRecheck: regrowthHoldRecheck,
++		},
++		"with the gate off a pending reclaim target written before still holds the probe back": {
++			slice: shrunkSlice(now, "", now, 0), want: true, wantRecheck: regrowthHoldRecheck,
++		},
++		"a pending preemptor holds the probe back after the release": {
++			gate: true, slice: released(requested), objects: []client.Object{preemptor().Obj()}, want: true, wantRecheck: regrowthHoldRecheck,
++		},
++		"with the gate off a pending preemptor recorded before still holds the probe back": {
++			slice: released(requested), objects: []client.Object{preemptor().Obj()}, want: true, wantRecheck: regrowthHoldRecheck,
++		},
++		"the recheck of a hold about to time out fires at the timeout": {
++			gate: true, slice: released(now.Add(-policy.ReclaimTimeout + 2*time.Second)), objects: []client.Object{preemptor().Obj()},
++			want: true, wantRecheck: 2 * time.Second,
++		},
++		"a hold ends when the reclaim request is as old as the reclaim timeout": {
++			gate: true, slice: released(now.Add(-policy.ReclaimTimeout)), objects: []client.Object{preemptor().Obj()},
++		},
++		"a preemptor without a recorded request time does not hold the probe back": {
++			gate: true, slice: func() *kueue.Workload {
++				wl := released(requested)
++				delete(wl.Annotations, constants.ReclaimRequestedAtAnnotation)
++				return wl
++			}(), objects: []client.Object{preemptor().Obj()},
++		},
++		"a preemptor holding quota in the cache releases the probe": {
++			gate: true, slice: released(requested), objects: []client.Object{reserved("other").Obj()}, cached: []client.Object{reserved("other").Obj()},
++		},
++		"a preemptor holding quota in the API only releases the probe": {
++			gate: true, slice: released(requested), objects: []client.Object{reserved("not-in-cache").Obj()},
++		},
++		"a preemptor evicted after the request went back to pending and releases the probe": {
++			gate: true, slice: released(requested), objects: []client.Object{evictedAt(requested.Add(time.Second))},
++		},
++		"a preemptor deactivated and reactivated after the request still holds the probe back": {
++			gate: true, slice: released(requested), objects: []client.Object{evicted(requested.Add(time.Second), metav1.ConditionTrue, kueue.WorkloadDeactivated)},
++			want: true, wantRecheck: regrowthHoldRecheck,
++		},
++		"a preemptor whose eviction ended after the request still holds the probe back": {
++			gate: true, slice: released(requested), objects: []client.Object{evicted(requested.Add(time.Second), metav1.ConditionFalse, kueue.WorkloadEvictedByPreemption)},
++			want: true, wantRecheck: regrowthHoldRecheck,
++		},
++		"a preemptor evicted before the request still holds the probe back": {
++			gate: true, slice: released(requested), objects: []client.Object{evictedAt(requested.Add(-time.Second))}, want: true, wantRecheck: regrowthHoldRecheck,
++		},
++		"an inactive preemptor releases the probe": {
++			gate: true, slice: released(requested), objects: []client.Object{preemptor().Active(false).Obj()},
++		},
++		"a finished preemptor releases the probe": {
++			gate: true, slice: released(requested), objects: []client.Object{preemptor().Finished().Obj()},
++		},
++		"a deleted preemptor releases the probe": {
++			gate: true, slice: released(requested),
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlices: true,
++				features.PartialPreemption:            tc.gate,
++			})
++			ctx, log := utiltesting.ContextWithLog(t)
++			f := newRegrowFixture(t, now, tc.slice, tc.cached, tc.objects...)
++			e := f.probe(t, 4)
++			got, nominated := f.scheduler.nominateWorkload(ctx, log, e.Head, f.snapshot)
++			if held := got.requeueReason == qcache.RequeueReasonRegrowthHeld; held != tc.want || held == nominated {
++				t.Fatalf("nominateWorkload() nominated = %v, requeueReason = %q, want held = %v", nominated, got.requeueReason, tc.want)
++			}
++			f.scheduler.regrowth.mu.Lock()
++			defer f.scheduler.regrowth.mu.Unlock()
++			if got := f.scheduler.regrowth.held.Has(workload.Key(e.Obj)); got != tc.want {
++				t.Errorf("held slice recorded for a retry = %v, want %v", got, tc.want)
++			}
++			if timer, armed := f.scheduler.regrowth.rechecks[workload.Key(e.Obj)]; armed != tc.want {
++				t.Errorf("recheck armed = %v, want %v", armed, tc.want)
++			} else if armed {
++				timer.Stop()
++				if f.recheck != tc.wantRecheck {
++					t.Errorf("recheck after %v, want %v", f.recheck, tc.wantRecheck)
++				}
++			}
++		})
++	}
++}
++
++func TestRegrowthStartsFromTheAfterReclaimCount(t *testing.T) {
++	now := time.Now()
++	for name, tc := range map[string]struct {
++		gate      bool
++		wantFit   bool
++		wantCount int32
++	}{
++		"the probe grows past what the shrunk slice runs": {
++			gate: true, wantFit: true, wantCount: 5,
++		},
++		"with the gate off a slice shrunk before still regrows from what it runs": {
++			wantFit: true, wantCount: 5,
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlices:                          true,
++				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++				features.PartialPreemption:                                     tc.gate,
++			})
++			ctx, _ := utiltesting.ContextWithLog(t)
++			// The shrunk slice is charged 4 CPUs; another workload takes 3, so the probe
++			// that replaces the slice has 5 CPUs.
++			other := utiltestingapi.MakeWorkload("other", "default").
++				PodSets(*utiltestingapi.MakePodSet("main", 3).Request(corev1.ResourceCPU, "1").Obj()).
++				ReserveQuotaAt(utiltestingapi.MakeAdmission("victim").PodSets(
++					utiltestingapi.MakePodSetAssignment("main").Count(3).Assignment(corev1.ResourceCPU, "default", "3").Obj()).Obj(), now).
++				Obj()
++			f := newRegrowFixture(t, now, shrunkSlice(now, "", now, 4), []client.Object{other}, other)
++			e := f.probe(t, 4)
++
++			assignment, _ := f.scheduler.getAssignments(ctx, &e.Info, f.snapshot)
++			if got := assignment.RepresentativeMode() == flavorassigner.Fit; got != tc.wantFit {
++				t.Errorf("getAssignments() fits = %v (mode %v), want %v", got, assignment.RepresentativeMode(), tc.wantFit)
++			}
++			if got := assignment.PodSets[0].Count; got != tc.wantCount {
++				t.Errorf("getAssignments() count = %d, want %d", got, tc.wantCount)
++			}
++		})
++	}
++}
+diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go
+index 92d2c63..0e942b5 100644
+--- a/pkg/workloadslicing/partial_preemption_test.go
++++ b/pkg/workloadslicing/partial_preemption_test.go
+@@ -119,11 +119,12 @@ func TestEnsureWorkloadSlicesReclaimScaleDown(t *testing.T) {
+ 			jobCount:  4,
+ 			wantCount: 4, wantTarget: 4, wantReclaimable: 4, wantCharged: 4,
+ 		},
+-		"with the gate off the scale-down follows upstream and the target keeps the charge": {
++		"with the gate off a target written before still keeps a slice at its admitted count": {
+ 			disablePartialPreemption: true,
+ 			count:                    8, admitted: 6, target: 4, reclaimable: 4,
+ 			jobCount:  6,
+-			wantCount: 6, wantTarget: 4, wantReclaimable: 4, wantCharged: 4,
++			wantCount: 8, wantTarget: 4, wantReclaimable: 4, wantCharged: 4,
++			wantUnchanged: true,
+ 		},
+ 	}
+ 	for name, tc := range testCases {
+@@ -149,7 +150,7 @@ func TestEnsureWorkloadSlicesReclaimScaleDown(t *testing.T) {
+ 				probe = utiltestingapi.MakeWorkload(testJobObject.Name+"-probe", testJobObject.Namespace).
+ 					OwnerReference(testJobGVK, testJobObject.Name, string(testJobObject.UID)).
+ 					Creation(now.Add(time.Minute)).
+-					Annotation(constants.WorkloadSliceReplacementForAnnotation, wl.Name).
++					Annotation(constants.WorkloadSliceReplacementForAnnotation, string(workload.Key(wl))).
+ 					PodSets(*utiltestingapi.MakePodSet("workers", int(tc.count)).Request(corev1.ResourceCPU, "1").Obj()).
+ 					Obj()
+ 				objects = append(objects, probe)
+diff --git a/pkg/workloadslicing/regrow_after_reclaim_test.go b/pkg/workloadslicing/regrow_after_reclaim_test.go
+new file mode 100644
+index 0000000..842ffba
+--- /dev/null
++++ b/pkg/workloadslicing/regrow_after_reclaim_test.go
+@@ -0,0 +1,319 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests for regrowth after a partial preemption reclaim in EnsureWorkloadSlices: when a probe
++// is needed, which pending probe a scale-down drops, and the after-reclaim baseline.
++
++package workloadslicing
++
++import (
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	batchv1 "k8s.io/api/batch/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/uuid"
++	"k8s.io/component-base/featuregate"
++	testingclock "k8s.io/utils/clock/testing"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
++)
++
++func TestEnsureWorkloadSlicesRegrowAfterReclaim(t *testing.T) {
++	partialJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
++		Name:        "partial",
++		Namespace:   "default",
++		UID:         uuid.NewUUID(),
++		Annotations: map[string]string{constants.ElasticJobScaleUpStrategyAnnotationKey: constants.ElasticJobScaleUpStrategyPartial},
++	}}
++	atomicJob := partialJob.DeepCopy()
++	atomicJob.Annotations = nil
++
++	// admitted is a slice of the job with 8 workers, granted workers admitted, a reclaim
++	// target of target workers when target is set, and reclaimable reclaimable workers.
++	admitted := func(job *batchv1.Job, granted, target, reclaimable int32) *kueue.Workload {
++		now := time.Now()
++		wl := utiltestingapi.MakeWorkload("slice", job.Namespace).
++			OwnerReference(testJobGVK, job.Name, string(job.UID)).
++			Creation(now).
++			PodSets(*utiltestingapi.MakePodSet("workers", 8).SetMinimumCount(8).Request(corev1.ResourceCPU, "1").Obj()).
++			ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++				utiltestingapi.MakePodSetAssignment("workers").Count(granted).Assignment(corev1.ResourceCPU, "default", "1").Obj()).Obj(), now).
++			AdmittedAt(true, now)
++		if target > 0 {
++			wl.Annotation(constants.ReclaimTargetCountsAnnotation, workload.FormatPodSetCounts(workload.PodSetsCounts{"workers": target})).
++				Annotation(constants.ReclaimPreemptorAnnotation, "default/preemptor")
++		}
++		if reclaimable > 0 {
++			wl.ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: reclaimable})
++		}
++		return wl.Obj()
++	}
++
++	cases := map[string]struct {
++		job      *batchv1.Job
++		slice    *kueue.Workload
++		jobCount int32
++		gate     bool
++		// wantProbe is true when EnsureWorkloadSlices asks for a new slice; otherwise it
++		// returns the slice with wantCount workers.
++		wantProbe bool
++		wantCount int32
++	}{
++		"released target regrows to the job's count": {
++			job: partialJob, slice: admitted(partialJob, 8, 4, 4), jobCount: 8, gate: true,
++			wantProbe: true,
++		},
++		"released target written before the gate was turned off still regrows": {
++			job: partialJob, slice: admitted(partialJob, 8, 4, 4), jobCount: 8,
++			wantProbe: true,
++		},
++		"slice that was never shrunk keeps upstream behavior with the gate off": {
++			job: partialJob, slice: admitted(partialJob, 8, 0, 0), jobCount: 8,
++			wantCount: 8,
++		},
++		"pending target waits for the release": {
++			job: partialJob, slice: admitted(partialJob, 8, 4, 0), jobCount: 8, gate: true,
++			wantCount: 8,
++		},
++		"atomic scale-up does not regrow": {
++			job: atomicJob, slice: admitted(atomicJob, 8, 4, 4), jobCount: 8, gate: true,
++			wantCount: 8,
++		},
++		"job above the target regrows although below the slice's count": {
++			job: partialJob, slice: admitted(partialJob, 6, 4, 4), jobCount: 6, gate: true,
++			wantProbe: true,
++		},
++		"job above the target regrows with the gate off": {
++			job: partialJob, slice: admitted(partialJob, 6, 4, 4), jobCount: 6,
++			wantProbe: true,
++		},
++		"job at the target scales the slice down in place": {
++			job: partialJob, slice: admitted(partialJob, 8, 4, 4), jobCount: 4, gate: true,
++			wantCount: 4,
++		},
++		"slice that was never shrunk keeps upstream behavior": {
++			job: partialJob, slice: admitted(partialJob, 8, 0, 0), jobCount: 8, gate: true,
++			wantCount: 8,
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++				features.PartialPreemption:                                     tc.gate,
++			})
++			ctx, _ := utiltesting.ContextWithLog(t)
++			clnt := testWorkloadClientBuilder().WithObjects(tc.slice).Build()
++			manager := Manager{Client: clnt, Clock: testingclock.NewFakeClock(time.Now())}
++			jobPodSets := []kueue.PodSet{*utiltestingapi.MakePodSet("workers", int(tc.jobCount)).Request(corev1.ResourceCPU, "1").Obj()}
++
++			got, compatible, err := manager.EnsureWorkloadSlices(ctx, jobPodSets, tc.job, testJobGVK)
++			if err != nil || !compatible {
++				t.Fatalf("EnsureWorkloadSlices() compatible = %v, error = %v", compatible, err)
++			}
++			if tc.wantProbe {
++				if got != nil {
++					t.Fatalf("EnsureWorkloadSlices() = %s, want a new slice", got.Name)
++				}
++				return
++			}
++			if got == nil {
++				t.Fatal("EnsureWorkloadSlices() asked for a new slice, want the existing one")
++			}
++			if gotCount := got.Spec.PodSets[0].Count; gotCount != tc.wantCount {
++				t.Errorf("EnsureWorkloadSlices() count = %d, want %d", gotCount, tc.wantCount)
++			}
++		})
++	}
++}
++
++func TestEnsureWorkloadSlicesScaleDownDuringPendingProbe(t *testing.T) {
++	now := time.Now()
++	slice := utiltestingapi.MakeWorkload("slice", testJobObject.Namespace).
++		OwnerReference(testJobGVK, testJobObject.Name, string(testJobObject.UID)).
++		Creation(now.Add(-time.Minute)).
++		PodSets(*utiltestingapi.MakePodSet("workers", 8).SetMinimumCount(4).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment("workers").Count(6).Assignment(corev1.ResourceCPU, "default", "6").Obj()).Obj(), now).
++		AdmittedAt(true, now).
++		Obj()
++	probe := utiltestingapi.MakeWorkload("probe", testJobObject.Namespace).
++		OwnerReference(testJobGVK, testJobObject.Name, string(testJobObject.UID)).
++		Creation(now).
++		Annotation(WorkloadSliceReplacementFor, string(workload.Key(slice))).
++		PodSets(*utiltestingapi.MakePodSet("workers", 8).SetMinimumCount(4).Request(corev1.ResourceCPU, "1").Obj()).
++		Obj()
++
++	partialJobObject := testJobObject.DeepCopy()
++	partialJobObject.Annotations = map[string]string{
++		constants.ElasticJobScaleUpStrategyAnnotationKey: constants.ElasticJobScaleUpStrategyPartial,
++	}
++	reclaimedSlice := utiltestingapi.MakeWorkload("reclaimed-slice", testJobObject.Namespace).
++		OwnerReference(testJobGVK, partialJobObject.Name, string(partialJobObject.UID)).
++		Creation(now.Add(-time.Minute)).
++		Annotation(constants.ReclaimTargetCountsAnnotation, "workers=4").
++		PodSets(*utiltestingapi.MakePodSet("workers", 8).SetMinimumCount(4).Request(corev1.ResourceCPU, "1").Obj()).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment("workers").Count(6).Assignment(corev1.ResourceCPU, "default", "6").Obj()).Obj(), now).
++		ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: 4}).
++		AdmittedAt(true, now).
++		Obj()
++	reclaimedProbe := utiltestingapi.MakeWorkload("reclaimed-probe", testJobObject.Namespace).
++		OwnerReference(testJobGVK, partialJobObject.Name, string(partialJobObject.UID)).
++		Creation(now).
++		Annotation(WorkloadSliceReplacementFor, string(workload.Key(reclaimedSlice))).
++		PodSets(*utiltestingapi.MakePodSet("workers", 8).SetMinimumCount(4).Request(corev1.ResourceCPU, "1").Obj()).
++		Obj()
++
++	cases := map[string]struct {
++		gate      bool
++		reclaimed bool
++		jobCount  int32
++		want      string
++		wantCount int32
++		// wantSliceCount and wantProbeFinished describe the stored slices afterwards.
++		wantSliceCount    int32
++		wantProbeCount    int32
++		wantProbeFinished bool
++	}{
++		"scale-down below the granted count lowers the admitted slice and drops the probe": {
++			gate: true, jobCount: 5,
++			want: "slice", wantCount: 5, wantSliceCount: 5, wantProbeCount: 8, wantProbeFinished: true,
++		},
++		"scale-down to the granted count drops the probe": {
++			gate: true, jobCount: 6,
++			want: "slice", wantCount: 6, wantSliceCount: 6, wantProbeCount: 8, wantProbeFinished: true,
++		},
++		"scale-down that still grows past the granted count updates the probe": {
++			gate: true, jobCount: 7,
++			want: "probe", wantCount: 7, wantSliceCount: 8, wantProbeCount: 7,
++		},
++		"scale-down updates the probe with the gate off": {
++			jobCount: 5,
++			want:     "probe", wantCount: 5, wantSliceCount: 8, wantProbeCount: 5,
++		},
++		"partially preempted scale-down above admitted count updates the probe": {
++			gate: true, reclaimed: true, jobCount: 7,
++			want: "reclaimed-probe", wantCount: 7, wantSliceCount: 8, wantProbeCount: 7,
++		},
++		"partially preempted scale-down between target and admitted count updates the probe": {
++			gate: true, reclaimed: true, jobCount: 6,
++			want: "reclaimed-probe", wantCount: 6, wantSliceCount: 8, wantProbeCount: 6,
++		},
++		"partially preempted scale-down to target drops the probe and lowers slice": {
++			gate: true, reclaimed: true, jobCount: 4,
++			want: "reclaimed-slice", wantCount: 4, wantSliceCount: 4, wantProbeCount: 8, wantProbeFinished: true,
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++				features.PartialPreemption:                                     tc.gate,
++			})
++			ctx, _ := utiltesting.ContextWithLog(t)
++			activeSlice := slice
++			activeProbe := probe
++			jobObj := testJobObject
++			if tc.reclaimed {
++				activeSlice = reclaimedSlice
++				activeProbe = reclaimedProbe
++				jobObj = partialJobObject
++			}
++			clnt := testWorkloadClientBuilder().WithObjects(activeSlice.DeepCopy(), activeProbe.DeepCopy()).Build()
++			manager := Manager{Client: clnt, Clock: testingclock.NewFakeClock(now)}
++			jobPodSets := []kueue.PodSet{*utiltestingapi.MakePodSet("workers", int(tc.jobCount)).Request(corev1.ResourceCPU, "1").Obj()}
++
++			got, compatible, err := manager.EnsureWorkloadSlices(ctx, jobPodSets, jobObj, testJobGVK)
++			if err != nil || !compatible || got == nil {
++				t.Fatalf("EnsureWorkloadSlices() = %v, compatible = %v, error = %v", got, compatible, err)
++			}
++			if got.Name != tc.want || got.Spec.PodSets[0].Count != tc.wantCount {
++				t.Errorf("EnsureWorkloadSlices() = %s with %d workers, want %s with %d", got.Name, got.Spec.PodSets[0].Count, tc.want, tc.wantCount)
++			}
++			var gotSlice, gotProbe kueue.Workload
++			if err := clnt.Get(ctx, client.ObjectKeyFromObject(activeSlice), &gotSlice); err != nil {
++				t.Fatal(err)
++			}
++			if err := clnt.Get(ctx, client.ObjectKeyFromObject(activeProbe), &gotProbe); err != nil {
++				t.Fatal(err)
++			}
++			gotCounts := []int32{gotSlice.Spec.PodSets[0].Count, gotProbe.Spec.PodSets[0].Count}
++			if diff := cmp.Diff([]int32{tc.wantSliceCount, tc.wantProbeCount}, gotCounts); diff != "" {
++				t.Errorf("Stored slice and probe counts (-want,+got):\n%s", diff)
++			}
++			if got := workloadfinish.IsFinished(&gotProbe); got != tc.wantProbeFinished {
++				t.Errorf("Probe finished = %v, want %v", got, tc.wantProbeFinished)
++			}
++		})
++	}
++}
++
++func TestAfterReclaimBaseline(t *testing.T) {
++	now := time.Now()
++	wl := utiltestingapi.MakeWorkload("slice", "default").
++		PodSets(
++			*utiltestingapi.MakePodSet("head", 1).Request(corev1.ResourceCPU, "1").Obj(),
++			*utiltestingapi.MakePodSet("workers", 8).Request(corev1.ResourceCPU, "1").Obj(),
++		).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment("head").Count(1).Obj(),
++			utiltestingapi.MakePodSetAssignment("workers").Count(6).Obj()).Obj(), now).
++		ReclaimablePods(kueue.ReclaimablePod{Name: "workers", Count: 4})
++	cases := map[string]struct {
++		gate     bool
++		reclaim  bool
++		expected workload.PodSetsCounts
++	}{
++		"partially preempted slice starts from what it runs": {
++			gate: true, reclaim: true,
++			expected: workload.PodSetsCounts{"head": 1, "workers": 4},
++		},
++		"a slice shrunk before the gate was turned off starts from what it runs": {
++			reclaim:  true,
++			expected: workload.PodSetsCounts{"head": 1, "workers": 4},
++		},
++		"gate off without a reclaim target starts from the grant": {
++			expected: workload.PodSetsCounts{"head": 1, "workers": 6},
++		},
++		"reclaimable pods without a reclaim target start from the grant": {
++			gate:     true,
++			expected: workload.PodSetsCounts{"head": 1, "workers": 6},
++		},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.PartialPreemption, tc.gate)
++			obj := wl.Clone().Obj()
++			if tc.reclaim {
++				workload.SetReclaimTargetCounts(obj, workload.PodSetsCounts{"workers": 4})
++			}
++			if diff := cmp.Diff(tc.expected, AfterReclaimBaseline(obj)); diff != "" {
++				t.Errorf("AfterReclaimBaseline() (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
+index 159a95e..e10da57 100644
+--- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
+@@ -311,18 +311,39 @@ var _ = ginkgo.Describe("RayCluster with partial preemption", ginkgo.Label("job:
+ 		expectPodsUsage(7)
+ 		probe := behavioral.ExpectNewWorkloadSlice(ctx, k8sClient, wl)
+ 
+-		ginkgo.By("shrinking the victim to four workers; no worker runs, so the quota is released at once")
+-		setReclaimTarget(wl, 4)
+-		expectSlice(wl, 8, 4, 4)
+-		expectPodsUsage(5)
+-
+-		ginkgo.By("admitting a preemptor into the released quota")
++		ginkgo.By("a preemptor waits for the quota")
+ 		preemptor := testingraycluster.MakeCluster("preemptor", ns.Name).
+ 			Queue(localQueue.Name).
+ 			RequestWorkerGroup(corev1.ResourceCPU, "1").
+ 			ScaleFirstWorkerGroup(1).
+ 			Obj()
+ 		behavioral.MustCreate(ctx, k8sClient, preemptor)
++		preemptorWl := &kueue.Workload{}
++		gomega.Eventually(func(g gomega.Gomega) {
++			list := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, list, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			found := false
++			for i := range list.Items {
++				if owner := metav1.GetControllerOf(&list.Items[i]); owner != nil && owner.Name == preemptor.Name {
++					list.Items[i].DeepCopyInto(preemptorWl)
++					found = true
++				}
++			}
++			g.Expect(found).Should(gomega.BeTrue())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("shrinking the victim to four workers for it; no worker runs, so the quota is released at once")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).Should(gomega.Succeed())
++			workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{workersGroupName: 4})
++			metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimPreemptorAnnotation, string(workload.Key(preemptorWl)))
++			metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimRequestedAtAnnotation, time.Now().UTC().Format(time.RFC3339))
++			g.Expect(k8sClient.Update(ctx, wl)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		expectSlice(wl, 8, 4, 4)
++
++		ginkgo.By("admitting the preemptor into the released quota")
++		behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, preemptorWl)
+ 		expectPodsUsage(7)
+ 
+ 		ginkgo.By("scaling the victim to six workers, its admitted count, as the autoscaler does")
+@@ -333,12 +354,16 @@ var _ = ginkgo.Describe("RayCluster with partial preemption", ginkgo.Label("job:
+ 			g.Expect(workload.ReclaimableCounts(wl)[workersGroupName]).Should(gomega.Equal(int32(4)))
+ 			g.Expect(workload.IsAdmitted(wl)).Should(gomega.BeTrue())
+ 		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
+-		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(probe))
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(probe), probe)).Should(gomega.Succeed())
++			g.Expect(probe.Spec.PodSets[workersPodSetIdx].Count).Should(gomega.Equal(int32(6)))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+ 		expectPodsUsage(7)
+ 
+-		ginkgo.By("scaling the victim to five workers, below its admitted count")
+-		scaleWorkers(rayCluster, 5)
+-		expectSlice(wl, 5, 4, 1)
++		ginkgo.By("scaling the victim to four workers, its reclaim target, dropping the probe")
++		scaleWorkers(rayCluster, 4)
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(probe))
++		expectSlice(wl, 4, 4, 0)
+ 		expectPodsUsage(7)
+ 		gomega.Expect(workload.IsAdmitted(wl)).Should(gomega.BeTrue())
+ 	})
+diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go
+new file mode 100644
+index 0000000..f893a9e
+--- /dev/null
++++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go
+@@ -0,0 +1,574 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Envtest specs for regrowth after a partial preemption reclaim of an elastic RayCluster:
++// the scale-up probe after the release, the preemptor hold-back, probe names, and scale-downs.
++
++package raycluster
++
++import (
++	"fmt"
++	"slices"
++	"time"
++
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	"k8s.io/component-base/featuregate"
++	"k8s.io/utils/clock"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++	"sigs.k8s.io/kueue/test/util/behavioral"
++)
++
++// regrowthRecheck is how often the scheduler requeues a held slice.
++const regrowthRecheck = 5 * time.Second
++
++// regrowAfterReclaimSpecs registers the specs of both gate settings. A spec writes the
++// reclaim target that it would write; it also writes the reclaimable pods once no worker
++// runs above the target.
++func regrowAfterReclaimSpecs(partialPreemption bool) {
++	var (
++		ns           *corev1.Namespace
++		flavor       *kueue.ResourceFlavor
++		clusterQueue *kueue.ClusterQueue
++		localQueue   *kueue.LocalQueue
++		// otherCQ is a ClusterQueue a spec adds for its preemptor.
++		otherCQ *kueue.ClusterQueue
++	)
++
++	ginkgo.BeforeAll(func() {
++		features.SetFeatureGatesDuringTest(ginkgo.GinkgoTB(), map[featuregate.Feature]bool{
++			features.ElasticJobsViaWorkloadSlices:                          true,
++			features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++			features.PartialPreemption:                                     partialPreemption,
++		})
++		fwk.StartManager(ctx, cfg, managerAndSchedulerSetup())
++	})
++	ginkgo.AfterAll(func() {
++		fwk.StopManager(ctx)
++	})
++
++	// createQueuesWithStrategy creates a ClusterQueue with pods pods of quota and its LocalQueue.
++	createQueuesWithStrategy := func(pods string, strategy kueue.QueueingStrategy) {
++		ginkgo.GinkgoHelper()
++		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "regrow-")
++		flavor = utiltestingapi.MakeResourceFlavor("default").Obj()
++		behavioral.MustCreate(ctx, k8sClient, flavor)
++		clusterQueue = utiltestingapi.MakeClusterQueue("victim").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas(flavor.Name).
++				Resource(corev1.ResourcePods, pods).
++				Resource(corev1.ResourceCPU, "100").
++				Obj()).
++			QueueingStrategy(strategy).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, clusterQueue)
++		localQueue = utiltestingapi.MakeLocalQueue("victim", ns.Name).ClusterQueue(clusterQueue.Name).Obj()
++		behavioral.MustCreate(ctx, k8sClient, localQueue)
++	}
++	createQueues := func(pods string) {
++		ginkgo.GinkgoHelper()
++		createQueuesWithStrategy(pods, kueue.BestEffortFIFO)
++	}
++	ginkgo.AfterEach(func() {
++		gomega.Expect(behavioral.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
++		if otherCQ != nil {
++			behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, otherCQ, true)
++			otherCQ = nil
++		}
++		behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, flavor, true)
++	})
++
++	createCluster := func(workers int32) *rayv1.RayCluster {
++		ginkgo.GinkgoHelper()
++		rayCluster := testingraycluster.MakeCluster("elastic", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			SetAnnotation(constants.ElasticJobScaleUpStrategyAnnotationKey, constants.ElasticJobScaleUpStrategyPartial).
++			Queue(localQueue.Name).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			FirstWorkerGroupReplicas(workers, 0, 16).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, rayCluster)
++		return rayCluster
++	}
++	scale := func(rayCluster *rayv1.RayCluster, replicas int32) {
++		ginkgo.GinkgoHelper()
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), rayCluster)).Should(gomega.Succeed())
++			rayCluster.Spec.WorkerGroupSpecs[0].Replicas = new(replicas)
++			g.Expect(k8sClient.Update(ctx, rayCluster)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	}
++	// expectReplicas checks that Kueue never wrote the worker group's replicas.
++	expectReplicas := func(rayCluster *rayv1.RayCluster, replicas int32) {
++		ginkgo.GinkgoHelper()
++		got := &rayv1.RayCluster{}
++		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), got)).Should(gomega.Succeed())
++		gomega.Expect(got.Spec.WorkerGroupSpecs[0].Replicas).Should(gomega.Equal(new(replicas)))
++	}
++	// reclaim writes the reclaim target, preemptor and request time that partial preemption
++	// sets on a victim in one update.
++	reclaim := func(wl *kueue.Workload, target int32, preemptor string) {
++		ginkgo.GinkgoHelper()
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).Should(gomega.Succeed())
++			workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{workersGroupName: target})
++			if preemptor != "" {
++				wl.Annotations[constants.ReclaimPreemptorAnnotation] = preemptor
++				wl.Annotations[constants.ReclaimRequestedAtAnnotation] = time.Now().UTC().Format(time.RFC3339)
++			}
++			g.Expect(k8sClient.Update(ctx, wl)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	}
++	// release raises the reclaimable pods, as the ElasticJobUngater (0008) does once the
++	// workers above the target are gone.
++	release := func(wl *kueue.Workload, reclaimable int32) {
++		ginkgo.GinkgoHelper()
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).Should(gomega.Succeed())
++			wl.Status.ReclaimablePods = []kueue.ReclaimablePod{{Name: workersGroupName, Count: reclaimable}}
++			g.Expect(k8sClient.Status().Update(ctx, wl)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	}
++	expectReplacement := func(wl *kueue.Workload) *kueue.Workload {
++		ginkgo.GinkgoHelper()
++		probe := behavioral.ExpectNewWorkloadSlice(ctx, k8sClient, wl)
++		gomega.Expect(probe.Spec.PodSets[workersPodSetIdx].Count).Should(gomega.Equal(int32(8)))
++		return probe
++	}
++	expectPendingFor := func(wl *kueue.Workload) {
++		ginkgo.GinkgoHelper()
++		gomega.Consistently(func(g gomega.Gomega) {
++			got := &kueue.Workload{}
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).Should(gomega.Succeed())
++			g.Expect(workload.HasQuotaReservation(got)).Should(gomega.BeFalse(), "workload %s holds quota", wl.Name)
++		}, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
++	}
++	// admitFully waits for the cluster's only slice to be admitted with all its workers.
++	admitFully := func(workers int32) *kueue.Workload {
++		ginkgo.GinkgoHelper()
++		slice := &behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 1)[0]
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, slice, workersGroupName, workers)
++		return slice
++	}
++	// partialScaleUp scales a 4-worker cluster with 7 pods of quota to 8 workers, which
++	// admits a slice with 6 of them and leaves a pending probe for all 8.
++	partialScaleUp := func(rayCluster *rayv1.RayCluster) (*kueue.Workload, *kueue.Workload) {
++		ginkgo.GinkgoHelper()
++		initial := admitFully(4)
++		scale(rayCluster, 8)
++		partial := expectReplacement(initial)
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, partial, workersGroupName, 6)
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(initial))
++		probe := expectReplacement(partial)
++		behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, probe)
++		return partial, probe
++	}
++	raiseQuota := func(pods string) {
++		ginkgo.GinkgoHelper()
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(clusterQueue), clusterQueue)).Should(gomega.Succeed())
++			behavioral.SetResourceNominalQuota(clusterQueue, corev1.ResourcePods, pods)
++			g.Expect(k8sClient.Update(ctx, clusterQueue)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	}
++
++	ginkgo.It("Should start a suspended cluster with its partially admitted slice rather than wait for the probe", func() {
++		createQueues("7")
++		rayCluster := createCluster(4)
++		partial, probe := partialScaleUp(rayCluster)
++
++		ginkgo.By("the partially admitted slice is deactivated, so the cluster is suspended and its probe becomes its only slice")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(partial), partial)).Should(gomega.Succeed())
++			partial.Spec.Active = new(false)
++			g.Expect(k8sClient.Update(ctx, partial)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(partial))
++
++		ginkgo.By("the probe is admitted with 6 of its 8 workers as the first slice of the restarted cluster")
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 6)
++
++		ginkgo.By("the cluster starts with that slice instead of staying suspended")
++		gomega.Eventually(func(g gomega.Gomega) {
++			got := &rayv1.RayCluster{}
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), got)).Should(gomega.Succeed())
++			g.Expect(got.Spec.Suspend).Should(gomega.Equal(new(false)))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("its own probe waits for capacity")
++		next := expectReplacement(probe)
++		behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, next)
++		expectReplicas(rayCluster, 8)
++	})
++
++	ginkgo.It("Should hold a pending probe back while the replaced slice's reclaim target is pending", func() {
++		createQueues("7")
++		rayCluster := createCluster(4)
++		partial, probe := partialScaleUp(rayCluster)
++
++		ginkgo.By("six running workers of the partially admitted slice cannot terminate yet")
++		const blocker = "test.kueue.x-k8s.io/block-deletion"
++		for i := range 6 {
++			pod := testingpod.MakePod(fmt.Sprintf("worker-%d", i), ns.Name).
++				Annotation(kueue.WorkloadSliceNameAnnotation, workloadslicing.SliceName(partial)).
++				Label(constants.PodSetLabel, workersGroupName).
++				Finalizer(blocker).
++				Obj()
++			behavioral.MustCreate(ctx, k8sClient, pod)
++			gomega.Eventually(func(g gomega.Gomega) {
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod)).Should(gomega.Succeed())
++				pod.Status.Phase = corev1.PodRunning
++				g.Expect(k8sClient.Status().Update(ctx, pod)).Should(gomega.Succeed())
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		}
++
++		ginkgo.By("a reclaim target is set on the partially admitted slice, and capacity frees")
++		reclaim(partial, 4, "")
++		raiseQuota("20")
++		expectPendingFor(probe)
++
++		ginkgo.By("the workers above the target terminate, and the target's quota is released")
++		// The stopper of patch 0008 has deleted the 2 workers above the target by now, and they
++		// stay Terminating; without it, the spec deletes them itself.
++		pods := &corev1.PodList{}
++		gomega.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name))).To(gomega.Succeed())
++		if !slices.ContainsFunc(pods.Items, func(p corev1.Pod) bool { return p.DeletionTimestamp != nil }) {
++			for i := range 2 {
++				gomega.Expect(k8sClient.Delete(ctx, &pods.Items[i])).Should(gomega.Succeed())
++			}
++		}
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			for i := range pods.Items {
++				pod := &pods.Items[i]
++				if controllerutil.RemoveFinalizer(pod, blocker) {
++					g.Expect(client.IgnoreNotFound(k8sClient.Update(ctx, pod))).Should(gomega.Succeed())
++				}
++			}
++			g.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			g.Expect(pods.Items).Should(gomega.HaveLen(4))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		release(partial, 4)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(partial), partial)).Should(gomega.Succeed())
++			g.Expect(partial.Status.ReclaimablePods).Should(gomega.ConsistOf(kueue.ReclaimablePod{Name: workersGroupName, Count: 4}))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 8)
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(partial))
++		expectReplicas(rayCluster, 8)
++	})
++
++	if !partialPreemption {
++		ginkgo.It("Should regrow a victim shrunk before the gate was turned off", func() {
++			createQueues("9")
++			rayCluster := createCluster(8)
++			slice := admitFully(8)
++			reclaim(slice, 4, "")
++			release(slice, 4)
++			probe := expectReplacement(slice)
++			behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 8)
++			expectReplicas(rayCluster, 8)
++		})
++
++		return
++	}
++
++	ginkgo.It("Should regrow a victim after the reclaim, once the preemptor no longer needs the quota", func() {
++		createQueues("9")
++		rayCluster := createCluster(8)
++		slice := admitFully(8)
++
++		ginkgo.By("a preemptor that does not fit waits")
++		preemptor := utiltestingapi.MakeWorkload("preemptor", ns.Name).Queue(kueue.LocalQueueName(localQueue.Name)).
++			PodSets(*utiltestingapi.MakePodSet("main", 3).Request(corev1.ResourceCPU, "1").Obj()).Obj()
++		behavioral.MustCreate(ctx, k8sClient, preemptor)
++		behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, preemptor)
++
++		ginkgo.By("partial preemption shrinks the victim to 4 workers and releases their quota")
++		reclaim(slice, 4, string(workload.Key(preemptor)))
++		release(slice, 4)
++		behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, preemptor)
++
++		ginkgo.By("a probe regrows the victim into the quota the preemptor left: 1 head + 5 workers")
++		probe := expectReplacement(slice)
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 5)
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(slice))
++		expectReplicas(rayCluster, 8)
++
++		ginkgo.By("the preemptor finishes and the next probe regrows the victim to all 8 workers")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(preemptor), preemptor)).Should(gomega.Succeed())
++			g.Expect(workloadfinish.Finish(ctx, k8sClient, preemptor, kueue.WorkloadFinishedReasonSucceeded, "done", clock.RealClock{})).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		next := expectReplacement(probe)
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, next, workersGroupName, 8)
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(probe))
++		expectReplicas(rayCluster, 8)
++	})
++
++	// setStopPolicy sets the stop policy of the LocalQueue lq.
++	setStopPolicy := func(lq *kueue.LocalQueue, policy kueue.StopPolicy) {
++		ginkgo.GinkgoHelper()
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(lq), lq)).Should(gomega.Succeed())
++			lq.Spec.StopPolicy = new(policy)
++			g.Expect(k8sClient.Update(ctx, lq)).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	}
++	// heldPreemptor creates a preemptor of 4 pods that waits on a held LocalQueue of another
++	// ClusterQueue, so it never competes for the victim's quota.
++	heldPreemptor := func() (*kueue.Workload, *kueue.LocalQueue) {
++		ginkgo.GinkgoHelper()
++		otherCQ = utiltestingapi.MakeClusterQueue("other").
++			ResourceGroup(*utiltestingapi.MakeFlavorQuotas(flavor.Name).Resource(corev1.ResourcePods, "4").Resource(corev1.ResourceCPU, "100").Obj()).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, otherCQ)
++		otherLQ := utiltestingapi.MakeLocalQueue("other", ns.Name).ClusterQueue(otherCQ.Name).StopPolicy(kueue.Hold).Obj()
++		behavioral.MustCreate(ctx, k8sClient, otherLQ)
++		preemptor := utiltestingapi.MakeWorkload("preemptor", ns.Name).Queue(kueue.LocalQueueName(otherLQ.Name)).
++			PodSets(*utiltestingapi.MakePodSet("main", 4).Request(corev1.ResourceCPU, "1").Obj()).Obj()
++		behavioral.MustCreate(ctx, k8sClient, preemptor)
++		return preemptor, otherLQ
++	}
++
++	ginkgo.It("Should hold the probe back while the recorded preemptor is pending", func() {
++		createQueues("9")
++		rayCluster := createCluster(8)
++		slice := admitFully(8)
++		preemptor, otherLQ := heldPreemptor()
++
++		ginkgo.By("the victim is shrunk and released; its probe would fit but waits for the preemptor")
++		reclaim(slice, 4, string(workload.Key(preemptor)))
++		release(slice, 4)
++		probe := expectReplacement(slice)
++		expectPendingFor(probe)
++
++		ginkgo.By("once the preemptor is admitted, the probe regrows the victim")
++		setStopPolicy(otherLQ, kueue.None)
++		behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, preemptor)
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 8)
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(slice))
++		expectReplicas(rayCluster, 8)
++	})
++
++	ginkgo.It("Should release the hold once the preemptor is deleted", func() {
++		createQueues("9")
++		rayCluster := createCluster(8)
++		slice := admitFully(8)
++		preemptor, _ := heldPreemptor()
++		reclaim(slice, 4, string(workload.Key(preemptor)))
++		release(slice, 4)
++		probe := expectReplacement(slice)
++		expectPendingFor(probe)
++
++		ginkgo.By("the preemptor is deleted while it waits; nothing in the victim's cohort changes")
++		gomega.Expect(k8sClient.Delete(ctx, preemptor)).Should(gomega.Succeed())
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 8)
++		expectReplicas(rayCluster, 8)
++	})
++
++	ginkgo.It("Should keep holding the probe when a preemptor that never held quota is deactivated and reactivated", func() {
++		createQueues("9")
++		createCluster(8)
++		slice := admitFully(8)
++		preemptor, otherLQ := heldPreemptor()
++		reclaim(slice, 4, string(workload.Key(preemptor)))
++		release(slice, 4)
++		probe := expectReplacement(slice)
++		expectPendingFor(probe)
++
++		ginkgo.By("deactivating the waiting preemptor marks it evicted although it never held quota")
++		setActive := func(active bool) {
++			ginkgo.GinkgoHelper()
++			gomega.Eventually(func(g gomega.Gomega) {
++				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(preemptor), preemptor)).Should(gomega.Succeed())
++				preemptor.Spec.Active = new(active)
++				g.Expect(k8sClient.Update(ctx, preemptor)).Should(gomega.Succeed())
++			}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		}
++		setActive(false)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(preemptor), preemptor)).Should(gomega.Succeed())
++			g.Expect(apimeta.IsStatusConditionTrue(preemptor.Status.Conditions, kueue.WorkloadEvicted)).Should(gomega.BeTrue())
++		}, behavioral.Timeout, behavioral.ShortInterval).Should(gomega.Succeed())
++		setActive(true)
++
++		ginkgo.By("once reactivated, the preemptor waits again, and so does the probe, across rechecks")
++		gomega.Consistently(func(g gomega.Gomega) {
++			got := &kueue.Workload{}
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(probe), got)).Should(gomega.Succeed())
++			g.Expect(workload.HasQuotaReservation(got)).Should(gomega.BeFalse(), "the probe holds quota")
++		}, 3*regrowthRecheck, behavioral.Interval).Should(gomega.Succeed())
++
++		ginkgo.By("once the preemptor is admitted, the probe regrows the victim")
++		setStopPolicy(otherLQ, kueue.None)
++		behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, preemptor)
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 8)
++	})
++
++	ginkgo.It("Should release the hold once the preemptor was admitted, even if it is evicted later", func() {
++		createQueues("9")
++		rayCluster := createCluster(8)
++		slice := admitFully(8)
++
++		ginkgo.By("the preemptor waits on a held LocalQueue of the victim's ClusterQueue")
++		preemptorLQ := utiltestingapi.MakeLocalQueue("preemptor", ns.Name).ClusterQueue(clusterQueue.Name).StopPolicy(kueue.Hold).Obj()
++		behavioral.MustCreate(ctx, k8sClient, preemptorLQ)
++		// A RayCluster rather than a bare Workload, so that its eviction releases the quota.
++		preemptorCluster := testingraycluster.MakeCluster("preemptor", ns.Name).
++			Queue(preemptorLQ.Name).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			ScaleFirstWorkerGroup(3).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, preemptorCluster)
++		preemptor := &kueue.Workload{}
++		gomega.Eventually(func(g gomega.Gomega) {
++			list := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, list, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			found := false
++			for i := range list.Items {
++				if owner := metav1.GetControllerOf(&list.Items[i]); owner != nil && owner.Name == preemptorCluster.Name {
++					list.Items[i].DeepCopyInto(preemptor)
++					found = true
++				}
++			}
++			g.Expect(found).Should(gomega.BeTrue())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		reclaim(slice, 4, string(workload.Key(preemptor)))
++		release(slice, 4)
++		probe := expectReplacement(slice)
++		expectPendingFor(probe)
++
++		ginkgo.By("the preemptor is admitted into the released quota, so the probe does not fit")
++		setStopPolicy(preemptorLQ, kueue.None)
++		behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, preemptor)
++		expectPendingFor(probe)
++
++		ginkgo.By("the preemptor is evicted and pending again; the quota it held goes to the probe")
++		setStopPolicy(preemptorLQ, kueue.HoldAndDrain)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(preemptor), preemptor)).Should(gomega.Succeed())
++			g.Expect(workload.HasQuotaReservation(preemptor)).Should(gomega.BeFalse())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		raiseQuota("10")
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 8)
++		expectReplicas(rayCluster, 8)
++	})
++
++	ginkgo.It("Should not block a StrictFIFO ClusterQueue while the probe is held", func() {
++		createQueuesWithStrategy("9", kueue.StrictFIFO)
++		createCluster(8)
++		slice := admitFully(8)
++		preemptor, _ := heldPreemptor()
++		reclaim(slice, 4, string(workload.Key(preemptor)))
++		release(slice, 4)
++		probe := expectReplacement(slice)
++		expectPendingFor(probe)
++
++		ginkgo.By("a workload that fits in the released quota is admitted behind the held probe")
++		next := utiltestingapi.MakeWorkload("next", ns.Name).Queue(kueue.LocalQueueName(localQueue.Name)).
++			PodSets(*utiltestingapi.MakePodSet("main", 2).Request(corev1.ResourceCPU, "1").Obj()).Obj()
++		behavioral.MustCreate(ctx, k8sClient, next)
++		behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, next)
++		behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, probe)
++	})
++
++
++	ginkgo.It("Should not reuse an earlier probe's name once a reclaim lowers the admitted level", func() {
++		createQueues("7")
++		rayCluster := createCluster(4)
++		_, firstProbe := partialScaleUp(rayCluster)
++
++		ginkgo.By("capacity frees and the first probe, named after the admitted level of 6 workers, is admitted with all 8")
++		raiseQuota("9")
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, firstProbe, workersGroupName, 8)
++
++		ginkgo.By("a preemptor reclaims 4 workers of it")
++		preemptor := utiltestingapi.MakeWorkload("preemptor", ns.Name).Queue(kueue.LocalQueueName(localQueue.Name)).
++			PodSets(*utiltestingapi.MakePodSet("main", 2).Request(corev1.ResourceCPU, "1").Obj()).Obj()
++		behavioral.MustCreate(ctx, k8sClient, preemptor)
++		behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, preemptor)
++		reclaim(firstProbe, 4, string(workload.Key(preemptor)))
++		release(firstProbe, 4)
++		behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, preemptor)
++
++		ginkgo.By("the regrowth probe is admitted with 6 workers, the level the first probe was named after")
++		regrown := expectReplacement(firstProbe)
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, regrown, workersGroupName, 6)
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(firstProbe))
++
++		ginkgo.By("its own probe does not collide with the first probe and regrows the cluster once the preemptor finishes")
++		next := expectReplacement(regrown)
++		gomega.Expect(next.Name).ShouldNot(gomega.Equal(firstProbe.Name))
++		behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, next)
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(preemptor), preemptor)).Should(gomega.Succeed())
++			g.Expect(workloadfinish.Finish(ctx, k8sClient, preemptor, kueue.WorkloadFinishedReasonSucceeded, "done", clock.RealClock{})).Should(gomega.Succeed())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, next, workersGroupName, 8)
++		expectReplicas(rayCluster, 8)
++	})
++
++	ginkgo.It("Should drop a pending probe when the autoscaler scales below the admitted count", func() {
++		createQueues("7")
++		rayCluster := createCluster(4)
++		partial, probe := partialScaleUp(rayCluster)
++
++		ginkgo.By("the autoscaler scales down to 5 workers while the probe is pending")
++		scale(rayCluster, 5)
++
++		ginkgo.By("the admitted slice is lowered in place and the probe is finished")
++		gomega.Eventually(func(g gomega.Gomega) {
++			got := &kueue.Workload{}
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(partial), got)).Should(gomega.Succeed())
++			g.Expect(got.Spec.PodSets[workersPodSetIdx].Count).Should(gomega.Equal(int32(5)))
++			g.Expect(workload.IsAdmitted(got)).Should(gomega.BeTrue())
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(probe))
++		expectReplicas(rayCluster, 5)
++
++		ginkgo.By("a later scale-up gets a new probe")
++		scale(rayCluster, 8)
++		gomega.Eventually(func(g gomega.Gomega) {
++			list := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, list, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			g.Expect(behavioral.FindNonFinishedWorkloads(list.Items)).Should(gomega.HaveLen(2))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++	})
++}
++
++var _ = ginkgo.Describe("RayCluster regrowth after a partial preemption reclaim", ginkgo.Label("job:ray", "area:jobs"), ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
++	regrowAfterReclaimSpecs(true)
++})
++
++var _ = ginkgo.Describe("RayCluster regrowth after a partial preemption reclaim with PartialPreemption off", ginkgo.Label("job:ray", "area:jobs"), ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
++	regrowAfterReclaimSpecs(false)
++})

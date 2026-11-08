@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simone Primarosa <simone.primarosa@gmail.com>
+Date: Sat, 7 Nov 2026 12:00:00 +01:00
+Subject: [PATCH] fix: allow updating queue and priority on running deployments via feature gate
+
+Modifying kueue.x-k8s.io/queue-name or kueue.x-k8s.io/priority-class on active Deployments is rejected by Kueue's admission webhook when replicas are ready, forcing operators to delete and recreate Deployments to adjust queue routing. This immutability check prevented zero-downtime rolling updates of long-running serving workloads across cluster queues or priority tiers.
+
+Upstream Kueue requires strict immutability of queue and priority labels on active Deployments whenever any replica is in a Ready state, ensuring consistent queue assignment across the lifetime of the Deployment. Under the repository architecture rules, changes that alter upstream admission validation must sit behind an explicit feature gate disabled by default to preserve standard semantics.
+
+Introduce the MutableDeploymentQueue feature gate (off by default) and relax immutability validation in the Deployment webhook when enabled. Allow updating queue names and adding or changing workload priority classes on running Deployments while preserving deletion checks, enabling rolling updates to apply new queue and priority assignments to subsequent pods.
+---
+diff --git a/pkg/controller/jobs/deployment/deployment_webhook.go b/pkg/controller/jobs/deployment/deployment_webhook.go
+index 1039f97..ff5d6f9 100644
+--- a/pkg/controller/jobs/deployment/deployment_webhook.go
++++ b/pkg/controller/jobs/deployment/deployment_webhook.go
+@@ -172,17 +172,34 @@ func (wh *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj *appsv1.De
+ 	allErrs := jobframework.ValidateQueueName(newDeployment.Object())
+ 	allErrs = append(allErrs, jobframework.ValidateElasticJobAnnotation(newDeployment.Object(), newDeployment.GVK())...)
+ 
+-	// Prevents updating the queue-name if at least one Pod is not suspended
+-	// or if the queue-name has been deleted.
+ 	isSuspended := oldDeployment.Status.ReadyReplicas == 0
+-	if !isSuspended || newQueueName == "" {
+-		allErrs = append(allErrs, apivalidation.ValidateImmutableField(newQueueName, oldQueueName, queueNameLabelPath)...)
++	if features.Enabled(features.MutableDeploymentQueue) {
++		// Prevents removing the queue-name once set.
++		// Changing the queue-name while Pods are ready is allowed because Kueue admits each
++		// Deployment Pod as its own workload, enabling zero-downtime rolling updates.
++		if newQueueName == "" {
++			allErrs = append(allErrs, apivalidation.ValidateImmutableField(newQueueName, oldQueueName, queueNameLabelPath)...)
++		}
++		// Adding or changing a WorkloadPriorityClass on a running Deployment is allowed for the same reason:
++		// only Pods created after the change carry the label, so their new workloads get the class
++		// while existing workloads keep their priority. Removing it stays rejected.
++		allErrs = append(allErrs, jobframework.ValidateUpdateForWorkloadPriorityClassName(
++			true,
++			oldDeployment.Object(),
++			newDeployment.Object(),
++		)...)
++	} else {
++		// Prevents updating the queue-name if at least one Pod is not suspended
++		// or if the queue-name has been deleted.
++		if !isSuspended || newQueueName == "" {
++			allErrs = append(allErrs, apivalidation.ValidateImmutableField(newQueueName, oldQueueName, queueNameLabelPath)...)
++		}
++		allErrs = append(allErrs, jobframework.ValidateUpdateForWorkloadPriorityClassName(
++			isSuspended,
++			oldDeployment.Object(),
++			newDeployment.Object(),
++		)...)
+ 	}
+-	allErrs = append(allErrs, jobframework.ValidateUpdateForWorkloadPriorityClassName(
+-		isSuspended,
+-		oldDeployment.Object(),
+-		newDeployment.Object(),
+-	)...)
+ 
+ 	if features.Enabled(features.AdmissionGatedBy) {
+ 		allErrs = append(allErrs, webhook.ValidateAdmissionGatedByAnnotationOnUpdate(oldDeployment.Object(), newDeployment.Object())...)
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index 46e4356..a47b406 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -927,6 +927,10 @@ const (
+ 	// not all Pods of the group succeeded. When disabled, such a Workload finishes with
+ 	// reason Succeeded, as before https://github.com/kubernetes-sigs/kueue/pull/16156.
+ 	DeclareWorkloadFailureOnUnretriablePodGroups featuregate.Feature = "DeclareWorkloadFailureOnUnretriablePodGroups"
++
++	// Enables updating queue and priority on running Deployments by relaxing
++	// immutability checks in the Deployment validation webhook.
++	MutableDeploymentQueue featuregate.Feature = "MutableDeploymentQueue"
+ )
+ 
+ func init() {
+@@ -1359,6 +1363,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+ 		{Version: version.MustParse("0.20"), Default: true, PreRelease: featuregate.Beta},
+ 	},
+ 
++	MutableDeploymentQueue: {
++		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
++	},
++
+ 	RecomputeAssignmentUponPreemptionTargetsOverlap: {
+ 		{Version: version.MustParse("0.20"), Default: true, PreRelease: featuregate.Beta},
+ 	},
+diff --git a/pkg/controller/jobs/deployment/deployment_webhook_test.go b/pkg/controller/jobs/deployment/deployment_webhook_test.go
+index 5ff6e83..4817a3a 100644
+--- a/pkg/controller/jobs/deployment/deployment_webhook_test.go
++++ b/pkg/controller/jobs/deployment/deployment_webhook_test.go
+@@ -570,6 +570,33 @@ func TestValidateUpdate(t *testing.T) {
+ 				},
+ 			}.ToAggregate(),
+ 		},
++		"with queue (ready replicas) allowed with MutableDeploymentQueue": {
++			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
++				Queue("test-queue").
++				ReadyReplicas(1).
++				Obj(),
++			newDeployment: testingdeployment.MakeDeployment("test-pod", "").
++				Queue("test-queue-new").
++				ReadyReplicas(1).
++				Obj(),
++			featureGates: map[featuregate.Feature]bool{features.MutableDeploymentQueue: true},
++		},
++		"delete queue (ready replicas)": {
++			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
++				Queue("test-queue").
++				ReadyReplicas(1).
++				Obj(),
++			newDeployment: testingdeployment.MakeDeployment("test-pod", "").
++				ReadyReplicas(1).
++				Obj(),
++			wantErr: field.ErrorList{
++				&field.Error{
++					Type:  field.ErrorTypeInvalid,
++					Field: "metadata.labels[kueue.x-k8s.io/queue-name]",
++				},
++			}.ToAggregate(),
++			featureGates: map[featuregate.Feature]bool{features.MutableDeploymentQueue: true},
++		},
+ 		"update priority-class when suspended": {
+ 			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
+ 				Queue("test-queue").
+@@ -597,6 +624,18 @@ func TestValidateUpdate(t *testing.T) {
+ 				},
+ 			}.ToAggregate(),
+ 		},
++		"add priority-class when replicas ready allowed with MutableDeploymentQueue": {
++			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
++				Queue("test-queue").
++				ReadyReplicas(int32(1)).
++				Obj(),
++			newDeployment: testingdeployment.MakeDeployment("test-pod", "").
++				Queue("test-queue").
++				Label(constants.WorkloadPriorityClassLabel, "test").
++				ReadyReplicas(int32(1)).
++				Obj(),
++			featureGates: map[featuregate.Feature]bool{features.MutableDeploymentQueue: true},
++		},
+ 		"update priority-class when replicas ready": {
+ 			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
+ 				Queue("test-queue").
+-- 
+2.48.1

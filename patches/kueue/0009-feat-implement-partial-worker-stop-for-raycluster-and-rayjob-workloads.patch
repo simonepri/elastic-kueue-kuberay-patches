@@ -1,0 +1,2236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simone Primarosa <simone.primarosa@gmail.com>
+Date: Sat, 7 Nov 2026 12:00:00 +01:00
+Subject: [PATCH] feat: implement partial worker stop for raycluster and rayjob workloads
+
+Preemption of Ray workloads in Kueue is entirely all-or-nothing, terminating the Ray Head pod, distributed state, and active drivers even when preempting only a subset of worker pods would free sufficient quota. Restarting the head pod destroys long-running checkpoints and driver connections, whereas elastic Ray clusters can dynamically shrink worker groups without interrupting head execution.
+
+Implement collaborative partial worker stopping for RayCluster and RayJob workloads by exposing the kueue.x-k8s.io/reclaim-target-counts annotation and reconciling partial preemption requests. Evict surplus worker pods in whole replica units by deletion cost and age while keeping the Ray Head pod and core cluster state operational.
+---
+diff --git a/pkg/constants/partial_preemption.go b/pkg/constants/partial_preemption.go
+new file mode 100644
+index 0000000..8951f53
+--- /dev/null
++++ b/pkg/constants/partial_preemption.go
+@@ -0,0 +1,34 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Defines annotations used for partial preemption and worker reclaim coordination.
++package constants
++
++const (
++	// ReclaimTargetCountsAnnotation is set by Kueue on a workload slice that partial
++	// preemption shrinks. Its value lists the pod count that each shrunk PodSet goes
++	// down to, as "<podSet>=<count>[,<podSet>=<count>]". The Pods above it are stopped,
++	// and once they are gone, they are marked reclaimable, which releases their quota.
++	ReclaimTargetCountsAnnotation = "kueue.x-k8s.io/reclaim-target-counts"
++
++	// ReclaimPreemptorAnnotation records the "<namespace>/<name>" of the Workload that
++	// set the reclaim target counts.
++	ReclaimPreemptorAnnotation = "kueue.x-k8s.io/reclaim-preemptor"
++
++	// ReclaimRequestedAtAnnotation records, in RFC 3339, when the reclaim target counts
++	// were first set.
++	ReclaimRequestedAtAnnotation = "kueue.x-k8s.io/reclaim-requested-at"
++)
+diff --git a/pkg/constants/ray.go b/pkg/constants/ray.go
+new file mode 100644
+index 0000000..666317b
+--- /dev/null
++++ b/pkg/constants/ray.go
+@@ -0,0 +1,8 @@
++// Shared names of the fixed Ray PodSets keep controllers and flavor assignment consistent.
++
++package constants
++
++const (
++	RayHeadPodSetName      = "head"
++	RaySubmitterPodSetName = "submitter"
++)
+diff --git a/pkg/controller/core/indexer/indexer.go b/pkg/controller/core/indexer/indexer.go
+index 1c69baa..dc9416d 100644
+--- a/pkg/controller/core/indexer/indexer.go
++++ b/pkg/controller/core/indexer/indexer.go
+@@ -19,6 +19,7 @@ package indexer
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	resourceapi "k8s.io/api/resource/v1"
+@@ -36,6 +37,7 @@ import (
+ )
+ 
+ const (
++	PodNodeNameKey                              = "spec.nodeName"
+ 	WorkloadQueueKey                            = "spec.queueName"
+ 	WorkloadClusterQueueKey                     = "status.admission.clusterQueue"
+ 	QueueClusterQueueKey                        = "spec.clusterQueue"
+@@ -216,6 +218,15 @@ func IndexPodWorkloadSliceName(obj client.Object) []string {
+ 	return nil
+ }
+ 
++// IndexPodNodeName indexes Pods by spec.nodeName.
++func IndexPodNodeName(obj client.Object) []string {
++	pod, ok := obj.(*corev1.Pod)
++	if !ok || pod.Spec.NodeName == "" {
++		return nil
++	}
++	return []string{pod.Spec.NodeName}
++}
++
+ func IndexWorkloadAdmissionCheck(obj client.Object) []string {
+ 	wl, ok := obj.(*kueue.Workload)
+ 	if !ok || len(wl.Status.AdmissionChecks) == 0 {
+@@ -341,6 +352,9 @@ func Setup(ctx context.Context, indexer client.FieldIndexer, opts ...Option) err
+ 	for _, opt := range opts {
+ 		opt(&o)
+ 	}
++	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameKey, IndexPodNodeName); err != nil && !strings.Contains(err.Error(), "indexer conflict") {
++		return fmt.Errorf("setting index on %s for Pod: %w", PodNodeNameKey, err)
++	}
+ 	if err := indexer.IndexField(ctx, &kueue.Workload{}, WorkloadQueueKey, IndexWorkloadQueue); err != nil {
+ 		return fmt.Errorf("setting index on queue for Workload: %w", err)
+ 	}
+diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
+new file mode 100644
+index 0000000..9be7e7f
+--- /dev/null
++++ b/pkg/controller/jobframework/partial_stop.go
+@@ -0,0 +1,91 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Reconciles partial preemption by marking stopped workers reclaimable and evicting if timeouts expire.
++package jobframework
++
++import (
++	"context"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/workload"
++	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// ReasonPartiallyStopped is the reason of the event recorded on a job whose Pods above
++// the reclaim target counts of partial preemption were stopped.
++const ReasonPartiallyStopped = "PartiallyStopped"
++
++// JobWithPartialStop is implemented by elastic jobs that partial preemption can shrink.
++// Once the Pods above the reclaim targets are gone, the ElasticJobUngater marks them
++// reclaimable, which releases their quota.
++type JobWithPartialStop interface {
++	// StopPartially brings each PodSet in targets down to its target count without changing
++	// the job's desired count, so the recreated pods stay gated. It makes no API call when the
++	// PodSets are already at their targets, and returns whether it stopped any pod.
++	StopPartially(ctx context.Context, c client.Client, wl *kueue.Workload, targets workload.PodSetsCounts) (bool, error)
++}
++
++// partialStopRequeueAfter is how often the job reconciler checks a job whose reclaim
++// targets are still pending, since it does not watch the job's Pods.
++const partialStopRequeueAfter = 5 * time.Second
++
++// stopJobPartially brings a running elastic job down to the pending reclaim target
++// counts of partial preemption. It reports whether a target is pending, in which case
++// the reconcile ends here and is requeued until the ElasticJobUngater releases the quota.
++func (r *JobReconciler) stopJobPartially(ctx context.Context, job GenericJob, wl *kueue.Workload) (ctrl.Result, bool, error) {
++	partialJob, ok := job.(JobWithPartialStop)
++	if !ok || !features.Enabled(features.PartialPreemption) || job.IsSuspended() || !workload.IsAdmitted(wl) || workloadevict.IsEvicted(wl) {
++		return ctrl.Result{}, false, nil
++	}
++	targets := workload.PendingReclaimTargetCounts(wl)
++	if len(targets) == 0 {
++		return ctrl.Result{}, false, nil
++	}
++	stopped, err := partialJob.StopPartially(ctx, r.client, wl, targets)
++	if stopped {
++		r.record.Eventf(job.Object(), nil, corev1.EventTypeNormal, ReasonPartiallyStopped, "PartiallyStopped",
++			"Stopping the pods above the reclaim target counts %s of workload '%s'", workload.FormatPodSetCounts(targets), workload.Key(wl))
++	}
++	if err != nil {
++		return ctrl.Result{}, true, err
++	}
++	return ctrl.Result{RequeueAfter: partialStopRequeueAfter}, true, nil
++}
++
++// clearReclaimedPods clears, right after the eviction released the Workload's quota,
++// the reclaimable Pods that partial preemption marked, so a re-admission does not
++// inherit them. The admission patch leaves out the reclaimable Pods, so the Workload
++// is read again first. A stale read is retried by the next reconcile, which the
++// admission change triggers, and the Workload controller clears them too.
++func (r *JobReconciler) clearReclaimedPods(ctx context.Context, wl *kueue.Workload) error {
++	if !workload.IsPartiallyPreempted(wl) {
++		return nil
++	}
++	latest := &kueue.Workload{}
++	if err := r.client.Get(ctx, client.ObjectKeyFromObject(wl), latest); err != nil {
++		return client.IgnoreNotFound(err)
++	}
++	_, err := workloadslicing.ClearReclaimablePodsForTargets(ctx, r.client, latest)
++	return client.IgnoreNotFound(err)
++}
+diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
+index 0d6a832..e509826 100644
+--- a/pkg/controller/jobframework/reconciler.go
++++ b/pkg/controller/jobframework/reconciler.go
+@@ -575,6 +575,11 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
+ 		return ctrl.Result{}, nil
+ 	}
+ 
++	// 3.1 stop the pods above the reclaim target counts of partial preemption
++	if result, pending, err := r.stopJobPartially(ctx, job, wl); pending || err != nil {
++		return result, err
++	}
++
+ 	// 4. update reclaimable counts if implemented by the job
+ 	jobRecl, implementsReclaimable := job.(JobWithReclaimablePods)
+ 	// The webhook rejects lowering reclaimablePods while the workload holds quota,
+@@ -622,6 +627,9 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
+ 			if err := r.clearAdmissionAfterEviction(ctx, job, wl); err != nil {
+ 				return ctrl.Result{}, fmt.Errorf("clearing admission: %w", err)
+ 			}
++			if err := r.clearReclaimedPods(ctx, wl); err != nil {
++				return ctrl.Result{}, fmt.Errorf("clearing reclaimed pods: %w", err)
++			}
+ 		}
+ 		requeueAfter, err := r.handleWorkloadAfterDeactivatedPolicy(ctx, job, wl)
+ 		return ctrl.Result{RequeueAfter: requeueAfter}, err
+diff --git a/pkg/controller/jobs/raycluster/partial_stop.go b/pkg/controller/jobs/raycluster/partial_stop.go
+new file mode 100644
+index 0000000..e067e5b
+--- /dev/null
++++ b/pkg/controller/jobs/raycluster/partial_stop.go
+@@ -0,0 +1,64 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Implements partial worker stopping and step-aligned reclaim floors for RayCluster workloads.
++package raycluster
++
++import (
++	"context"
++
++	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
++	corev1 "k8s.io/api/core/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++var _ jobframework.JobWithPartialStop = (*RayCluster)(nil)
++
++// StopPartially deletes the running worker Pods above the reclaim targets in whole
++// worker group replicas, the cheapest by pod deletion cost first, then the newest.
++// KubeRay recreates them, because the RayCluster keeps its replicas, and they stay
++// gated until the slice has room for them again.
++func (j *RayCluster) StopPartially(ctx context.Context, c client.Client, wl *kueue.Workload, targets workload.PodSetsCounts) (bool, error) {
++	return workloadslicing.DeletePodGroupsAboveCounts(ctx, c, wl, targets, workerReplicaName)
++}
++
++// workerReplicaName returns the worker group replica a Pod belongs to; the Pods of
++// a multi-host replica share it. A Pod without one is a replica of its own.
++func workerReplicaName(p *corev1.Pod) string {
++	if name, found := p.Labels[rayutils.RayWorkerReplicaNameKey]; found && name != "" {
++		return name
++	}
++	return p.Name
++}
++
++// readyWithHeadPod reports whether the readiness of the RayCluster is that of its
++// head Pod, as with the RayClusterHeadPodReady gate: while partial preemption shrinks
++// an elastic RayCluster, the workers it recreates stay gated, so the cluster may
++// never reach the Ready state, and waitForPodsReady would then evict it whole.
++// Without a reclaim target on its Workload, the cluster must reach the Ready state.
++func readyWithHeadPod(j *RayCluster, opts ...jobframework.PodsReadyOption) bool {
++	if !features.Enabled(features.PartialPreemption) || !workloadslicing.Enabled(j) {
++		return false
++	}
++	wl := jobframework.PodsReadyWorkload(opts...)
++	return wl != nil && len(workload.ReclaimTargetCounts(wl)) > 0
++}
+diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
+index c2c44dc..6547f29 100644
+--- a/pkg/controller/jobs/raycluster/raycluster_controller.go
++++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
+@@ -153,8 +153,8 @@ func (j *RayCluster) Finished(ctx context.Context) (message string, success, fin
+ 	return j.Status.Reason, j.Status.State != rayv1.Failed, false
+ }
+ 
+-func (j *RayCluster) PodsReady(ctx context.Context, _ client.Client, _ ...jobframework.PodsReadyOption) bool {
+-	if !features.Enabled(features.RayClusterHeadPodReady) {
++func (j *RayCluster) PodsReady(ctx context.Context, _ client.Client, opts ...jobframework.PodsReadyOption) bool {
++	if !features.Enabled(features.RayClusterHeadPodReady) && !readyWithHeadPod(j, opts...) {
+ 		return j.Status.State == rayv1.Ready
+ 	}
+ 	// RayClusters are commonly used as devboxes, where users may already be
+diff --git a/pkg/controller/jobs/rayjob/partial_stop.go b/pkg/controller/jobs/rayjob/partial_stop.go
+new file mode 100644
+index 0000000..9a31dc3
+--- /dev/null
++++ b/pkg/controller/jobs/rayjob/partial_stop.go
+@@ -0,0 +1,45 @@
++// RayJob worker reclaim uses the same replica boundaries and deletion policy as its RayCluster.
++
++package rayjob
++
++import (
++	"context"
++
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++var (
++	_ jobframework.JobWithPartialStop      = (*RayJob)(nil)
++	_ jobframework.JobWithPodSetCountSteps = (*RayJob)(nil)
++)
++
++func (j *RayJob) workerCluster() *raycluster.RayCluster {
++	cluster := &rayv1.RayCluster{ObjectMeta: j.ObjectMeta, Status: j.Status.RayClusterStatus}
++	if j.Spec.RayClusterSpec != nil {
++		cluster.Spec = *j.Spec.RayClusterSpec
++	}
++	return (*raycluster.RayCluster)(cluster)
++}
++
++func (j *RayJob) PodSetCountSteps() workload.PodSetsCounts {
++	return j.workerCluster().PodSetCountSteps()
++}
++
++// StopPartially preserves the head, submitter, and workers in other entries. Recreated
++// workers remain gated until the replacement slice has quota for them again.
++func (j *RayJob) StopPartially(ctx context.Context, c client.Client, wl *kueue.Workload, targets workload.PodSetsCounts) (bool, error) {
++	return j.workerCluster().StopPartially(ctx, c, wl, targets)
++}
++
++func (j *RayJob) readyDuringReclaim(opts ...jobframework.PodsReadyOption) bool {
++	wl := jobframework.PodsReadyWorkload(opts...)
++	return features.Enabled(features.PartialPreemption) && workloadslicing.Enabled(j) &&
++		wl != nil && len(workload.ReclaimTargetCounts(wl)) > 0
++}
+diff --git a/pkg/controller/jobs/rayjob/rayjob_controller.go b/pkg/controller/jobs/rayjob/rayjob_controller.go
+index f38883c..f8aab15 100644
+--- a/pkg/controller/jobs/rayjob/rayjob_controller.go
++++ b/pkg/controller/jobs/rayjob/rayjob_controller.go
+@@ -33,6 +33,7 @@ import (
+ 	"sigs.k8s.io/controller-runtime/pkg/handler"
+ 
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobs/ray"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
+@@ -46,8 +47,8 @@ var (
+ )
+ 
+ const (
+-	headGroupPodSetName    = "head"
+-	submitterJobPodSetName = "submitter"
++	headGroupPodSetName    = constants.RayHeadPodSetName
++	submitterJobPodSetName = constants.RaySubmitterPodSetName
+ 	FrameworkName          = "ray.io/rayjob"
+ )
+ 
+@@ -234,7 +235,10 @@ func (j *RayJob) Finished(ctx context.Context) (message string, success, finishe
+ 	return message, success, finished
+ }
+ 
+-func (j *RayJob) PodsReady(ctx context.Context, _ client.Client, _ ...jobframework.PodsReadyOption) bool {
++func (j *RayJob) PodsReady(ctx context.Context, c client.Client, opts ...jobframework.PodsReadyOption) bool {
++	if j.readyDuringReclaim(opts...) {
++		return j.workerCluster().PodsReady(ctx, c, opts...)
++	}
+ 	return j.Status.RayClusterStatus.State == rayv1.Ready
+ }
+ 
+diff --git a/pkg/controller/jobs/rayservice/rayservice_controller.go b/pkg/controller/jobs/rayservice/rayservice_controller.go
+index 5458119..4d46505 100644
+--- a/pkg/controller/jobs/rayservice/rayservice_controller.go
++++ b/pkg/controller/jobs/rayservice/rayservice_controller.go
+@@ -34,6 +34,7 @@ import (
+ 	"sigs.k8s.io/controller-runtime/pkg/handler"
+ 
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobs/ray"
+ 	"sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
+@@ -48,7 +49,7 @@ var (
+ )
+ 
+ const (
+-	headGroupPodSetName = "head"
++	headGroupPodSetName = constants.RayHeadPodSetName
+ 	FrameworkName       = "ray.io/rayservice"
+ )
+ 
+diff --git a/pkg/controller/tas/indexer/indexer.go b/pkg/controller/tas/indexer/indexer.go
+index 804aadf..f6de7de 100644
+--- a/pkg/controller/tas/indexer/indexer.go
++++ b/pkg/controller/tas/indexer/indexer.go
+@@ -20,11 +20,13 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"strconv"
++	"strings"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
+ 	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
+ 	"sigs.k8s.io/kueue/pkg/workload"
+ 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
+@@ -75,11 +77,7 @@ func indexPodNodeSelectorHostname(o client.Object) []string {
+ }
+ 
+ func indexPodNodeName(o client.Object) []string {
+-	pod, ok := o.(*corev1.Pod)
+-	if !ok {
+-		return nil
+-	}
+-	return []string{pod.Spec.NodeName}
++	return coreindexer.IndexPodNodeName(o)
+ }
+ 
+ func indexNodeHostname(o client.Object) []string {
+@@ -119,7 +117,7 @@ func SetupIndexes(ctx context.Context, indexer client.FieldIndexer) error {
+ 	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeSelectorHostnameKey, indexPodNodeSelectorHostname); err != nil {
+ 		return fmt.Errorf("setting index pod node selector hostname: %w", err)
+ 	}
+-	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameKey, indexPodNodeName); err != nil {
++	if err := indexer.IndexField(ctx, &corev1.Pod{}, PodNodeNameKey, indexPodNodeName); err != nil && !strings.Contains(err.Error(), "indexer conflict") {
+ 		return fmt.Errorf("setting index on %s for Pod: %w", PodNodeNameKey, err)
+ 	}
+ 	if err := indexer.IndexField(ctx, &corev1.Node{}, NodeHostnameKey, indexNodeHostname); err != nil {
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index 90f5e30..94abae6 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -45,6 +45,12 @@ const (
+ 	// Enables partial scale up for elastic jobs.
+ 	ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp featuregate.Feature = "ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp"
+ 
++	// owner: @reruno
++	// kep: https://github.com/kubernetes-sigs/kueue/pull/14589
++	//
++	// Enables preemption to shrink elastic workloads to their reclaim floor before evicting them.
++	PartialPreemption featuregate.Feature = "PartialPreemption"
++
+ 	// owner: @KunWuLuan
+ 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/582-preempt-based-on-flavor-order
+ 	//
+@@ -978,6 +984,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
+ 	TASPartialSlices:                                    {TopologyAwareScheduling},
+ 	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {ElasticJobsViaWorkloadSlices},
+ 	SchedulerLibraryIntegration:                         {TopologyAwareScheduling},
++	PartialPreemption:                                   {ElasticJobsViaWorkloadSlices, ReclaimablePods},
+ }
+ 
+ // defaultVersionedFeatureGates consists of all known Kueue-specific feature keys.
+@@ -998,6 +1005,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+ 	ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: {
+ 		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
+ 	},
++	PartialPreemption: {
++		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
++	},
+ 	FlavorFungibility: {
+ 		{Version: version.MustParse("0.5"), Default: true, PreRelease: featuregate.Beta},
+ 	},
+diff --git a/pkg/workload/partial_preemption.go b/pkg/workload/partial_preemption.go
+new file mode 100644
+index 0000000..d7d697c
+--- /dev/null
++++ b/pkg/workload/partial_preemption.go
+@@ -0,0 +1,181 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Manages partial preemption state, reclaim target counts, and reclaimable pod accounting.
++package workload
++
++import (
++	"maps"
++	"slices"
++	"time"
++
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/utils/ptr"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++// IsPartiallyPreempted reports whether partial preemption shrank, or is
++// shrinking, the workload.
++func IsPartiallyPreempted(wl *kueue.Workload) bool {
++	_, found := wl.Annotations[constants.ReclaimTargetCountsAnnotation]
++	return found
++}
++
++// ReclaimTargetCounts returns the reclaim target counts set by partial preemption.
++// Malformed entries are ignored, and so are stale targets (see ReclaimTargetsStale).
++func ReclaimTargetCounts(wl *kueue.Workload) PodSetsCounts {
++	if ReclaimTargetsStale(wl) {
++		return nil
++	}
++	return ParsePodSetCounts(wl.Annotations[constants.ReclaimTargetCountsAnnotation])
++}
++
++// ReclaimTargetsStale reports whether the reclaim targets were requested for an
++// earlier quota reservation than the current one: their requested-at time is
++// before the second the QuotaReserved condition last became true, and the quota
++// they reclaimed was already given back, so no PodSet with a target has reclaimable
++// Pods left. Such targets outlived the admission they were meant for, so they must
++// not shrink this one. When reclaimable Pods are left, because the admission was
++// released and reserved again before they were cleared, the Workload was admitted
++// for that smaller charge, so the targets still hold. Targets without a valid
++// requested-at time are never stale.
++func ReclaimTargetsStale(wl *kueue.Workload) bool {
++	requestedAt, err := time.Parse(time.RFC3339, wl.Annotations[constants.ReclaimRequestedAtAnnotation])
++	if err != nil {
++		return false
++	}
++	reserved := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadQuotaReserved)
++	if reserved == nil || reserved.Status != metav1.ConditionTrue ||
++		!requestedAt.Truncate(time.Second).Before(reserved.LastTransitionTime.Time) {
++		return false
++	}
++	targets := ParsePodSetCounts(wl.Annotations[constants.ReclaimTargetCountsAnnotation])
++	return !slices.ContainsFunc(wl.Status.ReclaimablePods, func(rp kueue.ReclaimablePod) bool {
++		_, found := targets[rp.Name]
++		return found && rp.Count > 0
++	})
++}
++
++// chargedCountsAfterReclaim raises the count of each PodSet with a reclaim target
++// in counts, the PodSet counts after its reclaimable Pods are subtracted, to at
++// least min(count, target): partial preemption keeps that many Pods running, so a
++// reclaimable count written ahead of the matching spec update never charges less.
++// Stale targets count too, since they only ever raise the charge.
++func chargedCountsAfterReclaim(wl *kueue.Workload, counts PodSetsCounts) {
++	targets := ParsePodSetCounts(wl.Annotations[constants.ReclaimTargetCountsAnnotation])
++	if len(targets) == 0 {
++		return
++	}
++	for _, ps := range wl.Spec.PodSets {
++		if target, found := targets[ps.Name]; found {
++			counts[ps.Name] = max(counts[ps.Name], min(ps.Count, target))
++		}
++	}
++}
++
++// SetReclaimTargetCounts sets the reclaim target counts of partial preemption.
++func SetReclaimTargetCounts(wl *kueue.Workload, targets PodSetsCounts) {
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimTargetCountsAnnotation, FormatPodSetCounts(targets))
++}
++
++// ClearReclaimTargets removes the reclaim target counts of partial preemption,
++// with the preemptor and the time they were requested at. It reports whether
++// it removed any of them.
++func ClearReclaimTargets(wl *kueue.Workload) bool {
++	cleared := false
++	for _, key := range []string{
++		constants.ReclaimTargetCountsAnnotation,
++		constants.ReclaimPreemptorAnnotation,
++		constants.ReclaimRequestedAtAnnotation,
++	} {
++		if _, found := wl.Annotations[key]; found {
++			delete(wl.Annotations, key)
++			cleared = true
++		}
++	}
++	return cleared
++}
++
++// PendingReclaimTargetCounts returns the reclaim target counts of the PodSets
++// that are still charged above them, so their quota is not released yet.
++func PendingReclaimTargetCounts(wl *kueue.Workload) PodSetsCounts {
++	granted := ExtractGrantedPodSetCountsAfterReclaim(wl)
++	var pending PodSetsCounts
++	for name, target := range ReclaimTargetCounts(wl) {
++		if count, found := granted[name]; found && target < count {
++			if pending == nil {
++				pending = make(PodSetsCounts)
++			}
++			pending[name] = target
++		}
++	}
++	return pending
++}
++
++// ReclaimablePodsForTargets returns the reclaimable Pods of wl with each PodSet
++// in targets marked reclaimable down to its target count, which releases the
++// quota of the Pods above it.
++func ReclaimablePodsForTargets(wl *kueue.Workload, targets PodSetsCounts) []kueue.ReclaimablePod {
++	counts := ExtractPodSetCountsFromWorkload(wl)
++	reclaimable := slices.Clone(wl.Status.ReclaimablePods)
++	for _, name := range slices.Sorted(maps.Keys(targets)) {
++		count := max(counts[name]-targets[name], 0)
++		if i := slices.IndexFunc(reclaimable, func(rp kueue.ReclaimablePod) bool { return rp.Name == name }); i != -1 {
++			reclaimable[i].Count = max(reclaimable[i].Count, count)
++		} else {
++			reclaimable = append(reclaimable, kueue.ReclaimablePod{Name: name, Count: count})
++		}
++	}
++	return reclaimable
++}
++
++// AdmittedPodSetCounts returns the pod count of each PodSet in the admission,
++// before any scale-down: the assignment count, or the spec count when it is unset.
++func AdmittedPodSetCounts(wl *kueue.Workload) PodSetsCounts {
++	if wl.Status.Admission == nil {
++		return nil
++	}
++	counts := ExtractPodSetCountsFromWorkload(wl)
++	admitted := make(PodSetsCounts, len(wl.Status.Admission.PodSetAssignments))
++	for _, psa := range wl.Status.Admission.PodSetAssignments {
++		admitted[psa.Name] = ptr.Deref(psa.Count, counts[psa.Name])
++	}
++	return admitted
++}
++
++// ReclaimablePodsAfterScaleDown returns the reclaimable Pods of wl with the count
++// of each PodSet that has a reclaim target re-derived after an in-place scale-down:
++// when the PodSet's count is below its admitted count and it is charged for fewer
++// Pods than its target, its reclaimable count becomes max(0, count - target), so it
++// is charged min(count, target) again. Other PodSets keep their count.
++func ReclaimablePodsAfterScaleDown(wl *kueue.Workload) []kueue.ReclaimablePod {
++	admitted := AdmittedPodSetCounts(wl)
++	counts := ExtractPodSetCountsFromWorkload(wl)
++	targets := ReclaimTargetCounts(wl)
++	reclaimable := slices.Clone(wl.Status.ReclaimablePods)
++	for i := range reclaimable {
++		rp := &reclaimable[i]
++		target, hasTarget := targets[rp.Name]
++		count := counts[rp.Name]
++		if hasTarget && count < admitted[rp.Name] && count-rp.Count < target {
++			rp.Count = max(0, count-target)
++		}
++	}
++	return reclaimable
++}
+diff --git a/pkg/workload/workload.go b/pkg/workload/workload.go
+index cd2cca9..5568fa7 100644
+--- a/pkg/workload/workload.go
++++ b/pkg/workload/workload.go
+@@ -763,6 +763,7 @@ func podSetsCountsAfterReclaim(wl *kueue.Workload) PodSetsCounts {
+ 			totalCounts[podSetName] -= min(rc, totalCounts[podSetName])
+ 		}
+ 	}
++	chargedCountsAfterReclaim(wl, totalCounts)
+ 	return totalCounts
+ }
+ 
+diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
+new file mode 100644
+index 0000000..cbe6f0c
+--- /dev/null
++++ b/pkg/workloadslicing/partial_preemption.go
+@@ -0,0 +1,449 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Deletes surplus worker pods and clears reclaimable pods for partially stopped workloads.
++package workloadslicing
++
++import (
++	"cmp"
++	"context"
++	"maps"
++	"slices"
++	"strconv"
++	"strings"
++
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/klog/v2"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	indexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	clientutil "sigs.k8s.io/kueue/pkg/util/client"
++	"sigs.k8s.io/kueue/pkg/util/parallelize"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
++	utilresource "sigs.k8s.io/kueue/pkg/util/resource"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++// runningPodsPerPodSet returns the Pods of the workload slice that hold their
++// resources, by PodSet: the ungated Pods that are not terminated, including the
++// terminating ones.
++func runningPodsPerPodSet(ctx context.Context, c client.Client, wl *kueue.Workload) (map[kueue.PodSetReference][]*corev1.Pod, error) {
++	pods, err := ListPodsForWorkloadSlice(ctx, c, wl.Namespace, SliceName(wl))
++	if err != nil {
++		return nil, err
++	}
++	running := make(map[kueue.PodSetReference][]*corev1.Pod)
++	for _, p := range pods {
++		if utilpod.IsTerminated(p) || utilpod.HasGate(p, kueue.ElasticJobSchedulingGate) {
++			continue
++		}
++		ps := kueue.PodSetReference(p.Labels[constants.PodSetLabel])
++		running[ps] = append(running[ps], p)
++	}
++	return running, nil
++}
++
++// PodsAboveCounts reports whether any PodSet of the workload slice still has
++// more running Pods than counts.
++func PodsAboveCounts(ctx context.Context, c client.Client, wl *kueue.Workload, counts workload.PodSetsCounts) (bool, error) {
++	running, err := runningPodsPerPodSet(ctx, c, wl)
++	if err != nil {
++		return false, err
++	}
++	for ps, count := range counts {
++		if int32(len(running[ps])) > count {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++// podGroup is a set of Pods that are deleted together.
++type podGroup struct {
++	pods         []*corev1.Pod
++	deletionCost int64
++	newest       *corev1.Pod
++}
++
++func podDeletionCost(p *corev1.Pod) int64 {
++	cost, err := strconv.ParseInt(p.Annotations[corev1.PodDeletionCost], 10, 32)
++	if err != nil {
++		return 0
++	}
++	return cost
++}
++
++// comparePodGroups orders pod groups by deletion cost ascending, then newest first.
++func comparePodGroups(a, b *podGroup) int {
++	if a.deletionCost != b.deletionCost {
++		return cmp.Compare(a.deletionCost, b.deletionCost)
++	}
++	if newerPod(a.newest, b.newest) {
++		return -1
++	}
++	if newerPod(b.newest, a.newest) {
++		return 1
++	}
++	return 0
++}
++
++type nodeReclaimUsage struct {
++	name              string
++	deletionCost      int64
++	podCount          int32
++	otherPods         int
++	otherAccelerators int64
++}
++
++func compareNodes(a, b *nodeReclaimUsage) int {
++	if a.deletionCost != b.deletionCost {
++		return cmp.Compare(a.deletionCost, b.deletionCost) // prefer lower total deletion cost
++	}
++	if a.podCount != b.podCount {
++		return cmp.Compare(b.podCount, a.podCount) // prefer node holding most pods
++	}
++	if a.otherAccelerators != b.otherAccelerators {
++		return cmp.Compare(a.otherAccelerators, b.otherAccelerators) // prefer fewer other accelerators
++	}
++	if a.otherPods != b.otherPods {
++		return cmp.Compare(a.otherPods, b.otherPods) // prefer fewer other pods
++	}
++	return strings.Compare(a.name, b.name)
++}
++
++func computeNodeUsages(
++	candidateNodes sets.Set[string],
++	candidatePods []corev1.Pod,
++	ourPodUIDs, ourPodNames sets.Set[string],
++	acceleratorResources sets.Set[corev1.ResourceName],
++) map[string]*nodeReclaimUsage {
++	usages := make(map[string]*nodeReclaimUsage, len(candidateNodes))
++	for nodeName := range candidateNodes {
++		usages[nodeName] = &nodeReclaimUsage{name: nodeName}
++	}
++	for i := range candidatePods {
++		p := &candidatePods[i]
++		if p.Spec.NodeName == "" || !candidateNodes.Has(p.Spec.NodeName) || utilpod.IsTerminated(p) || p.DeletionTimestamp != nil {
++			continue
++		}
++		if (p.UID != "" && ourPodUIDs.Has(string(p.UID))) || ourPodNames.Has(p.Name) {
++			continue
++		}
++		u := usages[p.Spec.NodeName]
++		u.otherPods++
++		for _, containers := range [][]corev1.Container{p.Spec.InitContainers, p.Spec.Containers} {
++			for _, c := range containers {
++				for resName := range acceleratorResources {
++					if q, ok := c.Resources.Requests[resName]; ok {
++						u.otherAccelerators += q.Value()
++					}
++				}
++			}
++		}
++	}
++	return usages
++}
++
++func podsToReclaim(
++	groups []*podGroup,
++	needed int32,
++	candidateNodes sets.Set[string],
++	candidatePods []corev1.Pod,
++	ourPodUIDs, ourPodNames sets.Set[string],
++	acceleratorResources sets.Set[corev1.ResourceName],
++) []*corev1.Pod {
++	var toDelete []*corev1.Pod
++
++	// 1. Separate unscheduled and scheduled groups. Unscheduled groups are deleted first.
++	var unscheduled []*podGroup
++	var scheduled []*podGroup
++	for _, g := range groups {
++		hasScheduled := false
++		for _, p := range g.pods {
++			if p.Spec.NodeName != "" {
++				hasScheduled = true
++				break
++			}
++		}
++		if hasScheduled {
++			scheduled = append(scheduled, g)
++		} else {
++			unscheduled = append(unscheduled, g)
++		}
++	}
++
++	slices.SortFunc(unscheduled, comparePodGroups)
++	for _, g := range unscheduled {
++		if needed <= 0 {
++			break
++		}
++		toDelete = append(toDelete, g.pods...)
++		needed -= int32(len(g.pods))
++	}
++
++	if needed <= 0 || len(scheduled) == 0 {
++		return toDelete
++	}
++
++	// 2. Group scheduled replica groups by node.
++	// Account each pod on its own node; a group whose pods span several nodes counts toward each of them.
++	nodeUsages := computeNodeUsages(candidateNodes, candidatePods, ourPodUIDs, ourPodNames, acceleratorResources)
++	nodeGroups := make(map[string][]*podGroup)
++	for _, g := range scheduled {
++		nodesForGroup := sets.New[string]()
++		for _, p := range g.pods {
++			if p.Spec.NodeName != "" {
++				nodesForGroup.Insert(p.Spec.NodeName)
++				u := nodeUsages[p.Spec.NodeName]
++				if u == nil {
++					u = &nodeReclaimUsage{name: p.Spec.NodeName}
++					nodeUsages[p.Spec.NodeName] = u
++				}
++				u.podCount++
++			}
++		}
++		for nodeName := range nodesForGroup {
++			nodeGroups[nodeName] = append(nodeGroups[nodeName], g)
++			nodeUsages[nodeName].deletionCost += g.deletionCost
++		}
++	}
++
++	deletedGroups := make(map[*podGroup]bool)
++	deleteGroup := func(g *podGroup) {
++		deletedGroups[g] = true
++		toDelete = append(toDelete, g.pods...)
++		needed -= int32(len(g.pods))
++		nodesForGroup := sets.New[string]()
++		for _, p := range g.pods {
++			if p.Spec.NodeName != "" {
++				nodesForGroup.Insert(p.Spec.NodeName)
++				if nu, ok := nodeUsages[p.Spec.NodeName]; ok {
++					nu.podCount--
++				}
++			}
++		}
++		for n := range nodesForGroup {
++			if nu, ok := nodeUsages[n]; ok {
++				nu.deletionCost -= g.deletionCost
++			}
++		}
++	}
++
++	for needed > 0 && len(nodeGroups) > 0 {
++		var wholeCandidates []*nodeReclaimUsage
++		for nodeName, grps := range nodeGroups {
++			u := nodeUsages[nodeName]
++			if u.podCount <= 0 {
++				continue
++			}
++			var nodeGroupPods int32
++			for _, g := range grps {
++				if !deletedGroups[g] {
++					nodeGroupPods += int32(len(g.pods))
++				}
++			}
++			if nodeGroupPods > 0 && nodeGroupPods <= needed {
++				wholeCandidates = append(wholeCandidates, u)
++			}
++		}
++
++		if len(wholeCandidates) > 0 {
++			slices.SortFunc(wholeCandidates, compareNodes)
++			chosen := wholeCandidates[0]
++			for _, g := range nodeGroups[chosen.name] {
++				if deletedGroups[g] {
++					continue
++				}
++				deleteGroup(g)
++			}
++			delete(nodeGroups, chosen.name)
++			continue
++		}
++
++		var activeNodes []*nodeReclaimUsage
++		for nodeName := range nodeGroups {
++			u := nodeUsages[nodeName]
++			if u.podCount > 0 {
++				activeNodes = append(activeNodes, u)
++			}
++		}
++		if len(activeNodes) == 0 {
++			break
++		}
++		slices.SortFunc(activeNodes, compareNodes)
++		chosen := activeNodes[0]
++		grps := nodeGroups[chosen.name]
++		slices.SortFunc(grps, comparePodGroups)
++		var remainingGrps []*podGroup
++		for _, g := range grps {
++			if deletedGroups[g] {
++				continue
++			}
++			if needed <= 0 {
++				remainingGrps = append(remainingGrps, g)
++			} else {
++				deleteGroup(g)
++			}
++		}
++		if len(remainingGrps) == 0 || nodeUsages[chosen.name].podCount <= 0 {
++			delete(nodeGroups, chosen.name)
++		} else {
++			nodeGroups[chosen.name] = remainingGrps
++		}
++	}
++
++	return toDelete
++}
++
++// extractAcceleratorResources finds accelerator extended resource names from the pod set's container requests.
++func extractAcceleratorResources(wl *kueue.Workload, psRef kueue.PodSetReference, live []*corev1.Pod) sets.Set[corev1.ResourceName] {
++	accelerators := sets.New[corev1.ResourceName]()
++	if idx := slices.IndexFunc(wl.Spec.PodSets, func(ps kueue.PodSet) bool { return ps.Name == psRef }); idx >= 0 {
++		for _, containers := range [][]corev1.Container{wl.Spec.PodSets[idx].Template.Spec.InitContainers, wl.Spec.PodSets[idx].Template.Spec.Containers} {
++			for _, c := range containers {
++				for resName, qty := range c.Resources.Requests {
++					if !qty.IsZero() && utilresource.IsExtendedResourceName(resName) {
++						accelerators.Insert(resName)
++					}
++				}
++			}
++		}
++	}
++	if accelerators.Len() == 0 {
++		for _, p := range live {
++			for _, containers := range [][]corev1.Container{p.Spec.InitContainers, p.Spec.Containers} {
++				for _, c := range containers {
++					for resName, qty := range c.Resources.Requests {
++						if !qty.IsZero() && utilresource.IsExtendedResourceName(resName) {
++							accelerators.Insert(resName)
++						}
++					}
++				}
++			}
++		}
++	}
++	return accelerators
++}
++
++// DeletePodGroupsAboveCounts deletes running Pods of the workload slice until
++// each PodSet in counts runs at most its count. When deleting pods, unscheduled
++// pods are deleted first, then whole nodes' worth of pods are deleted (ranking
++// candidate nodes first by lower total deletion cost of this pod set's groups on
++// the node, then greedily preferring nodes where this pod set holds the most pods,
++// breaking ties by fewer other accelerators or other pods on the node, then node
++// name). Any remaining pods are deleted from a partial node in deletion cost / age
++// order. Multi-host replica groups are kept whole. Terminating Pods are neither
++// deleted again nor counted, so a call made while earlier deletions are still
++// terminating deletes nothing more. It returns whether any Pod was deleted.
++func DeletePodGroupsAboveCounts(ctx context.Context, c client.Client, wl *kueue.Workload, counts workload.PodSetsCounts, groupOf func(*corev1.Pod) string) (bool, error) {
++	running, err := runningPodsPerPodSet(ctx, c, wl)
++	if err != nil {
++		return false, err
++	}
++	var toDelete []*corev1.Pod
++	for _, ps := range slices.Sorted(maps.Keys(counts)) {
++		// Terminating Pods are already on their way out, so only the others count
++		// toward the target here; PodsAboveCounts still waits for them to go.
++		live := slices.DeleteFunc(slices.Clone(running[ps]), func(p *corev1.Pod) bool { return p.DeletionTimestamp != nil })
++		remaining := int32(len(live))
++		if remaining <= counts[ps] {
++			continue
++		}
++		groupsByKey := make(map[string]*podGroup)
++		for _, p := range live {
++			key := groupOf(p)
++			g, found := groupsByKey[key]
++			if !found {
++				g = &podGroup{deletionCost: podDeletionCost(p), newest: p}
++				groupsByKey[key] = g
++			}
++			g.pods = append(g.pods, p)
++			g.deletionCost = max(g.deletionCost, podDeletionCost(p))
++			if newerPod(p, g.newest) {
++				g.newest = p
++			}
++		}
++		groups := slices.Collect(maps.Values(groupsByKey))
++		candidateNodes := sets.New[string]()
++		ourPodUIDs := sets.New[string]()
++		ourPodNames := sets.New[string]()
++		for _, p := range live {
++			if p.UID != "" {
++				ourPodUIDs.Insert(string(p.UID))
++			}
++			ourPodNames.Insert(p.Name)
++			if p.Spec.NodeName != "" {
++				candidateNodes.Insert(p.Spec.NodeName)
++			}
++		}
++		var candidatePods []corev1.Pod
++		if candidateNodes.Len() > 0 {
++			nodeNames := candidateNodes.UnsortedList()
++			slices.Sort(nodeNames)
++			for _, nodeName := range nodeNames {
++				var list corev1.PodList
++				if err := c.List(ctx, &list, client.MatchingFields{indexer.PodNodeNameKey: nodeName}); err != nil {
++					return false, err
++				}
++				candidatePods = append(candidatePods, list.Items...)
++			}
++		}
++		accelerators := extractAcceleratorResources(wl, ps, live)
++		toDelete = append(toDelete, podsToReclaim(groups, remaining-counts[ps], candidateNodes, candidatePods, ourPodUIDs, ourPodNames, accelerators)...)
++	}
++	log := ctrl.LoggerFrom(ctx)
++	err = parallelize.Until(ctx, len(toDelete), func(i int) error {
++		log.V(3).Info("Deleting elastic pod above the reclaim target count", "pod", klog.KObj(toDelete[i]))
++		return client.IgnoreNotFound(c.Delete(ctx, toDelete[i]))
++	})
++	return len(toDelete) > 0, err
++}
++
++// newerPod reports whether a was created after b, breaking ties by the higher name.
++func newerPod(a, b *corev1.Pod) bool {
++	if c := a.CreationTimestamp.Compare(b.CreationTimestamp.Time); c != 0 {
++		return c > 0
++	}
++	return strings.Compare(a.Name, b.Name) > 0
++}
++
++// ClearReclaimablePodsForTargets removes the reclaimable Pods of the PodSets with a
++// reclaim target from a Workload that no longer holds quota: they were only the Pods
++// partial preemption stopped, and the next admission must not inherit them. A merge
++// patch replaces the whole list, so the entries go even when another field manager
++// also owns them, which a server-side apply would leave behind. It reports whether
++// it wrote the Workload.
++func ClearReclaimablePodsForTargets(ctx context.Context, c client.Client, wl *kueue.Workload) (bool, error) {
++	if workload.HasQuotaReservation(wl) {
++		return false, nil
++	}
++	targets := workload.ParsePodSetCounts(wl.Annotations[constants.ReclaimTargetCountsAnnotation])
++	reclaimable := slices.DeleteFunc(slices.Clone(wl.Status.ReclaimablePods), func(rp kueue.ReclaimablePod) bool {
++		_, found := targets[rp.Name]
++		return found
++	})
++	if len(reclaimable) == len(wl.Status.ReclaimablePods) {
++		return false, nil
++	}
++	return true, clientutil.PatchStatus(ctx, c, wl, func() (bool, error) {
++		wl.Status.ReclaimablePods = reclaimable
++		return true, nil
++	})
++}
+diff --git a/pkg/controller/jobs/raycluster/partial_stop_test.go b/pkg/controller/jobs/raycluster/partial_stop_test.go
+new file mode 100644
+index 0000000..ea15b98
+--- /dev/null
++++ b/pkg/controller/jobs/raycluster/partial_stop_test.go
+@@ -0,0 +1,245 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests RayCluster partial worker stopping, floor enforcement, and reclaimable pod tracking.
++package raycluster
++
++import (
++	"slices"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
++	"sigs.k8s.io/controller-runtime/pkg/reconcile"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	testingrayutil "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func TestReconcileStopsWorkersAboveReclaimTargets(t *testing.T) {
++	testCases := map[string]struct {
++		disablePartialPreemption bool
++		wantPods                 []string
++		wantRequeue              bool
++	}{
++		"the workers above the target are deleted and the job is requeued": {
++			wantPods:    []string{"w-0", "w-1"},
++			wantRequeue: true,
++		},
++		"without the gate no worker is deleted": {
++			disablePartialPreemption: true,
++			wantPods:                 []string{"w-0", "w-1", "w-2", "w-3"},
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++			features.SetFeatureGateDuringTest(t, features.PartialPreemption, !tc.disablePartialPreemption)
++			ctx, _ := utiltesting.ContextWithLog(t)
++			now := time.Now().Truncate(time.Second)
++
++			job := testingrayutil.MakeCluster("job", "ns").
++				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++				Suspend(false).
++				Queue("lq").
++				RequestWorkerGroup(corev1.ResourceCPU, "1").
++				ScaleFirstWorkerGroup(4).
++				Obj()
++			podSets, err := (*RayCluster)(job).PodSets(ctx, nil)
++			if err != nil {
++				t.Fatalf("PodSets() error: %v", err)
++			}
++			workers := podSets[1].Name
++			wl := utiltestingapi.MakeWorkload("wl", "ns").
++				Finalizers(kueue.ResourceInUseFinalizerName).
++				Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++				Annotation(constants.ReclaimTargetCountsAnnotation, workload.FormatPodSetCounts(workload.PodSetsCounts{workers: 2})).
++				ControllerReference(gvk, job.Name, string(job.UID)).
++				PodSets(podSets...).
++				ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++					utiltestingapi.MakePodSetAssignment(podSets[0].Name).Obj(),
++					utiltestingapi.MakePodSetAssignment(workers).Count(4).Obj(),
++				).Obj(), now).
++				AdmittedAt(true, now).
++				Obj()
++			objs := []client.Object{utiltesting.MakeNamespace("ns"), job, wl}
++			for i := range 4 {
++				objs = append(objs, testingpod.MakePod("w-"+string(rune('0'+i)), "ns").
++					Annotation(kueue.WorkloadSliceNameAnnotation, wl.Name).
++					Label(constants.PodSetLabel, string(workers)).
++					Label(rayutils.RayWorkerReplicaNameKey, "replica-"+string(rune('0'+i))).
++					CreationTimestamp(now.Add(time.Duration(i)*time.Second)).
++					Obj())
++			}
++			builder := utiltesting.NewClientBuilder(rayv1.AddToScheme).
++				WithObjects(objs...).
++				WithStatusSubresource(wl).
++				WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName)
++			indexer := utiltesting.AsIndexer(builder)
++			if err := SetupIndexes(ctx, indexer); err != nil {
++				t.Fatalf("SetupIndexes() error: %v", err)
++			}
++			kClient := builder.Build()
++			reconciler, err := NewReconciler(ctx, kClient, indexer, &utiltesting.EventRecorder{})
++			if err != nil {
++				t.Fatalf("NewReconciler() error: %v", err)
++			}
++
++			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(job)})
++			if err != nil {
++				t.Fatalf("Reconcile() error: %v", err)
++			}
++			if gotRequeue := result.RequeueAfter > 0; gotRequeue != tc.wantRequeue {
++				t.Errorf("Reconcile() requeueAfter = %v, want requeue %v", result.RequeueAfter, tc.wantRequeue)
++			}
++			var pods corev1.PodList
++			if err := kClient.List(ctx, &pods); err != nil {
++				t.Fatalf("List() error: %v", err)
++			}
++			var gotPods []string
++			for _, p := range pods.Items {
++				gotPods = append(gotPods, p.Name)
++			}
++			slices.Sort(gotPods)
++			if diff := cmp.Diff(tc.wantPods, gotPods); diff != "" {
++				t.Errorf("Pods after reconcile (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestPodsReadyWithPartialPreemption(t *testing.T) {
++	testCases := map[string]struct {
++		partialPreemption bool
++		elastic           bool
++		target            bool
++		want              bool
++	}{
++		"a shrinking elastic RayCluster is ready with its head pod": {
++			partialPreemption: true,
++			elastic:           true,
++			target:            true,
++			want:              true,
++		},
++		"an elastic RayCluster without a target whose workers never start is not ready": {
++			partialPreemption: true,
++			elastic:           true,
++		},
++		"a RayCluster that is not elastic waits for the Ready state": {
++			partialPreemption: true,
++			target:            true,
++		},
++		"without the gate a shrinking elastic RayCluster waits for the Ready state": {
++			elastic: true,
++			target:  true,
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.PartialPreemption, tc.partialPreemption)
++			ctx, _ := utiltesting.ContextWithLog(t)
++			// The head is ready, but the workers never start, so KubeRay never reports Ready.
++			job := testingrayutil.MakeCluster("job", "ns").
++				StatusConditions(metav1.Condition{Type: string(rayv1.HeadPodReady), Status: metav1.ConditionTrue}).
++				Obj()
++			if tc.elastic {
++				metav1.SetMetaDataAnnotation(&job.ObjectMeta, workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)
++			}
++			wl := utiltestingapi.MakeWorkload("wl", "ns").Obj()
++			if tc.target {
++				workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{"workers-group-0": 1})
++			}
++			if got := (*RayCluster)(job).PodsReady(ctx, nil, jobframework.WithWorkload(wl)); got != tc.want {
++				t.Errorf("PodsReady() = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestReconcileClearsReclaimedPodsWhenEvictionReleasesQuota(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	ctx, _ := utiltesting.ContextWithLog(t)
++	now := time.Now().Truncate(time.Second)
++
++	job := testingrayutil.MakeCluster("job", "ns").
++		SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Suspend(true).
++		Queue("lq").
++		RequestWorkerGroup(corev1.ResourceCPU, "1").
++		ScaleFirstWorkerGroup(8).
++		Obj()
++	podSets, err := (*RayCluster)(job).PodSets(ctx, nil)
++	if err != nil {
++		t.Fatalf("PodSets() error: %v", err)
++	}
++	workers := podSets[1].Name
++	wl := utiltestingapi.MakeWorkload("wl", "ns").
++		Finalizers(kueue.ResourceInUseFinalizerName).
++		Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Annotation(constants.ReclaimTargetCountsAnnotation, workload.FormatPodSetCounts(workload.PodSetsCounts{workers: 4})).
++		Annotation(constants.ReclaimRequestedAtAnnotation, now.Format(time.RFC3339)).
++		ControllerReference(gvk, job.Name, string(job.UID)).
++		PodSets(podSets...).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(podSets[0].Name).Obj(),
++			utiltestingapi.MakePodSetAssignment(workers).Count(8).Obj(),
++		).Obj(), now).
++		AdmittedAt(true, now).
++		EvictedAt(now).
++		ReclaimablePods(kueue.ReclaimablePod{Name: workers, Count: 4}).
++		Obj()
++	builder := utiltesting.NewClientBuilder(rayv1.AddToScheme).
++		WithObjects(utiltesting.MakeNamespace("ns"), job, wl).
++		WithStatusSubresource(wl).
++		WithInterceptorFuncs(interceptor.Funcs{SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration})
++	indexer := utiltesting.AsIndexer(builder)
++	if err := SetupIndexes(ctx, indexer); err != nil {
++		t.Fatalf("SetupIndexes() error: %v", err)
++	}
++	kClient := builder.Build()
++	reconciler, err := NewReconciler(ctx, kClient, indexer, &utiltesting.EventRecorder{})
++	if err != nil {
++		t.Fatalf("NewReconciler() error: %v", err)
++	}
++	if _, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(job)}); err != nil {
++		t.Fatalf("Reconcile() error: %v", err)
++	}
++	var got kueue.Workload
++	if err := kClient.Get(ctx, client.ObjectKeyFromObject(wl), &got); err != nil {
++		t.Fatalf("Get() error: %v", err)
++	}
++	if workload.HasQuotaReservation(&got) {
++		t.Fatalf("The eviction did not release the quota")
++	}
++	if len(got.Status.ReclaimablePods) != 0 {
++		t.Errorf("Reclaimable pods = %v, want none in the same reconcile that released the quota", got.Status.ReclaimablePods)
++	}
++}
+diff --git a/pkg/controller/jobs/rayjob/partial_stop_test.go b/pkg/controller/jobs/rayjob/partial_stop_test.go
+new file mode 100644
+index 0000000..25d7b41
+--- /dev/null
++++ b/pkg/controller/jobs/rayjob/partial_stop_test.go
+@@ -0,0 +1,66 @@
++// Tests RayJob reclaim boundaries and readiness while replacement workers stay gated.
++
++package rayjob
++
++import (
++	"reflect"
++	"testing"
++
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/utils/ptr"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	"sigs.k8s.io/kueue/pkg/controller/jobframework"
++	"sigs.k8s.io/kueue/pkg/features"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	api "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++func TestReclaimRayJobWorkers(t *testing.T) {
++	ctx, _ := utiltesting.ContextWithLog(t)
++	job := &RayJob{Spec: rayv1.RayJobSpec{RayClusterSpec: &rayv1.RayClusterSpec{WorkerGroupSpecs: []rayv1.WorkerGroupSpec{{GroupName: "workers", Replicas: ptr.To[int32](4), MinReplicas: ptr.To[int32](1), NumOfHosts: 2}}}}}
++	if got := job.PodSetCountSteps(); !reflect.DeepEqual(got, workload.PodSetsCounts{"workers": 2}) {
++		t.Fatalf("steps=%v", got)
++	}
++	wl := api.MakeWorkload("slice", "ns").Obj()
++	objs := []client.Object{}
++	for name, entry := range map[string]string{"a": "workers", "b": "workers--2", "head": "head", "submitter": "submitter"} {
++		objs = append(objs, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", Annotations: map[string]string{kueue.WorkloadSliceNameAnnotation: wl.Name}, Labels: map[string]string{constants.PodSetLabel: entry}}})
++	}
++	c := utiltesting.NewClientBuilder().WithObjects(objs...).WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).Build()
++	if _, err := job.StopPartially(ctx, c, wl, workload.PodSetsCounts{"workers": 0}); err != nil {
++		t.Fatal(err)
++	}
++	var pods corev1.PodList
++	if err := c.List(ctx, &pods); err != nil {
++		t.Fatal(err)
++	}
++	if len(pods.Items) != 3 {
++		t.Fatalf("remaining pods=%v", pods.Items)
++	}
++	for _, p := range pods.Items {
++		if p.Name == "a" {
++			t.Fatal("reclaimed entry survived")
++		}
++	}
++}
++
++func TestRayJobReadyDuringReclaim(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++	ctx, _ := utiltesting.ContextWithLog(t)
++	job := &RayJob{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{workloadslicing.EnabledAnnotationKey: "true"}}, Status: rayv1.RayJobStatus{RayClusterStatus: rayv1.RayClusterStatus{Conditions: []metav1.Condition{{Type: string(rayv1.HeadPodReady), Status: metav1.ConditionTrue}}}}}
++	wl := api.MakeWorkload("slice", "ns").Obj()
++	if job.PodsReady(ctx, nil, jobframework.WithWorkload(wl)) {
++		t.Fatal("workers must be ready before reclaim")
++	}
++	workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{"workers": 0})
++	if !job.PodsReady(ctx, nil, jobframework.WithWorkload(wl)) {
++		t.Fatal("ready head must preserve a reclaimed job")
++	}
++}
+diff --git a/pkg/workload/partial_preemption_test.go b/pkg/workload/partial_preemption_test.go
+new file mode 100644
+index 0000000..5a4232b
+--- /dev/null
++++ b/pkg/workload/partial_preemption_test.go
+@@ -0,0 +1,294 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Tests parsing, formatting, and timeout evaluation of partial preemption annotations.
++package workload
++
++import (
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++)
++
++func TestParseAndFormatPodSetCounts(t *testing.T) {
++	testCases := map[string]struct {
++		value      string
++		want       PodSetsCounts
++		wantFormat string
++	}{
++		"empty": {},
++		"sorted by name": {
++			value:      "workers=4,head=1",
++			want:       PodSetsCounts{"head": 1, "workers": 4},
++			wantFormat: "head=1,workers=4",
++		},
++		"malformed entries are ignored": {
++			value:      "a=1,b,c=-1,d=x,=2,e=3",
++			want:       PodSetsCounts{"a": 1, "e": 3},
++			wantFormat: "a=1,e=3",
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			got := ParsePodSetCounts(tc.value)
++			if diff := cmp.Diff(tc.want, got); diff != "" {
++				t.Errorf("ParsePodSetCounts() (-want,+got):\n%s", diff)
++			}
++			if gotFormat := FormatPodSetCounts(got); gotFormat != tc.wantFormat {
++				t.Errorf("FormatPodSetCounts() = %q, want %q", gotFormat, tc.wantFormat)
++			}
++		})
++	}
++}
++
++// partiallyPreempted returns an admitted workload with one "workers" PodSet.
++func partiallyPreempted(count, admitted int32, targets string, reclaimable ...kueue.ReclaimablePod) *kueue.Workload {
++	wl := &kueue.Workload{
++		Spec: kueue.WorkloadSpec{PodSets: []kueue.PodSet{{Name: "workers", Count: count}}},
++		Status: kueue.WorkloadStatus{
++			Admission:       &kueue.Admission{PodSetAssignments: []kueue.PodSetAssignment{{Name: "workers", Count: &admitted}}},
++			ReclaimablePods: reclaimable,
++		},
++	}
++	if targets != "" {
++		wl.Annotations = map[string]string{constants.ReclaimTargetCountsAnnotation: targets}
++	}
++	return wl
++}
++
++func TestPendingReclaimTargetCounts(t *testing.T) {
++	testCases := map[string]struct {
++		wl   *kueue.Workload
++		want PodSetsCounts
++	}{
++		"no target": {
++			wl: partiallyPreempted(8, 8, ""),
++		},
++		"a target below the charged count is pending": {
++			wl:   partiallyPreempted(8, 8, "workers=4"),
++			want: PodSetsCounts{"workers": 4},
++		},
++		"a released target is not pending": {
++			wl: partiallyPreempted(8, 8, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++		},
++		"a target at a partial admission is not pending": {
++			wl: partiallyPreempted(8, 4, "workers=4"),
++		},
++		"a target of an unknown PodSet is ignored": {
++			wl: partiallyPreempted(8, 8, "other=1"),
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			if diff := cmp.Diff(tc.want, PendingReclaimTargetCounts(tc.wl)); diff != "" {
++				t.Errorf("PendingReclaimTargetCounts() (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestReclaimablePodsForTargets(t *testing.T) {
++	testCases := map[string]struct {
++		wl   *kueue.Workload
++		want []kueue.ReclaimablePod
++	}{
++		"adds the pods above the target": {
++			wl:   partiallyPreempted(8, 8, "workers=4"),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 4}},
++		},
++		"keeps a larger count": {
++			wl:   partiallyPreempted(8, 8, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 5}),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 5}},
++		},
++		"raises a smaller count": {
++			wl:   partiallyPreempted(8, 8, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 1}),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 4}},
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			got := ReclaimablePodsForTargets(tc.wl, ReclaimTargetCounts(tc.wl))
++			if diff := cmp.Diff(tc.want, got); diff != "" {
++				t.Errorf("ReclaimablePodsForTargets() (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestReclaimablePodsAfterScaleDown(t *testing.T) {
++	testCases := map[string]struct {
++		wl   *kueue.Workload
++		want []kueue.ReclaimablePod
++	}{
++		"scaled to the target": {
++			wl:   partiallyPreempted(4, 8, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 0}},
++		},
++		"a partially admitted victim scaled below its admitted count": {
++			wl:   partiallyPreempted(5, 6, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 1}},
++		},
++		"not scaled below the admitted count": {
++			wl:   partiallyPreempted(8, 6, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 4}},
++		},
++		"at the admitted count, where the webhook rejects a lower reclaimable count": {
++			wl:   partiallyPreempted(6, 6, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 4}},
++		},
++		"already charged the target": {
++			wl:   partiallyPreempted(5, 6, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 1}),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 1}},
++		},
++		"a pending target": {
++			wl:   partiallyPreempted(6, 8, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 1}),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 1}},
++		},
++		"no target": {
++			wl:   partiallyPreempted(4, 8, "", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++			want: []kueue.ReclaimablePod{{Name: "workers", Count: 4}},
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			if diff := cmp.Diff(tc.want, ReclaimablePodsAfterScaleDown(tc.wl)); diff != "" {
++				t.Errorf("ReclaimablePodsAfterScaleDown() (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestClearReclaimTargets(t *testing.T) {
++	wl := partiallyPreempted(8, 8, "workers=4")
++	wl.Annotations[constants.ReclaimPreemptorAnnotation] = "ns/preemptor"
++	wl.Annotations[constants.ReclaimRequestedAtAnnotation] = "2026-01-01T00:00:00Z"
++	wl.Annotations["other"] = "kept"
++	if !ClearReclaimTargets(wl) {
++		t.Errorf("ClearReclaimTargets() = false, want true")
++	}
++	if diff := cmp.Diff(map[string]string{"other": "kept"}, wl.Annotations); diff != "" {
++		t.Errorf("Annotations (-want,+got):\n%s", diff)
++	}
++	if ClearReclaimTargets(wl) {
++		t.Errorf("ClearReclaimTargets() = true on a cleared workload, want false")
++	}
++	if IsPartiallyPreempted(wl) {
++		t.Errorf("IsPartiallyPreempted() = true on a cleared workload")
++	}
++}
++
++func TestReclaimTargetsStale(t *testing.T) {
++	reservedAt := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
++	testCases := map[string]struct {
++		requestedAt string
++		reserved    bool
++		reclaimable []kueue.ReclaimablePod
++		wantStale   bool
++	}{
++		"requested before the current reservation, which inherited the reclaimable pods": {
++			requestedAt: reservedAt.Add(-time.Minute).Format(time.RFC3339),
++			reserved:    true,
++			reclaimable: []kueue.ReclaimablePod{{Name: "workers", Count: 4}},
++		},
++		"requested before the current reservation, with only another PodSet's reclaimable pods": {
++			requestedAt: reservedAt.Add(-time.Minute).Format(time.RFC3339),
++			reserved:    true,
++			reclaimable: []kueue.ReclaimablePod{{Name: "other", Count: 1}, {Name: "workers", Count: 0}},
++			wantStale:   true,
++		},
++		"requested during the current reservation": {
++			requestedAt: reservedAt.Add(time.Minute).Format(time.RFC3339),
++			reserved:    true,
++		},
++		"requested in the second the quota was reserved": {
++			requestedAt: reservedAt.Add(500 * time.Millisecond).Format(time.RFC3339Nano),
++			reserved:    true,
++		},
++		"requested before the current reservation": {
++			requestedAt: reservedAt.Add(-time.Minute).Format(time.RFC3339),
++			reserved:    true,
++			wantStale:   true,
++		},
++		"without a reservation": {
++			requestedAt: reservedAt.Add(-time.Minute).Format(time.RFC3339),
++		},
++		"without a valid requested-at time": {
++			requestedAt: "yesterday",
++			reserved:    true,
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			wl := partiallyPreempted(8, 8, "workers=4", tc.reclaimable...)
++			wl.Annotations[constants.ReclaimRequestedAtAnnotation] = tc.requestedAt
++			status := metav1.ConditionFalse
++			if tc.reserved {
++				status = metav1.ConditionTrue
++			}
++			wl.Status.Conditions = []metav1.Condition{{
++				Type:               kueue.WorkloadQuotaReserved,
++				Status:             status,
++				LastTransitionTime: metav1.NewTime(reservedAt),
++			}}
++			if got := ReclaimTargetsStale(wl); got != tc.wantStale {
++				t.Errorf("ReclaimTargetsStale() = %v, want %v", got, tc.wantStale)
++			}
++			wantTargets := PodSetsCounts{"workers": 4}
++			if tc.wantStale {
++				wantTargets = nil
++			}
++			if diff := cmp.Diff(wantTargets, ReclaimTargetCounts(wl)); diff != "" {
++				t.Errorf("ReclaimTargetCounts() (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestPodSetsCountsAfterReclaimWithTargets(t *testing.T) {
++	testCases := map[string]struct {
++		wl   *kueue.Workload
++		want PodSetsCounts
++	}{
++		"a reclaimable count written ahead of the spec update charges the target": {
++			wl:   partiallyPreempted(4, 8, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++			want: PodSetsCounts{"workers": 4},
++		},
++		"a target above the count charges the count": {
++			wl:   partiallyPreempted(3, 8, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++			want: PodSetsCounts{"workers": 3},
++		},
++		"a released target charges the target": {
++			wl:   partiallyPreempted(8, 8, "workers=4", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++			want: PodSetsCounts{"workers": 4},
++		},
++		"without a target the reclaimable pods are subtracted": {
++			wl:   partiallyPreempted(4, 8, "", kueue.ReclaimablePod{Name: "workers", Count: 4}),
++			want: PodSetsCounts{"workers": 0},
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			if diff := cmp.Diff(tc.want, podSetsCountsAfterReclaim(tc.wl)); diff != "" {
++				t.Errorf("podSetsCountsAfterReclaim() (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
+diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go
+new file mode 100644
+index 0000000..cbbd8e8
+--- /dev/null
++++ b/pkg/workloadslicing/partial_preemption_test.go
+@@ -0,0 +1,453 @@
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++// Unit tests for partial preemption pod deletion logic.
++package workloadslicing
++
++import (
++	"fmt"
++	"slices"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
++	"sigs.k8s.io/kueue/pkg/workload"
++)
++
++func TestDeletePodGroupsAboveCounts(t *testing.T) {
++	now := time.Now()
++	wl := utiltestingapi.MakeWorkload("wl", "ns").Annotation(kueue.WorkloadSliceNameAnnotation, "origin").Obj()
++	worker := func(name string, created time.Duration) *testingpod.PodWrapper {
++		return testingpod.MakePod(name, "ns").
++			Annotation(kueue.WorkloadSliceNameAnnotation, "origin").
++			Label(constants.PodSetLabel, "workers").
++			Request(corev1.ResourceName("nvidia.com/gpu"), "1").
++			CreationTimestamp(now.Add(created))
++	}
++	group := func(p *corev1.Pod) string {
++		if g, found := p.Labels["group"]; found {
++			return g
++		}
++		return p.Name
++	}
++	testCases := map[string]struct {
++		pods      []*corev1.Pod
++		otherPods []*corev1.Pod
++		counts    workload.PodSetsCounts
++		// repeat calls DeletePodGroupsAboveCounts again while the Pods it deleted
++		// are still terminating, held by a finalizer.
++		repeat      bool
++		wantDeleted []string
++		// wantAbove is whether PodsAboveCounts still reports Pods above the counts
++		// after the call, because terminating Pods hold their resources until gone.
++		wantAbove   bool
++		wantStopped bool
++	}{
++		"node A holds 8 idle pods (cost 0); node B holds 8 pods, 4 of them with a high deletion cost. Deleting 8 must empty node A": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			for i := range 8 {
++				name := fmt.Sprintf("w-a-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-a").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			for i := range 4 {
++				name := fmt.Sprintf("w-b-idle-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			for i := range 4 {
++				name := fmt.Sprintf("w-b-busy-%d", i)
++				pods = append(pods, worker(name, time.Duration(i+4)*time.Second).
++					NodeName("node-b").
++					Annotation(corev1.PodDeletionCost, "1000").
++					Obj())
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 8},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"multi-host 2-pod group split across two nodes": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			for i := range 2 {
++				pods = append(pods, worker(fmt.Sprintf("w-a-%d", i), time.Duration(i)*time.Second).NodeName("node-a").Obj())
++			}
++			for i := range 2 {
++				pods = append(pods, worker(fmt.Sprintf("w-b-%d", i), time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			p1 := worker("g1-0", 2*time.Second).Label("group", "g1").NodeName("node-a").Obj()
++			p2 := worker("g1-1", 2*time.Second).Label("group", "g1").NodeName("node-b").Obj()
++			pods = append(pods, p1, p2)
++			wantDeleted := []string{"g1-0", "g1-1"}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 4},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"multi-host groups spanning multiple nodes do not over-delete when node pod count is small": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			g1a := worker("g1-a", 0).Label("group", "g1").NodeName("node-a").Obj()
++			g1b := worker("g1-b", 0).Label("group", "g1").NodeName("node-b").Obj()
++			g2a := worker("g2-a", time.Second).Label("group", "g2").NodeName("node-a").Obj()
++			g2b := worker("g2-b", time.Second).Label("group", "g2").NodeName("node-c").Obj()
++			g3a := worker("g3-a", 2*time.Second).Label("group", "g3").NodeName("node-b").Obj()
++			g3b := worker("g3-b", 2*time.Second).Label("group", "g3").NodeName("node-c").Obj()
++			pods := []*corev1.Pod{g1a, g1b, g2a, g2b, g3a, g3b}
++			// node-a has 2 pods (from g1, g2). Needed = 2. But g1+g2 = 4 pods > needed, so node-a is not a whole candidate.
++			// Active node ordering picks node-a (alphabetical tie-breaker), and newest group on node-a (g2) is deleted.
++			wantDeleted := []string{"g2-a", "g2-b"}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 4},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"16 pods 8+8 on two nodes, delete 8 empties one node": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			for i := range 8 {
++				name := fmt.Sprintf("w-a-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-a").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			for i := range 8 {
++				pods = append(pods, worker(fmt.Sprintf("w-b-%d", i), time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
++			}{
++				pods:        pods,
++				counts:      workload.PodSetsCounts{"workers": 8},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"two nodes both with 8 idle pods, prefer node with fewer other pods": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			for i := range 8 {
++				name := fmt.Sprintf("w-a-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-a").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			for i := range 8 {
++				pods = append(pods, worker(fmt.Sprintf("w-b-%d", i), time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			otherPods := []*corev1.Pod{
++				testingpod.MakePod("other-system-pod", "ns").NodeName("node-b").Obj(),
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
++			}{
++				pods:        pods,
++				otherPods:   otherPods,
++				counts:      workload.PodSetsCounts{"workers": 8},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"two nodes both with 8 idle pods, prefer node with fewer other accelerators": func() struct {
++			pods        []*corev1.Pod
++			otherPods   []*corev1.Pod
++			counts      workload.PodSetsCounts
++			repeat      bool
++			wantDeleted []string
++			wantAbove   bool
++			wantStopped bool
++		} {
++			var pods []*corev1.Pod
++			var wantDeleted []string
++			for i := range 8 {
++				name := fmt.Sprintf("w-a-%d", i)
++				pods = append(pods, worker(name, time.Duration(i)*time.Second).NodeName("node-a").Obj())
++				wantDeleted = append(wantDeleted, name)
++			}
++			for i := range 8 {
++				pods = append(pods, worker(fmt.Sprintf("w-b-%d", i), time.Duration(i)*time.Second).NodeName("node-b").Obj())
++			}
++			otherPods := []*corev1.Pod{
++				testingpod.MakePod("gpu-pod", "ns").NodeName("node-b").Request(corev1.ResourceName("nvidia.com/gpu"), "1").Obj(),
++			}
++			slices.Sort(wantDeleted)
++			return struct {
++				pods        []*corev1.Pod
++				otherPods   []*corev1.Pod
++				counts      workload.PodSetsCounts
++				repeat      bool
++				wantDeleted []string
++				wantAbove   bool
++				wantStopped bool
++			}{
++				pods:        pods,
++				otherPods:   otherPods,
++				counts:      workload.PodSetsCounts{"workers": 8},
++				wantDeleted: wantDeleted,
++				wantStopped: true,
++			}
++		}(),
++		"newest pod is deleted first": {
++			pods: []*corev1.Pod{
++				worker("old", 0).Obj(),
++				worker("new", time.Second).Obj(),
++			},
++			counts:      workload.PodSetsCounts{"workers": 1},
++			wantDeleted: []string{"new"},
++			wantStopped: true,
++		},
++		"unscheduled pods are deleted before scheduled ones": {
++			pods: []*corev1.Pod{
++				worker("running", 0).NodeName("node-a").Obj(),
++				worker("pending", time.Second).Obj(),
++			},
++			counts:      workload.PodSetsCounts{"workers": 1},
++			wantDeleted: []string{"pending"},
++			wantStopped: true,
++		},
++		"lower deletion cost is deleted first": {
++			pods: []*corev1.Pod{
++				worker("busy", 0).Annotation(corev1.PodDeletionCost, "100").Obj(),
++				worker("idle", time.Second).Annotation(corev1.PodDeletionCost, "-100").Obj(),
++			},
++			counts:      workload.PodSetsCounts{"workers": 1},
++			wantDeleted: []string{"idle"},
++			wantStopped: true,
++		},
++		"deletion cost wins over creation age": {
++			pods: []*corev1.Pod{
++				worker("old-and-idle", 0).Annotation(corev1.PodDeletionCost, "-100").Obj(),
++				worker("young-and-busy", time.Second).Annotation(corev1.PodDeletionCost, "100").Obj(),
++			},
++			counts:      workload.PodSetsCounts{"workers": 1},
++			wantDeleted: []string{"old-and-idle"},
++			wantStopped: true,
++		},
++		"replica groups are kept whole, deleting as many groups as needed to reach the target": {
++			pods: []*corev1.Pod{
++				worker("g1-a", 0).Label("group", "g1").Obj(),
++				worker("g1-b", 0).Label("group", "g1").Obj(),
++				worker("g2-a", time.Second).Label("group", "g2").Obj(),
++				worker("g2-b", time.Second).Label("group", "g2").Obj(),
++				worker("g3-a", 2*time.Second).Label("group", "g3").Annotation(corev1.PodDeletionCost, "-1000").Obj(),
++				worker("g3-b", 2*time.Second).Label("group", "g3").Obj(),
++			},
++			counts:      workload.PodSetsCounts{"workers": 3},
++			wantDeleted: []string{"g2-a", "g2-b", "g3-a", "g3-b"},
++			wantStopped: true,
++		},
++		"a replica group costs as much as its costliest pod": {
++			pods: []*corev1.Pod{
++				worker("old-a", 0).Label("group", "old").Obj(),
++				worker("old-b", 0).Label("group", "old").Obj(),
++				worker("new-a", time.Second).Label("group", "new").Obj(),
++				worker("new-b", time.Second).Label("group", "new").Annotation(corev1.PodDeletionCost, "1000").Obj(),
++			},
++			counts:      workload.PodSetsCounts{"workers": 2},
++			wantDeleted: []string{"old-a", "old-b"},
++			wantStopped: true,
++		},
++		"terminating pods are neither deleted again nor counted toward the target": {
++			pods: []*corev1.Pod{
++				worker("a", 0).Obj(),
++				worker("b", time.Second).Obj(),
++				worker("c", 2*time.Second).Finalizer("test").DeletionTimestamp(now).Obj(),
++			},
++			counts:    workload.PodSetsCounts{"workers": 2},
++			wantAbove: true,
++		},
++		"a repeat call while the deleted pods terminate deletes nothing more": {
++			pods: []*corev1.Pod{
++				worker("w-0", 0).Finalizer("test").Obj(),
++				worker("w-1", 1*time.Second).Finalizer("test").Obj(),
++				worker("w-2", 2*time.Second).Finalizer("test").Obj(),
++				worker("w-3", 3*time.Second).Finalizer("test").Obj(),
++				worker("w-4", 4*time.Second).Finalizer("test").Obj(),
++				worker("w-5", 5*time.Second).Finalizer("test").Obj(),
++				worker("w-6", 6*time.Second).Finalizer("test").Obj(),
++				worker("w-7", 7*time.Second).Finalizer("test").Obj(),
++			},
++			counts:      workload.PodSetsCounts{"workers": 4},
++			repeat:      true,
++			wantDeleted: []string{"w-4", "w-5", "w-6", "w-7"},
++			wantStopped: true,
++			wantAbove:   true,
++		},
++		"gated, terminated, and other PodSets' pods are kept": {
++			pods: []*corev1.Pod{
++				worker("a", 0).Obj(),
++				worker("gated", time.Second).Gate(kueue.ElasticJobSchedulingGate).Obj(),
++				worker("done", 2*time.Second).StatusPhase(corev1.PodSucceeded).Obj(),
++				worker("head", 3*time.Second).Label(constants.PodSetLabel, "head").Obj(),
++			},
++			counts: workload.PodSetsCounts{"workers": 1},
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			ctx, _ := utiltesting.ContextWithLog(t)
++			objs := make([]client.Object, len(tc.pods)+len(tc.otherPods))
++			for i := range tc.pods {
++				objs[i] = tc.pods[i]
++			}
++			for i := range tc.otherPods {
++				objs[len(tc.pods)+i] = tc.otherPods[i]
++			}
++			clnt := utiltesting.NewClientBuilder().
++				WithObjects(objs...).
++				WithIndex(&corev1.Pod{}, indexer.WorkloadSliceNameKey, indexer.IndexPodWorkloadSliceName).
++				WithIndex(&corev1.Pod{}, indexer.PodNodeNameKey, indexer.IndexPodNodeName).
++				Build()
++			stopped, err := DeletePodGroupsAboveCounts(ctx, clnt, wl, tc.counts, group)
++			if err != nil {
++				t.Fatalf("DeletePodGroupsAboveCounts() error: %v", err)
++			}
++			if stopped != tc.wantStopped {
++				t.Errorf("DeletePodGroupsAboveCounts() = %v, want %v", stopped, tc.wantStopped)
++			}
++			if tc.repeat {
++				if above, err := PodsAboveCounts(ctx, clnt, wl, tc.counts); err != nil || !above {
++					t.Errorf("PodsAboveCounts() = %v, %v while the deleted pods terminate, want true", above, err)
++				}
++				stopped, err := DeletePodGroupsAboveCounts(ctx, clnt, wl, tc.counts, group)
++				if err != nil {
++					t.Fatalf("DeletePodGroupsAboveCounts() repeat error: %v", err)
++				}
++				if stopped {
++					t.Errorf("DeletePodGroupsAboveCounts() repeat = true, want false")
++				}
++			}
++			var deleted []string
++			for _, p := range tc.pods {
++				var got corev1.Pod
++				err := clnt.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: p.Name}, &got)
++				switch {
++				case apierrors.IsNotFound(err):
++					deleted = append(deleted, p.Name)
++				case err != nil:
++					t.Fatalf("Failed to get pod %s: %v", p.Name, err)
++				case got.DeletionTimestamp != nil && !slices.ContainsFunc(tc.pods, func(o *corev1.Pod) bool { return o.Name == p.Name && o.DeletionTimestamp != nil }):
++					deleted = append(deleted, p.Name)
++				}
++			}
++			slices.Sort(deleted)
++			if diff := cmp.Diff(tc.wantDeleted, deleted); diff != "" {
++				t.Errorf("Deleted pods (-want,+got):\n%s", diff)
++			}
++			above, err := PodsAboveCounts(ctx, clnt, wl, tc.counts)
++			if err != nil {
++				t.Fatalf("PodsAboveCounts() error: %v", err)
++			}
++			if above != tc.wantAbove {
++				t.Errorf("PodsAboveCounts() = %v after the deletion, want %v", above, tc.wantAbove)
++			}
++		})
++	}
++}
+-- 

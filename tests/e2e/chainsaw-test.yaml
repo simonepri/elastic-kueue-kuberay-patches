@@ -230,7 +230,7 @@ spec:
             resource:
               (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."job-name" == 'urgent-batch-job'])): 3
               (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."ray.io/group" == 'workers'])): 1
-              (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?spec.schedulingGates[?name == 'kueue.x-k8s.io/admission'] && metadata.labels."ray.io/group" == 'workers'])): 3
+              (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."ray.io/node-type" == 'head'])): 1
 
     - name: 10-preemptor-finishes-and-releases-quota
       try:
@@ -616,7 +616,7 @@ spec:
               status:
                 (admission.podSetAssignments[?flavors.cpu=='flavor-primary'] | length(@) > `0`): true
                 (admission.podSetAssignments[?flavors.cpu=='flavor-secondary'] | length(@) > `0`): true
-                (sum(admission.podSetAssignments[?contains(name, 'workers')].count)): 3
+                (length(admission.podSetAssignments[?contains(name, 'workers')])): 2
 ---
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test

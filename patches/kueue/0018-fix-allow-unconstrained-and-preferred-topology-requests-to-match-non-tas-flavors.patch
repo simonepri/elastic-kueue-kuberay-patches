@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simone Primarosa <simone.primarosa@gmail.com>
+Date: Mon, 9 Nov 2026 12:00:00 +01:00
+Subject: [PATCH] fix: allow unconstrained and preferred topology requests to match non-tas flavors
+
+Workloads specifying unconstrained topology or preferred topology levels are rejected when evaluated against non-TAS resource flavors, preventing fallback to non-topology capacity in heterogeneous queues.
+
+In Kueue's TAS flavor assigner, any workload with a topology request (even unconstrained or preferred-only) is marked as requiring TAS. When matching against a flavor without a topology name (flavor.Spec.TopologyName == nil), the assigner immediately rejects the flavor. Workloads intended to accept any placement or expressing soft preferences cannot be scheduled onto non-TAS flavors.
+
+Allow PodSets with unconstrained or soft topology requests to match non-TAS resource flavors by checking for hard required topology constraints before rejecting flavors lacking a topology.
+---
+diff --git a/pkg/scheduler/flavorassigner/tas_flavorassigner.go b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
+index 4f9b86a..0d97179 100644
+--- a/pkg/scheduler/flavorassigner/tas_flavorassigner.go
++++ b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
+@@ -17,6 +17,7 @@ limitations under the License.
+ package flavorassigner
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"slices"
+ 
+@@ -71,7 +72,10 @@ func (a *Assignment) WorkloadsTopologyRequests(log logr.Logger, wl *workload.Inf
+ 			}
+ 
+ 			psTASRequest, err := podSetTopologyRequest(psAssignment, wl, cq, isTASImplied, i, previousAssignment)
+-			if err != nil {
++			if errors.Is(err, ErrNoTASFlavorAssigned) && !hasRequiredTopologyConstraint(&podSet, wl.TopologySpreading) {
++				// The PodSet was assigned to a non-TAS flavor and does not require TAS, so no topology placement is needed.
++				continue
++			} else if err != nil {
+ 				a.psError(psAssignment, err)
+ 				continue
+ 			} else if psTASRequest != nil {
+@@ -196,6 +200,12 @@ func checkPodSetAndFlavorMatchForTAS(
+ 				// This flavor may still provide quota-only resources using ResourceTransformations.
+ 				return nil
+ 			}
++			if !hasRequiredTopologyConstraint(ps, topologySpreading) {
++				// If the PodSet does not have required topology constraints (e.g. it only requests
++				// unconstrained topology or a preferred topology level), then a non-TAS flavor is
++				// acceptable because it inherently satisfies unconstrained placement.
++				return nil
++			}
+ 			return new(fmt.Sprintf("Flavor %q does not support TopologyAwareScheduling", flavor.Name))
+ 		}
+ 		s := cq.TASFlavors[kueue.ResourceFlavorReference(flavor.Name)]
+@@ -276,3 +286,29 @@ func getPreviousTopologyAssignment(replaceWorkloadSlice *workload.Info, podSetNa
+ 	}
+ 	return nil
+ }
++
++// hasRequiredTopologyConstraint returns true if the PodSet has hard required topology constraints
++// or required topology spreading levels that cannot be satisfied by a non-TAS flavor.
++func hasRequiredTopologyConstraint(
++	ps *kueue.PodSet,
++	topologySpreading map[tas.PodSetGroupKey]*tas.SpreadingSpec,
++) bool {
++	if ps.TopologyRequest != nil {
++		if ps.TopologyRequest.Required != nil ||
++			ps.TopologyRequest.PodSetSliceRequiredTopology != nil ||
++			len(ps.TopologyRequest.PodsetSliceRequiredTopologyConstraints) > 0 {
++			return true
++		}
++	}
++	if features.Enabled(features.TASTopologySpreading) && topologySpreading != nil {
++		spec := topologySpreading[tas.GroupKeyForPodSet(ps)]
++		if spec != nil {
++			for _, rule := range spec.Rules {
++				if rule.EnforcementMode == tas.TopologySpreadingEnforcementModeRequired || rule.EnforcementMode == "" {
++					return true
++				}
++			}
++		}
++	}
++	return false
++}
+diff --git a/pkg/scheduler/flavorassigner/flavorassigner_test.go b/pkg/scheduler/flavorassigner/flavorassigner_test.go
+index 9ac4b92..1c18cca 100644
+--- a/pkg/scheduler/flavorassigner/flavorassigner_test.go
++++ b/pkg/scheduler/flavorassigner/flavorassigner_test.go
+@@ -7362,6 +7362,36 @@ func TestAssignFlavors_NoFitDueToCapacityAndLimits(t *testing.T) {
+ 				"flavor-a": "NoMatchingFlavor",
+ 			},
+ 		},
++		"TAS unconstrained allowed on non-TAS flavor": {
++			podSet: *utiltestingapi.MakePodSet("main", 1).
++				Request(corev1.ResourceCPU, "1").
++				UnconstrainedTopologyRequest().
++				Obj(),
++			cq:              tasCQ,
++			resourceFlavors: tasFlavors,
++			topologies: []*kueue.Topology{
++				utiltestingapi.MakeTopology("topology-tas").Levels("rack").Obj(),
++			},
++			featureGates: map[featuregate.Feature]bool{
++				features.TopologyAwareScheduling: true,
++			},
++			wantNoFitReason: "",
++		},
++		"TAS preferred allowed on non-TAS flavor": {
++			podSet: *utiltestingapi.MakePodSet("main", 1).
++				Request(corev1.ResourceCPU, "1").
++				PreferredTopologyRequest("rack").
++				Obj(),
++			cq:              tasCQ,
++			resourceFlavors: tasFlavors,
++			topologies: []*kueue.Topology{
++				utiltestingapi.MakeTopology("topology-tas").Levels("rack").Obj(),
++			},
++			featureGates: map[featuregate.Feature]bool{
++				features.TopologyAwareScheduling: true,
++			},
++			wantNoFitReason: "",
++		},
+ 		"TAS level not supported": {
+ 			podSet: *utiltestingapi.MakePodSet("main", 1).
+ 				Request(corev1.ResourceCPU, "1").

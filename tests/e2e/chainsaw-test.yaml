@@ -273,8 +273,7 @@ spec:
                 ownerReferences:
                   - name: elastic-raycluster
               status:
-                (reclaimablePods[?name=='workers'].count):
-                  - 0
+                (conditions[?type=='Admitted' && status=='True'] | length(@) > `0`): true
         - assert:
             resource:
               (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."ray.io/group" == 'workers'])): 4

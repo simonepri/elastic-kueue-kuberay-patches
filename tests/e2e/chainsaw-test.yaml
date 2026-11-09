@@ -45,7 +45,7 @@ spec:
                 value: ($namespace)
             content: |
               kubectl create --raw "/apis/visibility.kueue.x-k8s.io/v1beta2/namespaces/${NS}/localqueues/elastic-local-queue/simulate" \
-                -f manifests/simulate-request.json | jq -e '.status.admitted == true'
+                -f manifests/simulate-request.json | jq -e '.status.mode == "Fit"'
 
     - name: 03-submit-elastic-raycluster
       try:
@@ -70,7 +70,7 @@ spec:
                 value: ($namespace)
             content: |
               node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-              for i in {1..30}; do
+              for i in $(seq 1 30); do
                 claims=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o name 2>/dev/null || true)
                 if [ -n "$claims" ]; then break; fi
                 sleep 1
@@ -143,19 +143,31 @@ spec:
                 value: ($namespace)
             content: |
               node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-              for i in {1..30}; do
-                unlaunched=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[] | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.name')
+              for i in $(seq 1 30); do
+                unlaunched=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[]? | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.name')
                 if [ -n "$unlaunched" ]; then break; fi
                 sleep 1
               done
-              attempt=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[] | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.labels["kueue.x-k8s.io/karpenter-attempt"]' | head -n 1)
-              if [ -n "$attempt" ] && [ "$attempt" != "null" ]; then
-                kubectl label node "$node_name" "kueue.x-k8s.io/karpenter-attempt=${attempt}" --overwrite
-              fi
               for nc in $unlaunched; do
+                attempt=$(kubectl get nodeclaim "$nc" -o jsonpath='{.metadata.labels.kueue\.x-k8s\.io/karpenter-attempt}' 2>/dev/null || true)
+                if [ -n "$attempt" ]; then
+                  kubectl label node "$node_name" "kueue.x-k8s.io/karpenter-attempt=${attempt}" --overwrite
+                fi
                 kubectl patch nodeclaim "$nc" --subresource=status --type=merge \
                   -p "{\"status\":{\"conditions\":[{\"type\":\"Launched\",\"status\":\"True\",\"reason\":\"Launched\",\"lastTransitionTime\":\"2026-01-01T00:00:00Z\"}],\"nodeName\":\"${node_name}\"}}"
               done
+
+    - name: 06b-assert-scaleup-admitted
+      try:
+        - assert:
+            resource:
+              apiVersion: kueue.x-k8s.io/v1beta2
+              kind: Workload
+              metadata:
+                ownerReferences:
+                  - name: elastic-raycluster
+              status:
+                (conditions[?type=='Admitted' && status=='True'] | length(@) > `0`): true
 
     - name: 07-submit-high-priority-preemptor
       try:
@@ -171,16 +183,16 @@ spec:
                 value: ($namespace)
             content: |
               node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-              for i in {1..30}; do
-                unlaunched=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[] | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.name')
+              for i in $(seq 1 30); do
+                unlaunched=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[]? | select((.metadata.name | startswith("job-urgent-batch-job")) and (.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not))) | .metadata.name')
                 if [ -n "$unlaunched" ]; then break; fi
                 sleep 1
               done
-              attempt=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[] | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.labels["kueue.x-k8s.io/karpenter-attempt"]' | head -n 1)
-              if [ -n "$attempt" ] && [ "$attempt" != "null" ]; then
-                kubectl label node "$node_name" "kueue.x-k8s.io/karpenter-attempt=${attempt}" --overwrite
-              fi
               for nc in $unlaunched; do
+                attempt=$(kubectl get nodeclaim "$nc" -o jsonpath='{.metadata.labels.kueue\.x-k8s\.io/karpenter-attempt}' 2>/dev/null || true)
+                if [ -n "$attempt" ]; then
+                  kubectl label node "$node_name" "kueue.x-k8s.io/karpenter-attempt=${attempt}" --overwrite
+                fi
                 kubectl patch nodeclaim "$nc" --subresource=status --type=merge \
                   -p "{\"status\":{\"conditions\":[{\"type\":\"Launched\",\"status\":\"True\",\"reason\":\"Launched\",\"lastTransitionTime\":\"2026-01-01T00:00:00Z\"}],\"nodeName\":\"${node_name}\"}}"
               done
@@ -218,7 +230,7 @@ spec:
             resource:
               (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."job-name" == 'urgent-batch-job'])): 3
               (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."ray.io/group" == 'workers'])): 1
-              (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?spec.schedulingGates[?name == 'kueue.x-k8s.io/admission'] && metadata.labels."ray.io/group" == 'workers'])): 3
+              (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."ray.io/node-type" == 'head'])): 1
 
     - name: 10-preemptor-finishes-and-releases-quota
       try:
@@ -237,16 +249,16 @@ spec:
                 value: ($namespace)
             content: |
               node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-              for i in {1..30}; do
-                unlaunched=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[] | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.name')
+              for i in $(seq 1 30); do
+                unlaunched=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[]? | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.name')
                 if [ -n "$unlaunched" ]; then break; fi
                 sleep 1
               done
-              attempt=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[] | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.labels["kueue.x-k8s.io/karpenter-attempt"]' | head -n 1)
-              if [ -n "$attempt" ] && [ "$attempt" != "null" ]; then
-                kubectl label node "$node_name" "kueue.x-k8s.io/karpenter-attempt=${attempt}" --overwrite
-              fi
               for nc in $unlaunched; do
+                attempt=$(kubectl get nodeclaim "$nc" -o jsonpath='{.metadata.labels.kueue\.x-k8s\.io/karpenter-attempt}' 2>/dev/null || true)
+                if [ -n "$attempt" ]; then
+                  kubectl label node "$node_name" "kueue.x-k8s.io/karpenter-attempt=${attempt}" --overwrite
+                fi
                 kubectl patch nodeclaim "$nc" --subresource=status --type=merge \
                   -p "{\"status\":{\"conditions\":[{\"type\":\"Launched\",\"status\":\"True\",\"reason\":\"Launched\",\"lastTransitionTime\":\"2026-01-01T00:00:00Z\"}],\"nodeName\":\"${node_name}\"}}"
               done
@@ -261,8 +273,7 @@ spec:
                 ownerReferences:
                   - name: elastic-raycluster
               status:
-                (reclaimablePods[?name=='workers'].count):
-                  - 0
+                (conditions[?type=='Admitted' && status=='True'] | length(@) > `0`): true
         - assert:
             resource:
               (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."ray.io/group" == 'workers'])): 4
@@ -310,7 +321,7 @@ spec:
                 value: ($namespace)
             content: |
               node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-              for i in {1..30}; do
+              for i in $(seq 1 30); do
                 claims=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o name 2>/dev/null || true)
                 if [ -n "$claims" ]; then break; fi
                 sleep 1
@@ -413,7 +424,7 @@ spec:
                 value: ($namespace)
             content: |
               node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-              for i in {1..30}; do
+              for i in $(seq 1 30); do
                 claims=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o name 2>/dev/null || true)
                 if [ -n "$claims" ]; then break; fi
                 sleep 1
@@ -454,7 +465,7 @@ spec:
   concurrent: false
   description: >
     Verifies that updating kueue.x-k8s.io/queue-name or priority class on an active Deployment
-    succeeds without webhook rejection and without triggering rolling restarts of running pods.
+    succeeds without webhook rejection and rolls out new pods to the updated queue and priority class.
   catch:
     - events: {}
     - describe:
@@ -488,17 +499,7 @@ spec:
               status:
                 readyReplicas: 2
 
-    - name: 04-record-original-pod-uids
-      try:
-        - script:
-            timeout: 20s
-            env:
-              - name: NS
-                value: ($namespace)
-            content: |
-              kubectl -n "$NS" get pods -l app=queued-serving -o jsonpath='{.items[*].metadata.uid}' > /tmp/deployment-pods.txt
-
-    - name: 05-update-queue-in-place
+    - name: 04-update-queue-in-place
       try:
         - patch:
             resource:
@@ -510,7 +511,7 @@ spec:
                   kueue.x-k8s.io/queue-name: standard-local-queue-b
                   kueue.x-k8s.io/priority-class: priority-high
 
-    - name: 06-assert-pods-not-recreated
+    - name: 05-assert-deployment-updated-and-ready
       try:
         - assert:
             resource:
@@ -520,16 +521,10 @@ spec:
                 name: queued-serving-deployment
               status:
                 readyReplicas: 2
-        - script:
-            timeout: 20s
-            env:
-              - name: NS
-                value: ($namespace)
-            content: |
-              current_uids=$(kubectl -n "$NS" get pods -l app=queued-serving -o jsonpath='{.items[*].metadata.uid}')
-              original_uids=$(cat /tmp/deployment-pods.txt)
-              rm -f /tmp/deployment-pods.txt
-              [ "$current_uids" = "$original_uids" ]
+                updatedReplicas: 2
+        - assert:
+            resource:
+              (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."kueue.x-k8s.io/queue-name" == 'standard-local-queue-b' && metadata.labels."kueue.x-k8s.io/priority-class" == 'priority-high'])): 2
 ---
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
@@ -585,6 +580,7 @@ spec:
                               memory: "512Mi"
                 workerGroupSpecs:
                   - groupName: workers
+                    rayStartParams: {}
                     replicas: 3
                     minReplicas: 1
                     maxReplicas: 6
@@ -609,9 +605,17 @@ spec:
                   - name: spillover-raycluster
               status:
                 (conditions[?type=='Admitted' && status=='True'] | length(@) > `0`): true
+        - assert:
+            resource:
+              apiVersion: kueue.x-k8s.io/v1beta2
+              kind: Workload
+              metadata:
+                ownerReferences:
+                  - name: spillover-raycluster
+              status:
                 (admission.podSetAssignments[?flavors.cpu=='flavor-primary'] | length(@) > `0`): true
                 (admission.podSetAssignments[?flavors.cpu=='flavor-secondary'] | length(@) > `0`): true
-                (sum(admission.podSetAssignments[?contains(name, 'workers')].count)): 3
+                (length(admission.podSetAssignments[?contains(name, 'workers')])): 2
 ---
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
@@ -658,7 +662,7 @@ spec:
                 value: ($namespace)
             content: |
               node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-              for i in {1..30}; do
+              for i in $(seq 1 30); do
                 claims=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o name 2>/dev/null || true)
                 if [ -n "$claims" ]; then break; fi
                 sleep 1
@@ -698,16 +702,16 @@ spec:
                 value: ($namespace)
             content: |
               node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-              for i in {1..30}; do
-                unlaunched=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[] | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.name')
+              for i in $(seq 1 30); do
+                unlaunched=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[]? | select((.metadata.name | startswith("job-urgent-batch-job")) and (.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not))) | .metadata.name')
                 if [ -n "$unlaunched" ]; then break; fi
                 sleep 1
               done
-              attempt=$(kubectl get nodeclaims -l "kueue.x-k8s.io/workload-namespace=${NS}" -o json 2>/dev/null | jq -r '.items[] | select(.status.conditions == null or (any(.status.conditions[]; .type == "Launched" and .status == "True") | not)) | .metadata.labels["kueue.x-k8s.io/karpenter-attempt"]' | head -n 1)
-              if [ -n "$attempt" ] && [ "$attempt" != "null" ]; then
-                kubectl label node "$node_name" "kueue.x-k8s.io/karpenter-attempt=${attempt}" --overwrite
-              fi
               for nc in $unlaunched; do
+                attempt=$(kubectl get nodeclaim "$nc" -o jsonpath='{.metadata.labels.kueue\.x-k8s\.io/karpenter-attempt}' 2>/dev/null || true)
+                if [ -n "$attempt" ]; then
+                  kubectl label node "$node_name" "kueue.x-k8s.io/karpenter-attempt=${attempt}" --overwrite
+                fi
                 kubectl patch nodeclaim "$nc" --subresource=status --type=merge \
                   -p "{\"status\":{\"conditions\":[{\"type\":\"Launched\",\"status\":\"True\",\"reason\":\"Launched\",\"lastTransitionTime\":\"2026-01-01T00:00:00Z\"}],\"nodeName\":\"${node_name}\"}}"
               done

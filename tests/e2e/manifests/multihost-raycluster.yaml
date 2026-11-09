@@ -26,6 +26,7 @@ spec:
                 memory: "256Mi"
   workerGroupSpecs:
     - groupName: multihost-workers
+      rayStartParams: {}
       numOfHosts: 2
       replicas: 4
       minReplicas: 2

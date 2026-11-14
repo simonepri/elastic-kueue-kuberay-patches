@@ -42,7 +42,7 @@ index 0000000..f9ea8bb
 +// queues too, so it does not block the workloads behind it while it waits.
 +const RequeueReasonRegrowthHeld RequeueReason = "RegrowthHeld"
 diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
-index 30e8210..2932c1b 100644
+index 30e8210..33bb138 100644
 --- a/pkg/controller/jobframework/partial_stop.go
 +++ b/pkg/controller/jobframework/partial_stop.go
 @@ -26,7 +26,6 @@ import (
@@ -62,6 +62,70 @@ index 30e8210..2932c1b 100644
  		return ctrl.Result{}, false, nil
  	}
  	targetWl, err := r.podsReadyWorkload(ctx, job, wl)
+@@ -67,16 +66,29 @@ func (r *JobReconciler) stopJobPartially(ctx context.Context, job GenericJob, wl
+ 		return ctrl.Result{}, false, nil
+ 	}
+ 	// The workers stop once per reclaim request, which a mark on the Workload records.
+-	if !workload.ReclaimStopPending(targetWl) {
++	// While Pods still run above the targets, the stop is asserted again, since the job
++	// can change under it, for instance when an autoscaler rewrites the job's spec.
++	markPending := workload.ReclaimStopPending(targetWl)
++	targets := workload.PendingReclaimTargetCounts(targetWl)
++	pending := len(targets) > 0
++	running := false
++	if !markPending && pending {
++		var err error
++		if running, err = workloadslicing.PodsAboveCounts(ctx, r.client, targetWl, targets); err != nil {
++			return ctrl.Result{}, true, err
++		}
++	}
++	if !markPending && !running {
+ 		return ctrl.Result{}, false, nil
+ 	}
+ 	// The quota may be released before this reconcile looks at the job, when no worker
+ 	// ran above the target; the job's replicas still go down to it.
+-	targets := workload.PendingReclaimTargetCounts(targetWl)
+-	pending := len(targets) > 0
+ 	if !pending {
+ 		targets = workload.ReclaimTargetCounts(targetWl)
+ 	}
++	// The mark covers the request the workers are stopped for, not a deeper one that
++	// arrives while they stop.
++	request := workload.ReclaimRequest(targetWl)
+ 	stopped, err := partialJob.StopPartially(ctx, r.client, targetWl, targets)
+ 	if stopped {
+ 		r.record.Eventf(job.Object(), nil, corev1.EventTypeNormal, ReasonPartiallyStopped, "PartiallyStopped",
+@@ -85,11 +97,25 @@ func (r *JobReconciler) stopJobPartially(ctx context.Context, job GenericJob, wl
+ 	if err != nil {
+ 		return ctrl.Result{}, true, err
+ 	}
+-	if err := clientutil.Patch(ctx, r.client, targetWl, func() (bool, error) {
+-		workload.SetReclaimStopped(targetWl)
+-		return true, nil
+-	}, clientutil.WithRetryOnConflict()); err != nil {
+-		return ctrl.Result{}, true, client.IgnoreNotFound(err)
++	if !markPending {
++		// The request is marked stopped already: the job's own changes wake the reconcile
++		// up again, so nothing needs a requeue, and the rest of the reconcile goes on.
++		return ctrl.Result{}, false, nil
++	}
++	superseded := false
++	if err := clientutil.Patch(ctx, r.client, targetWl, func() (bool, error) {
++		superseded = workload.ReclaimRequest(targetWl) != request
++		if superseded {
++			return false, nil
++		}
++		workload.SetReclaimStoppedFor(targetWl, request)
++		return true, nil
++	}, clientutil.WithRetryOnConflict()); err != nil {
++		return ctrl.Result{}, true, client.IgnoreNotFound(err)
++	}
++	if superseded {
++		// A deeper request arrived, which nothing stopped for yet: look again at once.
++		return ctrl.Result{Requeue: true}, true, nil
+ 	}
+ 	if !pending {
+ 		return ctrl.Result{}, false, nil
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
 index 8857237..55338aa 100644
 --- a/pkg/controller/jobframework/reconciler.go
@@ -1768,7 +1832,7 @@ new file mode 100644
 index 0000000..0ab0d72
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,587 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2055,8 +2119,18 @@ index 0000000..0ab0d72
 +			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(partial), partial)).Should(gomega.Succeed())
 +			g.Expect(partial.Status.ReclaimablePods).Should(gomega.ConsistOf(kueue.ReclaimablePod{Name: workersGroupName, Count: 4}))
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
-+		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 8)
-+		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(partial))
++		// The job controller stopped the workers above the target and lowered the replicas
++		// with them; the autoscaler asks for all 8 workers again once they are gone.
++		scale(rayCluster, 8)
++		gomega.Eventually(func(g gomega.Gomega) {
++			list := &kueue.WorkloadList{}
++			g.Expect(k8sClient.List(ctx, list, client.InNamespace(ns.Name))).To(gomega.Succeed())
++			g.Expect(slices.ContainsFunc(list.Items, func(wl kueue.Workload) bool {
++				return wl.Status.Admission != nil && slices.ContainsFunc(wl.Status.Admission.PodSetAssignments, func(psa kueue.PodSetAssignment) bool {
++					return psa.Name == workersGroupName && psa.Count != nil && *psa.Count == 8
++				})
++			})).Should(gomega.BeTrue(), "no workload is admitted with all 8 workers")
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +		expectReplicas(rayCluster, 8)
 +	})
 +

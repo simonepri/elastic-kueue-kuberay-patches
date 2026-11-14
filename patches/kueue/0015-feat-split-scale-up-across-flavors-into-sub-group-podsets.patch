@@ -674,18 +674,179 @@ index 181f7b1..7b6ebb4 100644
  		template.Labels = make(map[string]string, 3)
  	}
 diff --git a/pkg/controller/jobs/raycluster/partial_stop.go b/pkg/controller/jobs/raycluster/partial_stop.go
-index ddc22fd..984c284 100644
+index ddc22fd..d9d6048 100644
 --- a/pkg/controller/jobs/raycluster/partial_stop.go
 +++ b/pkg/controller/jobs/raycluster/partial_stop.go
-@@ -79,7 +79,7 @@ func StopWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload,
- 		group := workerGroupName(p)
- 		byGroup[group] = append(byGroup[group], p)
+@@ -66,54 +66,56 @@ func StopWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload,
+ 		}
+ 		return DeleteWorkersAbove(ctx, c, wl, targets)
  	}
+-	leaving := sets.New[string]()
+-	for i := range cluster.Spec.WorkerGroupSpecs {
+-		leaving.Insert(cluster.Spec.WorkerGroupSpecs[i].ScaleStrategy.WorkersToDelete...)
+-	}
+-	pods, err := workloadslicing.PodGroupsAboveCounts(ctx, c, wl, targets, workerReplicaName, func(p *corev1.Pod) bool { return leaving.Has(p.Name) })
+-	if err != nil {
+-		return false, err
+-	}
+-	byGroup := make(map[string][]*corev1.Pod)
+-	for _, p := range pods {
+-		group := workerGroupName(p)
+-		byGroup[group] = append(byGroup[group], p)
+-	}
 -	groupTargets := targets
+-	slicePods, err := workloadslicing.ListPodsForWorkloadSlice(ctx, c, wl.Namespace, workloadslicing.SliceName(wl))
+-	if err != nil {
+-		return false, err
+-	}
+-	stopping := sets.New[string]()
+-	for _, p := range pods {
+-		stopping.Insert(p.Name)
+-	}
+-	staying := make(map[string][]*corev1.Pod)
+-	for _, p := range slicePods {
+-		if p.DeletionTimestamp == nil && !utilpod.IsTerminated(p) && !stopping.Has(p.Name) && !leaving.Has(p.Name) &&
+-			p.Labels[constants.PodSetLabel] != "" && p.Labels[rayutils.RayNodeTypeLabelKey] != string(rayv1.HeadNode) {
+-			staying[workerGroupName(p)] = append(staying[workerGroupName(p)], p)
+-		}
+-	}
 +	groupTargets := workloadslicing.FoldSplitCounts(wl.Spec.PodSets, targets)
- 	slicePods, err := workloadslicing.ListPodsForWorkloadSlice(ctx, c, wl.Namespace, workloadslicing.SliceName(wl))
- 	if err != nil {
- 		return false, err
+ 	var unlisted []*corev1.Pod
+-	err = clientutil.Patch(ctx, c, cluster, func() (bool, error) {
+-		unlisted = unlisted[:0]
++	stopped := false
++	// The Pods and the group state are read again on every attempt, since a conflict
++	// means the RayCluster changed under the previous one.
++	err := clientutil.Patch(ctx, c, cluster, func() (bool, error) {
++		unlisted, stopped = nil, false
++		leaving := sets.New[string]()
++		for i := range cluster.Spec.WorkerGroupSpecs {
++			leaving.Insert(cluster.Spec.WorkerGroupSpecs[i].ScaleStrategy.WorkersToDelete...)
++		}
++		pods, err := workloadslicing.PodGroupsAboveCounts(ctx, c, wl, targets, workerReplicaName, func(p *corev1.Pod) bool { return leaving.Has(p.Name) })
++		if err != nil {
++			return false, err
++		}
++		byGroup := make(map[string][]*corev1.Pod)
++		for _, p := range pods {
++			group := workerGroupName(p)
++			byGroup[group] = append(byGroup[group], p)
++		}
++		slicePods, err := workloadslicing.ListPodsForWorkloadSlice(ctx, c, wl.Namespace, workloadslicing.SliceName(wl))
++		if err != nil {
++			return false, err
++		}
++		stopping := sets.New[string]()
++		for _, p := range pods {
++			stopping.Insert(p.Name)
++		}
++		staying := make(map[string][]*corev1.Pod)
++		for _, p := range slicePods {
++			if p.DeletionTimestamp == nil && !utilpod.IsTerminated(p) && !stopping.Has(p.Name) && !leaving.Has(p.Name) &&
++				p.Labels[constants.PodSetLabel] != "" && p.Labels[rayutils.RayNodeTypeLabelKey] != string(rayv1.HeadNode) {
++				staying[workerGroupName(p)] = append(staying[workerGroupName(p)], p)
++			}
++		}
+ 		changed := false
+ 		for i := range cluster.Spec.WorkerGroupSpecs {
+ 			wgs := &cluster.Spec.WorkerGroupSpecs[i]
+-			var target *int32
+-			if count, found := groupTargets[kueue.NewPodSetReference(wgs.GroupName)]; found {
+-				target = &count
+-			}
+-			if target == nil && len(byGroup[wgs.GroupName]) == 0 {
++			target, found := groupTargets[kueue.NewPodSetReference(wgs.GroupName)]
++			if !found {
+ 				continue
+ 			}
+-			changed = lowerWorkerGroup(wgs, byGroup[wgs.GroupName], target, staying[wgs.GroupName]) || changed
++			groupPods := withinMinReplicas(wgs, byGroup[wgs.GroupName], staying[wgs.GroupName])
++			delete(byGroup, wgs.GroupName)
++			stopped = stopped || len(groupPods) > 0
++			changed = lowerWorkerGroup(wgs, groupPods, target, staying[wgs.GroupName]) || changed
+ 		}
+-		for group, groupPods := range byGroup {
+-			if !slices.ContainsFunc(cluster.Spec.WorkerGroupSpecs, func(wgs rayv1.WorkerGroupSpec) bool { return wgs.GroupName == group }) {
+-				unlisted = append(unlisted, groupPods...)
+-			}
++		// The Pods of a group without a target to lower are deleted directly.
++		for _, groupPods := range byGroup {
++			unlisted = append(unlisted, groupPods...)
+ 		}
+ 		return changed, nil
+ 	}, clientutil.WithRetryOnConflict())
+@@ -125,7 +127,7 @@ func StopWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload,
+ 			return true, err
+ 		}
+ 	}
+-	return len(pods) > 0, nil
++	return stopped || len(unlisted) > 0, nil
+ }
+ 
+ // DeleteWorkersAbove deletes the worker Pods above the reclaim targets directly, in
+@@ -135,12 +137,45 @@ func DeleteWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload
+ 	return workloadslicing.DeletePodGroupsAboveCounts(ctx, c, wl, targets, workerReplicaName)
+ }
+ 
+-// lowerWorkerGroup brings the worker group down to the reclaim target of its Pods, when
+-// it has one, and otherwise by the replicas of pods, never below its minReplicas, and
+-// lists pods in its workersToDelete, and reports whether it changed the group. KubeRay deletes a Pod of its choice when the group
++// withinMinReplicas returns the Pods of the worker group replicas of pods, the ones to
++// stop first, that can stop without the Pods left running or gated in staying falling
++// below the replicas the group's minReplicas keeps: lowering the replicas never goes
++// below that floor, so KubeRay would recreate the Pods that exceed it.
++func withinMinReplicas(wgs *rayv1.WorkerGroupSpec, pods, staying []*corev1.Pod) []*corev1.Pod {
++	replicaNames := sets.New[string]()
++	for _, p := range staying {
++		replicaNames.Insert(workerReplicaName(p))
++	}
++	allowed := max(int32(len(replicaNames.Union(replicasOf(pods))))-ptr.Deref(wgs.MinReplicas, 0), 0)
++	kept := sets.New[string]()
++	var within []*corev1.Pod
++	for _, p := range pods {
++		name := workerReplicaName(p)
++		if !kept.Has(name) {
++			if int32(kept.Len()) >= allowed {
++				continue
++			}
++			kept.Insert(name)
++		}
++		within = append(within, p)
++	}
++	return within
++}
++
++func replicasOf(pods []*corev1.Pod) sets.Set[string] {
++	names := sets.New[string]()
++	for _, p := range pods {
++		names.Insert(workerReplicaName(p))
++	}
++	return names
++}
++
++// lowerWorkerGroup brings the worker group down to the reclaim target of its Pods,
++// never below its minReplicas, lists pods in its workersToDelete, and reports whether
++// it changed the group. KubeRay deletes a Pod of its choice when the group
+ // has more Pods than replicas, which could be a running one, so it also lists the gated
+ // Pods of staying, the newest replicas first, that the lowered replicas leave no room for.
+-func lowerWorkerGroup(wgs *rayv1.WorkerGroupSpec, pods []*corev1.Pod, target *int32, staying []*corev1.Pod) bool {
++func lowerWorkerGroup(wgs *rayv1.WorkerGroupSpec, pods []*corev1.Pod, target int32, staying []*corev1.Pod) bool {
+ 	hosts := max(wgs.NumOfHosts, 1)
+ 	leaving := sets.New(wgs.ScaleStrategy.WorkersToDelete...)
+ 	for _, p := range pods {
+@@ -151,11 +186,7 @@ func lowerWorkerGroup(wgs *rayv1.WorkerGroupSpec, pods []*corev1.Pod, target *in
+ 	if wgs.MaxReplicas != nil {
+ 		current = min(current, *wgs.MaxReplicas)
+ 	}
+-	lowered := current - (int32(len(pods))+hosts-1)/hosts
+-	if target != nil {
+-		lowered = min(current, (*target+hosts-1)/hosts)
+-	}
+-	replicas := max(lowered, minReplicas)
++	replicas := max(min(current, (target+hosts-1)/hosts), minReplicas)
+ 	changed := false
+ 	if replicas < current {
+ 		wgs.Replicas = ptr.To(replicas)
 diff --git a/pkg/controller/jobs/rayjob/rayjob_webhook.go b/pkg/controller/jobs/rayjob/rayjob_webhook.go
 index f288243..3be4c09 100644
 --- a/pkg/controller/jobs/rayjob/rayjob_webhook.go
@@ -2039,6 +2200,363 @@ index 0000000..a1b7165
 +	}
 +	if diff := cmp.Diff([]string{"head", "workers"}, labels); diff != "" {
 +		t.Errorf("getPodSetsInfoFromStatus() PodSet labels (-want,+got):\n%s", diff)
++	}
++}
+diff --git a/pkg/controller/jobs/raycluster/partial_stop_test.go b/pkg/controller/jobs/raycluster/partial_stop_test.go
+index 7d1f616..76fbd26 100644
+--- a/pkg/controller/jobs/raycluster/partial_stop_test.go
++++ b/pkg/controller/jobs/raycluster/partial_stop_test.go
+@@ -18,6 +18,7 @@ limitations under the License.
+ package raycluster
+ 
+ import (
++	"context"
+ 	"testing"
+ 	"time"
+ 
+@@ -25,6 +26,7 @@ import (
+ 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+ 	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
+ 	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/utils/ptr"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+@@ -287,7 +289,15 @@ func TestStopWorkersAbove(t *testing.T) {
+ 		},
+ 		"the replicas stop at minReplicas": {
+ 			replicas: 3, minReplicas: 2, pods: 3, target: 0,
+-			wantReplicas: 2, wantWorkersToDelete: []string{"w-0", "w-1", "w-2"}, wantPods: 3, wantStopped: true,
++			wantReplicas: 2, wantWorkersToDelete: []string{"w-2"}, wantPods: 3, wantStopped: true,
++		},
++		"a multi-host group stops only the whole replicas above minReplicas": {
++			replicas: 3, minReplicas: 2, numOfHosts: 2, pods: 6, target: 0,
++			wantReplicas: 2, wantWorkersToDelete: []string{"w-4", "w-5"}, wantPods: 6, wantStopped: true,
++		},
++		"a group at minReplicas stops nothing": {
++			replicas: 2, minReplicas: 2, pods: 2, target: 0,
++			wantReplicas: 2, wantPods: 2,
+ 		},
+ 		"a worker already listed for deletion is not stopped again": {
+ 			replicas: 3, listed: []string{"w-3"}, pods: 4, target: 2,
+@@ -478,3 +488,319 @@ func TestReconcileLowersReplicasOnceWhenTheQuotaIsAlreadyReleased(t *testing.T)
+ 		t.Errorf("Replicas after the second reconcile = %d, want 4", got)
+ 	}
+ }
++
++// partialStopFixture is an admitted elastic RayCluster of four workers whose workload
++// asks to go down to two, with a reconciler over a fake client.
++type partialStopFixture struct {
++	job         *rayv1.RayCluster
++	wl          *kueue.Workload
++	workers     kueue.PodSetReference
++	kClient     client.Client
++	reconciler  reconcile.Reconciler
++	requestedAt time.Time
++}
++
++func newPartialStopFixture(t *testing.T, funcs interceptor.Funcs) *partialStopFixture {
++	t.Helper()
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++	ctx, _ := utiltesting.ContextWithLog(t)
++	now := time.Now().Truncate(time.Second)
++	f := &partialStopFixture{requestedAt: now}
++	f.job = testingrayutil.MakeCluster("job", "ns").
++		SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Suspend(false).
++		Queue("lq").
++		RequestWorkerGroup(corev1.ResourceCPU, "1").
++		ScaleFirstWorkerGroup(4).
++		Obj()
++	podSets, err := (*RayCluster)(f.job).PodSets(ctx, nil)
++	if err != nil {
++		t.Fatalf("PodSets() error: %v", err)
++	}
++	f.workers = podSets[1].Name
++	f.wl = utiltestingapi.MakeWorkload("wl", "ns").
++		Finalizers(kueue.ResourceInUseFinalizerName).
++		Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Annotation(constants.ReclaimTargetCountsAnnotation, workload.FormatPodSetCounts(workload.PodSetsCounts{f.workers: 2})).
++		Annotation(constants.ReclaimRequestedAtAnnotation, now.UTC().Format(time.RFC3339)).
++		ControllerReference(gvk, f.job.Name, string(f.job.UID)).
++		PodSets(podSets...).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(podSets[0].Name).Obj(),
++			utiltestingapi.MakePodSetAssignment(f.workers).Count(4).Obj(),
++		).Obj(), now).
++		AdmittedAt(true, now).
++		Obj()
++	objs := []client.Object{utiltesting.MakeNamespace("ns"), f.job, f.wl}
++	for i := range 4 {
++		objs = append(objs, testingpod.MakePod("w-"+string(rune('0'+i)), "ns").
++			Annotation(kueue.WorkloadSliceNameAnnotation, f.wl.Name).
++			Label(constants.PodSetLabel, string(f.workers)).
++			Label(rayutils.RayWorkerReplicaNameKey, "replica-"+string(rune('0'+i))).
++			CreationTimestamp(now.Add(time.Duration(i)*time.Second)).
++			Obj())
++	}
++	builder := utiltesting.NewClientBuilder(rayv1.AddToScheme).
++		WithObjects(objs...).
++		WithStatusSubresource(f.wl).
++		WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).
++		WithInterceptorFuncs(funcs)
++	indexer := utiltesting.AsIndexer(builder)
++	if err := SetupIndexes(ctx, indexer); err != nil {
++		t.Fatalf("SetupIndexes() error: %v", err)
++	}
++	f.kClient = builder.Build()
++	f.reconciler, err = NewReconciler(ctx, f.kClient, indexer, &utiltesting.EventRecorder{})
++	if err != nil {
++		t.Fatalf("NewReconciler() error: %v", err)
++	}
++	return f
++}
++
++func (f *partialStopFixture) reconcile(t *testing.T) reconcile.Result {
++	t.Helper()
++	ctx, _ := utiltesting.ContextWithLog(t)
++	result, err := f.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(f.job)})
++	if err != nil {
++		t.Fatalf("Reconcile() error: %v", err)
++	}
++	return result
++}
++
++func (f *partialStopFixture) group(t *testing.T) rayv1.WorkerGroupSpec {
++	t.Helper()
++	ctx, _ := utiltesting.ContextWithLog(t)
++	var got rayv1.RayCluster
++	if err := f.kClient.Get(ctx, client.ObjectKeyFromObject(f.job), &got); err != nil {
++		t.Fatalf("Get() error: %v", err)
++	}
++	return got.Spec.WorkerGroupSpecs[0]
++}
++
++func (f *partialStopFixture) workload(t *testing.T) *kueue.Workload {
++	t.Helper()
++	ctx, _ := utiltesting.ContextWithLog(t)
++	var got kueue.Workload
++	if err := f.kClient.Get(ctx, client.ObjectKeyFromObject(f.wl), &got); err != nil {
++		t.Fatalf("Get() error: %v", err)
++	}
++	return &got
++}
++
++func TestReconcileDoesNotMarkADeeperRequestStopped(t *testing.T) {
++	deeperAt := time.Now().Truncate(time.Second).Add(10 * time.Second).UTC().Format(time.RFC3339)
++	conflicted := false
++	var fixture *partialStopFixture
++	fixture = newPartialStopFixture(t, interceptor.Funcs{
++		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
++			if _, ok := obj.(*kueue.Workload); !ok || conflicted {
++				return c.Patch(ctx, obj, patch, opts...)
++			}
++			// The scheduler deepens the target between the stop and its mark.
++			conflicted = true
++			var latest kueue.Workload
++			if err := c.Get(ctx, client.ObjectKeyFromObject(obj), &latest); err != nil {
++				return err
++			}
++			latest.Annotations[constants.ReclaimTargetCountsAnnotation] = workload.FormatPodSetCounts(workload.PodSetsCounts{fixture.workers: 1})
++			latest.Annotations[constants.ReclaimRequestedAtAnnotation] = deeperAt
++			if err := c.Update(ctx, &latest); err != nil {
++				return err
++			}
++			return apierrors.NewConflict(kueue.Resource("workloads"), obj.GetName(), nil)
++		},
++	})
++
++	result := fixture.reconcile(t)
++	if !conflicted {
++		t.Fatal("The Workload mark was never patched")
++	}
++	if !workload.ReclaimStopPending(fixture.workload(t)) {
++		t.Errorf("The deeper request is marked stopped (%s=%q) though nothing stopped for it",
++			constants.ReclaimStoppedAtAnnotation, fixture.workload(t).Annotations[constants.ReclaimStoppedAtAnnotation])
++	}
++	if !result.Requeue && result.RequeueAfter == 0 {
++		t.Error("Reconcile() did not requeue to stop for the deeper request")
++	}
++
++	fixture.reconcile(t)
++	if got := ptr.Deref(fixture.group(t).Replicas, -1); got != 1 {
++		t.Errorf("Replicas after the next reconcile = %d, want 1, the deeper target", got)
++	}
++	if got := fixture.workload(t).Annotations[constants.ReclaimStoppedAtAnnotation]; got != deeperAt {
++		t.Errorf("%s = %q, want %q once the workers are stopped for it", constants.ReclaimStoppedAtAnnotation, got, deeperAt)
++	}
++}
++
++func TestReconcileAssertsTheStopWhileWorkersRunAboveTheTarget(t *testing.T) {
++	testCases := map[string]struct {
++		rewrite func(*rayv1.WorkerGroupSpec)
++	}{
++		"the autoscaler drops the workers to delete": {
++			rewrite: func(wgs *rayv1.WorkerGroupSpec) { wgs.ScaleStrategy.WorkersToDelete = nil },
++		},
++		"the autoscaler raises the replicas": {
++			rewrite: func(wgs *rayv1.WorkerGroupSpec) { wgs.Replicas = ptr.To[int32](4) },
++		},
++		"the autoscaler does both": {
++			rewrite: func(wgs *rayv1.WorkerGroupSpec) {
++				wgs.Replicas = ptr.To[int32](4)
++				wgs.ScaleStrategy.WorkersToDelete = nil
++			},
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			ctx, _ := utiltesting.ContextWithLog(t)
++			fixture := newPartialStopFixture(t, interceptor.Funcs{})
++			fixture.reconcile(t)
++			if got := ptr.Deref(fixture.group(t).Replicas, -1); got != 2 {
++				t.Fatalf("Replicas after the first reconcile = %d, want 2", got)
++			}
++
++			var cluster rayv1.RayCluster
++			if err := fixture.kClient.Get(ctx, client.ObjectKeyFromObject(fixture.job), &cluster); err != nil {
++				t.Fatalf("Get() error: %v", err)
++			}
++			tc.rewrite(&cluster.Spec.WorkerGroupSpecs[0])
++			if err := fixture.kClient.Update(ctx, &cluster); err != nil {
++				t.Fatalf("Update() error: %v", err)
++			}
++
++			fixture.reconcile(t)
++			group := fixture.group(t)
++			if got := ptr.Deref(group.Replicas, -1); got != 2 {
++				t.Errorf("Replicas after the next reconcile = %d, want 2", got)
++			}
++			if diff := cmp.Diff([]string{"w-2", "w-3"}, group.ScaleStrategy.WorkersToDelete); diff != "" {
++				t.Errorf("WorkersToDelete after the next reconcile (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestStopWorkersAboveReadsThePodsAgainOnConflict(t *testing.T) {
++	ctx, _ := utiltesting.ContextWithLog(t)
++	now := time.Now().Truncate(time.Second)
++	wl := utiltestingapi.MakeWorkload("wl", "ns").Obj()
++	cluster := &rayv1.RayCluster{
++		ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns"},
++		Spec: rayv1.RayClusterSpec{WorkerGroupSpecs: []rayv1.WorkerGroupSpec{{
++			GroupName: "workers", Replicas: ptr.To[int32](4), MaxReplicas: ptr.To[int32](10),
++		}}},
++	}
++	objs := []client.Object{cluster}
++	for i := range 4 {
++		objs = append(objs, testingpod.MakePod("w-"+string(rune('0'+i)), "ns").
++			Annotation(kueue.WorkloadSliceNameAnnotation, wl.Name).
++			Label(constants.PodSetLabel, "workers").
++			Label(rayutils.RayNodeGroupLabelKey, "workers").
++			Label(rayutils.RayWorkerReplicaNameKey, "replica-"+string(rune('0'+i))).
++			CreationTimestamp(now.Add(time.Duration(i)*time.Second)).
++			Obj())
++	}
++	conflicted := false
++	kClient := utiltesting.NewClientBuilder(rayv1.AddToScheme).WithObjects(objs...).
++		WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).
++		WithInterceptorFuncs(interceptor.Funcs{
++			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
++				if _, ok := obj.(*rayv1.RayCluster); !ok || conflicted {
++					return c.Patch(ctx, obj, patch, opts...)
++				}
++				// KubeRay finishes deleting a worker, and the autoscaler lowers the
++				// group, between the first read and the patch.
++				conflicted = true
++				if err := c.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "w-3", Namespace: "ns"}}); err != nil {
++					return err
++				}
++				var latest rayv1.RayCluster
++				if err := c.Get(ctx, client.ObjectKeyFromObject(obj), &latest); err != nil {
++					return err
++				}
++				latest.Spec.WorkerGroupSpecs[0].Replicas = ptr.To[int32](3)
++				if err := c.Update(ctx, &latest); err != nil {
++					return err
++				}
++				return apierrors.NewConflict(rayv1.GroupVersion.WithResource("rayclusters").GroupResource(), obj.GetName(), nil)
++			},
++		}).Build()
++
++	if _, err := StopWorkersAbove(ctx, kClient, wl, workload.PodSetsCounts{"workers": 2}, client.ObjectKeyFromObject(cluster)); err != nil {
++		t.Fatalf("StopWorkersAbove() error: %v", err)
++	}
++	var got rayv1.RayCluster
++	if err := kClient.Get(ctx, client.ObjectKeyFromObject(cluster), &got); err != nil {
++		t.Fatalf("Get() error: %v", err)
++	}
++	group := got.Spec.WorkerGroupSpecs[0]
++	if replicas := ptr.Deref(group.Replicas, -1); replicas != 2 {
++		t.Errorf("Replicas = %d, want 2", replicas)
++	}
++	if diff := cmp.Diff([]string{"w-2"}, group.ScaleStrategy.WorkersToDelete); diff != "" {
++		t.Errorf("WorkersToDelete, which lists the deleted worker w-3 when read before the conflict (-want,+got):\n%s", diff)
++	}
++}
++
++func TestStopWorkersAboveDeletesPodsOfAGroupWithoutATarget(t *testing.T) {
++	ctx, _ := utiltesting.ContextWithLog(t)
++	now := time.Now().Truncate(time.Second)
++	wl := utiltestingapi.MakeWorkload("wl", "ns").Obj()
++	cluster := &rayv1.RayCluster{
++		ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns"},
++		Spec: rayv1.RayClusterSpec{WorkerGroupSpecs: []rayv1.WorkerGroupSpec{{
++			GroupName: "workers", Replicas: ptr.To[int32](4), MaxReplicas: ptr.To[int32](10),
++		}}},
++	}
++	objs := []client.Object{cluster}
++	for i := range 4 {
++		// The Pods carry a PodSet name that is not the name of their worker group.
++		objs = append(objs, testingpod.MakePod("w-"+string(rune('0'+i)), "ns").
++			Annotation(kueue.WorkloadSliceNameAnnotation, wl.Name).
++			Label(constants.PodSetLabel, "elsewhere").
++			Label(rayutils.RayNodeGroupLabelKey, "workers").
++			Label(rayutils.RayWorkerReplicaNameKey, "replica-"+string(rune('0'+i))).
++			CreationTimestamp(now.Add(time.Duration(i)*time.Second)).
++			Obj())
++	}
++	conflicted := false
++	kClient := utiltesting.NewClientBuilder(rayv1.AddToScheme).WithObjects(objs...).
++		WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).
++		WithInterceptorFuncs(interceptor.Funcs{
++			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
++				if _, ok := obj.(*rayv1.RayCluster); !ok || conflicted {
++					return c.Patch(ctx, obj, patch, opts...)
++				}
++				// Another writer lowers the group between the first read and the patch,
++				// which an earlier version of the stop then lowered a second time.
++				conflicted = true
++				var latest rayv1.RayCluster
++				if err := c.Get(ctx, client.ObjectKeyFromObject(obj), &latest); err != nil {
++					return err
++				}
++				latest.Spec.WorkerGroupSpecs[0].Replicas = ptr.To[int32](2)
++				if err := c.Update(ctx, &latest); err != nil {
++					return err
++				}
++				return apierrors.NewConflict(rayv1.GroupVersion.WithResource("rayclusters").GroupResource(), obj.GetName(), nil)
++			},
++		}).Build()
++
++	if _, err := StopWorkersAbove(ctx, kClient, wl, workload.PodSetsCounts{"elsewhere": 2}, client.ObjectKeyFromObject(cluster)); err != nil {
++		t.Fatalf("StopWorkersAbove() error: %v", err)
++	}
++	var got rayv1.RayCluster
++	if err := kClient.Get(ctx, client.ObjectKeyFromObject(cluster), &got); err != nil {
++		t.Fatalf("Get() error: %v", err)
++	}
++	if replicas := ptr.Deref(got.Spec.WorkerGroupSpecs[0].Replicas, -1); replicas != 4 {
++		t.Errorf("Replicas = %d, want 4: a group without a target is not lowered, however often the patch retries", replicas)
++	}
++	var pods corev1.PodList
++	if err := kClient.List(ctx, &pods); err != nil {
++		t.Fatalf("List() error: %v", err)
++	}
++	if len(pods.Items) != 2 {
++		t.Errorf("Pods = %d, want 2 left, the others deleted directly", len(pods.Items))
 +	}
 +}
 diff --git a/pkg/controller/jobs/rayjob/rayjob_webhook_test.go b/pkg/controller/jobs/rayjob/rayjob_webhook_test.go

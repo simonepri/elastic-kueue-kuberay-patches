@@ -41,10 +41,10 @@ Implement collaborative partial worker stopping for RayCluster and RayJob worklo
 
 diff --git a/pkg/constants/partial_preemption.go b/pkg/constants/partial_preemption.go
 new file mode 100644
-index 0000000..c6e7b31
+index 0000000..ecf389b
 --- /dev/null
 +++ b/pkg/constants/partial_preemption.go
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,45 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -79,9 +79,15 @@ index 0000000..c6e7b31
 +	// were first set.
 +	ReclaimRequestedAtAnnotation = "kueue.x-k8s.io/reclaim-requested-at"
 +
-+	// ReclaimStoppedAtAnnotation records the ReclaimRequestedAtAnnotation value of the
-+	// reclaim request whose workers the job controller has stopped, so it stops them once
-+	// even if their quota was released before it looked.
++	// ReclaimGenerationAnnotation counts the requests that set or lowered the reclaim
++	// target counts. It tells apart two requests made within the same second, which
++	// ReclaimRequestedAtAnnotation cannot.
++	ReclaimGenerationAnnotation = "kueue.x-k8s.io/reclaim-generation"
++
++	// ReclaimStoppedAtAnnotation records the identity of the reclaim request whose
++	// workers the job controller has stopped, which is its ReclaimRequestedAtAnnotation
++	// value followed by "#" and its ReclaimGenerationAnnotation value when it has one, so
++	// it stops them once even if their quota was released before it looked.
 +	ReclaimStoppedAtAnnotation = "kueue.x-k8s.io/reclaim-stopped-at"
 +)
 diff --git a/pkg/constants/ray.go b/pkg/constants/ray.go
@@ -713,10 +719,10 @@ index 90f5e30..94abae6 100644
  	},
 diff --git a/pkg/workload/partial_preemption.go b/pkg/workload/partial_preemption.go
 new file mode 100644
-index 0000000..5b8304f
+index 0000000..49fcc18
 --- /dev/null
 +++ b/pkg/workload/partial_preemption.go
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,223 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -739,6 +745,7 @@ index 0000000..5b8304f
 +import (
 +	"maps"
 +	"slices"
++	"strconv"
 +	"time"
 +
 +	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -822,6 +829,7 @@ index 0000000..5b8304f
 +		constants.ReclaimTargetCountsAnnotation,
 +		constants.ReclaimPreemptorAnnotation,
 +		constants.ReclaimRequestedAtAnnotation,
++		constants.ReclaimGenerationAnnotation,
 +		constants.ReclaimStoppedAtAnnotation,
 +	} {
 +		if _, found := wl.Annotations[key]; found {
@@ -839,13 +847,36 @@ index 0000000..5b8304f
 +		return false
 +	}
 +	stoppedAt, found := wl.Annotations[constants.ReclaimStoppedAtAnnotation]
-+	return !found || stoppedAt != wl.Annotations[constants.ReclaimRequestedAtAnnotation]
++	return !found || stoppedAt != ReclaimRequest(wl)
++}
++
++// ReclaimRequest returns the identity of the reclaim request wl carries: the time it
++// was made at, and its generation when it has one, which tells apart two requests
++// made within the same second.
++func ReclaimRequest(wl *kueue.Workload) string {
++	request := wl.Annotations[constants.ReclaimRequestedAtAnnotation]
++	if generation, found := wl.Annotations[constants.ReclaimGenerationAnnotation]; found {
++		request += "#" + generation
++	}
++	return request
 +}
 +
 +// SetReclaimStopped records that the job controller has stopped the workers of the
 +// reclaim request of wl.
 +func SetReclaimStopped(wl *kueue.Workload) {
-+	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimStoppedAtAnnotation, wl.Annotations[constants.ReclaimRequestedAtAnnotation])
++	SetReclaimStoppedFor(wl, ReclaimRequest(wl))
++}
++
++// SetReclaimStoppedFor records that the job controller has stopped the workers of the
++// given reclaim request, as ReclaimRequest returned it when the workers were stopped.
++func SetReclaimStoppedFor(wl *kueue.Workload, request string) {
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimStoppedAtAnnotation, request)
++}
++
++// NextReclaimGeneration returns the generation that follows the one wl carries.
++func NextReclaimGeneration(wl *kueue.Workload) string {
++	generation, _ := strconv.Atoi(wl.Annotations[constants.ReclaimGenerationAnnotation])
++	return strconv.Itoa(generation + 1)
 +}
 +
 +// PendingReclaimTargetCounts returns the reclaim target counts of the PodSets
@@ -1996,10 +2027,10 @@ index 0000000..26dcdc6
 +}
 diff --git a/pkg/workload/partial_preemption_test.go b/pkg/workload/partial_preemption_test.go
 new file mode 100644
-index 0000000..5a4232b
+index 0000000..21b0b2e
 --- /dev/null
 +++ b/pkg/workload/partial_preemption_test.go
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,320 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2292,6 +2323,32 @@ index 0000000..5a4232b
 +				t.Errorf("podSetsCountsAfterReclaim() (-want,+got):\n%s", diff)
 +			}
 +		})
++	}
++}
++
++func TestReclaimStopPendingTellsApartRequestsOfTheSameSecond(t *testing.T) {
++	wl := &kueue.Workload{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
++		constants.ReclaimTargetCountsAnnotation: "a=2",
++		constants.ReclaimRequestedAtAnnotation:  "2026-01-01T00:00:00Z",
++		constants.ReclaimGenerationAnnotation:   "1",
++	}}}
++	if !ReclaimStopPending(wl) {
++		t.Fatal("ReclaimStopPending() = false for a request nothing stopped for")
++	}
++	request := ReclaimRequest(wl)
++	SetReclaimStopped(wl)
++	if ReclaimStopPending(wl) {
++		t.Fatal("ReclaimStopPending() = true after the request was marked stopped")
++	}
++
++	wl.Annotations[constants.ReclaimTargetCountsAnnotation] = "a=1"
++	wl.Annotations[constants.ReclaimGenerationAnnotation] = NextReclaimGeneration(wl)
++	if !ReclaimStopPending(wl) {
++		t.Error("ReclaimStopPending() = false for a deeper request made within the same second")
++	}
++	SetReclaimStoppedFor(wl, request)
++	if !ReclaimStopPending(wl) {
++		t.Error("ReclaimStopPending() = false after marking the earlier request stopped, want the deeper one pending")
 +	}
 +}
 diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go

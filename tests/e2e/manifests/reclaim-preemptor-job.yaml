@@ -1,0 +1,24 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reclaim-owner-job
+  labels:
+    kueue.x-k8s.io/queue-name: reclaim-owner-local-queue
+    kueue.x-k8s.io/priority-class: reclaim-priority-high
+spec:
+  parallelism: 5
+  completions: 5
+  template:
+    spec:
+      containers:
+        - name: worker
+          image: busybox:latest
+          command: ["sleep", "300"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "100m"
+              memory: "256Mi"
+      restartPolicy: Never

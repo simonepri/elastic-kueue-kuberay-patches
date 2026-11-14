@@ -5,14 +5,46 @@ Subject: [PATCH] feat: implement partial worker stop for raycluster and rayjob w
 
 Preemption of Ray workloads in Kueue is entirely all-or-nothing, terminating the Ray Head pod, distributed state, and active drivers even when preempting only a subset of worker pods would free sufficient quota. Restarting the head pod destroys long-running checkpoints and driver connections, whereas elastic Ray clusters can dynamically shrink worker groups without interrupting head execution.
 
-Implement collaborative partial worker stopping for RayCluster and RayJob workloads by exposing the kueue.x-k8s.io/reclaim-target-counts annotation and reconciling partial preemption requests. Evict surplus worker pods in whole replica units by deletion cost and age while keeping the Ray Head pod and core cluster state operational.
+Implement collaborative partial worker stopping for RayCluster and RayJob workloads by exposing the kueue.x-k8s.io/reclaim-target-counts annotation and reconciling partial preemption requests. Stop surplus worker pods in whole replica units by deletion cost and age while keeping the Ray Head pod and core cluster state operational. For a RayCluster, and for a RayJob with in-tree autoscaling, lower each shrunk worker group to its target and list the stopped pods in its scaleStrategy.workersToDelete, so KubeRay removes exactly those pods instead of recreating them and the Ray autoscaler starts from the lower replicas, once per reclaim request, which a Workload annotation records.
 ---
+ pkg/constants/partial_preemption.go           |  39 ++
+ pkg/constants/ray.go                          |   8 +
+ pkg/controller/core/indexer/indexer.go        |  14 +
+ pkg/controller/jobframework/partial_stop.go   | 108 ++++
+ pkg/controller/jobframework/reconciler.go     |   8 +
+ .../jobs/raycluster/partial_stop.go           | 216 ++++++++
+ .../jobs/raycluster/partial_stop_test.go      | 478 ++++++++++++++++++
+ .../jobs/raycluster/raycluster_controller.go  |   4 +-
+ pkg/controller/jobs/rayjob/partial_stop.go    |  53 ++
+ .../jobs/rayjob/partial_stop_test.go          | 109 ++++
+ .../jobs/rayjob/rayjob_controller.go          |  10 +-
+ .../jobs/rayservice/rayservice_controller.go  |   3 +-
+ pkg/controller/tas/indexer/indexer.go         |  10 +-
+ pkg/features/kube_features.go                 |  10 +
+ pkg/workload/partial_preemption.go            | 198 ++++++++
+ pkg/workload/partial_preemption_test.go       | 294 +++++++++++
+ pkg/workload/workload.go                      |   1 +
+ pkg/workloadslicing/partial_preemption.go     | 462 +++++++++++++++++
+ .../partial_preemption_test.go                | 453 +++++++++++++++++
+ 19 files changed, 2466 insertions(+), 12 deletions(-)
+ create mode 100644 pkg/constants/partial_preemption.go
+ create mode 100644 pkg/constants/ray.go
+ create mode 100644 pkg/controller/jobframework/partial_stop.go
+ create mode 100644 pkg/controller/jobs/raycluster/partial_stop.go
+ create mode 100644 pkg/controller/jobs/raycluster/partial_stop_test.go
+ create mode 100644 pkg/controller/jobs/rayjob/partial_stop.go
+ create mode 100644 pkg/controller/jobs/rayjob/partial_stop_test.go
+ create mode 100644 pkg/workload/partial_preemption.go
+ create mode 100644 pkg/workload/partial_preemption_test.go
+ create mode 100644 pkg/workloadslicing/partial_preemption.go
+ create mode 100644 pkg/workloadslicing/partial_preemption_test.go
+
 diff --git a/pkg/constants/partial_preemption.go b/pkg/constants/partial_preemption.go
 new file mode 100644
-index 0000000..8951f53
+index 0000000..ecf389b
 --- /dev/null
 +++ b/pkg/constants/partial_preemption.go
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,45 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -46,6 +78,17 @@ index 0000000..8951f53
 +	// ReclaimRequestedAtAnnotation records, in RFC 3339, when the reclaim target counts
 +	// were first set.
 +	ReclaimRequestedAtAnnotation = "kueue.x-k8s.io/reclaim-requested-at"
++
++	// ReclaimGenerationAnnotation counts the requests that set or lowered the reclaim
++	// target counts. It tells apart two requests made within the same second, which
++	// ReclaimRequestedAtAnnotation cannot.
++	ReclaimGenerationAnnotation = "kueue.x-k8s.io/reclaim-generation"
++
++	// ReclaimStoppedAtAnnotation records the identity of the reclaim request whose
++	// workers the job controller has stopped, which is its ReclaimRequestedAtAnnotation
++	// value followed by "#" and its ReclaimGenerationAnnotation value when it has one, so
++	// it stops them once even if their quota was released before it looked.
++	ReclaimStoppedAtAnnotation = "kueue.x-k8s.io/reclaim-stopped-at"
 +)
 diff --git a/pkg/constants/ray.go b/pkg/constants/ray.go
 new file mode 100644
@@ -109,10 +152,10 @@ index 1c69baa..dc9416d 100644
  	}
 diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
 new file mode 100644
-index 0000000..9be7e7f
+index 0000000..1676563
 --- /dev/null
 +++ b/pkg/controller/jobframework/partial_stop.go
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,108 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -142,6 +185,7 @@ index 0000000..9be7e7f
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	"sigs.k8s.io/kueue/pkg/features"
++	clientutil "sigs.k8s.io/kueue/pkg/util/client"
 +	"sigs.k8s.io/kueue/pkg/workload"
 +	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
 +	"sigs.k8s.io/kueue/pkg/workloadslicing"
@@ -155,14 +199,14 @@ index 0000000..9be7e7f
 +// Once the Pods above the reclaim targets are gone, the ElasticJobUngater marks them
 +// reclaimable, which releases their quota.
 +type JobWithPartialStop interface {
-+	// StopPartially brings each PodSet in targets down to its target count without changing
-+	// the job's desired count, so the recreated pods stay gated. It makes no API call when the
-+	// PodSets are already at their targets, and returns whether it stopped any pod.
++	// StopPartially brings each PodSet in targets down to its target count, and the job's
++	// desired count with it, so the pods it stops are not recreated. It makes no API call
++	// when the PodSets are already at their targets, and returns whether it changed anything.
 +	StopPartially(ctx context.Context, c client.Client, wl *kueue.Workload, targets workload.PodSetsCounts) (bool, error)
 +}
 +
-+// partialStopRequeueAfter is how often the job reconciler checks a job whose reclaim
-+// targets are still pending, since it does not watch the job's Pods.
++// partialStopRequeueAfter is how soon the job reconciler looks again at a job whose
++// reclaim targets are still pending, once it has stopped their workers.
 +const partialStopRequeueAfter = 5 * time.Second
 +
 +// stopJobPartially brings a running elastic job down to the pending reclaim target
@@ -173,9 +217,16 @@ index 0000000..9be7e7f
 +	if !ok || !features.Enabled(features.PartialPreemption) || job.IsSuspended() || !workload.IsAdmitted(wl) || workloadevict.IsEvicted(wl) {
 +		return ctrl.Result{}, false, nil
 +	}
-+	targets := workload.PendingReclaimTargetCounts(wl)
-+	if len(targets) == 0 {
++	// The workers stop once per reclaim request, which a mark on the Workload records.
++	if !workload.ReclaimStopPending(wl) {
 +		return ctrl.Result{}, false, nil
++	}
++	// The quota may be released before this reconcile looks at the job, when no worker
++	// ran above the target; the job's replicas still go down to it.
++	targets := workload.PendingReclaimTargetCounts(wl)
++	pending := len(targets) > 0
++	if !pending {
++		targets = workload.ReclaimTargetCounts(wl)
 +	}
 +	stopped, err := partialJob.StopPartially(ctx, r.client, wl, targets)
 +	if stopped {
@@ -184,6 +235,15 @@ index 0000000..9be7e7f
 +	}
 +	if err != nil {
 +		return ctrl.Result{}, true, err
++	}
++	if err := clientutil.Patch(ctx, r.client, wl, func() (bool, error) {
++		workload.SetReclaimStopped(wl)
++		return true, nil
++	}, clientutil.WithRetryOnConflict()); err != nil {
++		return ctrl.Result{}, true, client.IgnoreNotFound(err)
++	}
++	if !pending {
++		return ctrl.Result{}, false, nil
 +	}
 +	return ctrl.Result{RequeueAfter: partialStopRequeueAfter}, true, nil
 +}
@@ -232,10 +292,10 @@ index 0d6a832..e509826 100644
  		return ctrl.Result{RequeueAfter: requeueAfter}, err
 diff --git a/pkg/controller/jobs/raycluster/partial_stop.go b/pkg/controller/jobs/raycluster/partial_stop.go
 new file mode 100644
-index 0000000..e067e5b
+index 0000000..ddc22fd
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/partial_stop.go
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,216 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -257,26 +317,178 @@ index 0000000..e067e5b
 +
 +import (
 +	"context"
++	"maps"
++	"slices"
 +
++	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 +	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 +	corev1 "k8s.io/api/core/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/utils/ptr"
 +	"sigs.k8s.io/controller-runtime/pkg/client"
 +
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
 +	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 +	"sigs.k8s.io/kueue/pkg/features"
++	clientutil "sigs.k8s.io/kueue/pkg/util/client"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 +	"sigs.k8s.io/kueue/pkg/workload"
 +	"sigs.k8s.io/kueue/pkg/workloadslicing"
 +)
 +
 +var _ jobframework.JobWithPartialStop = (*RayCluster)(nil)
 +
-+// StopPartially deletes the running worker Pods above the reclaim targets in whole
++// StopPartially stops the running worker Pods above the reclaim targets in whole
 +// worker group replicas, the cheapest by pod deletion cost first, then the newest.
-+// KubeRay recreates them, because the RayCluster keeps its replicas, and they stay
-+// gated until the slice has room for them again.
++// It lowers each worker group to its target and lists
++// their Pods in the group's scaleStrategy.workersToDelete, so KubeRay removes
++// exactly those Pods and does not recreate them, and the Ray autoscaler starts
++// from the lower replicas.
 +func (j *RayCluster) StopPartially(ctx context.Context, c client.Client, wl *kueue.Workload, targets workload.PodSetsCounts) (bool, error) {
++	return StopWorkersAbove(ctx, c, wl, targets, types.NamespacedName{Namespace: j.Namespace, Name: j.Name})
++}
++
++// StopWorkersAbove stops the worker Pods above the reclaim targets through the
++// RayCluster key, as RayCluster.StopPartially does, and lowers each worker group that
++// has a target to it even when no Pod runs above it. Pods of a worker group that the
++// RayCluster does not list, or of a RayCluster that does not exist, are deleted
++// directly. It returns whether it changed the RayCluster or stopped any Pod.
++func StopWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload, targets workload.PodSetsCounts, key types.NamespacedName) (bool, error) {
++	cluster := &rayv1.RayCluster{}
++	if err := c.Get(ctx, key, cluster); err != nil {
++		if !apierrors.IsNotFound(err) {
++			return false, err
++		}
++		return DeleteWorkersAbove(ctx, c, wl, targets)
++	}
++	leaving := sets.New[string]()
++	for i := range cluster.Spec.WorkerGroupSpecs {
++		leaving.Insert(cluster.Spec.WorkerGroupSpecs[i].ScaleStrategy.WorkersToDelete...)
++	}
++	pods, err := workloadslicing.PodGroupsAboveCounts(ctx, c, wl, targets, workerReplicaName, func(p *corev1.Pod) bool { return leaving.Has(p.Name) })
++	if err != nil {
++		return false, err
++	}
++	byGroup := make(map[string][]*corev1.Pod)
++	for _, p := range pods {
++		group := workerGroupName(p)
++		byGroup[group] = append(byGroup[group], p)
++	}
++	groupTargets := targets
++	slicePods, err := workloadslicing.ListPodsForWorkloadSlice(ctx, c, wl.Namespace, workloadslicing.SliceName(wl))
++	if err != nil {
++		return false, err
++	}
++	stopping := sets.New[string]()
++	for _, p := range pods {
++		stopping.Insert(p.Name)
++	}
++	staying := make(map[string][]*corev1.Pod)
++	for _, p := range slicePods {
++		if p.DeletionTimestamp == nil && !utilpod.IsTerminated(p) && !stopping.Has(p.Name) && !leaving.Has(p.Name) &&
++			p.Labels[constants.PodSetLabel] != "" && p.Labels[rayutils.RayNodeTypeLabelKey] != string(rayv1.HeadNode) {
++			staying[workerGroupName(p)] = append(staying[workerGroupName(p)], p)
++		}
++	}
++	var unlisted []*corev1.Pod
++	err = clientutil.Patch(ctx, c, cluster, func() (bool, error) {
++		unlisted = unlisted[:0]
++		changed := false
++		for i := range cluster.Spec.WorkerGroupSpecs {
++			wgs := &cluster.Spec.WorkerGroupSpecs[i]
++			var target *int32
++			if count, found := groupTargets[kueue.NewPodSetReference(wgs.GroupName)]; found {
++				target = &count
++			}
++			if target == nil && len(byGroup[wgs.GroupName]) == 0 {
++				continue
++			}
++			changed = lowerWorkerGroup(wgs, byGroup[wgs.GroupName], target, staying[wgs.GroupName]) || changed
++		}
++		for group, groupPods := range byGroup {
++			if !slices.ContainsFunc(cluster.Spec.WorkerGroupSpecs, func(wgs rayv1.WorkerGroupSpec) bool { return wgs.GroupName == group }) {
++				unlisted = append(unlisted, groupPods...)
++			}
++		}
++		return changed, nil
++	}, clientutil.WithRetryOnConflict())
++	if err != nil {
++		return false, err
++	}
++	for _, p := range unlisted {
++		if err := c.Delete(ctx, p); client.IgnoreNotFound(err) != nil {
++			return true, err
++		}
++	}
++	return len(pods) > 0, nil
++}
++
++// DeleteWorkersAbove deletes the worker Pods above the reclaim targets directly, in
++// whole worker group replicas, and leaves the RayCluster as it is: KubeRay recreates
++// them, and they stay gated until the slice has room for them again.
++func DeleteWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload, targets workload.PodSetsCounts) (bool, error) {
 +	return workloadslicing.DeletePodGroupsAboveCounts(ctx, c, wl, targets, workerReplicaName)
++}
++
++// lowerWorkerGroup brings the worker group down to the reclaim target of its Pods, when
++// it has one, and otherwise by the replicas of pods, never below its minReplicas, and
++// lists pods in its workersToDelete, and reports whether it changed the group. KubeRay deletes a Pod of its choice when the group
++// has more Pods than replicas, which could be a running one, so it also lists the gated
++// Pods of staying, the newest replicas first, that the lowered replicas leave no room for.
++func lowerWorkerGroup(wgs *rayv1.WorkerGroupSpec, pods []*corev1.Pod, target *int32, staying []*corev1.Pod) bool {
++	hosts := max(wgs.NumOfHosts, 1)
++	leaving := sets.New(wgs.ScaleStrategy.WorkersToDelete...)
++	for _, p := range pods {
++		leaving.Insert(p.Name)
++	}
++	minReplicas := ptr.Deref(wgs.MinReplicas, 0)
++	current := max(ptr.Deref(wgs.Replicas, minReplicas), minReplicas)
++	if wgs.MaxReplicas != nil {
++		current = min(current, *wgs.MaxReplicas)
++	}
++	lowered := current - (int32(len(pods))+hosts-1)/hosts
++	if target != nil {
++		lowered = min(current, (*target+hosts-1)/hosts)
++	}
++	replicas := max(lowered, minReplicas)
++	changed := false
++	if replicas < current {
++		wgs.Replicas = ptr.To(replicas)
++		changed = true
++	} else {
++		replicas = current
++	}
++	excess := len(staying) - int(replicas*hosts)
++	for _, p := range slices.SortedFunc(slices.Values(staying), func(a, b *corev1.Pod) int { return -a.CreationTimestamp.Compare(b.CreationTimestamp.Time) }) {
++		if excess <= 0 {
++			break
++		}
++		if !utilpod.HasGate(p, kueue.ElasticJobSchedulingGate) || leaving.Has(p.Name) {
++			continue
++		}
++		for _, sibling := range staying {
++			if workerReplicaName(sibling) == workerReplicaName(p) && !leaving.Has(sibling.Name) {
++				leaving.Insert(sibling.Name)
++				excess--
++			}
++		}
++	}
++	listed := slices.Sorted(maps.Keys(leaving))
++	changed = changed || !slices.Equal(listed, wgs.ScaleStrategy.WorkersToDelete)
++	wgs.ScaleStrategy.WorkersToDelete = listed
++	return changed
++}
++
++// workerGroupName returns the worker group a Pod belongs to, which is the name of
++// its PodSet unless the PodSet is a split entry of the group.
++func workerGroupName(p *corev1.Pod) string {
++	if name := p.Labels[rayutils.RayNodeGroupLabelKey]; name != "" {
++		return name
++	}
++	return p.Labels[constants.PodSetLabel]
 +}
 +
 +// workerReplicaName returns the worker group replica a Pod belongs to; the Pods of
@@ -317,10 +529,10 @@ index c2c44dc..6547f29 100644
  	// RayClusters are commonly used as devboxes, where users may already be
 diff --git a/pkg/controller/jobs/rayjob/partial_stop.go b/pkg/controller/jobs/rayjob/partial_stop.go
 new file mode 100644
-index 0000000..9a31dc3
+index 0000000..b84c350
 --- /dev/null
 +++ b/pkg/controller/jobs/rayjob/partial_stop.go
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,53 @@
 +// RayJob worker reclaim uses the same replica boundaries and deletion policy as its RayCluster.
 +
 +package rayjob
@@ -329,6 +541,8 @@ index 0000000..9a31dc3
 +	"context"
 +
 +	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/utils/ptr"
 +	"sigs.k8s.io/controller-runtime/pkg/client"
 +	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 +	"sigs.k8s.io/kueue/pkg/controller/jobframework"
@@ -355,10 +569,16 @@ index 0000000..9a31dc3
 +	return j.workerCluster().PodSetCountSteps()
 +}
 +
-+// StopPartially preserves the head, submitter, and workers in other entries. Recreated
-+// workers remain gated until the replacement slice has quota for them again.
++// StopPartially preserves the head, submitter, and workers in other entries. With
++// in-tree autoscaling, Kueue counts the RayJob's workers from its RayCluster, so the
++// workers stop through that RayCluster, as for a RayCluster job; their replicas go
++// down with them. Otherwise it deletes the workers directly, and the recreated workers
++// remain gated until the replacement slice has quota for them again.
 +func (j *RayJob) StopPartially(ctx context.Context, c client.Client, wl *kueue.Workload, targets workload.PodSetsCounts) (bool, error) {
-+	return j.workerCluster().StopPartially(ctx, c, wl, targets)
++	if j.Spec.RayClusterSpec != nil && ptr.Deref(j.Spec.RayClusterSpec.EnableInTreeAutoscaling, false) && j.Status.RayClusterName != "" {
++		return raycluster.StopWorkersAbove(ctx, c, wl, targets, types.NamespacedName{Namespace: j.Namespace, Name: j.Status.RayClusterName})
++	}
++	return raycluster.DeleteWorkersAbove(ctx, c, wl, targets)
 +}
 +
 +func (j *RayJob) readyDuringReclaim(opts ...jobframework.PodsReadyOption) bool {
@@ -499,10 +719,10 @@ index 90f5e30..94abae6 100644
  	},
 diff --git a/pkg/workload/partial_preemption.go b/pkg/workload/partial_preemption.go
 new file mode 100644
-index 0000000..d7d697c
+index 0000000..49fcc18
 --- /dev/null
 +++ b/pkg/workload/partial_preemption.go
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,223 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -525,6 +745,7 @@ index 0000000..d7d697c
 +import (
 +	"maps"
 +	"slices"
++	"strconv"
 +	"time"
 +
 +	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -608,6 +829,8 @@ index 0000000..d7d697c
 +		constants.ReclaimTargetCountsAnnotation,
 +		constants.ReclaimPreemptorAnnotation,
 +		constants.ReclaimRequestedAtAnnotation,
++		constants.ReclaimGenerationAnnotation,
++		constants.ReclaimStoppedAtAnnotation,
 +	} {
 +		if _, found := wl.Annotations[key]; found {
 +			delete(wl.Annotations, key)
@@ -615,6 +838,45 @@ index 0000000..d7d697c
 +		}
 +	}
 +	return cleared
++}
++
++// ReclaimStopPending reports whether wl carries a reclaim request whose workers the job
++// controller has not stopped yet, whether or not their quota is still charged.
++func ReclaimStopPending(wl *kueue.Workload) bool {
++	if len(ReclaimTargetCounts(wl)) == 0 {
++		return false
++	}
++	stoppedAt, found := wl.Annotations[constants.ReclaimStoppedAtAnnotation]
++	return !found || stoppedAt != ReclaimRequest(wl)
++}
++
++// ReclaimRequest returns the identity of the reclaim request wl carries: the time it
++// was made at, and its generation when it has one, which tells apart two requests
++// made within the same second.
++func ReclaimRequest(wl *kueue.Workload) string {
++	request := wl.Annotations[constants.ReclaimRequestedAtAnnotation]
++	if generation, found := wl.Annotations[constants.ReclaimGenerationAnnotation]; found {
++		request += "#" + generation
++	}
++	return request
++}
++
++// SetReclaimStopped records that the job controller has stopped the workers of the
++// reclaim request of wl.
++func SetReclaimStopped(wl *kueue.Workload) {
++	SetReclaimStoppedFor(wl, ReclaimRequest(wl))
++}
++
++// SetReclaimStoppedFor records that the job controller has stopped the workers of the
++// given reclaim request, as ReclaimRequest returned it when the workers were stopped.
++func SetReclaimStoppedFor(wl *kueue.Workload, request string) {
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimStoppedAtAnnotation, request)
++}
++
++// NextReclaimGeneration returns the generation that follows the one wl carries.
++func NextReclaimGeneration(wl *kueue.Workload) string {
++	generation, _ := strconv.Atoi(wl.Annotations[constants.ReclaimGenerationAnnotation])
++	return strconv.Itoa(generation + 1)
 +}
 +
 +// PendingReclaimTargetCounts returns the reclaim target counts of the PodSets
@@ -698,10 +960,10 @@ index cd2cca9..5568fa7 100644
  
 diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
 new file mode 100644
-index 0000000..cbe6f0c
+index 0000000..718489b
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption.go
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,462 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1046,26 +1308,44 @@ index 0000000..cbe6f0c
 +	return accelerators
 +}
 +
-+// DeletePodGroupsAboveCounts deletes running Pods of the workload slice until
-+// each PodSet in counts runs at most its count. When deleting pods, unscheduled
++// DeletePodGroupsAboveCounts deletes the Pods that PodGroupsAboveCounts selects.
++// It returns whether any Pod was deleted.
++func DeletePodGroupsAboveCounts(ctx context.Context, c client.Client, wl *kueue.Workload, counts workload.PodSetsCounts, groupOf func(*corev1.Pod) string) (bool, error) {
++	toDelete, err := PodGroupsAboveCounts(ctx, c, wl, counts, groupOf, nil)
++	if err != nil {
++		return false, err
++	}
++	log := ctrl.LoggerFrom(ctx)
++	err = parallelize.Until(ctx, len(toDelete), func(i int) error {
++		log.V(3).Info("Deleting elastic pod above the reclaim target count", "pod", klog.KObj(toDelete[i]))
++		return client.IgnoreNotFound(c.Delete(ctx, toDelete[i]))
++	})
++	return len(toDelete) > 0, err
++}
++
++// PodGroupsAboveCounts selects the running Pods of the workload slice to stop until
++// each PodSet in counts runs at most its count. When selecting pods, unscheduled
 +// pods are deleted first, then whole nodes' worth of pods are deleted (ranking
 +// candidate nodes first by lower total deletion cost of this pod set's groups on
 +// the node, then greedily preferring nodes where this pod set holds the most pods,
 +// breaking ties by fewer other accelerators or other pods on the node, then node
 +// name). Any remaining pods are deleted from a partial node in deletion cost / age
-+// order. Multi-host replica groups are kept whole. Terminating Pods are neither
-+// deleted again nor counted, so a call made while earlier deletions are still
-+// terminating deletes nothing more. It returns whether any Pod was deleted.
-+func DeletePodGroupsAboveCounts(ctx context.Context, c client.Client, wl *kueue.Workload, counts workload.PodSetsCounts, groupOf func(*corev1.Pod) string) (bool, error) {
++// order. Multi-host replica groups are kept whole. Terminating Pods and the Pods
++// that skip reports as already leaving are neither selected again nor counted, so
++// a call made while earlier stops are still pending selects nothing more. A nil
++// skip keeps every Pod.
++func PodGroupsAboveCounts(ctx context.Context, c client.Client, wl *kueue.Workload, counts workload.PodSetsCounts, groupOf func(*corev1.Pod) string, skip func(*corev1.Pod) bool) ([]*corev1.Pod, error) {
 +	running, err := runningPodsPerPodSet(ctx, c, wl)
 +	if err != nil {
-+		return false, err
++		return nil, err
 +	}
 +	var toDelete []*corev1.Pod
 +	for _, ps := range slices.Sorted(maps.Keys(counts)) {
 +		// Terminating Pods are already on their way out, so only the others count
 +		// toward the target here; PodsAboveCounts still waits for them to go.
-+		live := slices.DeleteFunc(slices.Clone(running[ps]), func(p *corev1.Pod) bool { return p.DeletionTimestamp != nil })
++		live := slices.DeleteFunc(slices.Clone(running[ps]), func(p *corev1.Pod) bool {
++			return p.DeletionTimestamp != nil || skip != nil && skip(p)
++		})
 +		remaining := int32(len(live))
 +		if remaining <= counts[ps] {
 +			continue
@@ -1104,7 +1384,7 @@ index 0000000..cbe6f0c
 +			for _, nodeName := range nodeNames {
 +				var list corev1.PodList
 +				if err := c.List(ctx, &list, client.MatchingFields{indexer.PodNodeNameKey: nodeName}); err != nil {
-+					return false, err
++					return nil, err
 +				}
 +				candidatePods = append(candidatePods, list.Items...)
 +			}
@@ -1112,12 +1392,7 @@ index 0000000..cbe6f0c
 +		accelerators := extractAcceleratorResources(wl, ps, live)
 +		toDelete = append(toDelete, podsToReclaim(groups, remaining-counts[ps], candidateNodes, candidatePods, ourPodUIDs, ourPodNames, accelerators)...)
 +	}
-+	log := ctrl.LoggerFrom(ctx)
-+	err = parallelize.Until(ctx, len(toDelete), func(i int) error {
-+		log.V(3).Info("Deleting elastic pod above the reclaim target count", "pod", klog.KObj(toDelete[i]))
-+		return client.IgnoreNotFound(c.Delete(ctx, toDelete[i]))
-+	})
-+	return len(toDelete) > 0, err
++	return toDelete, nil
 +}
 +
 +// newerPod reports whether a was created after b, breaking ties by the higher name.
@@ -1153,10 +1428,10 @@ index 0000000..cbe6f0c
 +}
 diff --git a/pkg/controller/jobs/raycluster/partial_stop_test.go b/pkg/controller/jobs/raycluster/partial_stop_test.go
 new file mode 100644
-index 0000000..ea15b98
+index 0000000..9ca5d52
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/partial_stop_test.go
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,478 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1177,7 +1452,6 @@ index 0000000..ea15b98
 +package raycluster
 +
 +import (
-+	"slices"
 +	"testing"
 +	"time"
 +
@@ -1186,6 +1460,7 @@ index 0000000..ea15b98
 +	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 +	corev1 "k8s.io/api/core/v1"
 +	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/utils/ptr"
 +	"sigs.k8s.io/controller-runtime/pkg/client"
 +	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 +	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -1206,16 +1481,18 @@ index 0000000..ea15b98
 +func TestReconcileStopsWorkersAboveReclaimTargets(t *testing.T) {
 +	testCases := map[string]struct {
 +		disablePartialPreemption bool
-+		wantPods                 []string
++		wantReplicas             int32
++		wantWorkersToDelete      []string
 +		wantRequeue              bool
 +	}{
-+		"the workers above the target are deleted and the job is requeued": {
-+			wantPods:    []string{"w-0", "w-1"},
-+			wantRequeue: true,
++		"the workers above the target are left to KubeRay with lower replicas and the job is requeued": {
++			wantReplicas:        2,
++			wantWorkersToDelete: []string{"w-2", "w-3"},
++			wantRequeue:         true,
 +		},
-+		"without the gate no worker is deleted": {
++		"without the gate no worker is stopped": {
 +			disablePartialPreemption: true,
-+			wantPods:                 []string{"w-0", "w-1", "w-2", "w-3"},
++			wantReplicas:             4,
 +		},
 +	}
 +	for name, tc := range testCases {
@@ -1283,13 +1560,30 @@ index 0000000..ea15b98
 +			if err := kClient.List(ctx, &pods); err != nil {
 +				t.Fatalf("List() error: %v", err)
 +			}
-+			var gotPods []string
-+			for _, p := range pods.Items {
-+				gotPods = append(gotPods, p.Name)
++			if len(pods.Items) != 4 {
++				t.Errorf("Pods after reconcile = %d, want 4 left for KubeRay to delete", len(pods.Items))
 +			}
-+			slices.Sort(gotPods)
-+			if diff := cmp.Diff(tc.wantPods, gotPods); diff != "" {
-+				t.Errorf("Pods after reconcile (-want,+got):\n%s", diff)
++			var got rayv1.RayCluster
++			if err := kClient.Get(ctx, client.ObjectKeyFromObject(job), &got); err != nil {
++				t.Fatalf("Get() error: %v", err)
++			}
++			group := got.Spec.WorkerGroupSpecs[0]
++			if gotReplicas := ptr.Deref(group.Replicas, -1); gotReplicas != tc.wantReplicas {
++				t.Errorf("Replicas after reconcile = %d, want %d", gotReplicas, tc.wantReplicas)
++			}
++			if diff := cmp.Diff(tc.wantWorkersToDelete, group.ScaleStrategy.WorkersToDelete); diff != "" {
++				t.Errorf("WorkersToDelete after reconcile (-want,+got):\n%s", diff)
++			}
++
++			// Another pass, while KubeRay has not deleted the Pods yet, stops nothing more.
++			if _, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(job)}); err != nil {
++				t.Fatalf("second Reconcile() error: %v", err)
++			}
++			if err := kClient.Get(ctx, client.ObjectKeyFromObject(job), &got); err != nil {
++				t.Fatalf("Get() error: %v", err)
++			}
++			if gotReplicas := ptr.Deref(got.Spec.WorkerGroupSpecs[0].Replicas, -1); gotReplicas != tc.wantReplicas {
++				t.Errorf("Replicas after the second reconcile = %d, want %d", gotReplicas, tc.wantReplicas)
 +			}
 +		})
 +	}
@@ -1402,12 +1696,226 @@ index 0000000..ea15b98
 +		t.Errorf("Reclaimable pods = %v, want none in the same reconcile that released the quota", got.Status.ReclaimablePods)
 +	}
 +}
++
++func TestStopWorkersAbove(t *testing.T) {
++	testCases := map[string]struct {
++		replicas, minReplicas, numOfHosts int32
++		listed                            []string
++		pods, gated                       int
++		target                            int32
++		noCluster                         bool
++		wantReplicas                      int32
++		wantWorkersToDelete               []string
++		wantPods                          int
++		wantStopped                       bool
++	}{
++		"a single-host group ends at the target": {
++			replicas: 4, pods: 4, target: 1,
++			wantReplicas: 1, wantWorkersToDelete: []string{"w-1", "w-2", "w-3"}, wantPods: 4, wantStopped: true,
++		},
++		"the replicas of a multi-host group go down by whole replicas": {
++			replicas: 2, numOfHosts: 2, pods: 4, target: 2,
++			wantReplicas: 1, wantWorkersToDelete: []string{"w-2", "w-3"}, wantPods: 4, wantStopped: true,
++		},
++		"the replicas stop at minReplicas": {
++			replicas: 3, minReplicas: 2, pods: 3, target: 0,
++			wantReplicas: 2, wantWorkersToDelete: []string{"w-0", "w-1", "w-2"}, wantPods: 3, wantStopped: true,
++		},
++		"a worker already listed for deletion is not stopped again": {
++			replicas: 3, listed: []string{"w-3"}, pods: 4, target: 2,
++			wantReplicas: 2, wantWorkersToDelete: []string{"w-2", "w-3"}, wantPods: 4, wantStopped: true,
++		},
++		"replicas above the running workers end at the target too": {
++			replicas: 6, pods: 4, target: 2,
++			wantReplicas: 2, wantWorkersToDelete: []string{"w-2", "w-3"}, wantPods: 4, wantStopped: true,
++		},
++		"a gated worker the lowered replicas leave no room for is listed too": {
++			replicas: 3, pods: 3, gated: 1, target: 1,
++			wantReplicas: 1, wantWorkersToDelete: []string{"g-0", "w-1", "w-2"}, wantPods: 4, wantStopped: true,
++		},
++		"replicas above the running workers are lowered even with nothing to stop": {
++			replicas: 4, pods: 2, target: 2,
++			wantReplicas: 2, wantPods: 2,
++		},
++		"a group at its target is left alone": {
++			replicas: 2, pods: 2, target: 2,
++			wantReplicas: 2, wantPods: 2,
++		},
++		"the workers are deleted directly without a RayCluster": {
++			noCluster: true, pods: 4, target: 2, wantPods: 2, wantStopped: true,
++		},
++	}
++	for name, tc := range testCases {
++		t.Run(name, func(t *testing.T) {
++			ctx, _ := utiltesting.ContextWithLog(t)
++			now := time.Now().Truncate(time.Second)
++			wl := utiltestingapi.MakeWorkload("wl", "ns").Obj()
++			cluster := &rayv1.RayCluster{
++				ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns"},
++				Spec: rayv1.RayClusterSpec{WorkerGroupSpecs: []rayv1.WorkerGroupSpec{{
++					GroupName:     "workers",
++					Replicas:      ptr.To(tc.replicas),
++					MinReplicas:   ptr.To(tc.minReplicas),
++					MaxReplicas:   ptr.To(int32(10)),
++					NumOfHosts:    tc.numOfHosts,
++					ScaleStrategy: rayv1.ScaleStrategy{WorkersToDelete: tc.listed},
++				}}},
++			}
++			hosts := max(tc.numOfHosts, 1)
++			var objs []client.Object
++			for i := range tc.pods {
++				objs = append(objs, testingpod.MakePod("w-"+string(rune('0'+i)), "ns").
++					Annotation(kueue.WorkloadSliceNameAnnotation, wl.Name).
++					Label(constants.PodSetLabel, "workers").
++					Label(rayutils.RayNodeGroupLabelKey, "workers").
++					Label(rayutils.RayWorkerReplicaNameKey, "replica-"+string(rune('0'+int32(i)/hosts))).
++					CreationTimestamp(now.Add(time.Duration(i)*time.Second)).
++					Obj())
++			}
++			for i := range tc.gated {
++				objs = append(objs, testingpod.MakePod("g-"+string(rune('0'+i)), "ns").
++					Annotation(kueue.WorkloadSliceNameAnnotation, wl.Name).
++					Label(constants.PodSetLabel, "workers").
++					Label(rayutils.RayNodeGroupLabelKey, "workers").
++					Label(rayutils.RayWorkerReplicaNameKey, "replica-g"+string(rune('0'+i))).
++					CreationTimestamp(now.Add(time.Hour)).
++					Gate(kueue.ElasticJobSchedulingGate).
++					Obj())
++			}
++			if !tc.noCluster {
++				objs = append(objs, cluster)
++			}
++			kClient := utiltesting.NewClientBuilder(rayv1.AddToScheme).WithObjects(objs...).
++				WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).Build()
++
++			stopped, err := StopWorkersAbove(ctx, kClient, wl, workload.PodSetsCounts{"workers": tc.target}, client.ObjectKeyFromObject(cluster))
++			if err != nil {
++				t.Fatalf("StopWorkersAbove() error: %v", err)
++			}
++			if stopped != tc.wantStopped {
++				t.Errorf("StopWorkersAbove() = %v, want %v", stopped, tc.wantStopped)
++			}
++			var pods corev1.PodList
++			if err := kClient.List(ctx, &pods); err != nil {
++				t.Fatalf("List() error: %v", err)
++			}
++			if len(pods.Items) != tc.wantPods {
++				t.Errorf("Pods = %d, want %d", len(pods.Items), tc.wantPods)
++			}
++			if tc.noCluster {
++				return
++			}
++			var got rayv1.RayCluster
++			if err := kClient.Get(ctx, client.ObjectKeyFromObject(cluster), &got); err != nil {
++				t.Fatalf("Get() error: %v", err)
++			}
++			group := got.Spec.WorkerGroupSpecs[0]
++			if gotReplicas := ptr.Deref(group.Replicas, -1); gotReplicas != tc.wantReplicas {
++				t.Errorf("Replicas = %d, want %d", gotReplicas, tc.wantReplicas)
++			}
++			wantListed := tc.wantWorkersToDelete
++			if wantListed == nil {
++				wantListed = tc.listed
++			}
++			if diff := cmp.Diff(wantListed, group.ScaleStrategy.WorkersToDelete); diff != "" {
++				t.Errorf("WorkersToDelete (-want,+got):\n%s", diff)
++			}
++		})
++	}
++}
++
++func TestReconcileLowersReplicasOnceWhenTheQuotaIsAlreadyReleased(t *testing.T) {
++	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
++	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
++	ctx, _ := utiltesting.ContextWithLog(t)
++	now := time.Now().Truncate(time.Second)
++	requestedAt := now.UTC().Format(time.RFC3339)
++
++	job := testingrayutil.MakeCluster("job", "ns").
++		SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Suspend(false).
++		Queue("lq").
++		RequestWorkerGroup(corev1.ResourceCPU, "1").
++		ScaleFirstWorkerGroup(4).
++		Obj()
++	podSets, err := (*RayCluster)(job).PodSets(ctx, nil)
++	if err != nil {
++		t.Fatalf("PodSets() error: %v", err)
++	}
++	workers := podSets[1].Name
++	// Nothing ran above the target, so its quota is already released.
++	wl := utiltestingapi.MakeWorkload("wl", "ns").
++		Finalizers(kueue.ResourceInUseFinalizerName).
++		Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++		Annotation(constants.ReclaimTargetCountsAnnotation, workload.FormatPodSetCounts(workload.PodSetsCounts{workers: 2})).
++		Annotation(constants.ReclaimRequestedAtAnnotation, requestedAt).
++		ControllerReference(gvk, job.Name, string(job.UID)).
++		PodSets(podSets...).
++		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").PodSets(
++			utiltestingapi.MakePodSetAssignment(podSets[0].Name).Obj(),
++			utiltestingapi.MakePodSetAssignment(workers).Count(4).Obj(),
++		).Obj(), now).
++		AdmittedAt(true, now).
++		ReclaimablePods(kueue.ReclaimablePod{Name: workers, Count: 2}).
++		Obj()
++	builder := utiltesting.NewClientBuilder(rayv1.AddToScheme).
++		WithObjects(utiltesting.MakeNamespace("ns"), job, wl).
++		WithStatusSubresource(wl).
++		WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName)
++	indexer := utiltesting.AsIndexer(builder)
++	if err := SetupIndexes(ctx, indexer); err != nil {
++		t.Fatalf("SetupIndexes() error: %v", err)
++	}
++	kClient := builder.Build()
++	reconciler, err := NewReconciler(ctx, kClient, indexer, &utiltesting.EventRecorder{})
++	if err != nil {
++		t.Fatalf("NewReconciler() error: %v", err)
++	}
++	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(job)}
++	replicas := func() int32 {
++		var got rayv1.RayCluster
++		if err := kClient.Get(ctx, client.ObjectKeyFromObject(job), &got); err != nil {
++			t.Fatalf("Get() error: %v", err)
++		}
++		return ptr.Deref(got.Spec.WorkerGroupSpecs[0].Replicas, -1)
++	}
++
++	if _, err := reconciler.Reconcile(ctx, request); err != nil {
++		t.Fatalf("Reconcile() error: %v", err)
++	}
++	if got := replicas(); got != 2 {
++		t.Errorf("Replicas after reconcile = %d, want 2", got)
++	}
++	var gotWl kueue.Workload
++	if err := kClient.Get(ctx, client.ObjectKeyFromObject(wl), &gotWl); err != nil {
++		t.Fatalf("Get() error: %v", err)
++	}
++	if got := gotWl.Annotations[constants.ReclaimStoppedAtAnnotation]; got != requestedAt {
++		t.Errorf("%s = %q, want %q", constants.ReclaimStoppedAtAnnotation, got, requestedAt)
++	}
++
++	// The autoscaler asks for workers again; the request is already handled.
++	var cluster rayv1.RayCluster
++	if err := kClient.Get(ctx, client.ObjectKeyFromObject(job), &cluster); err != nil {
++		t.Fatalf("Get() error: %v", err)
++	}
++	cluster.Spec.WorkerGroupSpecs[0].Replicas = ptr.To[int32](4)
++	if err := kClient.Update(ctx, &cluster); err != nil {
++		t.Fatalf("Update() error: %v", err)
++	}
++	if _, err := reconciler.Reconcile(ctx, request); err != nil {
++		t.Fatalf("second Reconcile() error: %v", err)
++	}
++	if got := replicas(); got != 4 {
++		t.Errorf("Replicas after the second reconcile = %d, want 4", got)
++	}
++}
 diff --git a/pkg/controller/jobs/rayjob/partial_stop_test.go b/pkg/controller/jobs/rayjob/partial_stop_test.go
 new file mode 100644
-index 0000000..25d7b41
+index 0000000..26dcdc6
 --- /dev/null
 +++ b/pkg/controller/jobs/rayjob/partial_stop_test.go
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,109 @@
 +// Tests RayJob reclaim boundaries and readiness while replacement workers stay gated.
 +
 +package rayjob
@@ -1461,6 +1969,49 @@ index 0000000..25d7b41
 +	}
 +}
 +
++func TestRayJobStopsWorkersThroughItsRayCluster(t *testing.T) {
++	ctx, _ := utiltesting.ContextWithLog(t)
++	spec := &rayv1.RayClusterSpec{
++		EnableInTreeAutoscaling: ptr.To(true),
++		WorkerGroupSpecs:        []rayv1.WorkerGroupSpec{{GroupName: "workers", Replicas: ptr.To[int32](2)}},
++	}
++	job := &RayJob{
++		ObjectMeta: metav1.ObjectMeta{Name: "job", Namespace: "ns"},
++		Spec:       rayv1.RayJobSpec{RayClusterSpec: spec},
++		Status:     rayv1.RayJobStatus{RayClusterName: "job-abcde"},
++	}
++	child := &rayv1.RayCluster{
++		ObjectMeta: metav1.ObjectMeta{Name: "job-abcde", Namespace: "ns"},
++		Spec:       rayv1.RayClusterSpec{WorkerGroupSpecs: []rayv1.WorkerGroupSpec{{GroupName: "workers", Replicas: ptr.To[int32](2)}}},
++	}
++	wl := api.MakeWorkload("slice", "ns").Obj()
++	var objs []client.Object
++	objs = append(objs, child)
++	for _, name := range []string{"a", "b"} {
++		objs = append(objs, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", Annotations: map[string]string{kueue.WorkloadSliceNameAnnotation: wl.Name}, Labels: map[string]string{constants.PodSetLabel: "workers"}}})
++	}
++	c := utiltesting.NewClientBuilder(rayv1.AddToScheme).WithObjects(objs...).WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).Build()
++	stopped, err := job.StopPartially(ctx, c, wl, workload.PodSetsCounts{"workers": 0})
++	if err != nil || !stopped {
++		t.Fatalf("StopPartially() = %v, %v, want true", stopped, err)
++	}
++	var pods corev1.PodList
++	if err := c.List(ctx, &pods); err != nil {
++		t.Fatal(err)
++	}
++	if len(pods.Items) != 2 {
++		t.Errorf("pods=%d, want both left for KubeRay to delete", len(pods.Items))
++	}
++	var got rayv1.RayCluster
++	if err := c.Get(ctx, client.ObjectKeyFromObject(child), &got); err != nil {
++		t.Fatal(err)
++	}
++	group := got.Spec.WorkerGroupSpecs[0]
++	if ptr.Deref(group.Replicas, -1) != 0 || !reflect.DeepEqual(group.ScaleStrategy.WorkersToDelete, []string{"a", "b"}) {
++		t.Errorf("replicas=%v workersToDelete=%v, want 0 and [a b]", group.Replicas, group.ScaleStrategy.WorkersToDelete)
++	}
++}
++
 +func TestRayJobReadyDuringReclaim(t *testing.T) {
 +	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
 +	ctx, _ := utiltesting.ContextWithLog(t)
@@ -1476,10 +2027,10 @@ index 0000000..25d7b41
 +}
 diff --git a/pkg/workload/partial_preemption_test.go b/pkg/workload/partial_preemption_test.go
 new file mode 100644
-index 0000000..5a4232b
+index 0000000..21b0b2e
 --- /dev/null
 +++ b/pkg/workload/partial_preemption_test.go
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,320 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1772,6 +2323,32 @@ index 0000000..5a4232b
 +				t.Errorf("podSetsCountsAfterReclaim() (-want,+got):\n%s", diff)
 +			}
 +		})
++	}
++}
++
++func TestReclaimStopPendingTellsApartRequestsOfTheSameSecond(t *testing.T) {
++	wl := &kueue.Workload{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
++		constants.ReclaimTargetCountsAnnotation: "a=2",
++		constants.ReclaimRequestedAtAnnotation:  "2026-01-01T00:00:00Z",
++		constants.ReclaimGenerationAnnotation:   "1",
++	}}}
++	if !ReclaimStopPending(wl) {
++		t.Fatal("ReclaimStopPending() = false for a request nothing stopped for")
++	}
++	request := ReclaimRequest(wl)
++	SetReclaimStopped(wl)
++	if ReclaimStopPending(wl) {
++		t.Fatal("ReclaimStopPending() = true after the request was marked stopped")
++	}
++
++	wl.Annotations[constants.ReclaimTargetCountsAnnotation] = "a=1"
++	wl.Annotations[constants.ReclaimGenerationAnnotation] = NextReclaimGeneration(wl)
++	if !ReclaimStopPending(wl) {
++		t.Error("ReclaimStopPending() = false for a deeper request made within the same second")
++	}
++	SetReclaimStoppedFor(wl, request)
++	if !ReclaimStopPending(wl) {
++		t.Error("ReclaimStopPending() = false after marking the earlier request stopped, want the deeper one pending")
 +	}
 +}
 diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go
@@ -2233,4 +2810,3 @@ index 0000000..cbbd8e8
 +		})
 +	}
 +}
--- 

@@ -197,10 +197,10 @@ index 6da3b27..3c1cc74 100644
  }
 diff --git a/pkg/scheduler/preemption/partial_preemption.go b/pkg/scheduler/preemption/partial_preemption.go
 new file mode 100644
-index 0000000..0b4aab8
+index 0000000..2ebe452
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption.go
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,276 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -472,6 +472,7 @@ index 0000000..0b4aab8
 +		return false
 +	}
 +	workload.SetReclaimTargetCounts(wl, targets)
++	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimGenerationAnnotation, workload.NextReclaimGeneration(wl))
 +	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimPreemptorAnnotation, string(preemptor))
 +	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimRequestedAtAnnotation, now.UTC().Format(time.RFC3339))
 +	return true
@@ -1201,10 +1202,10 @@ index 0000000..83fb2de
 +}
 diff --git a/pkg/scheduler/preemption/partial_preemption_test.go b/pkg/scheduler/preemption/partial_preemption_test.go
 new file mode 100644
-index 0000000..dbc9110
+index 0000000..a3aa650
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption_test.go
-@@ -0,0 +1,927 @@
+@@ -0,0 +1,930 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1877,6 +1878,9 @@ index 0000000..dbc9110
 +	}
 +	if got := wl.Annotations[constants.ReclaimRequestedAtAnnotation]; got != now.UTC().Format(time.RFC3339) {
 +		t.Errorf("requested-at = %q, want the time the target was lowered, %s", got, now.UTC().Format(time.RFC3339))
++	}
++	if got := wl.Annotations[constants.ReclaimGenerationAnnotation]; got != "1" {
++		t.Errorf("generation = %q, want 1 for the first request", got)
 +	}
 +	if got := wl.Annotations[constants.ReclaimPreemptorAnnotation]; got != "default/next" {
 +		t.Errorf("preemptor = %q, want the preemptor that lowered the target", got)

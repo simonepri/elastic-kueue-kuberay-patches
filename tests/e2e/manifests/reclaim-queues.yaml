@@ -1,0 +1,68 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: reclaim-priority-low
+value: 100
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: WorkloadPriorityClass
+metadata:
+  name: reclaim-priority-high
+value: 1000
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: reclaim-flavor
+spec: {}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: reclaim-borrower-cluster-queue
+spec:
+  namespaceSelector: {}
+  cohortName: reclaim-cohort
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: reclaim-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "100m"
+            - name: "memory"
+              nominalQuota: "256Mi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: reclaim-owner-cluster-queue
+spec:
+  namespaceSelector: {}
+  cohortName: reclaim-cohort
+  preemption:
+    reclaimWithinCohort: Any
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: reclaim-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "500m"
+            - name: "memory"
+              nominalQuota: "1280Mi"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: reclaim-borrower-local-queue
+spec:
+  clusterQueue: reclaim-borrower-cluster-queue
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: reclaim-owner-local-queue
+spec:
+  clusterQueue: reclaim-owner-cluster-queue

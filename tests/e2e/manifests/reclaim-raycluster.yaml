@@ -1,0 +1,42 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: reclaim-raycluster
+  labels:
+    kueue.x-k8s.io/queue-name: reclaim-borrower-local-queue
+    kueue.x-k8s.io/priority-class: reclaim-priority-low
+  annotations:
+    kueue.x-k8s.io/elastic-job: "true"
+    kueue.x-k8s.io/elastic-job-scale-up-strategy: partial
+    kueue.x-k8s.io/reclaim-min-counts: '{"workers":0}'
+spec:
+  rayVersion: "2.60.0"
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: kind.local/ray:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "256Mi"
+  workerGroupSpecs:
+    - groupName: workers
+      rayStartParams: {}
+      replicas: 3
+      minReplicas: 0
+      maxReplicas: 3
+      template:
+        spec:
+          containers:
+            - name: ray-worker
+              image: kind.local/ray:latest
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"

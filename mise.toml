@@ -15,7 +15,7 @@ CLUSTER_NAME = "elastic-scale-lab"
 # Cluster tasks use only this kubeconfig, never the default one, so they cannot reach a cluster other than the lab.
 KUBECONFIG = "{{config_root}}/.local/kind/kubeconfig"
 # renovate: datasource=github-releases depName=kubernetes-sigs/kueue
-KUEUE_UPSTREAM = "v0.20.5"
+KUEUE_UPSTREAM = "v0.20.6"
 # renovate: datasource=github-releases depName=ray-project/kuberay
 KUBERAY_UPSTREAM = "v1.7.2"
 # renovate: datasource=github-releases depName=kubernetes-sigs/karpenter

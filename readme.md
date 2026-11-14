@@ -4,7 +4,7 @@
 [![Release Please](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml/badge.svg)](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](license)
 <!-- renovate: datasource=github-releases depName=kubernetes-sigs/kueue -->
-[![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.20.5-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.5)
+[![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.20.6-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.6)
 <!-- renovate: datasource=github-releases depName=ray-project/kuberay -->
 [![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.7.2-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.7.2)
 <!-- renovate: datasource=github-releases depName=kubernetes-sigs/karpenter -->

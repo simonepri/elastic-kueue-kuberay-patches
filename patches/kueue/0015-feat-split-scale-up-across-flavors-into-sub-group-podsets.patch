@@ -674,10 +674,10 @@ index 181f7b1..7b6ebb4 100644
  		template.Labels = make(map[string]string, 3)
  	}
 diff --git a/pkg/controller/jobs/raycluster/partial_stop.go b/pkg/controller/jobs/raycluster/partial_stop.go
-index c1a29df..5e43157 100644
+index ddc22fd..984c284 100644
 --- a/pkg/controller/jobs/raycluster/partial_stop.go
 +++ b/pkg/controller/jobs/raycluster/partial_stop.go
-@@ -78,7 +78,7 @@ func StopWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload,
+@@ -79,7 +79,7 @@ func StopWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload,
  		group := workerGroupName(p)
  		byGroup[group] = append(byGroup[group], p)
  	}

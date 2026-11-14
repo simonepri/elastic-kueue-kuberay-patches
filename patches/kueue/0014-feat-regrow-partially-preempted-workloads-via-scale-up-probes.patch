@@ -42,7 +42,7 @@ index 0000000..f9ea8bb
 +// queues too, so it does not block the workloads behind it while it waits.
 +const RequeueReasonRegrowthHeld RequeueReason = "RegrowthHeld"
 diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
-index 75c6aac..dc39c64 100644
+index 30e8210..2932c1b 100644
 --- a/pkg/controller/jobframework/partial_stop.go
 +++ b/pkg/controller/jobframework/partial_stop.go
 @@ -26,7 +26,6 @@ import (
@@ -50,10 +50,10 @@ index 75c6aac..dc39c64 100644
  
  	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 -	"sigs.k8s.io/kueue/pkg/features"
+ 	clientutil "sigs.k8s.io/kueue/pkg/util/client"
  	"sigs.k8s.io/kueue/pkg/workload"
  	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
- 	"sigs.k8s.io/kueue/pkg/workloadslicing"
-@@ -55,7 +54,7 @@ const partialStopRequeueAfter = 5 * time.Second
+@@ -56,7 +55,7 @@ const partialStopRequeueAfter = 5 * time.Second
  // the reconcile ends here and is requeued until the ElasticJobUngater releases the quota.
  func (r *JobReconciler) stopJobPartially(ctx context.Context, job GenericJob, wl *kueue.Workload) (ctrl.Result, bool, error) {
  	partialJob, ok := job.(JobWithPartialStop)
@@ -1019,7 +1019,7 @@ index 0000000..51e898a
 +	}
 +}
 diff --git a/pkg/controller/jobs/raycluster/partial_stop_test.go b/pkg/controller/jobs/raycluster/partial_stop_test.go
-index 0cc6445..d3c8c4b 100644
+index 9ca5d52..7d1f616 100644
 --- a/pkg/controller/jobs/raycluster/partial_stop_test.go
 +++ b/pkg/controller/jobs/raycluster/partial_stop_test.go
 @@ -56,9 +56,11 @@ func TestReconcileStopsWorkersAboveReclaimTargets(t *testing.T) {
@@ -1692,15 +1692,15 @@ index 0000000..842ffba
 +	}
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
-index daa66d4..7702e5a 100644
+index 37ed3d5..cd3b2a4 100644
 --- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
-@@ -311,18 +311,39 @@ var _ = ginkgo.Describe("RayCluster with partial preemption", ginkgo.Label("job:
+@@ -346,18 +346,40 @@ var _ = ginkgo.Describe("RayCluster with partial preemption", ginkgo.Label("job:
  		expectPodsUsage(7)
  		probe := behavioral.ExpectNewWorkloadSlice(ctx, k8sClient, wl)
  
 -		ginkgo.By("shrinking the victim to four workers; no worker runs, so the quota is released at once")
--		setReclaimTarget(wl, 4)
+-		setReclaimTarget(wl, 4, true)
 -		expectSlice(wl, 8, 4, 4)
 -		expectPodsUsage(5)
 -
@@ -1732,6 +1732,7 @@ index daa66d4..7702e5a 100644
 +			workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{workersGroupName: 4})
 +			metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimPreemptorAnnotation, string(workload.Key(preemptorWl)))
 +			metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimRequestedAtAnnotation, time.Now().UTC().Format(time.RFC3339))
++			workload.SetReclaimStopped(wl)
 +			g.Expect(k8sClient.Update(ctx, wl)).Should(gomega.Succeed())
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +		expectSlice(wl, 8, 4, 4)
@@ -1741,7 +1742,7 @@ index daa66d4..7702e5a 100644
  		expectPodsUsage(7)
  
  		ginkgo.By("scaling the victim to six workers, its admitted count, as the autoscaler does")
-@@ -333,12 +354,16 @@ var _ = ginkgo.Describe("RayCluster with partial preemption", ginkgo.Label("job:
+@@ -368,12 +390,16 @@ var _ = ginkgo.Describe("RayCluster with partial preemption", ginkgo.Label("job:
  			g.Expect(workload.ReclaimableCounts(wl)[workersGroupName]).Should(gomega.Equal(int32(4)))
  			g.Expect(workload.IsAdmitted(wl)).Should(gomega.BeTrue())
  		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
@@ -1764,10 +1765,10 @@ index daa66d4..7702e5a 100644
  	})
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go
 new file mode 100644
-index 0000000..a5e8a75
+index 0000000..0ab0d72
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go
-@@ -0,0 +1,574 @@
+@@ -0,0 +1,577 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1904,7 +1905,7 @@ index 0000000..a5e8a75
 +		gomega.Expect(got.Spec.WorkerGroupSpecs[0].Replicas).Should(gomega.Equal(new(replicas)))
 +	}
 +	// reclaim writes the reclaim target, preemptor and request time that partial preemption
-+	// sets on a victim in one update.
++	// sets on a victim in one update, with the request marked as already stopped.
 +	reclaim := func(wl *kueue.Workload, target int32, preemptor string) {
 +		ginkgo.GinkgoHelper()
 +		gomega.Eventually(func(g gomega.Gomega) {
@@ -1914,6 +1915,9 @@ index 0000000..a5e8a75
 +				wl.Annotations[constants.ReclaimPreemptorAnnotation] = preemptor
 +				wl.Annotations[constants.ReclaimRequestedAtAnnotation] = time.Now().UTC().Format(time.RFC3339)
 +			}
++			// These specs exercise the regrowth from the cluster's replicas as they are, so
++			// the job's workers count as stopped already and its replicas stay.
++			workload.SetReclaimStopped(wl)
 +			g.Expect(k8sClient.Update(ctx, wl)).Should(gomega.Succeed())
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +	}
@@ -2026,8 +2030,8 @@ index 0000000..a5e8a75
 +		expectPendingFor(probe)
 +
 +		ginkgo.By("the workers above the target terminate, and the target's quota is released")
-+		// The stopper of patch 0009 has listed the workers above the target for KubeRay, which
-+		// envtest does not run, so the spec deletes them itself.
++		// The stopper of patch 0008 has deleted the 2 workers above the target by now, and they
++		// stay Terminating; without it, the spec deletes them itself.
 +		pods := &corev1.PodList{}
 +		gomega.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name))).To(gomega.Succeed())
 +		if !slices.ContainsFunc(pods.Items, func(p corev1.Pod) bool { return p.DeletionTimestamp != nil }) {
@@ -2051,9 +2055,9 @@ index 0000000..a5e8a75
 +			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(partial), partial)).Should(gomega.Succeed())
 +			g.Expect(partial.Status.ReclaimablePods).Should(gomega.ConsistOf(kueue.ReclaimablePod{Name: workersGroupName, Count: 4}))
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
-+		ginkgo.By("the cluster ends at the target, so the probe has nothing left to grow")
-+		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(probe))
-+		expectReplicas(rayCluster, 4)
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, probe, workersGroupName, 8)
++		behavioral.ExpectWorkloadToFinish(ctx, k8sClient, client.ObjectKeyFromObject(partial))
++		expectReplicas(rayCluster, 8)
 +	})
 +
 +	if !partialPreemption {

@@ -9,18 +9,18 @@ When partial preemption shrinks a workload, Kueue must not immediately release q
 Introduce reclaim target tracking in the workload and elastic job ungater controllers. Cap ungating at the target counts, mark stopped pods reclaimable in the Workload status once they terminate, and reconcile in-place scale-downs so that autoscaler adjustments below or up to admitted counts preserve correct quota accounting. Defer an in-place scale-down that reaches a pending reclaim target until the pods above it are gone, so lowering the worker group replicas does not release quota early.
 ---
  pkg/controller/core/reclaim_targets.go        |  47 +++
- pkg/controller/core/reclaim_targets_test.go   | 146 ++++++++
+ pkg/controller/core/reclaim_targets_test.go   | 146 +++++++
  pkg/controller/core/workload_controller.go    |   3 +
  .../elasticjobs/elastic_job_ungater.go        |   4 +
  pkg/controller/elasticjobs/reclaim_targets.go |  76 ++++
- .../elasticjobs/reclaim_targets_test.go       | 209 +++++++++++
- pkg/controller/jobframework/partial_stop.go   |  15 +-
+ .../elasticjobs/reclaim_targets_test.go       | 209 ++++++++++
+ pkg/controller/jobframework/partial_stop.go   |  23 +-
  pkg/workloadslicing/manager.go                |  57 +++
- pkg/workloadslicing/partial_preemption.go     | 107 ++++++
- .../partial_preemption_test.go                | 198 +++++++++-
+ pkg/workloadslicing/partial_preemption.go     | 107 +++++
+ .../partial_preemption_test.go                | 198 ++++++++-
  pkg/workloadslicing/workloadslicing.go        |  38 +-
- ...ster_controller_partial_preemption_test.go | 345 ++++++++++++++++++
- 12 files changed, 1224 insertions(+), 21 deletions(-)
+ ...ster_controller_partial_preemption_test.go | 380 ++++++++++++++++++
+ 12 files changed, 1263 insertions(+), 25 deletions(-)
  create mode 100644 pkg/controller/core/reclaim_targets.go
  create mode 100644 pkg/controller/core/reclaim_targets_test.go
  create mode 100644 pkg/controller/elasticjobs/reclaim_targets.go
@@ -199,28 +199,37 @@ index 0000000..6df262b
 +	}
 +}
 diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
-index 9be7e7f..75c6aac 100644
+index 1676563..30e8210 100644
 --- a/pkg/controller/jobframework/partial_stop.go
 +++ b/pkg/controller/jobframework/partial_stop.go
-@@ -55,17 +55,24 @@ const partialStopRequeueAfter = 5 * time.Second
+@@ -56,30 +56,37 @@ const partialStopRequeueAfter = 5 * time.Second
  // the reconcile ends here and is requeued until the ElasticJobUngater releases the quota.
  func (r *JobReconciler) stopJobPartially(ctx context.Context, job GenericJob, wl *kueue.Workload) (ctrl.Result, bool, error) {
  	partialJob, ok := job.(JobWithPartialStop)
 -	if !ok || !features.Enabled(features.PartialPreemption) || job.IsSuspended() || !workload.IsAdmitted(wl) || workloadevict.IsEvicted(wl) {
 +	if !ok || !features.Enabled(features.PartialPreemption) || job.IsSuspended() || workloadevict.IsEvicted(wl) {
- 		return ctrl.Result{}, false, nil
- 	}
--	targets := workload.PendingReclaimTargetCounts(wl)
++		return ctrl.Result{}, false, nil
++	}
 +	targetWl, err := r.podsReadyWorkload(ctx, job, wl)
 +	if err != nil {
 +		return ctrl.Result{}, true, err
 +	}
 +	if targetWl == nil || !workload.IsAdmitted(targetWl) || workloadevict.IsEvicted(targetWl) {
-+		return ctrl.Result{}, false, nil
-+	}
-+	targets := workload.PendingReclaimTargetCounts(targetWl)
- 	if len(targets) == 0 {
  		return ctrl.Result{}, false, nil
+ 	}
+ 	// The workers stop once per reclaim request, which a mark on the Workload records.
+-	if !workload.ReclaimStopPending(wl) {
++	if !workload.ReclaimStopPending(targetWl) {
+ 		return ctrl.Result{}, false, nil
+ 	}
+ 	// The quota may be released before this reconcile looks at the job, when no worker
+ 	// ran above the target; the job's replicas still go down to it.
+-	targets := workload.PendingReclaimTargetCounts(wl)
++	targets := workload.PendingReclaimTargetCounts(targetWl)
+ 	pending := len(targets) > 0
+ 	if !pending {
+-		targets = workload.ReclaimTargetCounts(wl)
++		targets = workload.ReclaimTargetCounts(targetWl)
  	}
 -	stopped, err := partialJob.StopPartially(ctx, r.client, wl, targets)
 +	stopped, err := partialJob.StopPartially(ctx, r.client, targetWl, targets)
@@ -231,6 +240,14 @@ index 9be7e7f..75c6aac 100644
  	}
  	if err != nil {
  		return ctrl.Result{}, true, err
+ 	}
+-	if err := clientutil.Patch(ctx, r.client, wl, func() (bool, error) {
+-		workload.SetReclaimStopped(wl)
++	if err := clientutil.Patch(ctx, r.client, targetWl, func() (bool, error) {
++		workload.SetReclaimStopped(targetWl)
+ 		return true, nil
+ 	}, clientutil.WithRetryOnConflict()); err != nil {
+ 		return ctrl.Result{}, true, client.IgnoreNotFound(err)
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
 index e6e7158..0d0b0b9 100644
 --- a/pkg/workloadslicing/manager.go
@@ -1120,10 +1137,10 @@ index cbbd8e8..e4a6d2e 100644
  	wl := utiltestingapi.MakeWorkload("wl", "ns").Annotation(kueue.WorkloadSliceNameAnnotation, "origin").Obj()
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
 new file mode 100644
-index 0000000..daa66d4
+index 0000000..37ed3d5
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,380 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1193,13 +1210,18 @@ index 0000000..daa66d4
 +			g.Expect(resources[idx].Total.Value()).Should(gomega.Equal(pods))
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +	}
-+	setReclaimTarget := func(wl *kueue.Workload, target int32) {
++	// setReclaimTarget writes the reclaim target, as the preemptor would; with stopped, the
++	// job's workers count as stopped already, and its replicas stay as they are.
++	setReclaimTarget := func(wl *kueue.Workload, target int32, stopped bool) {
 +		ginkgo.GinkgoHelper()
 +		gomega.Eventually(func(g gomega.Gomega) {
 +			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).Should(gomega.Succeed())
 +			workload.SetReclaimTargetCounts(wl, workload.PodSetsCounts{workersGroupName: target})
 +			metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimPreemptorAnnotation, wl.Namespace+"/preemptor")
 +			metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ReclaimRequestedAtAnnotation, time.Now().UTC().Format(time.RFC3339))
++			if stopped {
++				workload.SetReclaimStopped(wl)
++			}
 +			g.Expect(k8sClient.Update(ctx, wl)).Should(gomega.Succeed())
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +	}
@@ -1315,7 +1337,7 @@ index 0000000..daa66d4
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +
 +		ginkgo.By("setting the reclaim target to two workers")
-+		setReclaimTarget(wl, 2)
++		setReclaimTarget(wl, 2, false)
 +
 +		ginkgo.By("lowering the worker group to two replicas and listing the cheaper replica for deletion")
 +		gomega.Eventually(func(g gomega.Gomega) {
@@ -1381,6 +1403,36 @@ index 0000000..daa66d4
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +	})
 +
++	ginkgo.It("Should lower the replicas to the target when no worker runs above it", func() {
++		rayCluster := testingraycluster.MakeCluster("victim", ns.Name).
++			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
++			Queue(localQueue.Name).
++			RequestWorkerGroup(corev1.ResourceCPU, "1").
++			ScaleFirstWorkerGroup(8).
++			Obj()
++		behavioral.MustCreate(ctx, k8sClient, rayCluster)
++		wl := &behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 1)[0]
++		behavioral.ExpectPodSetAdmittedCount(ctx, k8sClient, wl, workersGroupName, 8)
++
++		ginkgo.By("reclaiming four workers when none runs, so the quota is released at once")
++		setReclaimTarget(wl, 4, false)
++
++		ginkgo.By("lowering the worker group to the target, once")
++		gomega.Eventually(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), rayCluster)).Should(gomega.Succeed())
++			g.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Replicas).Should(gomega.Equal(new(int32(4))))
++		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
++		expectSlice(wl, 4, 4, 0)
++		expectPodsUsage(5)
++
++		ginkgo.By("leaving the replicas alone when the autoscaler asks for workers again")
++		scaleWorkers(rayCluster, 6)
++		gomega.Consistently(func(g gomega.Gomega) {
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), rayCluster)).Should(gomega.Succeed())
++			g.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Replicas).Should(gomega.Equal(new(int32(6))))
++		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
++	})
++
 +	ginkgo.It("Should charge the target when the autoscaler scales down after a reclaim", func() {
 +		rayCluster := testingraycluster.MakeCluster("victim", ns.Name).
 +			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
@@ -1394,7 +1446,7 @@ index 0000000..daa66d4
 +		expectPodsUsage(9)
 +
 +		ginkgo.By("shrinking the victim to four workers; no worker runs, so the quota is released at once")
-+		setReclaimTarget(wl, 4)
++		setReclaimTarget(wl, 4, true)
 +		expectSlice(wl, 8, 4, 4)
 +		expectPodsUsage(5)
 +
@@ -1438,7 +1490,7 @@ index 0000000..daa66d4
 +		probe := behavioral.ExpectNewWorkloadSlice(ctx, k8sClient, wl)
 +
 +		ginkgo.By("shrinking the victim to four workers; no worker runs, so the quota is released at once")
-+		setReclaimTarget(wl, 4)
++		setReclaimTarget(wl, 4, true)
 +		expectSlice(wl, 8, 4, 4)
 +		expectPodsUsage(5)
 +

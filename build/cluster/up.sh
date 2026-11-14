@@ -21,7 +21,7 @@ fi
 
 # 2. Create Kind cluster if not already running, writing its credentials only to this repository's kubeconfig,
 # then refuse to go on unless kubectl targets that cluster.
-: "${KUBECONFIG:?KUBECONFIG must name this repository's kind kubeconfig; run mise run cluster:up}"
+: "${KUBECONFIG:?KUBECONFIG must name the kind kubeconfig of this repository, so run mise run cluster:up}"
 mkdir -p "$(dirname "$KUBECONFIG")"
 if ! kind get clusters | grep -q "^$CLUSTER_NAME$"; then
   echo "Creating Kind cluster $CLUSTER_NAME..."

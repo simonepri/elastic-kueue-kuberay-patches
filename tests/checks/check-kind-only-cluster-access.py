@@ -66,6 +66,12 @@ class GuardTest(unittest.TestCase):
 
 
 class WiringTest(unittest.TestCase):
+    def test_cluster_scripts_parse(self):
+        for script in [SETUP, GUARD]:
+            with self.subTest(script=script.name):
+                result = subprocess.run(["bash", "-n", str(script)], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_setup_touches_the_cluster_only_after_the_guard(self):
         lines = SETUP.read_text().splitlines()
         guard_at = next(i for i, line in enumerate(lines) if line.strip() == GUARD_CALL)

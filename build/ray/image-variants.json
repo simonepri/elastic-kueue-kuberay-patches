@@ -1,5 +1,4 @@
 [
   { "variant": "", "platforms": "linux/amd64,linux/arm64" },
-  { "variant": "-gpu", "platforms": "linux/amd64" },
-  { "variant": "-cu126", "platforms": "linux/amd64" }
+  { "variant": "-cu130", "platforms": "linux/amd64" }
 ]

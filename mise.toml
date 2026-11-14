@@ -12,6 +12,8 @@ python = "3.13.3"
 
 [env]
 CLUSTER_NAME = "elastic-scale-lab"
+# Cluster tasks use only this kubeconfig, never the default one, so they cannot reach a cluster other than the lab.
+KUBECONFIG = "{{config_root}}/.local/kind/kubeconfig"
 # renovate: datasource=github-releases depName=kubernetes-sigs/kueue
 KUEUE_UPSTREAM = "v0.20.5"
 # renovate: datasource=github-releases depName=ray-project/kuberay
@@ -115,11 +117,12 @@ run = "build/cluster/up.sh"
 
 [tasks."cluster:down"]
 description = "Tear down local Kind cluster"
-run = "kind delete cluster --name {{env.CLUSTER_NAME}}"
+run = "kind delete cluster --name {{env.CLUSTER_NAME}} --kubeconfig {{env.KUBECONFIG}}"
 
 [tasks."test:checks"]
 description = "Run static analysis and release order assertions"
 run = """
+python3 tests/checks/check-kind-only-cluster-access.py
 python3 tests/checks/check-kueue-setup-rbac.py
 python3 tests/checks/check-delayed-topology-bounds.py
 bash tests/checks/check-ray-release-order.sh
@@ -150,4 +153,7 @@ run = "build/kueue/test-integration.sh"
 
 [tasks."test:e2e"]
 description = "Run end-to-end integration tests using Chainsaw"
-run = "chainsaw test --config tests/e2e/chainsaw-config.yaml tests/e2e/ tests/checks/fixtures/delayed-topology/"
+run = [
+  "bash build/cluster/require-kind-context.sh",
+  "chainsaw test --config tests/e2e/chainsaw-config.yaml tests/e2e/ tests/checks/fixtures/delayed-topology/",
+]

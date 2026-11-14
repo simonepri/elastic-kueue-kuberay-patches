@@ -8,7 +8,7 @@ ko = "0.19.1"
 colima = "0.10.3"
 docker-cli = "29.9.3"
 jq = "1.8.1"
-python = "3.13.3"
+python = "3.15.2"
 
 [env]
 CLUSTER_NAME = "elastic-scale-lab"

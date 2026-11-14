@@ -42,7 +42,7 @@ index 0000000..f9ea8bb
 +// queues too, so it does not block the workloads behind it while it waits.
 +const RequeueReasonRegrowthHeld RequeueReason = "RegrowthHeld"
 diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
-index 30e8210..33bb138 100644
+index 30e8210..889f2d3 100644
 --- a/pkg/controller/jobframework/partial_stop.go
 +++ b/pkg/controller/jobframework/partial_stop.go
 @@ -26,7 +26,6 @@ import (
@@ -95,37 +95,34 @@ index 30e8210..33bb138 100644
  	stopped, err := partialJob.StopPartially(ctx, r.client, targetWl, targets)
  	if stopped {
  		r.record.Eventf(job.Object(), nil, corev1.EventTypeNormal, ReasonPartiallyStopped, "PartiallyStopped",
-@@ -85,11 +97,25 @@ func (r *JobReconciler) stopJobPartially(ctx context.Context, job GenericJob, wl
+@@ -85,12 +97,26 @@ func (r *JobReconciler) stopJobPartially(ctx context.Context, job GenericJob, wl
  	if err != nil {
  		return ctrl.Result{}, true, err
  	}
--	if err := clientutil.Patch(ctx, r.client, targetWl, func() (bool, error) {
--		workload.SetReclaimStopped(targetWl)
--		return true, nil
--	}, clientutil.WithRetryOnConflict()); err != nil {
--		return ctrl.Result{}, true, client.IgnoreNotFound(err)
 +	if !markPending {
 +		// The request is marked stopped already: the job's own changes wake the reconcile
 +		// up again, so nothing needs a requeue, and the rest of the reconcile goes on.
 +		return ctrl.Result{}, false, nil
 +	}
 +	superseded := false
-+	if err := clientutil.Patch(ctx, r.client, targetWl, func() (bool, error) {
+ 	if err := clientutil.Patch(ctx, r.client, targetWl, func() (bool, error) {
+-		workload.SetReclaimStopped(targetWl)
 +		superseded = workload.ReclaimRequest(targetWl) != request
 +		if superseded {
 +			return false, nil
 +		}
 +		workload.SetReclaimStoppedFor(targetWl, request)
-+		return true, nil
-+	}, clientutil.WithRetryOnConflict()); err != nil {
-+		return ctrl.Result{}, true, client.IgnoreNotFound(err)
-+	}
+ 		return true, nil
+ 	}, clientutil.WithRetryOnConflict()); err != nil {
+ 		return ctrl.Result{}, true, client.IgnoreNotFound(err)
+ 	}
 +	if superseded {
 +		// A deeper request arrived, which nothing stopped for yet: look again at once.
 +		return ctrl.Result{Requeue: true}, true, nil
- 	}
++	}
  	if !pending {
  		return ctrl.Result{}, false, nil
+ 	}
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
 index 8857237..55338aa 100644
 --- a/pkg/controller/jobframework/reconciler.go
@@ -1829,7 +1826,7 @@ index 37ed3d5..cd3b2a4 100644
  	})
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go
 new file mode 100644
-index 0000000..0ab0d72
+index 0000000..25a5d5e
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go
 @@ -0,0 +1,587 @@
@@ -2094,8 +2091,8 @@ index 0000000..0ab0d72
 +		expectPendingFor(probe)
 +
 +		ginkgo.By("the workers above the target terminate, and the target's quota is released")
-+		// The stopper of patch 0008 has deleted the 2 workers above the target by now, and they
-+		// stay Terminating; without it, the spec deletes them itself.
++		// The job controller's partial stop may have deleted the 2 workers above the target
++		// by now, and they stay Terminating; otherwise the spec deletes them itself.
 +		pods := &corev1.PodList{}
 +		gomega.Expect(k8sClient.List(ctx, pods, client.InNamespace(ns.Name))).To(gomega.Succeed())
 +		if !slices.ContainsFunc(pods.Items, func(p corev1.Pod) bool { return p.DeletionTimestamp != nil }) {

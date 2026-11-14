@@ -12,8 +12,8 @@ Implement collaborative partial worker stopping for RayCluster and RayJob worklo
  pkg/controller/core/indexer/indexer.go        |  14 +
  pkg/controller/jobframework/partial_stop.go   |  91 ++++
  pkg/controller/jobframework/reconciler.go     |   8 +
- .../jobs/raycluster/partial_stop.go           | 167 +++++++
- .../jobs/raycluster/partial_stop_test.go      | 373 ++++++++++++++
+ .../jobs/raycluster/partial_stop.go           | 201 ++++++++
+ .../jobs/raycluster/partial_stop_test.go      | 387 +++++++++++++++
  .../jobs/raycluster/raycluster_controller.go  |   4 +-
  pkg/controller/jobs/rayjob/partial_stop.go    |  53 ++
  .../jobs/rayjob/partial_stop_test.go          | 109 +++++
@@ -26,7 +26,7 @@ Implement collaborative partial worker stopping for RayCluster and RayJob worklo
  pkg/workload/workload.go                      |   1 +
  pkg/workloadslicing/partial_preemption.go     | 462 ++++++++++++++++++
  .../partial_preemption_test.go                | 453 +++++++++++++++++
- 19 files changed, 2273 insertions(+), 12 deletions(-)
+ 19 files changed, 2321 insertions(+), 12 deletions(-)
  create mode 100644 pkg/constants/partial_preemption.go
  create mode 100644 pkg/constants/ray.go
  create mode 100644 pkg/controller/jobframework/partial_stop.go
@@ -264,10 +264,10 @@ index 0d6a832..e509826 100644
  		return ctrl.Result{RequeueAfter: requeueAfter}, err
 diff --git a/pkg/controller/jobs/raycluster/partial_stop.go b/pkg/controller/jobs/raycluster/partial_stop.go
 new file mode 100644
-index 0000000..b2bdd57
+index 0000000..c1a29df
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/partial_stop.go
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,201 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -306,6 +306,7 @@ index 0000000..b2bdd57
 +	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 +	"sigs.k8s.io/kueue/pkg/features"
 +	clientutil "sigs.k8s.io/kueue/pkg/util/client"
++	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 +	"sigs.k8s.io/kueue/pkg/workload"
 +	"sigs.k8s.io/kueue/pkg/workloadslicing"
 +)
@@ -347,7 +348,22 @@ index 0000000..b2bdd57
 +		group := workerGroupName(p)
 +		byGroup[group] = append(byGroup[group], p)
 +	}
-+	groupTargets := workloadslicing.FoldSplitCounts(wl.Spec.PodSets, targets)
++	groupTargets := targets
++	slicePods, err := workloadslicing.ListPodsForWorkloadSlice(ctx, c, wl.Namespace, workloadslicing.SliceName(wl))
++	if err != nil {
++		return false, err
++	}
++	stopping := sets.New[string]()
++	for _, p := range pods {
++		stopping.Insert(p.Name)
++	}
++	staying := make(map[string][]*corev1.Pod)
++	for _, p := range slicePods {
++		if p.DeletionTimestamp == nil && !utilpod.IsTerminated(p) && !stopping.Has(p.Name) && !leaving.Has(p.Name) &&
++			p.Labels[constants.PodSetLabel] != "" && p.Labels[rayutils.RayNodeTypeLabelKey] != string(rayv1.HeadNode) {
++			staying[workerGroupName(p)] = append(staying[workerGroupName(p)], p)
++		}
++	}
 +	var unlisted []*corev1.Pod
 +	err = clientutil.Patch(ctx, c, cluster, func() (bool, error) {
 +		unlisted = unlisted[:0]
@@ -361,7 +377,7 @@ index 0000000..b2bdd57
 +			if count, found := groupTargets[kueue.NewPodSetReference(group)]; found {
 +				target = &count
 +			}
-+			lowerWorkerGroup(&cluster.Spec.WorkerGroupSpecs[i], groupPods, target)
++			lowerWorkerGroup(&cluster.Spec.WorkerGroupSpecs[i], groupPods, target, staying[group])
 +		}
 +		return len(unlisted) < len(pods), nil
 +	}, clientutil.WithRetryOnConflict())
@@ -385,8 +401,10 @@ index 0000000..b2bdd57
 +
 +// lowerWorkerGroup brings the worker group down to the reclaim target of its Pods, when
 +// it has one, and otherwise by the replicas of pods, never below its minReplicas, and
-+// lists pods in its workersToDelete.
-+func lowerWorkerGroup(wgs *rayv1.WorkerGroupSpec, pods []*corev1.Pod, target *int32) {
++// lists pods in its workersToDelete. KubeRay deletes a Pod of its choice when the group
++// has more Pods than replicas, which could be a running one, so it also lists the gated
++// Pods of staying, the newest replicas first, that the lowered replicas leave no room for.
++func lowerWorkerGroup(wgs *rayv1.WorkerGroupSpec, pods []*corev1.Pod, target *int32, staying []*corev1.Pod) {
 +	hosts := max(wgs.NumOfHosts, 1)
 +	leaving := sets.New(wgs.ScaleStrategy.WorkersToDelete...)
 +	for _, p := range pods {
@@ -401,7 +419,23 @@ index 0000000..b2bdd57
 +	if target != nil {
 +		lowered = min(current, (*target+hosts-1)/hosts)
 +	}
-+	wgs.Replicas = ptr.To(max(lowered, minReplicas))
++	replicas := max(lowered, minReplicas)
++	wgs.Replicas = ptr.To(replicas)
++	excess := len(staying) - int(replicas*hosts)
++	for _, p := range slices.SortedFunc(slices.Values(staying), func(a, b *corev1.Pod) int { return -a.CreationTimestamp.Compare(b.CreationTimestamp.Time) }) {
++		if excess <= 0 {
++			break
++		}
++		if !utilpod.HasGate(p, kueue.ElasticJobSchedulingGate) || leaving.Has(p.Name) {
++			continue
++		}
++		for _, sibling := range staying {
++			if workerReplicaName(sibling) == workerReplicaName(p) && !leaving.Has(sibling.Name) {
++				leaving.Insert(sibling.Name)
++				excess--
++			}
++		}
++	}
 +	wgs.ScaleStrategy.WorkersToDelete = slices.Sorted(maps.Keys(leaving))
 +}
 +
@@ -1309,10 +1343,10 @@ index 0000000..718489b
 +}
 diff --git a/pkg/controller/jobs/raycluster/partial_stop_test.go b/pkg/controller/jobs/raycluster/partial_stop_test.go
 new file mode 100644
-index 0000000..0cc6445
+index 0000000..3a2fba8
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/partial_stop_test.go
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,387 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1582,7 +1616,7 @@ index 0000000..0cc6445
 +	testCases := map[string]struct {
 +		replicas, minReplicas, numOfHosts int32
 +		listed                            []string
-+		pods                              int
++		pods, gated                       int
 +		target                            int32
 +		noCluster                         bool
 +		wantReplicas                      int32
@@ -1609,6 +1643,10 @@ index 0000000..0cc6445
 +		"replicas above the running workers end at the target too": {
 +			replicas: 6, pods: 4, target: 2,
 +			wantReplicas: 2, wantWorkersToDelete: []string{"w-2", "w-3"}, wantPods: 4, wantStopped: true,
++		},
++		"a gated worker the lowered replicas leave no room for is listed too": {
++			replicas: 3, pods: 3, gated: 1, target: 1,
++			wantReplicas: 1, wantWorkersToDelete: []string{"g-0", "w-1", "w-2"}, wantPods: 4, wantStopped: true,
 +		},
 +		"a group at its target is left alone": {
 +			replicas: 2, pods: 2, target: 2,
@@ -1643,6 +1681,16 @@ index 0000000..0cc6445
 +					Label(rayutils.RayNodeGroupLabelKey, "workers").
 +					Label(rayutils.RayWorkerReplicaNameKey, "replica-"+string(rune('0'+int32(i)/hosts))).
 +					CreationTimestamp(now.Add(time.Duration(i)*time.Second)).
++					Obj())
++			}
++			for i := range tc.gated {
++				objs = append(objs, testingpod.MakePod("g-"+string(rune('0'+i)), "ns").
++					Annotation(kueue.WorkloadSliceNameAnnotation, wl.Name).
++					Label(constants.PodSetLabel, "workers").
++					Label(rayutils.RayNodeGroupLabelKey, "workers").
++					Label(rayutils.RayWorkerReplicaNameKey, "replica-g"+string(rune('0'+i))).
++					CreationTimestamp(now.Add(time.Hour)).
++					Gate(kueue.ElasticJobSchedulingGate).
 +					Obj())
 +			}
 +			if !tc.noCluster {

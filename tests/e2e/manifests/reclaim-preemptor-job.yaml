@@ -17,8 +17,8 @@ spec:
           resources:
             requests:
               cpu: "100m"
-              memory: "16Mi"
+              memory: "256Mi"
             limits:
               cpu: "100m"
-              memory: "16Mi"
+              memory: "256Mi"
       restartPolicy: Never

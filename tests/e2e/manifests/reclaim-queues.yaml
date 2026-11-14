@@ -24,12 +24,14 @@ spec:
   namespaceSelector: {}
   cohortName: reclaim-cohort
   resourceGroups:
-    - coveredResources: ["cpu"]
+    - coveredResources: ["cpu", "memory"]
       flavors:
         - name: reclaim-flavor
           resources:
             - name: "cpu"
               nominalQuota: "100m"
+            - name: "memory"
+              nominalQuota: "256Mi"
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
@@ -42,12 +44,14 @@ spec:
     reclaimWithinCohort: Any
     withinClusterQueue: LowerPriority
   resourceGroups:
-    - coveredResources: ["cpu"]
+    - coveredResources: ["cpu", "memory"]
       flavors:
         - name: reclaim-flavor
           resources:
             - name: "cpu"
               nominalQuota: "500m"
+            - name: "memory"
+              nominalQuota: "1280Mi"
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue

@@ -216,8 +216,17 @@ spec:
                 ownerReferences:
                   - name: elastic-raycluster
               status:
-                (reclaimablePods[?name=='workers'].count):
-                  - 3
+                (conditions[?type=='Admitted' && status=='True'] | length(@) > `0`): true
+        - assert:
+            resource:
+              apiVersion: ray.io/v1
+              kind: RayCluster
+              metadata:
+                name: elastic-raycluster
+              spec:
+                workerGroupSpecs:
+                  - groupName: workers
+                    replicas: 1
         - assert:
             resource:
               apiVersion: batch/v1
@@ -240,7 +249,20 @@ spec:
               kind: Job
               name: urgent-batch-job
 
-    - name: 10a-launch-regrow-nodeclaims
+    - name: 10a-autoscaler-requests-workers-again
+      try:
+        # Partial preemption lowered the replicas to the workers it left running, so the
+        # regrowth starts when the Ray autoscaler asks for the workers again.
+        - script:
+            timeout: 30s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: |
+              kubectl -n "${NS}" patch raycluster elastic-raycluster --type=json \
+                -p '[{"op":"replace","path":"/spec/workerGroupSpecs/0/replicas","value":4}]'
+
+    - name: 10b-launch-regrow-nodeclaims
       try:
         - script:
             timeout: 30s
@@ -739,3 +761,127 @@ spec:
               status:
                 (reclaimablePods[?name=='workers'].count):
                   - 2
+---
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: elastic-ray-partial-reclaim-keeps-workers-stopped
+  labels:
+    scenario: partial-reclaim-no-recreation
+spec:
+  concurrent: false
+  description: >
+    An elastic RayCluster that borrows quota from a cohort is reclaimed down to zero workers
+    by a higher-priority job of the queue that owns the quota. The reclaimed workers must stay
+    gone: KubeRay deletes exactly the workers listed for deletion and does not recreate them,
+    the worker group's replicas drop to the target, and no new workload slice requests the
+    reclaimed capacity while the preemptor holds it.
+  catch:
+    - events: {}
+    - describe:
+        apiVersion: ray.io/v1
+        kind: RayCluster
+    - describe:
+        apiVersion: kueue.x-k8s.io/v1beta2
+        kind: Workload
+    - describe:
+        apiVersion: v1
+        kind: Pod
+    - podLogs:
+        namespace: kueue-system
+        selector: control-plane=controller-manager
+        tail: 150
+  steps:
+    - name: 01-setup-cohort-queues
+      try:
+        - apply:
+            file: manifests/reclaim-queues.yaml
+
+    - name: 02-submit-borrowing-raycluster
+      try:
+        - apply:
+            file: manifests/reclaim-raycluster.yaml
+
+    - name: 03-assert-cluster-running-with-three-workers
+      try:
+        - assert:
+            resource:
+              apiVersion: kueue.x-k8s.io/v1beta2
+              kind: Workload
+              metadata:
+                ownerReferences:
+                  - name: reclaim-raycluster
+              status:
+                (conditions[?type=='Admitted' && status=='True'] | length(@) > `0`): true
+        - assert:
+            resource:
+              (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."ray.io/group" == 'workers'])): 3
+              (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."ray.io/node-type" == 'head'])): 1
+
+    - name: 04-submit-owner-job
+      try:
+        - apply:
+            file: manifests/reclaim-preemptor-job.yaml
+
+    - name: 05-assert-owner-runs-and-workers-are-reclaimed
+      try:
+        - assert:
+            resource:
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                name: reclaim-owner-job
+              status:
+                active: 5
+        - assert:
+            resource:
+              apiVersion: ray.io/v1
+              kind: RayCluster
+              metadata:
+                name: reclaim-raycluster
+              spec:
+                workerGroupSpecs:
+                  - groupName: workers
+                    replicas: 0
+        - assert:
+            resource:
+              (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?metadata.labels."ray.io/group" == 'workers'])): 0
+              (length(x_k8s_list($client, 'v1', 'Pod', $namespace).items[?status.phase == 'Running' && metadata.labels."ray.io/node-type" == 'head'])): 1
+
+    - name: 06-assert-reclaimed-workers-stay-gone
+      try:
+        - script:
+            timeout: 60s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: |
+              set -eu
+              # The workload is annotated with the reclaim target, and the worker group ends at it.
+              kubectl -n "${NS}" get workloads -o json | jq -e '[.items[]
+                | select(any(.metadata.ownerReferences[]?; .name == "reclaim-raycluster"))
+                | select(.metadata.annotations["kueue.x-k8s.io/reclaim-target-counts"] == "workers=0")] | length == 1' >/dev/null
+              kubectl -n "${NS}" get raycluster reclaim-raycluster -o json |
+                jq -e '.spec.workerGroupSpecs[0].replicas == 0' >/dev/null
+              # While the owner holds the quota, no worker returns and no slice requests one.
+              for i in $(seq 1 30); do
+                workers=$(kubectl -n "${NS}" get pods -l ray.io/cluster=reclaim-raycluster,ray.io/group=workers -o name | wc -l)
+                if [ "${workers}" -ne 0 ]; then
+                  echo "a reclaimed worker was recreated" >&2
+                  kubectl -n "${NS}" get pods -l ray.io/cluster=reclaim-raycluster >&2
+                  exit 1
+                fi
+                sleep 1
+              done
+              kubectl -n "${NS}" get workloads -o json | jq -e '[.items[]
+                | select(any(.metadata.ownerReferences[]?; .name == "reclaim-raycluster"))] | length == 1' >/dev/null
+              kubectl -n "${NS}" get raycluster reclaim-raycluster -o json |
+                jq -e '.spec.workerGroupSpecs[0].replicas == 0' >/dev/null
+        - assert:
+            resource:
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                name: reclaim-owner-job
+              status:
+                active: 5

@@ -6,7 +6,7 @@ Subject: [PATCH] feat: track workload reclaim targets and release quota as
 
 When partial preemption shrinks a workload, Kueue must not immediately release quota while surplus worker pods are still running or terminating, nor should it allow newly created pods to ungate above the reclaim target. Conversely, once stopped worker pods terminate, the freed quota must be released back to the ClusterQueue without waiting for the full workload slice to finish.
 
-Introduce reclaim target tracking in the workload and elastic job ungater controllers. Cap ungating at the target counts, mark stopped pods reclaimable in the Workload status once they terminate, and reconcile in-place scale-downs so that autoscaler adjustments below or up to admitted counts preserve correct quota accounting.
+Introduce reclaim target tracking in the workload and elastic job ungater controllers. Cap ungating at the target counts, mark stopped pods reclaimable in the Workload status once they terminate, and reconcile in-place scale-downs so that autoscaler adjustments below or up to admitted counts preserve correct quota accounting. Defer an in-place scale-down that reaches a pending reclaim target until the pods above it are gone, so lowering the worker group replicas does not release quota early.
 ---
  pkg/controller/core/reclaim_targets.go        |  47 +++
  pkg/controller/core/reclaim_targets_test.go   | 146 ++++++++
@@ -15,12 +15,13 @@ Introduce reclaim target tracking in the workload and elastic job ungater contro
  pkg/controller/elasticjobs/reclaim_targets.go |  76 ++++
  .../elasticjobs/reclaim_targets_test.go       | 209 +++++++++++
  pkg/controller/jobframework/partial_stop.go   |  15 +-
- pkg/workloadslicing/manager.go                |  48 +++
- pkg/workloadslicing/partial_preemption.go     |  90 +++++
- .../partial_preemption_test.go                | 192 +++++++++-
- pkg/workloadslicing/workloadslicing.go        |  46 ++-
+ .../jobs/raycluster/partial_stop.go           |   2 +-
+ pkg/workloadslicing/manager.go                |  57 +++
+ pkg/workloadslicing/partial_preemption.go     | 107 ++++++
+ .../partial_preemption_test.go                | 198 +++++++++-
+ pkg/workloadslicing/workloadslicing.go        |  38 +-
  ...ster_controller_partial_preemption_test.go | 345 ++++++++++++++++++
- 12 files changed, 1192 insertions(+), 29 deletions(-)
+ 13 files changed, 1225 insertions(+), 22 deletions(-)
  create mode 100644 pkg/controller/core/reclaim_targets.go
  create mode 100644 pkg/controller/core/reclaim_targets_test.go
  create mode 100644 pkg/controller/elasticjobs/reclaim_targets.go
@@ -231,8 +232,21 @@ index 9be7e7f..75c6aac 100644
  	}
  	if err != nil {
  		return ctrl.Result{}, true, err
+diff --git a/pkg/controller/jobs/raycluster/partial_stop.go b/pkg/controller/jobs/raycluster/partial_stop.go
+index b2bdd57..b80a0b4 100644
+--- a/pkg/controller/jobs/raycluster/partial_stop.go
++++ b/pkg/controller/jobs/raycluster/partial_stop.go
+@@ -77,7 +77,7 @@ func StopWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload,
+ 		group := workerGroupName(p)
+ 		byGroup[group] = append(byGroup[group], p)
+ 	}
+-	groupTargets := workloadslicing.FoldSplitCounts(wl.Spec.PodSets, targets)
++	groupTargets := targets
+ 	var unlisted []*corev1.Pod
+ 	err = clientutil.Patch(ctx, c, cluster, func() (bool, error) {
+ 		unlisted = unlisted[:0]
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index e6e7158..5237dfe 100644
+index e6e7158..0d0b0b9 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -31,6 +31,7 @@ import (
@@ -243,10 +257,13 @@ index e6e7158..5237dfe 100644
  )
  
  // Manager holds the dependencies for managing workload slices.
-@@ -134,11 +135,19 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -134,11 +135,22 @@ func (r *Manager) EnsureWorkloadSlices(
  		// a. It hasn't been admitted (no quota reserved), or
  		// b. It's a scale-down event.
  		if !workload.HasQuotaReservation(wl) || ScaledDown(wlPodSetsCounts, jobPodSetsCounts) {
++			if reachesPendingTargets(wl, jobPodSetsCounts) {
++				return wl, true, nil
++			}
 +			reclaim := newReclaimScaleDown(wl, jobPodSetsCounts)
 +			if reclaim.keepsSlice(wlPodSetsCounts, jobPodSetsCounts) {
 +				return wl, true, nil
@@ -263,7 +280,7 @@ index e6e7158..5237dfe 100644
  			return wl, true, nil
  		}
  
-@@ -162,6 +171,37 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -162,6 +174,40 @@ func (r *Manager) EnsureWorkloadSlices(
  			return nil, true, nil
  		}
  
@@ -275,6 +292,9 @@ index e6e7158..5237dfe 100644
 +				return nil, false, nil
 +			}
 +			if ScaledDown(targetCounts, jobPodSetsCounts) {
++				if reachesPendingTargets(targetWorkload, jobPodSetsCounts) {
++					return targetWorkload, true, nil
++				}
 +				admittedCounts := workload.AdmittedPodSetCounts(targetWorkload)
 +				if pendingReplacement != nil && !admittedCounts.HasFewerReplicasThan(jobPodSetsCounts) {
 +					if err := workloadfinish.Finish(ctx, r.Client, pendingReplacement, kueue.WorkloadSliceReplaced, "Replaced to accommodate a new workload slice", r.Clock); err != nil {
@@ -301,10 +321,13 @@ index e6e7158..5237dfe 100644
  		selectedCounts := workload.ExtractPodSetCountsFromWorkload(selectedWorkload)
  
  		if !jobPodSetsCounts.HasSamePodSetKeys(selectedCounts) {
-@@ -173,11 +213,19 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -173,11 +219,22 @@ func (r *Manager) EnsureWorkloadSlices(
  		}
  
  		if !workload.HasQuotaReservation(selectedWorkload) || ScaledDown(selectedCounts, jobPodSetsCounts) {
++			if reachesPendingTargets(selectedWorkload, jobPodSetsCounts) {
++				return selectedWorkload, true, nil
++			}
 +			reclaim := newReclaimScaleDown(selectedWorkload, jobPodSetsCounts)
 +			if reclaim.keepsSlice(selectedCounts, jobPodSetsCounts) {
 +				return selectedWorkload, true, nil
@@ -322,7 +345,7 @@ index e6e7158..5237dfe 100644
  		}
  
 diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
-index cbe6f0c..e19bbc8 100644
+index 718489b..6144869 100644
 --- a/pkg/workloadslicing/partial_preemption.go
 +++ b/pkg/workloadslicing/partial_preemption.go
 @@ -34,6 +34,7 @@ import (
@@ -333,10 +356,27 @@ index cbe6f0c..e19bbc8 100644
  	clientutil "sigs.k8s.io/kueue/pkg/util/client"
  	"sigs.k8s.io/kueue/pkg/util/parallelize"
  	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
-@@ -424,6 +425,95 @@ func newerPod(a, b *corev1.Pod) bool {
+@@ -437,6 +438,112 @@ func newerPod(a, b *corev1.Pod) bool {
  	return strings.Compare(a.Name, b.Name) > 0
  }
  
++// reachesPendingTargets reports whether the job's counts bring a PodSet down to a
++// reclaim target whose quota partial preemption has not released yet. The job lowers
++// its counts to the targets when it stops the Pods above them, and a scale-down
++// applied before those Pods are gone would release their quota early, so it waits
++// until the quota is released.
++func reachesPendingTargets(wl *kueue.Workload, jobCounts workload.PodSetsCounts) bool {
++	if !workload.HasQuotaReservation(wl) {
++		return false
++	}
++	for name, target := range workload.PendingReclaimTargetCounts(wl) {
++		if count, found := jobCounts[name]; found && count <= target {
++			return true
++		}
++	}
++	return false
++}
++
 +// reclaimScaleDown keeps the quota charge of a partially preempted workload slice
 +// right when the job scales it down in place. A PodSet with a reclaim target keeps
 +// its spec count while the job's count is at or above its admitted count, because
@@ -862,7 +902,7 @@ index 0000000..a2e860b
 +	}
 +}
 diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go
-index cbbd8e8..92d2c63 100644
+index cbbd8e8..e4a6d2e 100644
 --- a/pkg/workloadslicing/partial_preemption_test.go
 +++ b/pkg/workloadslicing/partial_preemption_test.go
 @@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
@@ -879,7 +919,7 @@ index cbbd8e8..92d2c63 100644
  	"fmt"
  	"slices"
  	"testing"
-@@ -26,18 +28,206 @@ import (
+@@ -26,18 +28,212 @@ import (
  	"github.com/google/go-cmp/cmp"
  	corev1 "k8s.io/api/core/v1"
  	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -967,6 +1007,12 @@ index cbbd8e8..92d2c63 100644
 +			count: 8, admitted: 8, target: 4, reclaimable: 0,
 +			jobCount:  6,
 +			wantCount: 6, wantTarget: 4, wantReclaimable: 0, wantCharged: 6,
++		},
++		"a job lowered to the target waits until the pods above it stopped": {
++			count: 8, admitted: 8, target: 4, reclaimable: 0,
++			jobCount:  4,
++			wantCount: 8, wantTarget: 4, wantReclaimable: 0, wantCharged: 8,
++			wantUnchanged: true,
 +		},
 +		"a failed reclaimable write after the spec update still charges the target": {
 +			failStatusWrite: true,
@@ -1088,7 +1134,7 @@ index cbbd8e8..92d2c63 100644
  	wl := utiltestingapi.MakeWorkload("wl", "ns").Annotation(kueue.WorkloadSliceNameAnnotation, "origin").Obj()
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
 new file mode 100644
-index 0000000..159a95e
+index 0000000..daa66d4
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
 @@ -0,0 +1,345 @@
@@ -1120,7 +1166,6 @@ index 0000000..159a95e
 +	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 +	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
 +	corev1 "k8s.io/api/core/v1"
-+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 +	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 +	"k8s.io/component-base/featuregate"
 +	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1286,26 +1331,28 @@ index 0000000..159a95e
 +		ginkgo.By("setting the reclaim target to two workers")
 +		setReclaimTarget(wl, 2)
 +
-+		ginkgo.By("deleting the cheaper replica as a whole and keeping the protected one")
++		ginkgo.By("lowering the worker group to two replicas and listing the cheaper replica for deletion")
 +		gomega.Eventually(func(g gomega.Gomega) {
-+			g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(w2), &corev1.Pod{}))).Should(gomega.BeTrue())
-+			var got corev1.Pod
-+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(w3), &got)).Should(gomega.Succeed())
-+			g.Expect(got.DeletionTimestamp).ShouldNot(gomega.BeNil())
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), rayCluster)).Should(gomega.Succeed())
++			group := rayCluster.Spec.WorkerGroupSpecs[0]
++			g.Expect(group.Replicas).Should(gomega.Equal(new(int32(2))))
++			g.Expect(group.ScaleStrategy.WorkersToDelete).Should(gomega.ConsistOf("w-2", "w-3"))
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
-+		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(w0), &corev1.Pod{})).Should(gomega.Succeed())
-+		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(w1), &corev1.Pod{})).Should(gomega.Succeed())
 +
-+		ginkgo.By("recreating the deleted workers, gated, as KubeRay does")
-+		w4 := createWorker(rayCluster, wl, "w-4", "replica-c")
-+		w5 := createWorker(rayCluster, wl, "w-5", "replica-c")
++		ginkgo.By("leaving the Pods to KubeRay")
++		for _, p := range []*corev1.Pod{w0, w1, w2, w3} {
++			gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(p), &corev1.Pod{})).Should(gomega.Succeed())
++		}
 +
-+		ginkgo.By("keeping the quota while a worker above the target is still terminating")
++		ginkgo.By("deleting the listed workers, as KubeRay does")
++		gomega.Expect(k8sClient.Delete(ctx, w2)).Should(gomega.Succeed())
++		gomega.Expect(k8sClient.Delete(ctx, w3)).Should(gomega.Succeed())
++
++		ginkgo.By("keeping the quota and the slice while a worker above the target is still terminating")
 +		gomega.Consistently(func(g gomega.Gomega) {
 +			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).Should(gomega.Succeed())
 +			g.Expect(wl.Status.ReclaimablePods).Should(gomega.BeEmpty())
-+			g.Expect(isGated(g, w4)).Should(gomega.BeTrue())
-+			g.Expect(isGated(g, w5)).Should(gomega.BeTrue())
++			g.Expect(wl.Spec.PodSets[workersPodSetIdx].Count).Should(gomega.Equal(int32(4)))
 +		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 +		expectPodsUsage(5)
 +
@@ -1317,19 +1364,18 @@ index 0000000..159a95e
 +			g.Expect(k8sClient.Update(ctx, &got)).Should(gomega.Succeed())
 +		}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 +
-+		ginkgo.By("releasing the quota of the two workers above the target")
-+		expectSlice(wl, 4, 2, 2)
++		ginkgo.By("releasing the quota of the two workers above the target and charging the target")
++		expectSlice(wl, 2, 2, 0)
 +		expectPodsUsage(3)
 +
-+		ginkgo.By("keeping the recreated workers gated")
++		ginkgo.By("keeping the RayCluster at the target, with no worker recreated")
 +		gomega.Consistently(func(g gomega.Gomega) {
-+			g.Expect(isGated(g, w4)).Should(gomega.BeTrue())
-+			g.Expect(isGated(g, w5)).Should(gomega.BeTrue())
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), rayCluster)).Should(gomega.Succeed())
++			g.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Replicas).Should(gomega.Equal(new(int32(2))))
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(w0), &corev1.Pod{})).Should(gomega.Succeed())
++			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(w1), &corev1.Pod{})).Should(gomega.Succeed())
 +		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
-+
-+		ginkgo.By("keeping the RayCluster's replicas")
-+		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(rayCluster), rayCluster)).Should(gomega.Succeed())
-+		gomega.Expect(rayCluster.Spec.WorkerGroupSpecs[0].Replicas).Should(gomega.Equal(new(int32(4))))
++		behavioral.ExpectWorkloadsInNamespace(ctx, k8sClient, ns.Name, 1)
 +
 +		ginkgo.By("releasing the Workload's quota")
 +		gomega.Eventually(func(g gomega.Gomega) {

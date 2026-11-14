@@ -8,6 +8,33 @@ Partial preemption must not shrink an elastic workload below the minimum viable 
 
 Introduce the kueue.x-k8s.io/reclaim-min-counts annotation and JobWithReclaimMinCounts interface. RayCluster and RayJob set worker group floors to minReplicas, while EnsureWorkloadSlices synchronizes floor metadata across active workload slices capped at each slice count.
 ---
+ pkg/constants/reclaim_floors.go               |  25 ++
+ pkg/controller/jobframework/reclaim_floors.go |  67 +++++
+ pkg/controller/jobframework/reconciler.go     |   3 +-
+ pkg/controller/jobs/raycluster/common.go      |  19 ++
+ .../jobs/raycluster/raycluster_controller.go  |   1 +
+ .../reclaim_floors_external_test.go           |  38 +++
+ .../jobs/raycluster/reclaim_floors_test.go    | 117 +++++++++
+ pkg/controller/jobs/rayjob/partial_stop.go    |   5 +
+ .../jobs/rayjob/partial_stop_test.go          |   7 +
+ pkg/workload/reclaim_floors.go                |  40 +++
+ pkg/workload/reclaim_floors_test.go           |  69 +++++
+ pkg/workloadslicing/manager.go                |  82 ++++--
+ pkg/workloadslicing/podset_steps.go           |  52 ++--
+ pkg/workloadslicing/reclaim_floors.go         |  46 ++++
+ pkg/workloadslicing/reclaim_floors_test.go    | 242 ++++++++++++++++++
+ ...ycluster_controller_reclaim_floors_test.go | 196 ++++++++++++++
+ 16 files changed, 969 insertions(+), 40 deletions(-)
+ create mode 100644 pkg/constants/reclaim_floors.go
+ create mode 100644 pkg/controller/jobframework/reclaim_floors.go
+ create mode 100644 pkg/controller/jobs/raycluster/reclaim_floors_external_test.go
+ create mode 100644 pkg/controller/jobs/raycluster/reclaim_floors_test.go
+ create mode 100644 pkg/workload/reclaim_floors.go
+ create mode 100644 pkg/workload/reclaim_floors_test.go
+ create mode 100644 pkg/workloadslicing/reclaim_floors.go
+ create mode 100644 pkg/workloadslicing/reclaim_floors_test.go
+ create mode 100644 test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
+
 diff --git a/pkg/constants/reclaim_floors.go b/pkg/constants/reclaim_floors.go
 new file mode 100644
 index 0000000..e50662b
@@ -183,10 +210,10 @@ index 6547f29..d4231e4 100644
  func (j *RayCluster) CustomEquivalenceOptions(_ context.Context, _ client.Client, _ *kueue.Workload) []equality.ComparePodSetsOption {
  	return EquivalenceOptions()
 diff --git a/pkg/controller/jobs/rayjob/partial_stop.go b/pkg/controller/jobs/rayjob/partial_stop.go
-index 9a31dc3..a408cea 100644
+index b84c350..9d5546c 100644
 --- a/pkg/controller/jobs/rayjob/partial_stop.go
 +++ b/pkg/controller/jobs/rayjob/partial_stop.go
-@@ -18,6 +18,7 @@ import (
+@@ -20,6 +20,7 @@ import (
  var (
  	_ jobframework.JobWithPartialStop      = (*RayJob)(nil)
  	_ jobframework.JobWithPodSetCountSteps = (*RayJob)(nil)
@@ -194,7 +221,7 @@ index 9a31dc3..a408cea 100644
  )
  
  func (j *RayJob) workerCluster() *raycluster.RayCluster {
-@@ -32,6 +33,10 @@ func (j *RayJob) PodSetCountSteps() workload.PodSetsCounts {
+@@ -34,6 +35,10 @@ func (j *RayJob) PodSetCountSteps() workload.PodSetsCounts {
  	return j.workerCluster().PodSetCountSteps()
  }
  
@@ -202,9 +229,9 @@ index 9a31dc3..a408cea 100644
 +	return j.workerCluster().ReclaimMinCounts()
 +}
 +
- // StopPartially preserves the head, submitter, and workers in other entries. Recreated
- // workers remain gated until the replacement slice has quota for them again.
- func (j *RayJob) StopPartially(ctx context.Context, c client.Client, wl *kueue.Workload, targets workload.PodSetsCounts) (bool, error) {
+ // StopPartially preserves the head, submitter, and workers in other entries. With
+ // in-tree autoscaling, Kueue counts the RayJob's workers from its RayCluster, so the
+ // workers stop through that RayCluster, as for a RayCluster job; their replicas go
 diff --git a/pkg/workload/reclaim_floors.go b/pkg/workload/reclaim_floors.go
 new file mode 100644
 index 0000000..e03fda3
@@ -252,7 +279,7 @@ index 0000000..e03fda3
 +	wl.Annotations[constants.ReclaimMinCountsAnnotation] = FormatPodSetCounts(counts)
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 5237dfe..dee3b24 100644
+index 0d0b0b9..c851fd3 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -113,6 +113,13 @@ func (r *Manager) EnsureWorkloadSlices(
@@ -269,7 +296,7 @@ index 5237dfe..dee3b24 100644
  		// If counts match, return the existing workload slice or nil if the workload was partially admitted.
  		if jobPodSetsCounts.EqualTo(wlPodSetsCounts) {
  			if workload.IsAdmitted(wl) {
-@@ -123,20 +130,20 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -123,23 +130,23 @@ func (r *Manager) EnsureWorkloadSlices(
  					}
  				}
  			}
@@ -286,6 +313,9 @@ index 5237dfe..dee3b24 100644
  		// b. It's a scale-down event.
 -		if !workload.HasQuotaReservation(wl) || ScaledDown(wlPodSetsCounts, jobPodSetsCounts) {
 +		if isScaleDown {
+ 			if reachesPendingTargets(wl, jobPodSetsCounts) {
+ 				return wl, true, nil
+ 			}
  			reclaim := newReclaimScaleDown(wl, jobPodSetsCounts)
  			if reclaim.keepsSlice(wlPodSetsCounts, jobPodSetsCounts) {
 +				if options.apply(wl) {
@@ -296,7 +326,7 @@ index 5237dfe..dee3b24 100644
  				return wl, true, nil
  			}
  			applyPodSetCounts(wl)
-@@ -155,14 +162,6 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -158,14 +165,6 @@ func (r *Manager) EnsureWorkloadSlices(
  		return nil, true, nil
  
  	default:
@@ -311,7 +341,7 @@ index 5237dfe..dee3b24 100644
  		selectedWorkload, err := normalizeActiveSlices(ctx, r.Client, r.Clock, workloads)
  		if err != nil {
  			return nil, true, err
-@@ -171,7 +170,26 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -174,7 +173,26 @@ func (r *Manager) EnsureWorkloadSlices(
  			return nil, true, nil
  		}
  
@@ -338,7 +368,7 @@ index 5237dfe..dee3b24 100644
  		if latestWithQuotaReservation != nil && workload.IsPartiallyPreempted(latestWithQuotaReservation) {
  			targetWorkload := latestWithQuotaReservation
  			targetCounts := workload.ExtractPodSetCountsFromWorkload(targetWorkload)
-@@ -187,6 +205,11 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -193,6 +211,11 @@ func (r *Manager) EnsureWorkloadSlices(
  				}
  				reclaim := newReclaimScaleDown(targetWorkload, jobPodSetsCounts)
  				if reclaim.keepsSlice(targetCounts, jobPodSetsCounts) {
@@ -350,7 +380,7 @@ index 5237dfe..dee3b24 100644
  					return targetWorkload, true, nil
  				}
  				applyPodSetCounts(targetWorkload)
-@@ -202,12 +225,6 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -208,12 +231,6 @@ func (r *Manager) EnsureWorkloadSlices(
  			}
  		}
  
@@ -363,8 +393,8 @@ index 5237dfe..dee3b24 100644
  		if jobPodSetsCounts.EqualTo(selectedCounts) {
  			return selectedWorkload, true, nil
  		}
-@@ -215,6 +232,11 @@ func (r *Manager) EnsureWorkloadSlices(
- 		if !workload.HasQuotaReservation(selectedWorkload) || ScaledDown(selectedCounts, jobPodSetsCounts) {
+@@ -224,6 +241,11 @@ func (r *Manager) EnsureWorkloadSlices(
+ 			}
  			reclaim := newReclaimScaleDown(selectedWorkload, jobPodSetsCounts)
  			if reclaim.keepsSlice(selectedCounts, jobPodSetsCounts) {
 +				if options.apply(selectedWorkload) {
@@ -375,7 +405,7 @@ index 5237dfe..dee3b24 100644
  				return selectedWorkload, true, nil
  			}
  			applyPodSetCounts(selectedWorkload)
-@@ -233,3 +255,23 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -242,3 +264,23 @@ func (r *Manager) EnsureWorkloadSlices(
  		return nil, true, nil
  	}
  }
@@ -690,7 +720,7 @@ index 0000000..da9ba0e
 +	}
 +}
 diff --git a/pkg/controller/jobs/rayjob/partial_stop_test.go b/pkg/controller/jobs/rayjob/partial_stop_test.go
-index 25d7b41..06cb4cb 100644
+index 26dcdc6..b153328 100644
 --- a/pkg/controller/jobs/rayjob/partial_stop_test.go
 +++ b/pkg/controller/jobs/rayjob/partial_stop_test.go
 @@ -28,6 +28,13 @@ func TestReclaimRayJobWorkers(t *testing.T) {

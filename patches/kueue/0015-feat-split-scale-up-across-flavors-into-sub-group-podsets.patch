@@ -7,6 +7,43 @@ When an elastic workload scales up, the scheduler assigns flavors per PodSet. If
 
 Split elastic worker groups into sub-group PodSets with deterministic numeric suffixes upon scheduler refusal. Each split entry preserves the original group's template and properties while allowing independent flavor assignment and ungate tracking. Update workload slicing, flavor assignment, preemption scoring, and pod admission ungating to reconcile split entries transparently without altering the parent job specification.
 ---
+ charts/kueue/templates/webhook/manifests.yaml |   1 +
+ config/components/webhook/manifests.yaml      |   1 +
+ .../elasticjobs/elastic_flavor_placement.go   |   5 +-
+ .../elasticjobs/elastic_job_ungater.go        |  32 +-
+ .../elasticjobs/ungate_split_entries.go       | 118 ++++
+ .../elasticjobs/ungate_split_entries_test.go  | 168 ++++++
+ pkg/controller/jobframework/flavor_split.go   | 237 ++++++++
+ .../flavor_split_external_test.go             | 284 +++++++++
+ .../jobframework/flavor_split_test.go         |  68 +++
+ pkg/controller/jobframework/reclaim_floors.go |   1 +
+ pkg/controller/jobframework/reconciler.go     |  12 +-
+ .../raycluster/elastic_template_restamp.go    |  15 +-
+ .../jobs/raycluster/partial_stop.go           |   2 +-
+ pkg/controller/jobs/rayjob/rayjob_webhook.go  |  66 ++-
+ .../jobs/rayjob/rayjob_webhook_test.go        |  33 ++
+ pkg/features/kube_features.go                 |  11 +
+ pkg/scheduler/flavorassigner/flavor_split.go  |  74 +++
+ .../flavorassigner/flavor_split_test.go       | 295 +++++++++
+ .../flavorassigner/flavorassigner.go          |   7 +
+ pkg/scheduler/preemption/flavor_split_test.go | 100 ++++
+ pkg/workloadslicing/flavor_split.go           | 362 +++++++++++
+ pkg/workloadslicing/flavor_split_test.go      | 561 ++++++++++++++++++
+ pkg/workloadslicing/manager.go                |  74 ++-
+ pkg/workloadslicing/podset_steps.go           |   6 +-
+ pkg/workloadslicing/regrow_after_reclaim.go   |   4 +-
+ 25 files changed, 2510 insertions(+), 27 deletions(-)
+ create mode 100644 pkg/controller/elasticjobs/ungate_split_entries.go
+ create mode 100644 pkg/controller/elasticjobs/ungate_split_entries_test.go
+ create mode 100644 pkg/controller/jobframework/flavor_split.go
+ create mode 100644 pkg/controller/jobframework/flavor_split_external_test.go
+ create mode 100644 pkg/controller/jobframework/flavor_split_test.go
+ create mode 100644 pkg/scheduler/flavorassigner/flavor_split.go
+ create mode 100644 pkg/scheduler/flavorassigner/flavor_split_test.go
+ create mode 100644 pkg/scheduler/preemption/flavor_split_test.go
+ create mode 100644 pkg/workloadslicing/flavor_split.go
+ create mode 100644 pkg/workloadslicing/flavor_split_test.go
+
 diff --git a/charts/kueue/templates/webhook/manifests.yaml b/charts/kueue/templates/webhook/manifests.yaml
 index a7815cf..a5093a5 100644
 --- a/charts/kueue/templates/webhook/manifests.yaml
@@ -636,6 +673,19 @@ index 181f7b1..7b6ebb4 100644
  	if template.Labels == nil {
  		template.Labels = make(map[string]string, 3)
  	}
+diff --git a/pkg/controller/jobs/raycluster/partial_stop.go b/pkg/controller/jobs/raycluster/partial_stop.go
+index b80a0b4..b2bdd57 100644
+--- a/pkg/controller/jobs/raycluster/partial_stop.go
++++ b/pkg/controller/jobs/raycluster/partial_stop.go
+@@ -77,7 +77,7 @@ func StopWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload,
+ 		group := workerGroupName(p)
+ 		byGroup[group] = append(byGroup[group], p)
+ 	}
+-	groupTargets := targets
++	groupTargets := workloadslicing.FoldSplitCounts(wl.Spec.PodSets, targets)
+ 	var unlisted []*corev1.Pod
+ 	err = clientutil.Patch(ctx, c, cluster, func() (bool, error) {
+ 		unlisted = unlisted[:0]
 diff --git a/pkg/controller/jobs/rayjob/rayjob_webhook.go b/pkg/controller/jobs/rayjob/rayjob_webhook.go
 index f288243..3be4c09 100644
 --- a/pkg/controller/jobs/rayjob/rayjob_webhook.go
@@ -785,6 +835,7 @@ index 94abae6..87906a4 100644
  		{Version: version.MustParse("0.14"), Default: true, PreRelease: featuregate.Beta},
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
 new file mode 100644
+index 0000000..bc28229
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
 @@ -0,0 +1,74 @@
@@ -893,6 +944,7 @@ index def383f..d1bae08 100644
  						flavorNoFitReason = mostSevereReason(flavorNoFitReason, kueue.WorkloadQuotaReservedReasonNoMatchingFlavor)
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
 new file mode 100644
+index 0000000..bfff290
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split.go
 @@ -0,0 +1,362 @@
@@ -1259,7 +1311,7 @@ new file mode 100644
 +	return changed
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index eea2259..5654a05 100644
+index 59e14a6..05835f9 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -21,12 +21,16 @@ import (
@@ -1307,7 +1359,7 @@ index eea2259..5654a05 100644
  
  		// Check if pod sets are structurally compatible (same number and names).
  		if !jobPodSetsCounts.HasSamePodSetKeys(wlPodSetsCounts) {
-@@ -130,7 +144,7 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -133,7 +147,7 @@ func (r *Manager) EnsureWorkloadSlices(
  				}
  				return wl, true, nil
  			}
@@ -1316,7 +1368,7 @@ index eea2259..5654a05 100644
  			options.apply(wl)
  			reclaim.apply(wl)
  			if err := r.Client.Update(ctx, wl); err != nil {
-@@ -174,12 +188,21 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -177,12 +191,21 @@ func (r *Manager) EnsureWorkloadSlices(
  		if selectedWorkload == nil {
  			return nil, true, nil
  		}
@@ -1339,7 +1391,7 @@ index eea2259..5654a05 100644
  		if !jobPodSetsCounts.HasSamePodSetKeys(selectedCounts) {
  			return nil, false, nil
  		}
-@@ -198,6 +221,9 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -201,6 +224,9 @@ func (r *Manager) EnsureWorkloadSlices(
  		}
  
  		if jobPodSetsCounts.EqualTo(selectedCounts) {
@@ -1349,7 +1401,7 @@ index eea2259..5654a05 100644
  			return selectedWorkload, true, nil
  		}
  
-@@ -211,7 +237,7 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -217,7 +243,7 @@ func (r *Manager) EnsureWorkloadSlices(
  				}
  				return selectedWorkload, true, nil
  			}
@@ -1358,7 +1410,7 @@ index eea2259..5654a05 100644
  			options.apply(selectedWorkload)
  			reclaim.apply(selectedWorkload)
  			if err := r.Client.Update(ctx, selectedWorkload); err != nil {
-@@ -228,6 +254,44 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -234,6 +260,44 @@ func (r *Manager) EnsureWorkloadSlices(
  	}
  }
  
@@ -2446,6 +2498,7 @@ index 0000000..590423c
 +}
 diff --git a/pkg/workloadslicing/flavor_split_test.go b/pkg/workloadslicing/flavor_split_test.go
 new file mode 100644
+index 0000000..703a5d8
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split_test.go
 @@ -0,0 +1,561 @@

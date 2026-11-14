@@ -19,11 +19,17 @@ if ! docker info >/dev/null 2>&1; then
   fi
 fi
 
-# 2. Create Kind cluster if not already running
+# 2. Create Kind cluster if not already running, writing its credentials only to this repository's kubeconfig,
+# then refuse to go on unless kubectl targets that cluster.
+: "${KUBECONFIG:?KUBECONFIG must name the kind kubeconfig of this repository, so run mise run cluster:up}"
+mkdir -p "$(dirname "$KUBECONFIG")"
 if ! kind get clusters | grep -q "^$CLUSTER_NAME$"; then
   echo "Creating Kind cluster $CLUSTER_NAME..."
-  kind create cluster --config kind-config.yaml --name "$CLUSTER_NAME"
+  kind create cluster --config kind-config.yaml --name "$CLUSTER_NAME" --kubeconfig "$KUBECONFIG"
+else
+  kind export kubeconfig --name "$CLUSTER_NAME" --kubeconfig "$KUBECONFIG"
 fi
+bash build/cluster/require-kind-context.sh
 echo "Labeling Kind nodes for elastic nodepool workloads..."
 kubectl label nodes --all karpenter.sh/nodepool=elastic-nodepool --overwrite
 

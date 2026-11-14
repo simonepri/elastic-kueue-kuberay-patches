@@ -11,3 +11,6 @@ third_party/interlink/
 third_party/ray/
 
 .*-image.txt
+
+# Kind cluster credentials written by cluster:up
+/.local/

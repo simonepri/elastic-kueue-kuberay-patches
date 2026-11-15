@@ -5,7 +5,7 @@ Subject: [PATCH] feat: clamp raycluster worker scale up to kueue clusterqueue qu
 
 Ray's in-tree autoscaler calculates desired worker counts based purely on application task and actor resource requirements without awareness of Kubernetes scheduling queue limits. In an environment managed by Kueue, uncoordinated scale-up requests periodically exceed ClusterQueue nominal quota and cohort borrowing limits, creating surplus worker pods that remain indefinitely gated or pending, consuming namespace resources and triggering controller thrashing.
 
-Introduce a ScaleGate reconciler guarded by the ScaleGate feature gate that inspects the managing Kueue ClusterQueue, cohort tree, and flavor definitions to dynamically calculate the maximum feasible worker capacity after deducting head pod requests. Clamp spec.workerGroupSpecs[].maxReplicas to this computed ceiling while preserving original configured limits in annotations so maxReplicas can be restored upon quota growth.
+Introduce a ScaleGate reconciler guarded by the ScaleGate feature gate that inspects the managing Kueue ClusterQueue, cohort tree, and flavor definitions to dynamically calculate the maximum feasible worker capacity after deducting head pod requests. Clamp spec.workerGroupSpecs[].maxReplicas to this computed ceiling while preserving original configured limits in annotations so maxReplicas can be restored upon quota growth. Read admitted Workloads straight from the API server, listing only those labelled with the cluster's job UID, and watch Workloads by metadata alone, so the operator never caches a full copy of every Workload in the cluster.
 ---
 diff --git a/helm-chart/kuberay-operator/templates/_helpers.tpl b/helm-chart/kuberay-operator/templates/_helpers.tpl
 index cd6443e..fc5c5d1 100644
@@ -66,10 +66,10 @@ index 953bf6f..98f933f 100644
    resources:
 diff --git a/ray-operator/controllers/ray/scalegate_controller.go b/ray-operator/controllers/ray/scalegate_controller.go
 new file mode 100644
-index 0000000..eb05ef7
+index 0000000..7246274
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller.go
-@@ -0,0 +1,832 @@
+@@ -0,0 +1,847 @@
 +package ray
 +
 +import (
@@ -125,13 +125,19 @@ index 0000000..eb05ef7
 +// kueueVersions lists the Kueue API versions ScaleGate reads, newest first.
 +var kueueVersions = []string{"v1beta2", "v1beta1"}
 +
++// kueueJobUIDLabel is the label Kueue sets on a Workload to the UID of the job it admits.
++const kueueJobUIDLabel = "kueue.x-k8s.io/job-uid"
++
 +// ScaleGateReconciler caps the maxReplicas of each worker group of a Kueue-queued RayCluster at the most workers its
 +// ClusterQueue could ever hold, so the Ray autoscaler cannot request pods Kueue can never admit. It writes nothing
 +// else: the Ray autoscaler is the only writer of replicas and workersToDelete, and the operator already limits the
 +// pods it creates to maxReplicas.
 +type ScaleGateReconciler struct {
 +	client.Client
-+	Scheme *runtime.Scheme
++	// APIReader reads Workloads straight from the API server, so the operator caches no full copy of every Workload in
++	// the cluster; Workload watches keep only object metadata. Nil reads through Client.
++	APIReader client.Reader
++	Scheme    *runtime.Scheme
 +	// FlavorSplit sums the flavors of a resource group in the bound, as Kueue may split a worker group across them.
 +	FlavorSplit bool
 +}
@@ -509,11 +515,15 @@ index 0000000..eb05ef7
 +
 +// listKueueObjects lists Kueue objects at the newest API version the cluster serves.
 +func (r *ScaleGateReconciler) listKueueObjects(ctx context.Context, kind string, opts ...client.ListOption) ([]unstructured.Unstructured, error) {
++	var reader client.Reader = r.Client
++	if kind == "Workload" && r.APIReader != nil {
++		reader = r.APIReader
++	}
 +	var lastErr error
 +	for _, v := range kueueVersions {
 +		list := &unstructured.UnstructuredList{}
 +		list.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: v, Kind: kind + "List"})
-+		if lastErr = r.List(ctx, list, opts...); lastErr == nil {
++		if lastErr = reader.List(ctx, list, opts...); lastErr == nil {
 +			return list.Items, nil
 +		}
 +		if !meta.IsNoMatchError(lastErr) {
@@ -691,9 +701,14 @@ index 0000000..eb05ef7
 +			owners[ref.UID] = true
 +		}
 +	}
-+	workloads, err := r.listKueueObjects(ctx, "Workload", client.InNamespace(rc.Namespace))
-+	if err != nil {
-+		return nil, nil, err
++	// Kueue labels each Workload with the UID of the job it admits, so one list per owner reads only this cluster's.
++	var workloads []unstructured.Unstructured
++	for uid := range owners {
++		owned, err := r.listKueueObjects(ctx, "Workload", client.InNamespace(rc.Namespace), client.MatchingLabels{kueueJobUIDLabel: string(uid)})
++		if err != nil {
++			return nil, nil, err
++		}
++		workloads = append(workloads, owned...)
 +	}
 +	counts := map[string]int64{}
 +	headFlavors := map[string]string{}
@@ -886,7 +901,7 @@ index 0000000..eb05ef7
 +		return reqs
 +	}), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 +
-+	wlObj := &unstructured.Unstructured{}
++	wlObj := &metav1.PartialObjectMetadata{}
 +	wlObj.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"})
 +	bld.Watches(wlObj, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 +		for _, ref := range obj.GetOwnerReferences() {
@@ -898,12 +913,12 @@ index 0000000..eb05ef7
 +			}
 +		}
 +		return nil
-+	}))
++	}), builder.OnlyMetadata)
 +
 +	return bld.Complete(r)
 +}
 diff --git a/ray-operator/main.go b/ray-operator/main.go
-index d033987..ae5b956 100644
+index d033987..d2e259d 100644
 --- a/ray-operator/main.go
 +++ b/ray-operator/main.go
 @@ -368,6 +368,12 @@ func main() {
@@ -911,7 +926,7 @@ index d033987..ae5b956 100644
  	}
  
 +	if features.Enabled(features.ScaleGate) {
-+		exitOnError((&ray.ScaleGateReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ScaleGate")
++		exitOnError((&ray.ScaleGateReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr), "unable to create controller", "controller", "ScaleGate")
 +	} else {
 +		setupLog.Info("ScaleGate feature gate is disabled, skipping ScaleGate controller setup")
 +	}
@@ -947,10 +962,10 @@ index 8b1db76..b5811de 100644
  // SetFeatureGateDuringTest is a helper method to override feature gates in tests.
 diff --git a/ray-operator/controllers/ray/scalegate_controller_unit_test.go b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
 new file mode 100644
-index 0000000..2f6eb90
+index 0000000..090ad42
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
-@@ -0,0 +1,966 @@
+@@ -0,0 +1,996 @@
 +package ray
 +
 +import (
@@ -1093,6 +1108,7 @@ index 0000000..2f6eb90
 +		},
 +	}}
 +	wl.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "ray.io/v1", Kind: "RayCluster", Name: "gang", UID: "raycluster-uid"}})
++	wl.SetLabels(map[string]string{kueueJobUIDLabel: "raycluster-uid"})
 +	return wl
 +}
 +
@@ -1582,6 +1598,7 @@ index 0000000..2f6eb90
 +				"podSetAssignments": podSetAssignments,
 +			}}
 +			wl.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "ray.io/v1", Kind: "RayCluster", Name: "gang", UID: "raycluster-uid"}})
++			wl.SetLabels(map[string]string{kueueJobUIDLabel: "raycluster-uid"})
 +
 +			mapper := meta.NewDefaultRESTMapper(nil)
 +			mapper.Add(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"}, meta.RESTScopeNamespace)
@@ -1639,6 +1656,7 @@ index 0000000..2f6eb90
 +		},
 +	}}
 +	wl.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "ray.io/v1", Kind: "RayCluster", Name: "gang", UID: "raycluster-uid"}})
++	wl.SetLabels(map[string]string{kueueJobUIDLabel: "raycluster-uid"})
 +	got, _ := sgReconcile(t, queue, rc, wl)
 +	if replicas, _, maxReplicas := sgWorkerCounts(t, got); replicas != 16 || maxReplicas != 12 {
 +		t.Errorf("worker group = replicas %d, max %d; want 16, 12 (the admitted count from 8+4)", replicas, maxReplicas)
@@ -1915,5 +1933,32 @@ index 0000000..2f6eb90
 +func TestKueueAPIAvailable(t *testing.T) {
 +	if kueueAPIAvailable(nil) {
 +		t.Fatalf("expected kueueAPIAvailable(nil) to return false")
++	}
++}
++
++// Workloads come from the uncached reader and only those labelled with the cluster's job UID count, so the operator
++// needs no cache of every Workload in the cluster.
++func TestScaleGateReadsOwnWorkloadsThroughAPIReader(t *testing.T) {
++	rc := sgRayCluster("team-queue", 4, 1, 8)
++	own := sgAdmittedWorkload(3)
++	other := sgAdmittedWorkload(7)
++	other.SetName("raycluster-other")
++	other.SetLabels(map[string]string{kueueJobUIDLabel: "other-uid"})
++	mapper := meta.NewDefaultRESTMapper(nil)
++	mapper.Add(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"}, meta.RESTScopeNamespace)
++	scheme := runtime.NewScheme()
++	if err := rayv1.AddToScheme(scheme); err != nil {
++		t.Fatalf("AddToScheme: %v", err)
++	}
++	cached := clientFake.NewClientBuilder().WithScheme(scheme).WithRESTMapper(mapper).WithObjects(rc).Build()
++	apiReader := clientFake.NewClientBuilder().WithScheme(scheme).WithRESTMapper(mapper).WithObjects(own, other).Build()
++	r := &ScaleGateReconciler{Client: cached, APIReader: apiReader}
++
++	got, _, err := r.admittedWorkerCounts(context.Background(), rc)
++	if err != nil {
++		t.Fatalf("admittedWorkerCounts: %v", err)
++	}
++	if want := map[string]int64{"head": 1, "gpu-workers": 3}; !reflect.DeepEqual(got, want) {
++		t.Errorf("admittedWorkerCounts = %v; want %v", got, want)
 +	}
 +}

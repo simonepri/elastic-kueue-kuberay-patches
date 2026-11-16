@@ -14,12 +14,16 @@ a RAY_RUNNING to RAY_RUNNING transition that only updates the ray node id, and c
 second instance. The dead old ray node no longer stops an instance that has moved away
 from it.
 
+The move waits until the ray node the instance is bound to is dead or gone, so a stale
+alive old node cannot pull the instance back. If GCS reports the old node dead before
+the new raylet registers, the instance is still stopped, as upstream does today.
+
 Upstream status: not yet reported to ray-project/ray; related to ray-project/ray#65416.
 ---
  .../ray/autoscaler/v2/instance_manager/common.py   |    3 
- .../autoscaler/v2/instance_manager/reconciler.py   |   48 +++++++
- python/ray/autoscaler/v2/tests/test_reconciler.py  |  136 ++++++++++++++++++--
- 3 files changed, 169 insertions(+), 18 deletions(-)
+ .../autoscaler/v2/instance_manager/reconciler.py   |   56 ++++++
+ python/ray/autoscaler/v2/tests/test_reconciler.py  |  189 ++++++++++++++++++--
+ 3 files changed, 230 insertions(+), 18 deletions(-)
 
 diff --git a/python/ray/autoscaler/v2/instance_manager/common.py b/python/ray/autoscaler/v2/instance_manager/common.py
 index 82de2b6..77f90c9 100644
@@ -36,7 +40,7 @@ index 82de2b6..77f90c9 100644
                  Instance.RAY_STOP_REQUESTED,
                  # Ray is stopping (currently draining),
 diff --git a/python/ray/autoscaler/v2/instance_manager/reconciler.py b/python/ray/autoscaler/v2/instance_manager/reconciler.py
-index 92ee0a3..1c9a65b 100644
+index 92ee0a3..af67487 100644
 --- a/python/ray/autoscaler/v2/instance_manager/reconciler.py
 +++ b/python/ray/autoscaler/v2/instance_manager/reconciler.py
 @@ -745,9 +745,17 @@ class Reconciler:
@@ -59,7 +63,7 @@ index 92ee0a3..1c9a65b 100644
                  else:
                      # This should only happen to a ray node that's not managed by us.
                      logger.warning(
-@@ -1754,6 +1762,17 @@ class Reconciler:
+@@ -1754,6 +1762,22 @@ class Reconciler:
          ray_node_ids_managed_by_im = {
              instance.node_id for instance in instances if instance.node_id
          }
@@ -73,11 +77,16 @@ index 92ee0a3..1c9a65b 100644
 +            and instance.status
 +            not in [IMInstance.TERMINATED, IMInstance.ALLOCATION_FAILED]
 +        }
++        alive_ray_node_ids = {
++            binary_to_hex(ray_node.node_id)
++            for ray_node in ray_nodes
++            if ray_node.status != NodeStatus.DEAD
++        }
 +        moved_instance_ids = set()
  
          for ray_node in ray_nodes:
              if not ray_node.instance_id:
-@@ -1767,6 +1786,31 @@ class Reconciler:
+@@ -1767,6 +1791,34 @@ class Reconciler:
              if cloud_instance_id in cloud_instance_ids_managed_by_im:
                  continue
  
@@ -87,9 +96,12 @@ index 92ee0a3..1c9a65b 100644
 +            if im_instance is not None:
 +                # The raylet restarted in place: attribute the new ray node to the
 +                # existing instance instead of creating a second instance for the
-+                # same cloud instance, which counts against max_workers.
++                # same cloud instance, which counts against max_workers. Wait until
++                # the ray node it is bound to is dead or gone, so that a stale alive
++                # old node cannot move the instance back and forth.
 +                if (
 +                    im_instance.status == IMInstance.RAY_RUNNING
++                    and im_instance.node_id not in alive_ray_node_ids
 +                    and ray_node.status != NodeStatus.DEAD
 +                    and im_instance.instance_id not in moved_instance_ids
 +                ):
@@ -110,10 +122,10 @@ index 92ee0a3..1c9a65b 100644
              updates[ray_node_id] = IMInstanceUpdateEvent(
                  instance_id=InstanceUtil.random_instance_id(),  # Assign a new id.
 diff --git a/python/ray/autoscaler/v2/tests/test_reconciler.py b/python/ray/autoscaler/v2/tests/test_reconciler.py
-index a50e78f..524056a 100644
+index a50e78f..62bb719 100644
 --- a/python/ray/autoscaler/v2/tests/test_reconciler.py
 +++ b/python/ray/autoscaler/v2/tests/test_reconciler.py
-@@ -1975,29 +1975,133 @@ class TestReconciler:
+@@ -1975,29 +1975,186 @@ class TestReconciler:
              ray_install_errors=[],
              autoscaling_config=MockAutoscalingConfig(),
          )
@@ -214,6 +226,59 @@ index a50e78f..524056a 100644
 +        TestReconciler._reconcile_ray_nodes(setup, ray_nodes[:1], [])
 +        instances, _ = instance_storage.get_instances()
 +        assert instances["i-1"].status == Instance.TERMINATED
++
++    @staticmethod
++    def test_restarted_raylet_with_old_node_still_alive(setup):
++        """
++        Test that the instance stays on the old ray node while GCS still lists it as
++        alive, and moves to the new ray node only once the old one is dead.
++        """
++        _, instance_storage, _, _ = setup
++        TestReconciler._add_instances(
++            instance_storage,
++            [
++                create_instance(
++                    "i-1",
++                    status=Instance.RAY_RUNNING,
++                    cloud_instance_id="c-1",
++                    ray_node_id=binary_to_hex(b"r-1"),
++                ),
++            ],
++        )
++
++        def ray_nodes(old_status):
++            return [
++                NodeState(
++                    node_id=b"r-1",
++                    status=old_status,
++                    instance_id="c-1",
++                    ray_node_type_name="type-1",
++                ),
++                NodeState(
++                    node_id=b"r-2",
++                    status=NodeStatus.RUNNING,
++                    instance_id="c-1",
++                    ray_node_type_name="type-1",
++                ),
++            ]
++
++        def assert_single_running_instance(node_id):
++            instances, _ = instance_storage.get_instances()
++            assert list(instances) == ["i-1"]
++            assert instances["i-1"].status == Instance.RAY_RUNNING
++            assert instances["i-1"].node_id == binary_to_hex(node_id)
++
++        for _ in range(3):
++            TestReconciler._reconcile_ray_nodes(
++                setup, ray_nodes(NodeStatus.RUNNING), ["c-1"]
++            )
++            assert_single_running_instance(b"r-1")
++
++        for _ in range(3):
++            TestReconciler._reconcile_ray_nodes(
++                setup, ray_nodes(NodeStatus.DEAD), ["c-1"]
++            )
++            assert_single_running_instance(b"r-2")
 +
 +    @staticmethod
 +    def test_restarted_raylet_does_not_claim_other_cloud_instance(setup):

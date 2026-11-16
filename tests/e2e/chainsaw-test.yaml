@@ -197,6 +197,32 @@ spec:
                   -p "{\"status\":{\"conditions\":[{\"type\":\"Launched\",\"status\":\"True\",\"reason\":\"Launched\",\"lastTransitionTime\":\"2026-01-01T00:00:00Z\"}],\"nodeName\":\"${node_name}\"}}"
               done
 
+    # The kind cluster has one node standing in for every NodeClaim, and each launch step stamps it with that claim's
+    # attempt label. A worker the slice replacement recreated can still be pending for an earlier attempt when 07a
+    # stamps the preemptor's, so once the preemptor's pods are bound, the node takes the pending worker's attempt.
+    - name: 07b-place-pending-workers
+      try:
+        - script:
+            timeout: 120s
+            env:
+              - name: NS
+                value: ($namespace)
+            content: |
+              node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+              for i in $(seq 1 90); do
+                running=$(kubectl get pods -n "$NS" -l job-name=urgent-batch-job --field-selector=status.phase=Running -o name | wc -l)
+                if [ "$running" -ge 3 ]; then break; fi
+                sleep 1
+              done
+              for i in $(seq 1 20); do
+                attempt=$(kubectl get pods -n "$NS" -l ray.io/group=workers --field-selector=status.phase=Pending -o json | jq -r '[.items[].spec | (.nodeSelector["kueue.x-k8s.io/karpenter-attempt"] // empty), (.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[]?.matchExpressions[]? | select(.key == "kueue.x-k8s.io/karpenter-attempt") | .values[0])] | first // empty')
+                if [ -n "$attempt" ]; then break; fi
+                sleep 1
+              done
+              if [ -n "$attempt" ]; then
+                kubectl label node "$node_name" "kueue.x-k8s.io/karpenter-attempt=${attempt}" --overwrite
+              fi
+
     - name: 08-assert-partial-preemption-and-head-survival
       try:
         - assert:

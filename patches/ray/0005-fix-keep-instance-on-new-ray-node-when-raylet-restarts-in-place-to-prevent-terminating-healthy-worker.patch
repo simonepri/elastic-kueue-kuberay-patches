@@ -1,0 +1,330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Simone Primarosa <simone.primarosa@gmail.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] fix: keep the instance on the new ray node when a raylet restarts in place
+
+When a worker raylet restarts inside the same Kubernetes pod, the pod keeps its cloud
+instance id but the raylet gets a new ray node id. The autoscaler v2 reconciler only
+treats instances without a ray node id as already managed, so it creates a second
+instance for the same pod. The autoscaler then counts two workers of the type, exceeds
+max_workers and terminates the healthy restarted pod.
+
+The reconciler now moves the existing RAY_RUNNING instance to the new ray node, through
+a RAY_RUNNING to RAY_RUNNING transition that only updates the ray node id, and creates no
+second instance. The dead old ray node no longer stops an instance that has moved away
+from it.
+
+The move waits until the ray node the instance is bound to is dead or gone, so a stale
+alive old node cannot pull the instance back. If GCS reports the old node dead before
+the new raylet registers, the instance is still stopped, as upstream does today.
+
+Upstream status: not yet reported to ray-project/ray; related to ray-project/ray#65416.
+---
+ .../ray/autoscaler/v2/instance_manager/common.py   |    3 
+ .../autoscaler/v2/instance_manager/reconciler.py   |   56 ++++++
+ python/ray/autoscaler/v2/tests/test_reconciler.py  |  189 ++++++++++++++++++--
+ 3 files changed, 230 insertions(+), 18 deletions(-)
+
+diff --git a/python/ray/autoscaler/v2/instance_manager/common.py b/python/ray/autoscaler/v2/instance_manager/common.py
+index 82de2b6..77f90c9 100644
+--- a/python/ray/autoscaler/v2/instance_manager/common.py
++++ b/python/ray/autoscaler/v2/instance_manager/common.py
+@@ -272,6 +272,9 @@ class InstanceUtil:
+             # Ray process is installed and running on the cloud instance. When in this
+             # status, a ray node must be present in the ray cluster.
+             Instance.RAY_RUNNING: {
++                # The ray node restarted in place on the same cloud instance and
++                # re-registered under a new ray node id.
++                Instance.RAY_RUNNING,
+                 # Ray is requested to be stopped.
+                 Instance.RAY_STOP_REQUESTED,
+                 # Ray is stopping (currently draining),
+diff --git a/python/ray/autoscaler/v2/instance_manager/reconciler.py b/python/ray/autoscaler/v2/instance_manager/reconciler.py
+index 92ee0a3..af67487 100644
+--- a/python/ray/autoscaler/v2/instance_manager/reconciler.py
++++ b/python/ray/autoscaler/v2/instance_manager/reconciler.py
+@@ -745,9 +745,17 @@ class Reconciler:
+                     # provider.
+                     im_instance = im_instances_by_cloud_instance_id[ray_node_id]
+                 elif ray_node.instance_id:
+-                    im_instance = im_instances_by_cloud_instance_id[
++                    im_instance = im_instances_by_cloud_instance_id.get(
+                         ray_node.instance_id
+-                    ]
++                    )
++                    if ray_node.status == NodeStatus.DEAD and (
++                        im_instance is None
++                        or (im_instance.node_id and im_instance.node_id != ray_node_id)
++                    ):
++                        # A dead ray node that a restarted raylet replaced. The
++                        # instance follows its current ray node, so the stale one
++                        # must not stop it.
++                        continue
+                 else:
+                     # This should only happen to a ray node that's not managed by us.
+                     logger.warning(
+@@ -1754,6 +1762,22 @@ class Reconciler:
+         ray_node_ids_managed_by_im = {
+             instance.node_id for instance in instances if instance.node_id
+         }
++        # Instances bound to a ray node, which may restart in place under a new
++        # ray node id on the same cloud instance.
++        im_instances_with_ray_node_by_cloud_instance_id = {
++            instance.cloud_instance_id: instance
++            for instance in instances
++            if instance.cloud_instance_id
++            and instance.node_id
++            and instance.status
++            not in [IMInstance.TERMINATED, IMInstance.ALLOCATION_FAILED]
++        }
++        alive_ray_node_ids = {
++            binary_to_hex(ray_node.node_id)
++            for ray_node in ray_nodes
++            if ray_node.status != NodeStatus.DEAD
++        }
++        moved_instance_ids = set()
+ 
+         for ray_node in ray_nodes:
+             if not ray_node.instance_id:
+@@ -1767,6 +1791,34 @@ class Reconciler:
+             if cloud_instance_id in cloud_instance_ids_managed_by_im:
+                 continue
+ 
++            im_instance = im_instances_with_ray_node_by_cloud_instance_id.get(
++                cloud_instance_id
++            )
++            if im_instance is not None:
++                # The raylet restarted in place: attribute the new ray node to the
++                # existing instance instead of creating a second instance for the
++                # same cloud instance, which counts against max_workers. Wait until
++                # the ray node it is bound to is dead or gone, so that a stale alive
++                # old node cannot move the instance back and forth.
++                if (
++                    im_instance.status == IMInstance.RAY_RUNNING
++                    and im_instance.node_id not in alive_ray_node_ids
++                    and ray_node.status != NodeStatus.DEAD
++                    and im_instance.instance_id not in moved_instance_ids
++                ):
++                    moved_instance_ids.add(im_instance.instance_id)
++                    updates[ray_node_id] = IMInstanceUpdateEvent(
++                        instance_id=im_instance.instance_id,
++                        new_instance_status=IMInstance.RAY_RUNNING,
++                        details=(
++                            "ray node restarted on the same cloud instance: "
++                            f"{im_instance.node_id} -> {ray_node_id}"
++                        ),
++                        ray_node_id=ray_node_id,
++                        instance_type=im_instance.instance_type,
++                    )
++                continue
++
+             is_head = is_head_node(ray_node)
+             updates[ray_node_id] = IMInstanceUpdateEvent(
+                 instance_id=InstanceUtil.random_instance_id(),  # Assign a new id.
+diff --git a/python/ray/autoscaler/v2/tests/test_reconciler.py b/python/ray/autoscaler/v2/tests/test_reconciler.py
+index a50e78f..62bb719 100644
+--- a/python/ray/autoscaler/v2/tests/test_reconciler.py
++++ b/python/ray/autoscaler/v2/tests/test_reconciler.py
+@@ -1975,29 +1975,186 @@ class TestReconciler:
+             ray_install_errors=[],
+             autoscaling_config=MockAutoscalingConfig(),
+         )
++        # The restarted ray node r-2 moves the existing instance i-1 over to it. No
++        # second instance is created for c-1, and the dead r-1 does not stop i-1.
+         events = subscriber.events
+-        assert len(events) == 4
+-        assert events[0].new_instance_status == Instance.ALLOCATED
+-        assert events[0].cloud_instance_id == "c-1"
++        assert len(events) == 1
++        assert events[0].new_instance_status == Instance.RAY_RUNNING
++        assert events[0].instance_id == "i-1"
+         assert events[0].ray_node_id == binary_to_hex(b"r-2")
+ 
+-        assert events[1].new_instance_status == Instance.RAY_RUNNING
+-        assert events[1].instance_id == events[0].instance_id
+-        assert events[1].ray_node_id == binary_to_hex(b"r-2")
++        instances, _ = instance_storage.get_instances()
++        assert len(instances) == 1
++        assert instances["i-1"].status == Instance.RAY_RUNNING
++        assert instances["i-1"].node_id == binary_to_hex(b"r-2")
+ 
+-        assert events[2].new_instance_status == Instance.RAY_STOPPED
+-        assert events[2].instance_id == "i-1"
+-        assert events[2].ray_node_id == binary_to_hex(b"r-1")
+-        # c-1 has been reused by the new ray node r-2 (now RAY_RUNNING), so the
+-        # stale i-1 row must not terminate c-1. It is marked TERMINATED to clean
+-        # up the record without issuing a cloud termination request.
+-        assert events[3].new_instance_status == Instance.TERMINATED
+-        assert events[3].instance_id == "i-1"
++    @staticmethod
++    def _reconcile_ray_nodes(setup, ray_nodes, cloud_instance_ids):
++        instance_manager, _, _, cloud_resource_monitor = setup
++        Reconciler.reconcile(
++            instance_manager,
++            scheduler=MockScheduler(),
++            cloud_provider=MagicMock(),
++            cloud_resource_monitor=cloud_resource_monitor,
++            ray_cluster_resource_state=ClusterResourceState(node_states=ray_nodes),
++            non_terminated_cloud_instances={
++                cloud_instance_id: CloudInstance(
++                    cloud_instance_id, "type-1", True, NodeKind.WORKER
++                )
++                for cloud_instance_id in cloud_instance_ids
++            },
++            cloud_provider_errors=[],
++            ray_install_errors=[],
++            autoscaling_config=MockAutoscalingConfig(),
++        )
++
++    @staticmethod
++    def test_restarted_raylet_keeps_its_instance(setup):
++        """
++        Test that a raylet restarting in place moves its running instance to the new
++        ray node, keeps a single instance, and is not stopped by the dead old node.
++        """
++        _, instance_storage, subscriber, _ = setup
++        TestReconciler._add_instances(
++            instance_storage,
++            [
++                create_instance(
++                    "i-1",
++                    status=Instance.RAY_RUNNING,
++                    cloud_instance_id="c-1",
++                    ray_node_id=binary_to_hex(b"r-1"),
++                ),
++            ],
++        )
++        ray_nodes = [
++            NodeState(
++                node_id=b"r-1",
++                status=NodeStatus.DEAD,
++                instance_id="c-1",
++                ray_node_type_name="type-1",
++            ),
++            NodeState(
++                node_id=b"r-2",
++                status=NodeStatus.RUNNING,
++                instance_id="c-1",
++                ray_node_type_name="type-1",
++            ),
++        ]
++
++        # The old dead node stays listed, so reconcile repeatedly.
++        for _ in range(3):
++            subscriber.clear()
++            TestReconciler._reconcile_ray_nodes(setup, ray_nodes, ["c-1"])
++
++            instances, _ = instance_storage.get_instances()
++            assert list(instances) == ["i-1"]
++            assert instances["i-1"].status == Instance.RAY_RUNNING
++            assert instances["i-1"].node_id == binary_to_hex(b"r-2")
++            assert instances["i-1"].cloud_instance_id == "c-1"
++            for event in subscriber.events:
++                assert event.new_instance_status == Instance.RAY_RUNNING
++
++        # Once the pod goes away, the leftover dead node must not break reconcile.
++        TestReconciler._reconcile_ray_nodes(setup, ray_nodes[:1], [])
++        instances, _ = instance_storage.get_instances()
++        assert instances["i-1"].status == Instance.TERMINATED
++
++    @staticmethod
++    def test_restarted_raylet_with_old_node_still_alive(setup):
++        """
++        Test that the instance stays on the old ray node while GCS still lists it as
++        alive, and moves to the new ray node only once the old one is dead.
++        """
++        _, instance_storage, _, _ = setup
++        TestReconciler._add_instances(
++            instance_storage,
++            [
++                create_instance(
++                    "i-1",
++                    status=Instance.RAY_RUNNING,
++                    cloud_instance_id="c-1",
++                    ray_node_id=binary_to_hex(b"r-1"),
++                ),
++            ],
++        )
++
++        def ray_nodes(old_status):
++            return [
++                NodeState(
++                    node_id=b"r-1",
++                    status=old_status,
++                    instance_id="c-1",
++                    ray_node_type_name="type-1",
++                ),
++                NodeState(
++                    node_id=b"r-2",
++                    status=NodeStatus.RUNNING,
++                    instance_id="c-1",
++                    ray_node_type_name="type-1",
++                ),
++            ]
++
++        def assert_single_running_instance(node_id):
++            instances, _ = instance_storage.get_instances()
++            assert list(instances) == ["i-1"]
++            assert instances["i-1"].status == Instance.RAY_RUNNING
++            assert instances["i-1"].node_id == binary_to_hex(node_id)
++
++        for _ in range(3):
++            TestReconciler._reconcile_ray_nodes(
++                setup, ray_nodes(NodeStatus.RUNNING), ["c-1"]
++            )
++            assert_single_running_instance(b"r-1")
++
++        for _ in range(3):
++            TestReconciler._reconcile_ray_nodes(
++                setup, ray_nodes(NodeStatus.DEAD), ["c-1"]
++            )
++            assert_single_running_instance(b"r-2")
++
++    @staticmethod
++    def test_restarted_raylet_does_not_claim_other_cloud_instance(setup):
++        """
++        Test that a ray node on a different cloud instance still gets its own
++        unmanaged instance and leaves the existing instance untouched.
++        """
++        _, instance_storage, _, _ = setup
++        TestReconciler._add_instances(
++            instance_storage,
++            [
++                create_instance(
++                    "i-1",
++                    status=Instance.RAY_RUNNING,
++                    cloud_instance_id="c-1",
++                    ray_node_id=binary_to_hex(b"r-1"),
++                ),
++            ],
++        )
++        ray_nodes = [
++            NodeState(
++                node_id=b"r-1",
++                status=NodeStatus.RUNNING,
++                instance_id="c-1",
++                ray_node_type_name="type-1",
++            ),
++            NodeState(
++                node_id=b"r-2",
++                status=NodeStatus.RUNNING,
++                instance_id="c-2",
++                ray_node_type_name="type-1",
++            ),
++        ]
++
++        TestReconciler._reconcile_ray_nodes(setup, ray_nodes, ["c-1", "c-2"])
+ 
+         instances, _ = instance_storage.get_instances()
+         assert len(instances) == 2
+-        statuses = {instance.status for instance in instances.values()}
+-        assert statuses == {Instance.RAY_RUNNING, Instance.TERMINATED}
++        assert instances["i-1"].status == Instance.RAY_RUNNING
++        assert instances["i-1"].node_id == binary_to_hex(b"r-1")
++        (new_instance,) = [i for i in instances.values() if i.instance_id != "i-1"]
++        assert new_instance.cloud_instance_id == "c-2"
++        assert new_instance.node_id == binary_to_hex(b"r-2")
++        assert new_instance.status == Instance.RAY_RUNNING
+ 
+     @staticmethod
+     def test_ray_head_restarted_on_the_same_cloud_instance(setup):

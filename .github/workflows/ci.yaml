@@ -102,12 +102,28 @@ jobs:
         run: mise run build
       - name: Spin up Cluster and Deploy Patched Controllers
         run: mise run cluster:up
+      - name: Watch Workloads and Events
+        # Chainsaw deletes each test namespace on exit, so stream changes while they exist.
+        run: |
+          mkdir -p evidence
+          nohup kubectl get workloads -A -o yaml --watch > evidence/workloads-watch.yaml 2>&1 &
+          nohup kubectl get events -A -o yaml --watch > evidence/events-watch.yaml 2>&1 &
       - name: Run Canonical E2E Integration Test
         run: mise run test:e2e
-      - name: Dump Controller Logs on Failure
+      - name: Collect Failure Evidence
         if: failure()
         run: |
-          echo "=== Kueue Controller Logs ==="
-          kubectl logs -n kueue-system -l app.kubernetes.io/name=kueue --tail=200 || true
-          echo "=== KubeRay Operator Logs ==="
-          kubectl logs -n default -l app.kubernetes.io/name=kuberay-operator --tail=200 || true
+          mkdir -p evidence
+          pkill -f 'kubectl get' || true
+          kubectl logs -n kueue-system -l app.kubernetes.io/name=kueue --tail=-1 > evidence/kueue-controller.log 2>&1 || true
+          kubectl logs -n kueue-system -l app.kubernetes.io/name=kueue --tail=-1 --previous > evidence/kueue-controller-previous.log 2>&1 || true
+          kubectl logs -n default -l app.kubernetes.io/name=kuberay-operator --tail=-1 > evidence/kuberay-operator.log 2>&1 || true
+          kubectl get workloads -A -o yaml > evidence/workloads.yaml 2>&1 || true
+          kubectl get events -A --sort-by=.lastTimestamp -o yaml > evidence/events.yaml 2>&1 || true
+      - name: Upload Failure Evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-evidence
+          path: evidence/
+          retention-days: 14

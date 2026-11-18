@@ -14,7 +14,8 @@ split path. Quota accounting includes earlier PodSets, independent
 resource groups, borrowing policy, lending limits, count steps and
 reclaim floors. Workers need neither MinCount nor partial scale-up;
 insufficient aggregate quota keeps the existing partial-admission
-behavior.
+behavior. A V(3) log line records the proposal with the PodSets and
+per-flavor quota it was computed from.
 ---
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
 index 6c0869b..a265e47 100644
@@ -94,9 +95,10 @@ index d4231e4..7064363 100644
  )
  
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
+index bc28229..16fbd1c 100644
 --- a/pkg/scheduler/flavorassigner/flavor_split.go
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
-@@ -14,61 +14,267 @@
+@@ -14,61 +14,309 @@ See the License for the specific language governing permissions and
  limitations under the License.
  */
  
@@ -290,7 +292,49 @@ diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavor
 +		split.Fills = append(split.Fills, fill)
 +	}
 +	return split
- }
++}
++
++// logGreedySplit records the inputs and result of one proposal at debug level so a flaky split can
++// be reconstructed from controller logs alone. It never changes the proposal.
++func (a *FlavorAssigner) logGreedySplit(log logr.Logger, ips indexedPodSet, usage resources.FlavorResourceQuantities, split *GreedySplit) {
++	l := log.V(3)
++	if !l.Enabled() {
++		return
++	}
++	podSets := make([]map[string]any, 0, len(a.wl.TotalRequests))
++	for _, psr := range a.wl.TotalRequests {
++		requests := map[string]string{}
++		perPod := map[string]string{}
++		if psr.Requests != nil {
++			for name, amount := range psr.Requests.Iter() {
++				requests[string(name)] = amount.String()
++			}
++		}
++		if psr.PerPodRequests != nil {
++			for name, amount := range psr.PerPodRequests.Iter() {
++				perPod[string(name)] = amount.String()
++			}
++		}
++		podSets = append(podSets, map[string]any{"name": psr.Name, "count": psr.Count, "requests": requests, "perPodRequests": perPod})
++	}
++	flavorQuota := map[string]map[string]string{}
++	for i := range a.cq.ResourceGroups {
++		rg := &a.cq.ResourceGroups[i]
++		for _, flavor := range rg.Flavors {
++			for name := range rg.CoveredResources {
++				fr := resources.FlavorResource{Flavor: flavor, Resource: name}
++				flavorQuota[string(flavor)+"/"+string(name)] = map[string]string{
++					"usage":     usage[fr].String(),
++					"available": a.cq.Available(fr).String(),
++					"nominal":   a.cq.QuotaFor(fr).Nominal.String(),
++				}
++			}
++		}
++	}
++	l.Info("Greedy flavor split proposed",
++		"workload", workload.Key(a.wl.Obj), "generation", a.wl.Obj.Generation,
++		"proposedPodSet", ips.podSet.Name, "podSets", podSets, "flavorQuota", flavorQuota, "proposal", split)
++}
 +
 +// greedyGroupFills applies the ordinary quota and eligibility rules to one resource group.
 +// Resource groups have disjoint resources, so their plans share only PodSet count boundaries.
@@ -400,9 +444,9 @@ diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavor
 +func placesByTopology(tr *kueue.PodSetTopologyRequest) bool {
 +	return tr != nil && (tr.Required != nil || tr.Preferred != nil || (tr.Unconstrained != nil && *tr.Unconstrained) ||
 +		tr.PodSetGroupName != nil || tr.PodSetSliceRequiredTopology != nil)
-+}
+ }
 diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
-index 568186b..815c69f 100644
+index d1bae08..d77376b 100644
 --- a/pkg/scheduler/flavorassigner/flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/flavorassigner.go
 @@ -18,6 +18,7 @@ package flavorassigner
@@ -413,7 +457,7 @@ index 568186b..815c69f 100644
  	"fmt"
  	"maps"
  	"math"
-@@ -336,6 +337,7 @@ func (a *FlavorAssigner) AssignFlavors(
+@@ -339,6 +340,7 @@ func (a *FlavorAssigner) AssignFlavors(
  	for i, podSet := range requests {
  		if a.cq.RGByResource(corev1.ResourcePods) != nil {
  			if podSet.Requests != nil {
@@ -421,7 +465,7 @@ index 568186b..815c69f 100644
  				podSet.Requests.Set(corev1.ResourcePods, resources.NewAmount(int64(podSet.Count)))
  			} else {
  				podSet.Requests = resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourcePods: int64(podSet.Count)})
-@@ -404,6 +406,19 @@ func (a *FlavorAssigner) AssignFlavors(
+@@ -407,6 +409,20 @@ func (a *FlavorAssigner) AssignFlavors(
  			}
  		}
  
@@ -429,6 +473,7 @@ index 568186b..815c69f 100644
 +		// Earlier groups have already charged quotaUsage; only this group is proposed per cycle.
 +		if len(podSets) == 1 && counts == nil {
 +			if split := a.greedySplit(log, podSets[0], quotaUsage); split != nil {
++				a.logGreedySplit(log, podSets[0], quotaUsage, split)
 +				payload, _ := json.Marshal(split)
 +				psa := podSets[0].podSetAssignment
 +				psa.Flavors = nil
@@ -441,7 +486,7 @@ index 568186b..815c69f 100644
  		requests := resources.NewRequests()
  		psIDs := make([]int, len(podSets))
  		for idx, podset := range podSets {
-@@ -892,10 +907,7 @@ func (a *FlavorAssigner) findFlavorForPodSets(
+@@ -892,10 +908,7 @@ func (a *FlavorAssigner) findFlavorForPodSets(
  						// Flavor mismatch. Skip further checks for this resource.
  						representativeMode = worstGranularMode()
  						msg := fmt.Sprintf("could not assign %s flavor since the original workload is assigned: %s", fName, originalFlavor)
@@ -468,10 +513,10 @@ index a194232..cd9451e 100644
  		// the counts Reduce returns.
  		var bestPartialPlan *assignment.Plan
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
-index 8d9a02e..b47081f 100644
+index bfff290..1ae87c0 100644
 --- a/pkg/workloadslicing/flavor_split.go
 +++ b/pkg/workloadslicing/flavor_split.go
-@@ -286,11 +286,14 @@ func ExpandToSplitEntries(podSets []kueue.PodSet, floors, steps workload.PodSets
+@@ -286,13 +286,16 @@ func ExpandToSplitEntries(podSets []kueue.PodSet, floors, steps workload.PodSets
  // preemption releases quota, is not split, because another flavor would not help it.
  func splitTriedProbe(probe, replaced *kueue.Workload) bool {
  	if workload.HasQuotaReservation(probe) || workloadevict.IsEvicted(probe) ||
@@ -490,7 +535,9 @@ index 8d9a02e..b47081f 100644
 +	_, isGreedy := flavorassigner.ParseGreedySplit(cond.Message)
 +	return cond.Reason == flavorassigner.GrowthFitsOtherFlavorReason || isGreedy
  }
-@@ -304,6 +304,14 @@ func splitTriedProbe(probe, replaced *kueue.Workload) bool {
+ 
+ // SplitGrowth moves the growth of each PodSet of probe over what replaced runs in its entries to
+@@ -303,6 +306,14 @@ func splitTriedProbe(probe, replaced *kueue.Workload) bool {
  // with a topology request or a count step above 1 are not split, nor any once the Workload has
  // as many PodSets as the API allows. It reports whether it changed probe.
  func SplitGrowth(probe, replaced *kueue.Workload, partial bool) bool {
@@ -505,7 +552,7 @@ index 8d9a02e..b47081f 100644
  	running := AfterReclaimBaseline(replaced)
  	steps := workload.PodSetCountSteps(probe)
  	groups := splitGroups(probe.Spec.PodSets)
-@@ -361,3 +369,88 @@ func SplitGrowth(probe, replaced *kueue.Workload, partial bool) bool {
+@@ -360,3 +371,88 @@ func SplitGrowth(probe, replaced *kueue.Workload, partial bool) bool {
  	}
  	return changed
  }
@@ -595,7 +642,7 @@ index 8d9a02e..b47081f 100644
 +	}
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 5654a05..01647a1 100644
+index 05835f9..66ac598 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -70,6 +70,10 @@ func (r *Manager) EnsureWorkloadSlices(
@@ -609,7 +656,7 @@ index 5654a05..01647a1 100644
  		for i := range wl.Spec.PodSets {
  			for _, jobPodSet := range jobPodSets {
  				if wl.Spec.PodSets[i].Name == jobPodSet.Name {
-@@ -174,6 +178,9 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -177,6 +181,9 @@ func (r *Manager) EnsureWorkloadSlices(
  					}
  				}
  			}
@@ -619,7 +666,7 @@ index 5654a05..01647a1 100644
  			return wl, true, nil
  		}
  
-@@ -264,7 +271,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
+@@ -270,7 +277,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
  		return nil
  	}
  	replaced := admittedPredecessor(workloads, probe)
@@ -628,7 +675,7 @@ index 5654a05..01647a1 100644
  		return nil
  	}
  	// The scheduler writes the probe's status while the reconciler decides, so a conflict
-@@ -278,7 +285,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
+@@ -284,7 +291,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
  			return nil
  		}
  		ctrl.LoggerFrom(ctx).V(2).Info("Splitting the growth of a refused workload slice into PodSets that may take another flavor",
@@ -1268,7 +1315,7 @@ index 0000000..cce7800
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
 new file mode 100644
-index 0000000..9991aac
+index 0000000..3427395
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
 @@ -0,0 +1,82 @@

@@ -16,6 +16,14 @@ reclaim floors. Workers need neither MinCount nor partial scale-up;
 insufficient aggregate quota keeps the existing partial-admission
 behavior. An Info log line records the proposal with the PodSets and
 per-flavor quota it was computed from.
+
+Left on the assignment, the flavor scan progress of the earlier PodSets
+would mark the flavors they fit as tried and make the queue re-evaluate
+the unchanged Workload at once. A cycle that ran before the job
+reconciler applied the proposal would then move an earlier PodSet to its
+next flavor and replace the proposal with one computed against that
+move, which splits the workers into more PodSets than needed. A proposal
+therefore records no scan progress.
 ---
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
 index 6c0869b..a265e47 100644
@@ -95,7 +103,7 @@ index d4231e4..7064363 100644
  )
  
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
-index bc28229..c8dd3ee 100644
+index bc28229..1dd9c28 100644
 --- a/pkg/scheduler/flavorassigner/flavor_split.go
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
 @@ -14,61 +14,305 @@ See the License for the specific language governing permissions and
@@ -442,7 +450,7 @@ index bc28229..c8dd3ee 100644
 +		tr.PodSetGroupName != nil || tr.PodSetSliceRequiredTopology != nil)
  }
 diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
-index d1bae08..d77376b 100644
+index d1bae08..73d08a1 100644
 --- a/pkg/scheduler/flavorassigner/flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/flavorassigner.go
 @@ -18,6 +18,7 @@ package flavorassigner
@@ -461,7 +469,7 @@ index d1bae08..d77376b 100644
  				podSet.Requests.Set(corev1.ResourcePods, resources.NewAmount(int64(podSet.Count)))
  			} else {
  				podSet.Requests = resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourcePods: int64(podSet.Count)})
-@@ -407,6 +409,20 @@ func (a *FlavorAssigner) AssignFlavors(
+@@ -407,6 +409,26 @@ func (a *FlavorAssigner) AssignFlavors(
  			}
  		}
  
@@ -475,6 +483,12 @@ index d1bae08..d77376b 100644
 +				psa.Flavors = nil
 +				psa.Status = *NewStatus(greedySplitPrefix + string(payload))
 +				assignment.append(podSets[0].originalIndex, podSets[0].podSet.Requests, psa)
++				// The proposal fixes the earlier PodSets on the flavors they fit, and the job reconciler
++				// rewrites the Workload from it. Scan progress would mark those flavors as tried, so the
++				// queue would re-evaluate the unchanged Workload at once and, when that outruns the
++				// rewrite, move an earlier PodSet to its next flavor and replace the proposal with one
++				// computed against it. A proposal therefore records no scan progress.
++				assignment.FlavorScanState.TriedFlavors = nil
 +				return assignment
 +			}
 +		}
@@ -482,7 +496,7 @@ index d1bae08..d77376b 100644
  		requests := resources.NewRequests()
  		psIDs := make([]int, len(podSets))
  		for idx, podset := range podSets {
-@@ -892,10 +908,7 @@ func (a *FlavorAssigner) findFlavorForPodSets(
+@@ -892,10 +914,7 @@ func (a *FlavorAssigner) findFlavorForPodSets(
  						// Flavor mismatch. Skip further checks for this resource.
  						representativeMode = worstGranularMode()
  						msg := fmt.Sprintf("could not assign %s flavor since the original workload is assigned: %s", fName, originalFlavor)
@@ -839,10 +853,10 @@ index dd5ac5a..8b0091a 100644
  	assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, workload.NewInfo(log, replaced),
 diff --git a/pkg/scheduler/flavorassigner/greedy_split_test.go b/pkg/scheduler/flavorassigner/greedy_split_test.go
 new file mode 100644
-index 0000000..a0084f7
+index 0000000..8b66686
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/greedy_split_test.go
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,321 @@
 +// Tests ordered flavor fill proposals and verifies that assignment leaves its input untouched.
 +
 +/*
@@ -1037,6 +1051,9 @@ index 0000000..a0084f7
 +			if ok && assignment.RepresentativeMode() != NoFit {
 +				t.Fatal("proposal must refuse admission")
 +			}
++			if ok && assignment.FlavorScanState.PendingFlavors() {
++				t.Fatal("proposal must record no flavor scan progress")
++			}
 +		})
 +	}
 +}
@@ -1159,6 +1176,189 @@ index 0000000..a0084f7
 +		if final.PodSets[i].Flavors[corev1.ResourcePods].Name != want {
 +			t.Fatalf("entry %d assigned to %v", i, final.PodSets[i].Flavors)
 +		}
++	}
++}
+diff --git a/pkg/scheduler/greedy_split_scanstate_test.go b/pkg/scheduler/greedy_split_scanstate_test.go
+new file mode 100644
+index 0000000..4fe6fba
+--- /dev/null
++++ b/pkg/scheduler/greedy_split_scanstate_test.go
+@@ -0,0 +1,177 @@
++// Verifies that a greedy flavor split proposal records no scan progress, so a requeued Workload gets the same proposal again.
++
++/*
++Copyright The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package scheduler
++
++import (
++	"fmt"
++	"testing"
++
++	corev1 "k8s.io/api/core/v1"
++	apimeta "k8s.io/apimachinery/pkg/api/meta"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/component-base/featuregate"
++	"k8s.io/utils/ptr"
++
++	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
++	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
++	"sigs.k8s.io/kueue/pkg/constants"
++	"sigs.k8s.io/kueue/pkg/features"
++	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
++	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++	api "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
++	"sigs.k8s.io/kueue/pkg/workload"
++	"sigs.k8s.io/kueue/pkg/workloadslicing"
++)
++
++// rayHeadAndWorkersWorkload is a Ray head of 0.5 CPU and three elastic workers of 1 CPU each. The head
++// fits on either flavor of the ClusterQueue below and the workers fit on neither alone, so they split.
++func rayHeadAndWorkersWorkload() *kueue.Workload {
++	head := api.MakePodSet("head", 1).Request(corev1.ResourceCPU, "500m").Request(corev1.ResourceMemory, "512Mi").Obj()
++	workers := api.MakePodSet("workers", 3).Request(corev1.ResourceCPU, "1").Request(corev1.ResourceMemory, "1Gi").Obj()
++	workers.MinCount = ptr.To[int32](1)
++	return api.MakeWorkload("ray", "default").Queue("lq").Annotation(constants.ElasticJobAnnotation, "true").
++		Annotation(workloadslicing.EnabledAnnotationKey, "true").PodSets(*head, *workers).Obj()
++}
++
++// TestGreedySplitProposalRepeatsWhenRequeuedBeforeApplied drives two scheduling cycles on the same
++// Workload spec, carrying the flavor scan state between them as entry.recordAssignment does, or as
++// the queue manager does when an update of the Workload makes it rebuild the Info, then applies the
++// second proposal as the job reconciler does when it reads the condition after the second cycle wrote it.
++func TestGreedySplitProposalRepeatsWhenRequeuedBeforeApplied(t *testing.T) {
++	cases := map[string]struct {
++		// rebuildInfo hands the second cycle a new Info that holds a copy of the scan state.
++		rebuildInfo bool
++	}{
++		"scan state kept on the entry's Info":                 {},
++		"scan state copied to an Info the queue manager made": {rebuildInfo: true},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
++				features.ElasticJobsViaWorkloadSlicesFlavorChangeFromZero:      true,
++				features.ElasticJobsViaWorkloadSlicesFlavorSplit:               true,
++				features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
++			})
++			ctx, log := utiltesting.ContextWithLog(t)
++			cl := utiltesting.NewClientBuilder().Build()
++			cqCache := schdcache.New(cl)
++			for _, n := range []string{"p", "s"} {
++				cqCache.AddOrUpdateResourceFlavor(log, api.MakeResourceFlavor(n).NodeLabel("instance-tier", map[string]string{"p": "primary", "s": "secondary"}[n]).Obj())
++			}
++			if err := cqCache.AddClusterQueue(ctx, api.MakeClusterQueue("cq").ResourceGroup(
++				*api.MakeFlavorQuotas("p").Resource(corev1.ResourceCPU, "2").Resource(corev1.ResourceMemory, "4Gi").Obj(),
++				*api.MakeFlavorQuotas("s").Resource(corev1.ResourceCPU, "2").Resource(corev1.ResourceMemory, "4Gi").Obj()).Obj()); err != nil {
++				t.Fatal(err)
++			}
++			qManager := qcache.NewManagerForUnitTests(cl, cqCache)
++			s := New(qManager, cqCache, cl, &utiltesting.EventRecorder{}, WithPreemptionExpectations(preemptexpectations.New()))
++			wl := rayHeadAndWorkersWorkload()
++			info := workload.NewInfo(log, wl.DeepCopy())
++			info.ClusterQueue = "cq"
++
++			assign := func() flavorassigner.Assignment {
++				snap, err := cqCache.Snapshot(ctx)
++				if err != nil {
++					t.Fatal(err)
++				}
++				s.schedulingCycle++
++				as, _ := s.getAssignments(ctx, info, snap)
++				return as
++			}
++			headFlavor := func(as flavorassigner.Assignment) string {
++				if len(as.PodSets) == 0 || as.PodSets[0].Flavors[corev1.ResourceCPU] == nil {
++					return "-"
++				}
++				return string(as.PodSets[0].Flavors[corev1.ResourceCPU].Name)
++			}
++
++			first := assign()
++			split, ok := flavorassigner.ParseGreedySplit(first.Message())
++			if !ok {
++				t.Fatalf("cycle 0: expected a greedy proposal, got mode %v: %s", first.RepresentativeMode(), first.Message())
++			}
++			t.Logf("cycle 0: head on %s, proposal %v, pending flavors %t", headFlavor(first), split.Fills, first.FlavorScanState.PendingFlavors())
++
++			// The scheduler keeps the assignment's scan state on the entry and hands the entry's Info to
++			// the queue, which requeues the Workload at once when PendingFlavors is true. An update of
++			// the Workload makes the queue manager build a new Info and copy the scan state onto it
++			// when the scheduling shape matches. The reconciler has not applied the proposal yet, so
++			// the next cycle sees the same spec.
++			if tc.rebuildInfo {
++				info = workload.NewInfo(log, wl.DeepCopy())
++				info.ClusterQueue = "cq"
++				info.FlavorScanState = first.FlavorScanState.Clone()
++			} else {
++				info.FlavorScanState = &first.FlavorScanState
++			}
++
++			second := assign()
++			split2, ok := flavorassigner.ParseGreedySplit(second.Message())
++			if !ok {
++				t.Fatalf("cycle 1: expected a greedy proposal, got mode %v: %s", second.RepresentativeMode(), second.Message())
++			}
++			t.Logf("cycle 1: head on %s, proposal %v", headFlavor(second), split2.Fills)
++			if headFlavor(second) != headFlavor(first) || fmt.Sprint(split2.Fills) != fmt.Sprint(split.Fills) {
++				t.Errorf("cycle 1 must repeat cycle 0 on the unchanged Workload: head %s -> %s, proposal %v -> %v",
++					headFlavor(first), headFlavor(second), split.Fills, split2.Fills)
++			}
++
++			// The reconciler applies the proposal it reads, the latest one.
++			apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse,
++				Reason: "Pending", Message: second.Message(), ObservedGeneration: wl.Generation})
++			if !workloadslicing.SplitGrowth(wl, nil, true) {
++				t.Fatal("split not applied")
++			}
++			for cycle := 2; cycle < 6; cycle++ {
++				info = workload.NewInfo(log, wl.DeepCopy())
++				info.ClusterQueue = "cq"
++				as := assign()
++				if sp, ok := flavorassigner.ParseGreedySplit(as.Message()); ok {
++					t.Logf("cycle %d: proposal %v", cycle, sp.Fills)
++					apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse,
++						Reason: "Pending", Message: as.Message(), ObservedGeneration: wl.Generation})
++					if !workloadslicing.SplitGrowth(wl, nil, true) {
++						t.Fatal("split not applied")
++					}
++					continue
++				}
++				var final []string
++				workers := 0
++				for _, ps := range as.PodSets {
++					fl := "-"
++					if f := ps.Flavors[corev1.ResourceCPU]; f != nil {
++						fl = string(f.Name)
++					}
++					final = append(final, fmt.Sprintf("%s=%d@%s", ps.Name, ps.Count, fl))
++					if ps.Name != "head" {
++						workers++
++					}
++				}
++				t.Logf("cycle %d: mode %v, final %v", cycle, as.RepresentativeMode(), final)
++				if workers != 2 {
++					t.Errorf("expected 2 worker PodSets, got %d: %v", workers, final)
++				}
++				return
++			}
++			t.Fatal("never admitted")
++		})
 +	}
 +}
 diff --git a/pkg/workloadslicing/greedy_split_test.go b/pkg/workloadslicing/greedy_split_test.go

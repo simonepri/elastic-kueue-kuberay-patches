@@ -14,7 +14,7 @@ split path. Quota accounting includes earlier PodSets, independent
 resource groups, borrowing policy, lending limits, count steps and
 reclaim floors. Workers need neither MinCount nor partial scale-up;
 insufficient aggregate quota keeps the existing partial-admission
-behavior. A V(3) log line records the proposal with the PodSets and
+behavior. An Info log line records the proposal with the PodSets and
 per-flavor quota it was computed from.
 ---
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
@@ -95,10 +95,10 @@ index d4231e4..7064363 100644
  )
  
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
-index bc28229..16fbd1c 100644
+index bc28229..c8dd3ee 100644
 --- a/pkg/scheduler/flavorassigner/flavor_split.go
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
-@@ -14,61 +14,309 @@ See the License for the specific language governing permissions and
+@@ -14,61 +14,305 @@ See the License for the specific language governing permissions and
  limitations under the License.
  */
  
@@ -294,13 +294,9 @@ index bc28229..16fbd1c 100644
 +	return split
 +}
 +
-+// logGreedySplit records the inputs and result of one proposal at debug level so a flaky split can
-+// be reconstructed from controller logs alone. It never changes the proposal.
++// logGreedySplit records the inputs and result of one proposal at the default log level so a flaky
++// split can be reconstructed from controller logs alone. It never changes the proposal.
 +func (a *FlavorAssigner) logGreedySplit(log logr.Logger, ips indexedPodSet, usage resources.FlavorResourceQuantities, split *GreedySplit) {
-+	l := log.V(3)
-+	if !l.Enabled() {
-+		return
-+	}
 +	podSets := make([]map[string]any, 0, len(a.wl.TotalRequests))
 +	for _, psr := range a.wl.TotalRequests {
 +		requests := map[string]string{}
@@ -331,7 +327,7 @@ index bc28229..16fbd1c 100644
 +			}
 +		}
 +	}
-+	l.Info("Greedy flavor split proposed",
++	log.Info("Greedy flavor split proposed",
 +		"workload", workload.Key(a.wl.Obj), "generation", a.wl.Obj.Generation,
 +		"proposedPodSet", ips.podSet.Name, "podSets", podSets, "flavorQuota", flavorQuota, "proposal", split)
 +}

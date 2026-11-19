@@ -9,7 +9,7 @@ CLUSTER_NAME="${CLUSTER_NAME:-elastic-scale-lab}"
 KUEUE_UPSTREAM="${KUEUE_UPSTREAM:-v0.20.5}"
 KUBERAY_UPSTREAM="${KUBERAY_UPSTREAM:-v1.7.2}"
 KARPENTER_UPSTREAM="${KARPENTER_UPSTREAM:-v1.15.1}"
-KUEUE_LOG_LEVEL="${KUEUE_LOG_LEVEL:-3}"
+KUEUE_LOG_LEVEL="${KUEUE_LOG_LEVEL:-}"
 KUEUE_FEATURE_GATES="${KUEUE_FEATURE_GATES:-ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true,ElasticJobsViaWorkloadSlicesFlavorSplit=true,KarpenterAdmissionCheck=true,MutableDeploymentQueue=true,VisibilityOnDemand=true,PreSubmissionSimulator=true}"
 
 # 1. Ensure container runtime is running (starts Colima on macOS if docker daemon is inactive)
@@ -161,8 +161,11 @@ if [ -n "$rayjob_webhook" ]; then
 fi
 
 echo "Enabling Kueue feature gates: $KUEUE_FEATURE_GATES"
-kubectl patch deployment/kueue-controller-manager -n kueue-system --type=json \
-  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates='"$KUEUE_FEATURE_GATES"'"},{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--zap-log-level='"$KUEUE_LOG_LEVEL"'"}]'
+KUEUE_ARG_PATCH='{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--feature-gates='"$KUEUE_FEATURE_GATES"'"}'
+if [ -n "$KUEUE_LOG_LEVEL" ]; then
+  KUEUE_ARG_PATCH="$KUEUE_ARG_PATCH"',{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--zap-log-level='"$KUEUE_LOG_LEVEL"'"}'
+fi
+kubectl patch deployment/kueue-controller-manager -n kueue-system --type=json -p "[$KUEUE_ARG_PATCH]"
 kubectl set resources deployment/kueue-controller-manager -n kueue-system --limits=memory=2Gi --requests=memory=512Mi
 
 # 7. Wait for rollouts

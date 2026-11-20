@@ -1,5 +1,5 @@
 [tools]
-go = "1.27.3"
+go = "1.27.4"
 kind = "0.33.0"
 kubectl = "1.37.2"
 "aqua:kyverno/chainsaw" = "0.2.15"

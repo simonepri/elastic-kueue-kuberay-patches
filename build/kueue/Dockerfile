@@ -6,7 +6,7 @@ WORKDIR /workspace
 
 COPY go.mod go.sum ./
 COPY hack/testing/retry.sh /usr/local/bin/retry.sh
-RUN retry.sh --attempts 7 --delay 2 --exponential --stream -- go mod download
+RUN retry.sh --attempts 7 --delay 2 --stream -- go mod download
 
 COPY . .
 ARG GIT_TAG GIT_COMMIT TARGETARCH CGO_ENABLED=0

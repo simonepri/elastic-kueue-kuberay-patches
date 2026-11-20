@@ -26,7 +26,7 @@ move, which splits the workers into more PodSets than needed. A proposal
 therefore records no scan progress.
 ---
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index 6c0869b..a265e47 100644
+index 6c0869bc..a265e47e 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -378,7 +378,7 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
@@ -39,7 +39,7 @@ index 6c0869b..a265e47 100644
  		return nil, nil, err
  	}
 diff --git a/pkg/controller/elasticjobs/ungate_split_entries.go b/pkg/controller/elasticjobs/ungate_split_entries.go
-index e0dec0d..a8602c8 100644
+index e0dec0dd..a8602c8d 100644
 --- a/pkg/controller/elasticjobs/ungate_split_entries.go
 +++ b/pkg/controller/elasticjobs/ungate_split_entries.go
 @@ -72,10 +72,12 @@ func (r *elasticJobUngater) ungateSplitGroups(
@@ -82,7 +82,7 @@ index e0dec0d..a8602c8 100644
  			if entry != base {
  				for _, p := range slices.SortedFunc(slices.Values(gated[entry]), byName) {
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index d4231e4..7064363 100644
+index d4231e45..70643639 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -31,6 +31,7 @@ import (
@@ -103,7 +103,7 @@ index d4231e4..7064363 100644
  )
  
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
-index bc28229..1dd9c28 100644
+index bc28229b..1dd9c288 100644
 --- a/pkg/scheduler/flavorassigner/flavor_split.go
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
 @@ -14,61 +14,305 @@ See the License for the specific language governing permissions and
@@ -450,7 +450,7 @@ index bc28229..1dd9c28 100644
 +		tr.PodSetGroupName != nil || tr.PodSetSliceRequiredTopology != nil)
  }
 diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
-index d1bae08..73d08a1 100644
+index c381c95d..7d7d118d 100644
 --- a/pkg/scheduler/flavorassigner/flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/flavorassigner.go
 @@ -18,6 +18,7 @@ package flavorassigner
@@ -509,10 +509,10 @@ index d1bae08..73d08a1 100644
  						flavorQuotaReasons = append(flavorQuotaReasons, msg)
  						flavorNoFitReason = mostSevereReason(flavorNoFitReason, kueue.WorkloadQuotaReservedReasonNoMatchingFlavor)
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index a194232..cd9451e 100644
+index 856da69d..3ae1097d 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
-@@ -1589,7 +1589,8 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1607,7 +1607,8 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  	assignmentPlan := planner.Plan(ctx, &initialAssignment)
  	topologyRetry := assignmentPlan.TopologyRetry
  
@@ -523,7 +523,7 @@ index a194232..cd9451e 100644
  		// the counts Reduce returns.
  		var bestPartialPlan *assignment.Plan
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
-index bfff290..1ae87c0 100644
+index bfff290a..1ae87c09 100644
 --- a/pkg/workloadslicing/flavor_split.go
 +++ b/pkg/workloadslicing/flavor_split.go
 @@ -286,13 +286,16 @@ func ExpandToSplitEntries(podSets []kueue.PodSet, floors, steps workload.PodSets
@@ -652,7 +652,7 @@ index bfff290..1ae87c0 100644
 +	}
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 05835f9..66ac598 100644
+index 05835f9f..66ac5989 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -70,6 +70,10 @@ func (r *Manager) EnsureWorkloadSlices(
@@ -696,7 +696,7 @@ index 05835f9..66ac598 100644
  				if getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(probe), probe); getErr != nil {
 diff --git a/pkg/controller/elasticjobs/ungate_split_steps_test.go b/pkg/controller/elasticjobs/ungate_split_steps_test.go
 new file mode 100644
-index 0000000..24ea21d
+index 00000000..24ea21d3
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/ungate_split_steps_test.go
 @@ -0,0 +1,72 @@
@@ -773,7 +773,7 @@ index 0000000..24ea21d
 +	}
 +}
 diff --git a/pkg/scheduler/flavorassigner/flavor_split_test.go b/pkg/scheduler/flavorassigner/flavor_split_test.go
-index dd5ac5a..8b0091a 100644
+index dd5ac5a9..8b0091a9 100644
 --- a/pkg/scheduler/flavorassigner/flavor_split_test.go
 +++ b/pkg/scheduler/flavorassigner/flavor_split_test.go
 @@ -23,11 +23,11 @@ import (
@@ -853,7 +853,7 @@ index dd5ac5a..8b0091a 100644
  	assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, workload.NewInfo(log, replaced),
 diff --git a/pkg/scheduler/flavorassigner/greedy_split_test.go b/pkg/scheduler/flavorassigner/greedy_split_test.go
 new file mode 100644
-index 0000000..8b66686
+index 00000000..8b666868
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/greedy_split_test.go
 @@ -0,0 +1,321 @@
@@ -1180,7 +1180,7 @@ index 0000000..8b66686
 +}
 diff --git a/pkg/scheduler/greedy_split_scanstate_test.go b/pkg/scheduler/greedy_split_scanstate_test.go
 new file mode 100644
-index 0000000..4fe6fba
+index 00000000..4fe6fba9
 --- /dev/null
 +++ b/pkg/scheduler/greedy_split_scanstate_test.go
 @@ -0,0 +1,177 @@
@@ -1363,7 +1363,7 @@ index 0000000..4fe6fba
 +}
 diff --git a/pkg/workloadslicing/greedy_split_test.go b/pkg/workloadslicing/greedy_split_test.go
 new file mode 100644
-index 0000000..cce7800
+index 00000000..cce7800d
 --- /dev/null
 +++ b/pkg/workloadslicing/greedy_split_test.go
 @@ -0,0 +1,142 @@
@@ -1511,7 +1511,7 @@ index 0000000..cce7800
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
 new file mode 100644
-index 0000000..3427395
+index 00000000..3427395d
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
 @@ -0,0 +1,82 @@
@@ -1599,7 +1599,7 @@ index 0000000..3427395
 +})
 diff --git a/test/integration/singlecluster/scheduler/greedy_split_test.go b/test/integration/singlecluster/scheduler/greedy_split_test.go
 new file mode 100644
-index 0000000..6d2e18f
+index 00000000..6d2e18f3
 --- /dev/null
 +++ b/test/integration/singlecluster/scheduler/greedy_split_test.go
 @@ -0,0 +1,93 @@
@@ -1696,5 +1696,3 @@ index 0000000..6d2e18f
 +		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 +	}, ginkgo.Entry("atomic", false, false), ginkgo.Entry("partial", true, false), ginkgo.Entry("initial nonzero", false, true))
 +})
--- 
-2.56.0

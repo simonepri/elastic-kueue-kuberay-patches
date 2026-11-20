@@ -8,28 +8,9 @@ When partial preemption shrinks a workload, Kueue must not immediately release q
 
 Introduce reclaim target tracking in the workload and elastic job ungater controllers. Cap ungating at the target counts, mark stopped pods reclaimable in the Workload status once they terminate, and reconcile in-place scale-downs so that autoscaler adjustments below or up to admitted counts preserve correct quota accounting. Defer an in-place scale-down that reaches a pending reclaim target until the pods above it are gone, so lowering the worker group replicas does not release quota early.
 ---
- pkg/controller/core/reclaim_targets.go        |  47 +++
- pkg/controller/core/reclaim_targets_test.go   | 146 +++++++
- pkg/controller/core/workload_controller.go    |   3 +
- .../elasticjobs/elastic_job_ungater.go        |   4 +
- pkg/controller/elasticjobs/reclaim_targets.go |  76 ++++
- .../elasticjobs/reclaim_targets_test.go       | 209 ++++++++++
- pkg/controller/jobframework/partial_stop.go   |  23 +-
- pkg/workloadslicing/manager.go                |  57 +++
- pkg/workloadslicing/partial_preemption.go     | 107 +++++
- .../partial_preemption_test.go                | 198 ++++++++-
- pkg/workloadslicing/workloadslicing.go        |  38 +-
- ...ster_controller_partial_preemption_test.go | 380 ++++++++++++++++++
- 12 files changed, 1263 insertions(+), 25 deletions(-)
- create mode 100644 pkg/controller/core/reclaim_targets.go
- create mode 100644 pkg/controller/core/reclaim_targets_test.go
- create mode 100644 pkg/controller/elasticjobs/reclaim_targets.go
- create mode 100644 pkg/controller/elasticjobs/reclaim_targets_test.go
- create mode 100644 test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
-
 diff --git a/pkg/controller/core/reclaim_targets.go b/pkg/controller/core/reclaim_targets.go
 new file mode 100644
-index 0000000..b925e0c
+index 00000000..b925e0c1
 --- /dev/null
 +++ b/pkg/controller/core/reclaim_targets.go
 @@ -0,0 +1,47 @@
@@ -81,10 +62,10 @@ index 0000000..b925e0c
 +	}))
 +}
 diff --git a/pkg/controller/core/workload_controller.go b/pkg/controller/core/workload_controller.go
-index eaa2713..7cb66cf 100644
+index 4e2ef7ac..db9eab14 100644
 --- a/pkg/controller/core/workload_controller.go
 +++ b/pkg/controller/core/workload_controller.go
-@@ -770,6 +770,9 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
+@@ -585,6 +585,9 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
  	// false before the workloads eviction.
  	if !workload.IsAdmitted(&wl) {
  		if !workload.HasQuotaReservation(&wl) {
@@ -95,7 +76,7 @@ index eaa2713..7cb66cf 100644
  			if err != nil {
  				return ctrl.Result{}, client.IgnoreNotFound(err)
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index 91f7dd5..7721599 100644
+index 91f7dd5a..7721599b 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -142,6 +142,9 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
@@ -118,7 +99,7 @@ index 91f7dd5..7721599 100644
  	admissionUpdates := make(map[kueue.PodSetReference]podAdmissionUpdate)
 diff --git a/pkg/controller/elasticjobs/reclaim_targets.go b/pkg/controller/elasticjobs/reclaim_targets.go
 new file mode 100644
-index 0000000..6df262b
+index 00000000..6df262b8
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/reclaim_targets.go
 @@ -0,0 +1,76 @@
@@ -199,7 +180,7 @@ index 0000000..6df262b
 +	}
 +}
 diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
-index 1676563..30e8210 100644
+index 1676563f..30e8210e 100644
 --- a/pkg/controller/jobframework/partial_stop.go
 +++ b/pkg/controller/jobframework/partial_stop.go
 @@ -56,30 +56,37 @@ const partialStopRequeueAfter = 5 * time.Second
@@ -249,7 +230,7 @@ index 1676563..30e8210 100644
  	}, clientutil.WithRetryOnConflict()); err != nil {
  		return ctrl.Result{}, true, client.IgnoreNotFound(err)
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index e6e7158..0d0b0b9 100644
+index e6e7158b..0d0b0b9e 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -31,6 +31,7 @@ import (
@@ -348,7 +329,7 @@ index e6e7158..0d0b0b9 100644
  		}
  
 diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
-index 718489b..6144869 100644
+index 718489b5..61448699 100644
 --- a/pkg/workloadslicing/partial_preemption.go
 +++ b/pkg/workloadslicing/partial_preemption.go
 @@ -34,6 +34,7 @@ import (
@@ -473,7 +454,7 @@ index 718489b..6144869 100644
  // reclaim target from a Workload that no longer holds quota: they were only the Pods
  // partial preemption stopped, and the next admission must not inherit them. A merge
 diff --git a/pkg/workloadslicing/workloadslicing.go b/pkg/workloadslicing/workloadslicing.go
-index 55b6ca1..35eb6c9 100644
+index 55b6ca14..35eb6c97 100644
 --- a/pkg/workloadslicing/workloadslicing.go
 +++ b/pkg/workloadslicing/workloadslicing.go
 @@ -342,23 +342,12 @@ func replacementTarget(wl *kueue.Workload) *workload.Reference {
@@ -539,7 +520,7 @@ index 55b6ca1..35eb6c9 100644
  		"total", len(workloads),
 diff --git a/pkg/controller/core/reclaim_targets_test.go b/pkg/controller/core/reclaim_targets_test.go
 new file mode 100644
-index 0000000..1401d7a
+index 00000000..1401d7ab
 --- /dev/null
 +++ b/pkg/controller/core/reclaim_targets_test.go
 @@ -0,0 +1,146 @@
@@ -691,7 +672,7 @@ index 0000000..1401d7a
 +}
 diff --git a/pkg/controller/elasticjobs/reclaim_targets_test.go b/pkg/controller/elasticjobs/reclaim_targets_test.go
 new file mode 100644
-index 0000000..a2e860b
+index 00000000..a2e860b5
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/reclaim_targets_test.go
 @@ -0,0 +1,209 @@
@@ -905,7 +886,7 @@ index 0000000..a2e860b
 +	}
 +}
 diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go
-index cbbd8e8..e4a6d2e 100644
+index cbbd8e86..e4a6d2e0 100644
 --- a/pkg/workloadslicing/partial_preemption_test.go
 +++ b/pkg/workloadslicing/partial_preemption_test.go
 @@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
@@ -1137,7 +1118,7 @@ index cbbd8e8..e4a6d2e 100644
  	wl := utiltestingapi.MakeWorkload("wl", "ns").Annotation(kueue.WorkloadSliceNameAnnotation, "origin").Obj()
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
 new file mode 100644
-index 0000000..37ed3d5
+index 00000000..37ed3d58
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
 @@ -0,0 +1,380 @@

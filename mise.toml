@@ -7,7 +7,7 @@ helm = "4.3.2"
 ko = "0.19.1"
 colima = "0.10.3"
 docker-cli = "29.10.0"
-jq = "1.8.1"
+jq = "1.8.2"
 python = "3.15.2"
 
 [env]

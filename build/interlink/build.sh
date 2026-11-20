@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TAG="${INTERLINK_IMAGE_TAG:-0.6.2-patched}"
+TAG="${INTERLINK_IMAGE_TAG:-0.6.3-patched}"
 SRC="$ROOT/third_party/interlink"
 DOCKERFILE="$ROOT/build/interlink/Dockerfile"
 

@@ -8,13 +8,13 @@ Pods offloaded to remote execution providers report the virtual kubelet host nod
 Extend types.PodStatus with optional podIP and podIPs fields and update checkPodsStatus to propagate the returned remote addresses directly onto in-cluster Status.PodIP and Status.PodIPs while preserving Status.HostIP at the node address. Align podIPs with Kubernetes validation by ordering the primary podIP first and deduplicating remaining addresses.
 ---
 diff --git a/pkg/interlink/types.go b/pkg/interlink/types.go
-index 5356d7c..1748285 100644
+index bbf9bfd..47a8759 100644
 --- a/pkg/interlink/types.go
 +++ b/pkg/interlink/types.go
-@@ -42,6 +42,10 @@ type PodStatus struct {
- 	PodNamespace string `json:"namespace"`
- 	// JobID is the remote system's job identifier (e.g., SLURM job ID, container ID)
- 	JobID string `json:"JID"`
+@@ -52,6 +52,10 @@ type PodStatus struct {
+ 	// job, for the shadow's unix sockets. It is empty while the job is queued, and
+ 	// empty when the plugin has none. interLink publishes it next to NodeName.
+ 	SocketDir string `json:"socketDir,omitempty"`
 +	// PodIP is the IP address of the remote workload, when the plugin knows it
 +	PodIP string `json:"podIP,omitempty"`
 +	// PodIPs lists all IP addresses of the remote workload, when the plugin knows them
@@ -23,10 +23,10 @@ index 5356d7c..1748285 100644
  	Containers []v1.ContainerStatus `json:"containers"`
  	// InitContainers holds the status of all init containers in the pod
 diff --git a/pkg/virtualkubelet/execute.go b/pkg/virtualkubelet/execute.go
-index d34e1e1..2168ada 100644
+index 194ba45..0fffcba 100644
 --- a/pkg/virtualkubelet/execute.go
 +++ b/pkg/virtualkubelet/execute.go
-@@ -1576,6 +1576,30 @@ func checkPodsStatus(ctx context.Context, p *Provider, pod *v1.Pod, token string
+@@ -1696,6 +1696,30 @@ func checkPodsStatus(ctx context.Context, p *Provider, pod *v1.Pod, token string
  			// path) do not observe a partially-updated pod status.
  			p.podsMu.Lock()
  

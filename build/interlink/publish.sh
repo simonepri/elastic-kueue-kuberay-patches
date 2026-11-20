@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TAG="${INTERLINK_UPSTREAM:-0.6.2}-p${INTERLINK_PATCH_VERSION:-0.5.0}"
+TAG="${INTERLINK_UPSTREAM:-0.6.3}-p${INTERLINK_PATCH_VERSION:-0.5.0}"
 DOCKERFILE="$ROOT/build/interlink/Dockerfile"
 
 "$ROOT/build/interlink/patch.sh"

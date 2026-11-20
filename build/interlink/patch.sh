@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-UPSTREAM="${INTERLINK_UPSTREAM:-0.6.2}"
+UPSTREAM="${INTERLINK_UPSTREAM:-0.6.3}"
 TARGET="$ROOT/third_party/interlink"
 PATCH_DIR="$ROOT/patches/interlink"
 

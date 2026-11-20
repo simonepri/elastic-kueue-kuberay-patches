@@ -6,6 +6,7 @@ Subject: [PATCH] feat: clamp raycluster worker scale up to kueue clusterqueue qu
 Ray's in-tree autoscaler calculates desired worker counts based purely on application task and actor resource requirements without awareness of Kubernetes scheduling queue limits. In an environment managed by Kueue, uncoordinated scale-up requests periodically exceed ClusterQueue nominal quota and cohort borrowing limits, creating surplus worker pods that remain indefinitely gated or pending, consuming namespace resources and triggering controller thrashing.
 
 Introduce a ScaleGate reconciler guarded by the ScaleGate feature gate that inspects the managing Kueue ClusterQueue, cohort tree, and flavor definitions to dynamically calculate the maximum feasible worker capacity after deducting head pod requests. Clamp spec.workerGroupSpecs[].maxReplicas to this computed ceiling while preserving original configured limits in annotations so maxReplicas can be restored upon quota growth. Read admitted Workloads straight from the API server, listing only those labelled with the cluster's job UID, and watch Workloads by metadata alone, so the operator never caches a full copy of every Workload in the cluster.
+A RayJob owns the Workloads of its RayCluster, so their admission, such as a scale-up slice granting more workers than the current cap, never reconciled ScaleGate and the cap held until an unrelated RayCluster, ClusterQueue, or LocalQueue event, leaving the Ray autoscaler unable to create workers Kueue had already admitted. Map a Workload owned by a RayJob to that job's RayCluster, read from the RayJob's recorded cluster name or, before it is recorded, from the RayCluster the job owns.
 ---
 diff --git a/helm-chart/kuberay-operator/templates/_helpers.tpl b/helm-chart/kuberay-operator/templates/_helpers.tpl
 index cd6443e..fc5c5d1 100644
@@ -66,10 +67,10 @@ index 953bf6f..98f933f 100644
    resources:
 diff --git a/ray-operator/controllers/ray/scalegate_controller.go b/ray-operator/controllers/ray/scalegate_controller.go
 new file mode 100644
-index 0000000..7246274
+index 0000000..e0de39a
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller.go
-@@ -0,0 +1,847 @@
+@@ -0,0 +1,872 @@
 +package ray
 +
 +import (
@@ -836,6 +837,41 @@ index 0000000..7246274
 +	return false
 +}
 +
++// workloadRequests maps a Workload to the RayCluster it admits: the owning RayCluster, or the RayCluster of the owning
++// RayJob.
++func (r *ScaleGateReconciler) workloadRequests(ctx context.Context, obj client.Object) []ctrl.Request {
++	for _, ref := range obj.GetOwnerReferences() {
++		switch ref.Kind {
++		case "RayCluster":
++			return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: ref.Name}}}
++		case "RayJob":
++			job := &rayv1.RayJob{}
++			if err := r.Get(ctx, types.NamespacedName{Namespace: obj.GetNamespace(), Name: ref.Name}, job); err != nil {
++				return nil
++			}
++			if job.Status.RayClusterName != "" {
++				return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: job.Namespace, Name: job.Status.RayClusterName}}}
++			}
++			// The RayJob has not recorded its cluster yet, so find it by owner.
++			rcList := &rayv1.RayClusterList{}
++			if err := r.List(ctx, rcList, client.InNamespace(obj.GetNamespace())); err != nil {
++				return nil
++			}
++			var reqs []ctrl.Request
++			for _, rc := range rcList.Items {
++				for _, owner := range rc.OwnerReferences {
++					if owner.UID == ref.UID {
++						reqs = append(reqs, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: rc.Namespace, Name: rc.Name}})
++						break
++					}
++				}
++			}
++			return reqs
++		}
++	}
++	return nil
++}
++
 +func (r *ScaleGateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 +	if enabled, err := strconv.ParseBool(os.Getenv(flavorSplitEnv)); err == nil && enabled {
 +		r.FlavorSplit = true
@@ -903,17 +939,7 @@ index 0000000..7246274
 +
 +	wlObj := &metav1.PartialObjectMetadata{}
 +	wlObj.SetGroupVersionKind(schema.GroupVersionKind{Group: "kueue.x-k8s.io", Version: "v1beta2", Kind: "Workload"})
-+	bld.Watches(wlObj, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-+		for _, ref := range obj.GetOwnerReferences() {
-+			if ref.Kind == "RayCluster" {
-+				return []ctrl.Request{{NamespacedName: types.NamespacedName{
-+					Namespace: obj.GetNamespace(),
-+					Name:      ref.Name,
-+				}}}
-+			}
-+		}
-+		return nil
-+	}), builder.OnlyMetadata)
++	bld.Watches(wlObj, handler.EnqueueRequestsFromMapFunc(r.workloadRequests), builder.OnlyMetadata)
 +
 +	return bld.Complete(r)
 +}
@@ -962,10 +988,10 @@ index 8b1db76..b5811de 100644
  // SetFeatureGateDuringTest is a helper method to override feature gates in tests.
 diff --git a/ray-operator/controllers/ray/scalegate_controller_unit_test.go b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
 new file mode 100644
-index 0000000..090ad42
+index 0000000..657cc97
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
-@@ -0,0 +1,996 @@
+@@ -0,0 +1,1055 @@
 +package ray
 +
 +import (
@@ -1960,5 +1986,64 @@ index 0000000..090ad42
 +	}
 +	if want := map[string]int64{"head": 1, "gpu-workers": 3}; !reflect.DeepEqual(got, want) {
 +		t.Errorf("admittedWorkerCounts = %v; want %v", got, want)
++	}
++}
++
++// A Workload reaches its RayCluster through the owning RayCluster, or through the owning RayJob: by the RayJob's
++// recorded cluster name, or by the RayCluster the RayJob owns while that name is still empty.
++func TestScaleGateMapsWorkloadToRayCluster(t *testing.T) {
++	scheme := runtime.NewScheme()
++	if err := rayv1.AddToScheme(scheme); err != nil {
++		t.Fatalf("AddToScheme: %v", err)
++	}
++	job := func(name, uid, cluster string) *rayv1.RayJob {
++		return &rayv1.RayJob{
++			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name, UID: types.UID(uid)},
++			Status:     rayv1.RayJobStatus{RayClusterName: cluster},
++		}
++	}
++	cluster := func(name string, ownerUID string) *rayv1.RayCluster {
++		rc := &rayv1.RayCluster{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name}}
++		if ownerUID != "" {
++			rc.OwnerReferences = []metav1.OwnerReference{{Kind: "RayJob", Name: "pending-job", UID: types.UID(ownerUID)}}
++		}
++		return rc
++	}
++	workload := func(kind, name, uid string) *metav1.PartialObjectMetadata {
++		wl := &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "wl"}}
++		if kind != "" {
++			wl.OwnerReferences = []metav1.OwnerReference{{Kind: kind, Name: name, UID: types.UID(uid)}}
++		}
++		return wl
++	}
++	req := func(name string) ctrl.Request {
++		return ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: name}}
++	}
++
++	tests := []struct {
++		name string
++		wl   *metav1.PartialObjectMetadata
++		want []ctrl.Request
++	}{
++		{"RayJob with a recorded cluster", workload("RayJob", "done-job", "job-1"), []ctrl.Request{req("job-cluster")}},
++		{"RayJob without a recorded cluster", workload("RayJob", "pending-job", "job-2"), []ctrl.Request{req("pending-cluster")}},
++		{"RayCluster", workload("RayCluster", "direct", "rc-1"), []ctrl.Request{req("direct")}},
++		{"no owner", workload("", "", ""), nil},
++	}
++	fakeClient := clientFake.NewClientBuilder().WithScheme(scheme).WithObjects(
++		job("done-job", "job-1", "job-cluster"),
++		job("pending-job", "job-2", ""),
++		cluster("job-cluster", "job-1"),
++		cluster("pending-cluster", "job-2"),
++		cluster("other-cluster", "job-3"),
++		cluster("direct", ""),
++	).Build()
++	r := &ScaleGateReconciler{Client: fakeClient}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := r.workloadRequests(context.Background(), tc.wl); !reflect.DeepEqual(got, tc.want) {
++				t.Errorf("workloadRequests = %v; want %v", got, tc.want)
++			}
++		})
 +	}
 +}

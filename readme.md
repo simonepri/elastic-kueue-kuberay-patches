@@ -10,7 +10,7 @@
 <!-- renovate: datasource=github-releases depName=kubernetes-sigs/karpenter -->
 [![Tested on Karpenter](https://img.shields.io/badge/tested%20on%20karpenter-v1.15.1-blue)](https://github.com/kubernetes-sigs/karpenter/releases/tag/v1.15.1)
 <!-- renovate: datasource=github-releases depName=interlink-hq/interLink -->
-[![Tested on interLink](https://img.shields.io/badge/tested%20on%20interlink-0.6.2-blue)](https://github.com/interlink-hq/interLink/releases/tag/v0.6.2)
+[![Tested on interLink](https://img.shields.io/badge/tested%20on%20interlink-0.6.3-blue)](https://github.com/interlink-hq/interLink/releases/tag/v0.6.3)
 <!-- renovate: datasource=github-releases depName=ray-project/ray -->
 [![Tested on Ray](https://img.shields.io/badge/tested%20on%20ray-2.60.0-blue)](https://github.com/ray-project/ray/releases/tag/ray-2.60.0)
 

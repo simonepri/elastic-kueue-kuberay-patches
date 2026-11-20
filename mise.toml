@@ -21,7 +21,7 @@ KUBERAY_UPSTREAM = "v1.7.2"
 # renovate: datasource=github-releases depName=kubernetes-sigs/karpenter
 KARPENTER_UPSTREAM = "v1.15.1"
 # renovate: datasource=github-releases depName=interlink-hq/interLink
-INTERLINK_UPSTREAM = "0.6.2"
+INTERLINK_UPSTREAM = "0.6.3"
 # renovate: datasource=github-releases depName=ray-project/ray
 RAY_UPSTREAM = "2.60.0"
 RAY_PYTHON = "py313"

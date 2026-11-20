@@ -11,7 +11,7 @@ Enforce whole-replica step increments during partial scale-up for workloads impl
 ---
 diff --git a/pkg/constants/podset_steps.go b/pkg/constants/podset_steps.go
 new file mode 100644
-index 000000000..c7327a379
+index 00000000..c7327a37
 --- /dev/null
 +++ b/pkg/constants/podset_steps.go
 @@ -0,0 +1,24 @@
@@ -40,7 +40,7 @@ index 000000000..c7327a379
 +	PodSetCountStepsAnnotation = "kueue.x-k8s.io/podset-count-steps"
 +)
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index e3141d478..cecebf3c4 100644
+index e3141d47..cecebf3c 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -307,14 +307,19 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
@@ -68,7 +68,7 @@ index e3141d478..cecebf3c4 100644
  		log.V(4).Info("elastic ungating quota accounting for PodSet",
 diff --git a/pkg/controller/elasticjobs/ungate_whole_groups.go b/pkg/controller/elasticjobs/ungate_whole_groups.go
 new file mode 100644
-index 000000000..f68380762
+index 00000000..f6838076
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/ungate_whole_groups.go
 @@ -0,0 +1,83 @@
@@ -157,7 +157,7 @@ index 000000000..f68380762
 +}
 diff --git a/pkg/controller/jobframework/podset_steps.go b/pkg/controller/jobframework/podset_steps.go
 new file mode 100644
-index 000000000..bdf9d36d1
+index 00000000..bdf9d36d
 --- /dev/null
 +++ b/pkg/controller/jobframework/podset_steps.go
 @@ -0,0 +1,71 @@
@@ -233,10 +233,10 @@ index 000000000..bdf9d36d1
 +	return workloadslicing.WithPodSetCountSteps(steps)
 +}
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index 8ce219fc5..0f2673652 100644
+index ce0a8c68..ed5f3679 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -1202,7 +1202,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
+@@ -1337,7 +1337,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
  		// Workload slices allow modifications only to PodSet.Count.
  		// Any other changes will result in the slice being marked as incompatible,
  		// and the workload will fall back to being processed by the original ensureOneWorkload function.
@@ -245,7 +245,7 @@ index 8ce219fc5..0f2673652 100644
  		if err != nil {
  			return nil, err
  		}
-@@ -1965,6 +1965,7 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
+@@ -2126,6 +2126,7 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
  	}
  
  	wl := NewWorkload(newWorkloadName(job, extra), object, podSets, labelKeysToCopy, annotationsToCopy)
@@ -254,7 +254,7 @@ index 8ce219fc5..0f2673652 100644
  		wl.Labels = make(map[string]string)
  	}
 diff --git a/pkg/controller/jobs/raycluster/common.go b/pkg/controller/jobs/raycluster/common.go
-index 24ccd0754..a7bf80c43 100644
+index cf1222f7..aacf084a 100644
 --- a/pkg/controller/jobs/raycluster/common.go
 +++ b/pkg/controller/jobs/raycluster/common.go
 @@ -49,6 +49,7 @@ import (
@@ -288,7 +288,7 @@ index 24ccd0754..a7bf80c43 100644
  func BuildPodSets(rayClusterSpec *rayv1.RayClusterSpec, annotations map[string]string) ([]kueue.PodSet, error) {
  	podSets := make([]kueue.PodSet, 0)
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index 208700403..c2c44dcc5 100644
+index 20870040..c2c44dcc 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -81,6 +81,7 @@ type RayCluster rayv1.RayCluster
@@ -301,7 +301,7 @@ index 208700403..c2c44dcc5 100644
  	return EquivalenceOptions()
 diff --git a/pkg/scheduler/flavorassigner/podset_reducer_steps.go b/pkg/scheduler/flavorassigner/podset_reducer_steps.go
 new file mode 100644
-index 000000000..aed9f3ad7
+index 00000000..aed9f3ad
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/podset_reducer_steps.go
 @@ -0,0 +1,96 @@
@@ -403,7 +403,7 @@ index 000000000..aed9f3ad7
 +}
 diff --git a/pkg/scheduler/partial_scale_up_steps.go b/pkg/scheduler/partial_scale_up_steps.go
 new file mode 100644
-index 000000000..2112c464d
+index 00000000..2112c464
 --- /dev/null
 +++ b/pkg/scheduler/partial_scale_up_steps.go
 @@ -0,0 +1,34 @@
@@ -442,10 +442,10 @@ index 000000000..2112c464d
 +	return workload.PodSetCountSteps(wl)
 +}
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index 744b71326..27382ba4b 100644
+index 5fe96361..e79ff2f9 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
-@@ -1601,7 +1601,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1619,7 +1619,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  		// Only an admitted predecessor can already be running these PodSets. A predecessor
  		// that only holds quota may still be waiting for admission checks and needs the baseline back.
  		mustGrow := replaceableWorkloadSlice != nil && workload.IsAdmitted(replaceableWorkloadSlice.Obj)
@@ -456,7 +456,7 @@ index 744b71326..27382ba4b 100644
  		}
 diff --git a/pkg/workload/podset_steps.go b/pkg/workload/podset_steps.go
 new file mode 100644
-index 000000000..afa51acb9
+index 00000000..afa51acb
 --- /dev/null
 +++ b/pkg/workload/podset_steps.go
 @@ -0,0 +1,83 @@
@@ -544,7 +544,7 @@ index 000000000..afa51acb9
 +	wl.Annotations[constants.PodSetCountStepsAnnotation] = FormatPodSetCounts(steps)
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 209983e49..e6e7158bd 100644
+index 209983e4..e6e7158b 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -53,7 +53,9 @@ func (r *Manager) EnsureWorkloadSlices(
@@ -602,7 +602,7 @@ index 209983e49..e6e7158bd 100644
  			}
 diff --git a/pkg/workloadslicing/podset_steps.go b/pkg/workloadslicing/podset_steps.go
 new file mode 100644
-index 000000000..5ca98c6fc
+index 00000000..5ca98c6f
 --- /dev/null
 +++ b/pkg/workloadslicing/podset_steps.go
 @@ -0,0 +1,72 @@
@@ -680,7 +680,7 @@ index 000000000..5ca98c6fc
 +}
 diff --git a/pkg/controller/elasticjobs/ungate_whole_groups_test.go b/pkg/controller/elasticjobs/ungate_whole_groups_test.go
 new file mode 100644
-index 000000000..3aeeaa276
+index 00000000..3aeeaa27
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/ungate_whole_groups_test.go
 @@ -0,0 +1,179 @@
@@ -865,7 +865,7 @@ index 000000000..3aeeaa276
 +}
 diff --git a/pkg/scheduler/flavorassigner/podset_reducer_steps_test.go b/pkg/scheduler/flavorassigner/podset_reducer_steps_test.go
 new file mode 100644
-index 000000000..d182e0270
+index 00000000..d182e027
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/podset_reducer_steps_test.go
 @@ -0,0 +1,138 @@
@@ -1009,7 +1009,7 @@ index 000000000..d182e0270
 +}
 diff --git a/pkg/scheduler/partial_scale_up_steps_test.go b/pkg/scheduler/partial_scale_up_steps_test.go
 new file mode 100644
-index 000000000..fa93b37cf
+index 00000000..fa93b37c
 --- /dev/null
 +++ b/pkg/scheduler/partial_scale_up_steps_test.go
 @@ -0,0 +1,50 @@
@@ -1065,7 +1065,7 @@ index 000000000..fa93b37cf
 +}
 diff --git a/pkg/workload/podset_steps_test.go b/pkg/workload/podset_steps_test.go
 new file mode 100644
-index 000000000..53e0d4372
+index 00000000..53e0d437
 --- /dev/null
 +++ b/pkg/workload/podset_steps_test.go
 @@ -0,0 +1,96 @@
@@ -1167,7 +1167,7 @@ index 000000000..53e0d4372
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_multi_host_scaleup_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_multi_host_scaleup_test.go
 new file mode 100644
-index 000000000..16c50287d
+index 00000000..16c50287
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_multi_host_scaleup_test.go
 @@ -0,0 +1,144 @@
@@ -1315,6 +1315,3 @@ index 000000000..16c50287d
 +		growsInWholeReplicas()
 +	})
 +})
--- 
-2.56.0
-

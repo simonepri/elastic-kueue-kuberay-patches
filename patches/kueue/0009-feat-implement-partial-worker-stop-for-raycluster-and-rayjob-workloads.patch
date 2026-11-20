@@ -7,41 +7,9 @@ Preemption of Ray workloads in Kueue is entirely all-or-nothing, terminating the
 
 Implement collaborative partial worker stopping for RayCluster and RayJob workloads by exposing the kueue.x-k8s.io/reclaim-target-counts annotation and reconciling partial preemption requests. Stop surplus worker pods in whole replica units by deletion cost and age while keeping the Ray Head pod and core cluster state operational. For a RayCluster, and for a RayJob with in-tree autoscaling, lower each shrunk worker group to its target and list the stopped pods in its scaleStrategy.workersToDelete, so KubeRay removes exactly those pods instead of recreating them and the Ray autoscaler starts from the lower replicas, once per reclaim request, which a Workload annotation records.
 ---
- pkg/constants/partial_preemption.go           |  39 ++
- pkg/constants/ray.go                          |   8 +
- pkg/controller/core/indexer/indexer.go        |  14 +
- pkg/controller/jobframework/partial_stop.go   | 108 ++++
- pkg/controller/jobframework/reconciler.go     |   8 +
- .../jobs/raycluster/partial_stop.go           | 216 ++++++++
- .../jobs/raycluster/partial_stop_test.go      | 478 ++++++++++++++++++
- .../jobs/raycluster/raycluster_controller.go  |   4 +-
- pkg/controller/jobs/rayjob/partial_stop.go    |  53 ++
- .../jobs/rayjob/partial_stop_test.go          | 109 ++++
- .../jobs/rayjob/rayjob_controller.go          |  10 +-
- .../jobs/rayservice/rayservice_controller.go  |   3 +-
- pkg/controller/tas/indexer/indexer.go         |  10 +-
- pkg/features/kube_features.go                 |  10 +
- pkg/workload/partial_preemption.go            | 198 ++++++++
- pkg/workload/partial_preemption_test.go       | 294 +++++++++++
- pkg/workload/workload.go                      |   1 +
- pkg/workloadslicing/partial_preemption.go     | 462 +++++++++++++++++
- .../partial_preemption_test.go                | 453 +++++++++++++++++
- 19 files changed, 2466 insertions(+), 12 deletions(-)
- create mode 100644 pkg/constants/partial_preemption.go
- create mode 100644 pkg/constants/ray.go
- create mode 100644 pkg/controller/jobframework/partial_stop.go
- create mode 100644 pkg/controller/jobs/raycluster/partial_stop.go
- create mode 100644 pkg/controller/jobs/raycluster/partial_stop_test.go
- create mode 100644 pkg/controller/jobs/rayjob/partial_stop.go
- create mode 100644 pkg/controller/jobs/rayjob/partial_stop_test.go
- create mode 100644 pkg/workload/partial_preemption.go
- create mode 100644 pkg/workload/partial_preemption_test.go
- create mode 100644 pkg/workloadslicing/partial_preemption.go
- create mode 100644 pkg/workloadslicing/partial_preemption_test.go
-
 diff --git a/pkg/constants/partial_preemption.go b/pkg/constants/partial_preemption.go
 new file mode 100644
-index 0000000..ecf389b
+index 00000000..ecf389b0
 --- /dev/null
 +++ b/pkg/constants/partial_preemption.go
 @@ -0,0 +1,45 @@
@@ -92,7 +60,7 @@ index 0000000..ecf389b
 +)
 diff --git a/pkg/constants/ray.go b/pkg/constants/ray.go
 new file mode 100644
-index 0000000..666317b
+index 00000000..666317b0
 --- /dev/null
 +++ b/pkg/constants/ray.go
 @@ -0,0 +1,8 @@
@@ -105,7 +73,7 @@ index 0000000..666317b
 +	RaySubmitterPodSetName = "submitter"
 +)
 diff --git a/pkg/controller/core/indexer/indexer.go b/pkg/controller/core/indexer/indexer.go
-index 1c69baa..dc9416d 100644
+index 1c69baac..dc9416de 100644
 --- a/pkg/controller/core/indexer/indexer.go
 +++ b/pkg/controller/core/indexer/indexer.go
 @@ -19,6 +19,7 @@ package indexer
@@ -152,7 +120,7 @@ index 1c69baa..dc9416d 100644
  	}
 diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
 new file mode 100644
-index 0000000..1676563
+index 00000000..1676563f
 --- /dev/null
 +++ b/pkg/controller/jobframework/partial_stop.go
 @@ -0,0 +1,108 @@
@@ -265,34 +233,33 @@ index 0000000..1676563
 +	return client.IgnoreNotFound(err)
 +}
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index 0d6a832..e509826 100644
+index 0a26b6fd..3fda5795 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -575,6 +575,11 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
- 		return ctrl.Result{}, nil
+@@ -460,6 +460,10 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
  	}
  
-+	// 3.1 stop the pods above the reclaim target counts of partial preemption
+ 	// The helpers below require a non-nil wl.
 +	if result, pending, err := r.stopJobPartially(ctx, job, wl); pending || err != nil {
 +		return result, err
 +	}
 +
- 	// 4. update reclaimable counts if implemented by the job
- 	jobRecl, implementsReclaimable := job.(JobWithReclaimablePods)
- 	// The webhook rejects lowering reclaimablePods while the workload holds quota,
-@@ -622,6 +627,9 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
+ 	if done, result, err := r.reconcileReclaimablePods(ctx, job, wl); done {
+ 		return result, err
+ 	}
+@@ -760,6 +764,9 @@ func (r *JobReconciler) reconcileEvicted(ctx context.Context, job GenericJob, wl
  			if err := r.clearAdmissionAfterEviction(ctx, job, wl); err != nil {
- 				return ctrl.Result{}, fmt.Errorf("clearing admission: %w", err)
+ 				return true, ctrl.Result{}, fmt.Errorf("clearing admission: %w", err)
  			}
 +			if err := r.clearReclaimedPods(ctx, wl); err != nil {
-+				return ctrl.Result{}, fmt.Errorf("clearing reclaimed pods: %w", err)
++				return true, ctrl.Result{}, fmt.Errorf("clearing reclaimed pods: %w", err)
 +			}
  		}
  		requeueAfter, err := r.handleWorkloadAfterDeactivatedPolicy(ctx, job, wl)
- 		return ctrl.Result{RequeueAfter: requeueAfter}, err
+ 		return true, ctrl.Result{RequeueAfter: requeueAfter}, err
 diff --git a/pkg/controller/jobs/raycluster/partial_stop.go b/pkg/controller/jobs/raycluster/partial_stop.go
 new file mode 100644
-index 0000000..ddc22fd
+index 00000000..ddc22fd5
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/partial_stop.go
 @@ -0,0 +1,216 @@
@@ -513,7 +480,7 @@ index 0000000..ddc22fd
 +	return wl != nil && len(workload.ReclaimTargetCounts(wl)) > 0
 +}
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index c2c44dc..6547f29 100644
+index c2c44dcc..6547f297 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -153,8 +153,8 @@ func (j *RayCluster) Finished(ctx context.Context) (message string, success, fin
@@ -529,7 +496,7 @@ index c2c44dc..6547f29 100644
  	// RayClusters are commonly used as devboxes, where users may already be
 diff --git a/pkg/controller/jobs/rayjob/partial_stop.go b/pkg/controller/jobs/rayjob/partial_stop.go
 new file mode 100644
-index 0000000..b84c350
+index 00000000..b84c350e
 --- /dev/null
 +++ b/pkg/controller/jobs/rayjob/partial_stop.go
 @@ -0,0 +1,53 @@
@@ -587,7 +554,7 @@ index 0000000..b84c350
 +		wl != nil && len(workload.ReclaimTargetCounts(wl)) > 0
 +}
 diff --git a/pkg/controller/jobs/rayjob/rayjob_controller.go b/pkg/controller/jobs/rayjob/rayjob_controller.go
-index f38883c..f8aab15 100644
+index f38883ce..f8aab15e 100644
 --- a/pkg/controller/jobs/rayjob/rayjob_controller.go
 +++ b/pkg/controller/jobs/rayjob/rayjob_controller.go
 @@ -33,6 +33,7 @@ import (
@@ -622,7 +589,7 @@ index f38883c..f8aab15 100644
  }
  
 diff --git a/pkg/controller/jobs/rayservice/rayservice_controller.go b/pkg/controller/jobs/rayservice/rayservice_controller.go
-index 5458119..4d46505 100644
+index 5458119d..4d465054 100644
 --- a/pkg/controller/jobs/rayservice/rayservice_controller.go
 +++ b/pkg/controller/jobs/rayservice/rayservice_controller.go
 @@ -34,6 +34,7 @@ import (
@@ -643,7 +610,7 @@ index 5458119..4d46505 100644
  )
  
 diff --git a/pkg/controller/tas/indexer/indexer.go b/pkg/controller/tas/indexer/indexer.go
-index 804aadf..f6de7de 100644
+index 804aadf4..f6de7deb 100644
 --- a/pkg/controller/tas/indexer/indexer.go
 +++ b/pkg/controller/tas/indexer/indexer.go
 @@ -20,11 +20,13 @@ import (
@@ -683,7 +650,7 @@ index 804aadf..f6de7de 100644
  	}
  	if err := indexer.IndexField(ctx, &corev1.Node{}, NodeHostnameKey, indexNodeHostname); err != nil {
 diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
-index 90f5e30..94abae6 100644
+index 35164b57..445aa036 100644
 --- a/pkg/features/kube_features.go
 +++ b/pkg/features/kube_features.go
 @@ -45,6 +45,12 @@ const (
@@ -699,7 +666,7 @@ index 90f5e30..94abae6 100644
  	// owner: @KunWuLuan
  	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/582-preempt-based-on-flavor-order
  	//
-@@ -978,6 +984,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
+@@ -996,6 +1002,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
  	TASPartialSlices:                                    {TopologyAwareScheduling},
  	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {ElasticJobsViaWorkloadSlices},
  	SchedulerLibraryIntegration:                         {TopologyAwareScheduling},
@@ -707,7 +674,7 @@ index 90f5e30..94abae6 100644
  }
  
  // defaultVersionedFeatureGates consists of all known Kueue-specific feature keys.
-@@ -998,6 +1005,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+@@ -1016,6 +1023,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
  	ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: {
  		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
  	},
@@ -719,7 +686,7 @@ index 90f5e30..94abae6 100644
  	},
 diff --git a/pkg/workload/partial_preemption.go b/pkg/workload/partial_preemption.go
 new file mode 100644
-index 0000000..49fcc18
+index 00000000..49fcc188
 --- /dev/null
 +++ b/pkg/workload/partial_preemption.go
 @@ -0,0 +1,223 @@
@@ -947,7 +914,7 @@ index 0000000..49fcc18
 +	return reclaimable
 +}
 diff --git a/pkg/workload/workload.go b/pkg/workload/workload.go
-index cd2cca9..5568fa7 100644
+index 2c41cf22..c70b63bd 100644
 --- a/pkg/workload/workload.go
 +++ b/pkg/workload/workload.go
 @@ -763,6 +763,7 @@ func podSetsCountsAfterReclaim(wl *kueue.Workload) PodSetsCounts {
@@ -960,7 +927,7 @@ index cd2cca9..5568fa7 100644
  
 diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
 new file mode 100644
-index 0000000..718489b
+index 00000000..718489b5
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption.go
 @@ -0,0 +1,462 @@
@@ -1428,7 +1395,7 @@ index 0000000..718489b
 +}
 diff --git a/pkg/controller/jobs/raycluster/partial_stop_test.go b/pkg/controller/jobs/raycluster/partial_stop_test.go
 new file mode 100644
-index 0000000..9ca5d52
+index 00000000..9ca5d52a
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/partial_stop_test.go
 @@ -0,0 +1,478 @@
@@ -1912,7 +1879,7 @@ index 0000000..9ca5d52
 +}
 diff --git a/pkg/controller/jobs/rayjob/partial_stop_test.go b/pkg/controller/jobs/rayjob/partial_stop_test.go
 new file mode 100644
-index 0000000..26dcdc6
+index 00000000..26dcdc67
 --- /dev/null
 +++ b/pkg/controller/jobs/rayjob/partial_stop_test.go
 @@ -0,0 +1,109 @@
@@ -2027,7 +1994,7 @@ index 0000000..26dcdc6
 +}
 diff --git a/pkg/workload/partial_preemption_test.go b/pkg/workload/partial_preemption_test.go
 new file mode 100644
-index 0000000..21b0b2e
+index 00000000..21b0b2e0
 --- /dev/null
 +++ b/pkg/workload/partial_preemption_test.go
 @@ -0,0 +1,320 @@
@@ -2353,7 +2320,7 @@ index 0000000..21b0b2e
 +}
 diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go
 new file mode 100644
-index 0000000..cbbd8e8
+index 00000000..cbbd8e86
 --- /dev/null
 +++ b/pkg/workloadslicing/partial_preemption_test.go
 @@ -0,0 +1,453 @@

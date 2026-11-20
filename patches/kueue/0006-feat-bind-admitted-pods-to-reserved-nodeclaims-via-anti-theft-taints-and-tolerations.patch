@@ -8,7 +8,7 @@ When Kueue admits multi-slice elastic workloads on dynamic capacity, long-lived 
 Strip per-attempt Karpenter node selectors and anti-theft tolerations from elastic job pod templates via deferKarpenterPlacementToPods so subsequent slices do not inherit stale placement. In ElasticJobUngater, inject admission check tolerations onto gated elastic pods before releasing their scheduling gates when KarpenterAdmissionCheck is enabled.
 ---
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index cecebf3..5a42ea9 100644
+index cecebf3c..5a42ea93 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -45,6 +45,7 @@ import (
@@ -68,7 +68,7 @@ index cecebf3..5a42ea9 100644
  	// so the index lookup returns every pod created on behalf of this job.
 diff --git a/pkg/controller/jobframework/karpenter_placement.go b/pkg/controller/jobframework/karpenter_placement.go
 new file mode 100644
-index 0000000..32e0585
+index 00000000..32e05855
 --- /dev/null
 +++ b/pkg/controller/jobframework/karpenter_placement.go
 @@ -0,0 +1,68 @@
@@ -141,10 +141,10 @@ index 0000000..32e0585
 +	}
 +}
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index adc4963..6d33b7c 100644
+index 71daa5d1..d06ed0a7 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -1674,6 +1674,7 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
+@@ -1828,6 +1828,7 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
  	infoMap := slices.ToRefMap(info, func(psi *podset.PodSetInfo) kueue.PodSetReference { return psi.Name })
  	runningPodSets := wl.Spec.DeepCopy().PodSets
  	canBePartiallyAdmitted := workload.CanBePartiallyAdmitted(wl)
@@ -152,7 +152,7 @@ index adc4963..6d33b7c 100644
  	for i := range runningPodSets {
  		ps := &runningPodSets[i]
  		psi, found := infoMap[ps.Name]
-@@ -1775,6 +1776,7 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
+@@ -1936,6 +1937,7 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
  	if err != nil {
  		return err
  	}
@@ -161,7 +161,7 @@ index adc4963..6d33b7c 100644
  		if err := deferAdmissionCheckNodeSelectorsToPods(ctx, r.client, wl, info); err != nil {
  			return err
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater_test.go b/pkg/controller/elasticjobs/elastic_job_ungater_test.go
-index 9bc912d..cb087ca 100644
+index 9bc912d5..cb087ca5 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater_test.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater_test.go
 @@ -97,9 +97,14 @@ func makeElasticPodForPodSet(name string, podSet kueue.PodSetReference) *testing
@@ -238,7 +238,7 @@ index 9bc912d..cb087ca 100644
  			// Leftover consume annotations must not permanently gate pods when
 diff --git a/pkg/controller/jobframework/karpenter_placement_test.go b/pkg/controller/jobframework/karpenter_placement_test.go
 new file mode 100644
-index 0000000..f3d9718
+index 00000000..f3d97188
 --- /dev/null
 +++ b/pkg/controller/jobframework/karpenter_placement_test.go
 @@ -0,0 +1,74 @@
@@ -318,7 +318,7 @@ index 0000000..f3d9718
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go
 new file mode 100644
-index 0000000..9d21bf6
+index 00000000..9d21bf6d
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go
 @@ -0,0 +1,114 @@

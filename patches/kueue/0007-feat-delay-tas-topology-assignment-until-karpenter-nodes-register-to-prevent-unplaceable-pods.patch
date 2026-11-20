@@ -8,7 +8,7 @@ Kueue's Topology-Aware Scheduling (TAS) assigns topology domains to workloads du
 Introduce a delayed topology assignment mechanism that defers TAS domain binding for Karpenter-backed workloads until provisioned nodes register and publish their topology labels. Re-evaluate topology fit against actual registered node labels before ungating workload pods, avoiding scheduling deadlocks.
 ---
 diff --git a/pkg/cache/scheduler/admissioncheck.go b/pkg/cache/scheduler/admissioncheck.go
-index c8d840c..703ea4f 100644
+index c8d840c1..703ea4f3 100644
 --- a/pkg/cache/scheduler/admissioncheck.go
 +++ b/pkg/cache/scheduler/admissioncheck.go
 @@ -18,5 +18,6 @@ package scheduler
@@ -20,7 +20,7 @@ index c8d840c..703ea4f 100644
 +	KarpenterNodeClass bool
  }
 diff --git a/pkg/cache/scheduler/cache.go b/pkg/cache/scheduler/cache.go
-index 3ce3b99..83f3e48 100644
+index bbffcce7..b86533fd 100644
 --- a/pkg/cache/scheduler/cache.go
 +++ b/pkg/cache/scheduler/cache.go
 @@ -41,6 +41,7 @@ import (
@@ -31,7 +31,7 @@ index 3ce3b99..83f3e48 100644
  	utilindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
  	"sigs.k8s.io/kueue/pkg/dra"
  	"sigs.k8s.io/kueue/pkg/features"
-@@ -415,7 +416,8 @@ func (c *Cache) AddOrUpdateAdmissionCheck(log logr.Logger, ac *kueue.AdmissionCh
+@@ -417,7 +418,8 @@ func (c *Cache) AddOrUpdateAdmissionCheck(log logr.Logger, ac *kueue.AdmissionCh
  
  	newAC := AdmissionCheck{
  		Active:     apimeta.IsStatusConditionTrue(ac.Status.Conditions, kueue.AdmissionCheckActive),
@@ -42,7 +42,7 @@ index 3ce3b99..83f3e48 100644
  	c.admissionChecks[kueue.AdmissionCheckReference(ac.Name)] = newAC
  
 diff --git a/pkg/cache/scheduler/clusterqueue_snapshot.go b/pkg/cache/scheduler/clusterqueue_snapshot.go
-index d7cd326..e805b6c 100644
+index 6201608b..5dff7d7e 100644
 --- a/pkg/cache/scheduler/clusterqueue_snapshot.go
 +++ b/pkg/cache/scheduler/clusterqueue_snapshot.go
 @@ -86,7 +86,8 @@ type ClusterQueueSnapshot struct {
@@ -57,7 +57,7 @@ index d7cd326..e805b6c 100644
  
 diff --git a/pkg/cache/scheduler/karpenter.go b/pkg/cache/scheduler/karpenter.go
 new file mode 100644
-index 0000000..cc370ff
+index 00000000..cc370ff4
 --- /dev/null
 +++ b/pkg/cache/scheduler/karpenter.go
 @@ -0,0 +1,51 @@
@@ -113,7 +113,7 @@ index 0000000..cc370ff
 +	return c.flavorsForKarpenterACs.Has(rf)
 +}
 diff --git a/pkg/cache/scheduler/snapshot.go b/pkg/cache/scheduler/snapshot.go
-index 00c9537..62e889a 100644
+index 00c95372..62e889a1 100644
 --- a/pkg/cache/scheduler/snapshot.go
 +++ b/pkg/cache/scheduler/snapshot.go
 @@ -494,6 +494,7 @@ func (c *Cache) snapshotClusterQueue(
@@ -125,10 +125,10 @@ index 00c9537..62e889a 100644
  		draBackedResources:            c.draBackedResources,
  	}
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
-index 046045a..74c2382 100644
+index df8019af..64956072 100644
 --- a/pkg/controller/admissionchecks/karpenter/controller.go
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
-@@ -295,7 +295,14 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
+@@ -305,7 +305,14 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
  		if check.State == kueue.CheckStatePending {
  			result, err = c.reconcileCheck(ctx, wl, check.Name, cfg)
  		} else {
@@ -144,7 +144,7 @@ index 046045a..74c2382 100644
  		}
  		if expiry > 0 && (result.RequeueAfter == 0 || expiry < result.RequeueAfter) {
  			result.RequeueAfter = expiry
-@@ -425,6 +432,14 @@ func (c *Controller) reconcileCheck(ctx context.Context, wl *kueue.Workload, che
+@@ -435,6 +442,14 @@ func (c *Controller) reconcileCheck(ctx context.Context, wl *kueue.Workload, che
  	if len(guarded) == 0 {
  		return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady, "No pods require NodeClaims")
  	}
@@ -159,7 +159,7 @@ index 046045a..74c2382 100644
  
  	workloadID := workloadClaimLabel(wl.Namespace, wl.Name, wl.UID)
  	claims, err := c.listNodeClaims(ctx, wl.Namespace, workloadID)
-@@ -617,6 +632,50 @@ func (c *Controller) reconcileCheck(ctx context.Context, wl *kueue.Workload, che
+@@ -637,6 +652,50 @@ func (c *Controller) reconcileCheck(ctx context.Context, wl *kueue.Workload, che
  	return ctrl.Result{RequeueAfter: min(pollInterval, cfg.launchTimeout-elapsed)}, nil
  }
  
@@ -210,7 +210,7 @@ index 046045a..74c2382 100644
  // fail releases the attempt's NodeClaims, excludes the flavors the check guards, and sets the check to Retry
  // so that Kueue evicts the Workload and assigns it a flavor that is still allowed.
  func (c *Controller) fail(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, cfg config, claims map[string]*unstructured.Unstructured, reason string) error {
-@@ -1164,6 +1223,35 @@ func (c *Controller) releaseDisruptionHolds(ctx context.Context, wl *kueue.Workl
+@@ -1206,6 +1265,35 @@ func (c *Controller) releaseDisruptionHolds(ctx context.Context, wl *kueue.Workl
  	if err != nil {
  		return ctrl.Result{}, err
  	}
@@ -246,7 +246,7 @@ index 046045a..74c2382 100644
  	held := 0
  	for i := range claims {
  		claim := &claims[i]
-@@ -1179,7 +1267,7 @@ func (c *Controller) releaseDisruptionHolds(ctx context.Context, wl *kueue.Workl
+@@ -1221,7 +1309,7 @@ func (c *Controller) releaseDisruptionHolds(ctx context.Context, wl *kueue.Workl
  		if err != nil {
  			want = 1
  		}
@@ -256,7 +256,7 @@ index 046045a..74c2382 100644
  			continue
  		}
 diff --git a/pkg/scheduler/flavorassigner/tas_flavorassigner.go b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
-index 3894955..4f9b86a 100644
+index 3894955f..4f9b86ac 100644
 --- a/pkg/scheduler/flavorassigner/tas_flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
 @@ -102,9 +102,10 @@ func podSetTopologyRequest(psAssignment *PodSetAssignment,
@@ -274,7 +274,7 @@ index 3894955..4f9b86a 100644
  	}
 diff --git a/pkg/cache/scheduler/karpenter_test.go b/pkg/cache/scheduler/karpenter_test.go
 new file mode 100644
-index 0000000..cbcc5cb
+index 00000000..cbcc5cbb
 --- /dev/null
 +++ b/pkg/cache/scheduler/karpenter_test.go
 @@ -0,0 +1,93 @@
@@ -373,7 +373,7 @@ index 0000000..cbcc5cb
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/topology_test.go b/pkg/controller/admissionchecks/karpenter/topology_test.go
 new file mode 100644
-index 0000000..4001771
+index 00000000..40017717
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/topology_test.go
 @@ -0,0 +1,267 @@
@@ -646,7 +646,7 @@ index 0000000..4001771
 +}
 diff --git a/test/integration/singlecluster/tas/karpenter-crds.yaml b/test/integration/singlecluster/tas/karpenter-crds.yaml
 new file mode 100644
-index 0000000..a463f09
+index 00000000..a463f09d
 --- /dev/null
 +++ b/test/integration/singlecluster/tas/karpenter-crds.yaml
 @@ -0,0 +1,58 @@
@@ -709,7 +709,7 @@ index 0000000..a463f09
 +              type: object
 +              x-kubernetes-preserve-unknown-fields: true
 diff --git a/test/integration/singlecluster/tas/suite_test.go b/test/integration/singlecluster/tas/suite_test.go
-index cebb9f6..69291d4 100644
+index cebb9f61..69291d40 100644
 --- a/test/integration/singlecluster/tas/suite_test.go
 +++ b/test/integration/singlecluster/tas/suite_test.go
 @@ -66,6 +66,7 @@ var _ = ginkgo.BeforeSuite(func() {
@@ -722,7 +722,7 @@ index cebb9f6..69291d4 100644
  	cfg = fwk.Init()
 diff --git a/test/integration/singlecluster/tas/tas_karpenter_test.go b/test/integration/singlecluster/tas/tas_karpenter_test.go
 new file mode 100644
-index 0000000..f55a524
+index 00000000..f55a5246
 --- /dev/null
 +++ b/test/integration/singlecluster/tas/tas_karpenter_test.go
 @@ -0,0 +1,314 @@

@@ -10,7 +10,7 @@ Upstream Kueue requires strict immutability of queue and priority labels on acti
 Introduce the MutableDeploymentQueue feature gate (off by default) and relax immutability validation in the Deployment webhook when enabled. Allow updating queue names and adding or changing workload priority classes on running Deployments while preserving deletion checks, enabling rolling updates to apply new queue and priority assignments to subsequent pods.
 ---
 diff --git a/pkg/controller/jobs/deployment/deployment_webhook.go b/pkg/controller/jobs/deployment/deployment_webhook.go
-index 1039f97..ff5d6f9 100644
+index 1039f973..ff5d6f90 100644
 --- a/pkg/controller/jobs/deployment/deployment_webhook.go
 +++ b/pkg/controller/jobs/deployment/deployment_webhook.go
 @@ -172,17 +172,34 @@ func (wh *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj *appsv1.De
@@ -58,13 +58,13 @@ index 1039f97..ff5d6f9 100644
  	if features.Enabled(features.AdmissionGatedBy) {
  		allErrs = append(allErrs, webhook.ValidateAdmissionGatedByAnnotationOnUpdate(oldDeployment.Object(), newDeployment.Object())...)
 diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
-index 46e4356..a47b406 100644
+index dd635c6e..69bbd91b 100644
 --- a/pkg/features/kube_features.go
 +++ b/pkg/features/kube_features.go
-@@ -927,6 +927,10 @@ const (
- 	// not all Pods of the group succeeded. When disabled, such a Workload finishes with
- 	// reason Succeeded, as before https://github.com/kubernetes-sigs/kueue/pull/16156.
- 	DeclareWorkloadFailureOnUnretriablePodGroups featuregate.Feature = "DeclareWorkloadFailureOnUnretriablePodGroups"
+@@ -945,6 +945,10 @@ const (
+ 	// sets back a priority changed directly on the Workload. Disable this gate to
+ 	// keep such a priority until the class is reconciled again.
+ 	WorkloadPriorityClassWatchesWorkloads featuregate.Feature = "WorkloadPriorityClassWatchesWorkloads"
 +
 +	// Enables updating queue and priority on running Deployments by relaxing
 +	// immutability checks in the Deployment validation webhook.
@@ -72,7 +72,7 @@ index 46e4356..a47b406 100644
  )
  
  func init() {
-@@ -1359,6 +1363,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+@@ -1377,6 +1381,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
  		{Version: version.MustParse("0.20"), Default: true, PreRelease: featuregate.Beta},
  	},
  
@@ -84,7 +84,7 @@ index 46e4356..a47b406 100644
  		{Version: version.MustParse("0.20"), Default: true, PreRelease: featuregate.Beta},
  	},
 diff --git a/pkg/controller/jobs/deployment/deployment_webhook_test.go b/pkg/controller/jobs/deployment/deployment_webhook_test.go
-index 5ff6e83..4817a3a 100644
+index 5ff6e838..4817a3ac 100644
 --- a/pkg/controller/jobs/deployment/deployment_webhook_test.go
 +++ b/pkg/controller/jobs/deployment/deployment_webhook_test.go
 @@ -570,6 +570,33 @@ func TestValidateUpdate(t *testing.T) {
@@ -140,5 +140,3 @@ index 5ff6e83..4817a3a 100644
  		"update priority-class when replicas ready": {
  			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
  				Queue("test-queue").
--- 
-2.48.1

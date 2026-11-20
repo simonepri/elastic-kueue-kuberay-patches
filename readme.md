@@ -4,7 +4,7 @@
 [![Release Please](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml/badge.svg)](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](license)
 <!-- renovate: datasource=github-releases depName=kubernetes-sigs/kueue -->
-[![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.20.5-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.5)
+[![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.20.7-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.7)
 <!-- renovate: datasource=github-releases depName=ray-project/kuberay -->
 [![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.7.2-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.7.2)
 <!-- renovate: datasource=github-releases depName=kubernetes-sigs/karpenter -->
@@ -32,7 +32,7 @@ With this patchset applied, the controllers collaborate dynamically:
 
 ```mermaid
 flowchart TD
-    subgraph Kueue ["Kueue (Patched v0.20.5)"]
+    subgraph Kueue ["Kueue (Patched v0.20.7)"]
         K1["1. Karpenter Admission Check<br>• Provisions NodeClaims sized with DaemonSet overhead<br>• Sets anti-theft taints karpenter.sh/claimed-by<br>• Delays TAS placement until nodes register"]
         K2["2. Partial Preemption<br>• Reclaims elastic workers to minReplicas floor<br>• Keeps Ray head alive; releases quota dynamically<br>• Submits scale-up probes to regrow once quota frees"]
         K3["3. Greedy Flavor Fill<br>• Splits scale-up across ResourceFlavors on refusal notes<br>• Proposes ordered flavor fills without mutating scheduler inputs"]
@@ -77,7 +77,7 @@ All Ray patches address core cluster stability in high-churn and multi-region en
 
 ---
 
-### 3. Kueue (`v0.20.5`)
+### 3. Kueue (`v0.20.7`)
 
 #### Part 1: Bug Fixes (Ordered by Severity)
 | # | Patch File | Severity | Upstream Problem / Failure Mode | Solution | Validating Tests |

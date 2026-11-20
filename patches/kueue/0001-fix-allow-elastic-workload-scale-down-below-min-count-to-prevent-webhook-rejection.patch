@@ -10,7 +10,7 @@ Under partial scale-up, Kueue initializes a worker group's minCount to the repli
 Cap minCount at the new replica count during workload scale-down, allowing the Workload validation webhook to accept reduced replica specifications while ensuring un-admitted workloads preserve all-or-nothing admission semantics.
 ---
 diff --git a/pkg/webhooks/workload_webhook.go b/pkg/webhooks/workload_webhook.go
-index 7caf2434f..3f90bf0cd 100644
+index 7caf2434..3f90bf0c 100644
 --- a/pkg/webhooks/workload_webhook.go
 +++ b/pkg/webhooks/workload_webhook.go
 @@ -501,16 +501,19 @@ func scaledDownPodSetNames(wl *kueue.Workload) sets.Set[kueue.PodSetReference] {
@@ -36,7 +36,7 @@ index 7caf2434f..3f90bf0cd 100644
  	if len(new) != len(old) {
  		return field.ErrorList{field.Invalid(path, new, apivalidation.FieldImmutableErrorMsg)}
 diff --git a/pkg/workload/podsetscounts.go b/pkg/workload/podsetscounts.go
-index 0da51ceba..aa4727482 100644
+index 0da51ceb..aa472748 100644
 --- a/pkg/workload/podsetscounts.go
 +++ b/pkg/workload/podsetscounts.go
 @@ -102,7 +102,7 @@ func ExtractPodSetCountsFromWorkload(wl *kueue.Workload) PodSetsCounts {
@@ -64,7 +64,7 @@ index 0da51ceba..aa4727482 100644
  	}
  }
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 52f022d6e..209983e49 100644
+index 52f022d6..209983e4 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -55,6 +55,23 @@ func (r *Manager) EnsureWorkloadSlices(
@@ -110,10 +110,10 @@ index 52f022d6e..209983e49 100644
  				return nil, true, fmt.Errorf("failed to update workload pod set counts: %w", err)
  			}
 diff --git a/pkg/webhooks/workload_webhook_test.go b/pkg/webhooks/workload_webhook_test.go
-index 2a0048dcb..a4125e4c4 100644
+index d522fa04..326c1db0 100644
 --- a/pkg/webhooks/workload_webhook_test.go
 +++ b/pkg/webhooks/workload_webhook_test.go
-@@ -1709,6 +1709,116 @@ func TestValidateWorkloadUpdate(t *testing.T) {
+@@ -1706,6 +1706,116 @@ func TestValidateWorkloadUpdate(t *testing.T) {
  	}
  }
  
@@ -231,7 +231,7 @@ index 2a0048dcb..a4125e4c4 100644
  	elasticWorkload := func() *kueue.Workload {
  		return utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
 diff --git a/pkg/workload/podsetscounts_test.go b/pkg/workload/podsetscounts_test.go
-index 7a927110c..c9b0ac5d9 100644
+index 7a927110..c9b0ac5d 100644
 --- a/pkg/workload/podsetscounts_test.go
 +++ b/pkg/workload/podsetscounts_test.go
 @@ -366,6 +366,42 @@ func TestApplyPodSetCounts(t *testing.T) {
@@ -278,7 +278,7 @@ index 7a927110c..c9b0ac5d9 100644
  	for name, tt := range tests {
  		t.Run(name, func(t *testing.T) {
 diff --git a/pkg/workloadslicing/workloadslicing_test.go b/pkg/workloadslicing/workloadslicing_test.go
-index 2ac4dc72c..d276e4c53 100644
+index 2ac4dc72..d276e4c5 100644
 --- a/pkg/workloadslicing/workloadslicing_test.go
 +++ b/pkg/workloadslicing/workloadslicing_test.go
 @@ -48,6 +48,7 @@ import (
@@ -484,10 +484,10 @@ index 2ac4dc72c..d276e4c53 100644
  	now := time.Now()
  	fakeClock := testingclock.NewFakeClock(now)
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_scaleup_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_scaleup_test.go
-index 2a2ff3e3c..481c91710 100644
+index bc21427a..5e95ac51 100644
 --- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_scaleup_test.go
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_scaleup_test.go
-@@ -277,6 +277,53 @@ var _ = ginkgo.Describe("RayCluster with partial replica scale-up for elastic jo
+@@ -264,6 +264,53 @@ var _ = ginkgo.Describe("RayCluster with partial replica scale-up for elastic jo
  		}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
  	})
  
@@ -541,6 +541,3 @@ index 2a2ff3e3c..481c91710 100644
  	ginkgo.It("Should give the spare capacity to the earlier worker group rather than spread it", func() {
  		// Two worker groups drawing on the same quota, so they compete. Both want two more
  		// workers and only two pods are spare, which forces a choice: the earlier group is the
--- 
-2.56.0
-

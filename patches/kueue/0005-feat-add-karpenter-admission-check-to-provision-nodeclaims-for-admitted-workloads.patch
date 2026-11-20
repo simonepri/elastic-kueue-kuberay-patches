@@ -8,7 +8,7 @@ Admitted workloads scheduled onto dynamic cloud capacity experience prolonged sc
 Implement a Karpenter AdmissionCheck controller in Kueue that reconciles admitted Workloads against Karpenter NodePool and NodeClaim custom resources. Provision dedicated NodeClaim objects matching the workload's admitted flavor and pod count, holding workload admission checks in a pending state until NodeClaims become Launched (or Registered when configured), and inject anti-theft taints, tolerations, and node selectors to isolate provisioned capacity.
 ---
 diff --git a/charts/kueue/templates/rbac/role.yaml b/charts/kueue/templates/rbac/role.yaml
-index 28a86f9..ad8691f 100644
+index 28a86f90..ad8691f8 100644
 --- a/charts/kueue/templates/rbac/role.yaml
 +++ b/charts/kueue/templates/rbac/role.yaml
 @@ -32,6 +32,7 @@ rules:
@@ -57,10 +57,10 @@ index 28a86f9..ad8691f 100644
        - autoscaling.x-k8s.io
      resources:
 diff --git a/cmd/kueue/main.go b/cmd/kueue/main.go
-index 69e2eb5..8f3d159 100644
+index 6e53b4d9..5ab35129 100644
 --- a/cmd/kueue/main.go
 +++ b/cmd/kueue/main.go
-@@ -54,6 +54,7 @@ import (
+@@ -55,6 +55,7 @@ import (
  	"sigs.k8s.io/kueue/pkg/cache/scheduler/was"
  	"sigs.k8s.io/kueue/pkg/config"
  	"sigs.k8s.io/kueue/pkg/constants"
@@ -68,7 +68,7 @@ index 69e2eb5..8f3d159 100644
  	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/multikueue"
  	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/multikueue/externalframeworks"
  	"sigs.k8s.io/kueue/pkg/controller/admissionchecks/provisioning"
-@@ -563,6 +564,12 @@ func setupControllers(
+@@ -567,6 +568,12 @@ func setupControllers(
  		}
  	}
  
@@ -82,7 +82,7 @@ index 69e2eb5..8f3d159 100644
  		adapters, err := integrationManager.GetMultiKueueAdapters(sets.New(cfg.Integrations.Frameworks...))
  		if err != nil {
 diff --git a/config/components/rbac/role.yaml b/config/components/rbac/role.yaml
-index 7db4025..24a2891 100644
+index 7db40252..24a2891b 100644
 --- a/config/components/rbac/role.yaml
 +++ b/config/components/rbac/role.yaml
 @@ -13,6 +13,7 @@ rules:
@@ -124,10 +124,10 @@ index 7db4025..24a2891 100644
    - apps
    resources:
 diff --git a/pkg/cache/queue/cluster_queue.go b/pkg/cache/queue/cluster_queue.go
-index 3db5d8f..e9ddb5f 100644
+index 41064971..5748029e 100644
 --- a/pkg/cache/queue/cluster_queue.go
 +++ b/pkg/cache/queue/cluster_queue.go
-@@ -397,6 +397,9 @@ func (c *ClusterQueue) PushOrUpdate(wInfo *workload.Info) {
+@@ -398,6 +398,9 @@ func (c *ClusterQueue) PushOrUpdate(wInfo *workload.Info) {
  		if !specChangedSinceEval &&
  			equality.Semantic.DeepEqual(oldInfo.Obj.Spec, wInfo.Obj.Spec) &&
  			!priorityBoostAnnotationChanged(oldInfo, wInfo) &&
@@ -139,7 +139,7 @@ index 3db5d8f..e9ddb5f 100644
  			equality.Semantic.DeepEqual(apimeta.FindStatusCondition(oldInfo.Obj.Status.Conditions, kueue.WorkloadEvicted),
 diff --git a/pkg/constants/karpenter.go b/pkg/constants/karpenter.go
 new file mode 100644
-index 0000000..f678d98
+index 00000000..f678d98b
 --- /dev/null
 +++ b/pkg/constants/karpenter.go
 @@ -0,0 +1,25 @@
@@ -170,7 +170,7 @@ index 0000000..f678d98
 +)
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
 new file mode 100644
-index 0000000..df8019a
+index 00000000..df8019af
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
 @@ -0,0 +1,1446 @@
@@ -1622,7 +1622,7 @@ index 0000000..df8019a
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/overhead.go b/pkg/controller/admissionchecks/karpenter/overhead.go
 new file mode 100644
-index 0000000..da8008a
+index 00000000..da8008ae
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/overhead.go
 @@ -0,0 +1,340 @@
@@ -1968,7 +1968,7 @@ index 0000000..da8008a
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/placement.go b/pkg/controller/admissionchecks/karpenter/placement.go
 new file mode 100644
-index 0000000..268bf7f
+index 00000000..268bf7f5
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/placement.go
 @@ -0,0 +1,97 @@
@@ -2071,7 +2071,7 @@ index 0000000..268bf7f
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/provisioned.go b/pkg/controller/admissionchecks/karpenter/provisioned.go
 new file mode 100644
-index 0000000..1568bf6
+index 00000000..1568bf68
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/provisioned.go
 @@ -0,0 +1,101 @@
@@ -2177,10 +2177,10 @@ index 0000000..1568bf6
 +	return ordered, ""
 +}
 diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
-index a47b406..90f5e30 100644
+index 69bbd91b..35164b57 100644
 --- a/pkg/features/kube_features.go
 +++ b/pkg/features/kube_features.go
-@@ -931,6 +931,10 @@ const (
+@@ -949,6 +949,10 @@ const (
  	// Enables updating queue and priority on running Deployments by relaxing
  	// immutability checks in the Deployment validation webhook.
  	MutableDeploymentQueue featuregate.Feature = "MutableDeploymentQueue"
@@ -2191,7 +2191,7 @@ index a47b406..90f5e30 100644
  )
  
  func init() {
-@@ -1367,6 +1371,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+@@ -1385,6 +1389,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
  		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
  	},
  
@@ -2203,7 +2203,7 @@ index a47b406..90f5e30 100644
  		{Version: version.MustParse("0.20"), Default: true, PreRelease: featuregate.Beta},
  	},
 diff --git a/pkg/cache/queue/cluster_queue_test.go b/pkg/cache/queue/cluster_queue_test.go
-index ff3e6fb..8070848 100644
+index ff3e6fb3..8070848b 100644
 --- a/pkg/cache/queue/cluster_queue_test.go
 +++ b/pkg/cache/queue/cluster_queue_test.go
 @@ -37,6 +37,7 @@ import (
@@ -2250,7 +2250,7 @@ index ff3e6fb..8070848 100644
  	cq := newClusterQueueImpl(ctx, nil, defaultOrdering, testingclock.NewFakeClock(time.Now()))
 diff --git a/pkg/controller/admissionchecks/karpenter/controller_test.go b/pkg/controller/admissionchecks/karpenter/controller_test.go
 new file mode 100644
-index 0000000..3b03896
+index 00000000..3b038964
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/controller_test.go
 @@ -0,0 +1,1513 @@
@@ -3769,7 +3769,7 @@ index 0000000..3b03896
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/overhead_test.go b/pkg/controller/admissionchecks/karpenter/overhead_test.go
 new file mode 100644
-index 0000000..1add32b
+index 00000000..1add32bc
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/overhead_test.go
 @@ -0,0 +1,286 @@
@@ -4061,7 +4061,7 @@ index 0000000..1add32b
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/placement_test.go b/pkg/controller/admissionchecks/karpenter/placement_test.go
 new file mode 100644
-index 0000000..29f8d43
+index 00000000..29f8d43d
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/placement_test.go
 @@ -0,0 +1,254 @@
@@ -4321,7 +4321,7 @@ index 0000000..29f8d43
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/provisioned_test.go b/pkg/controller/admissionchecks/karpenter/provisioned_test.go
 new file mode 100644
-index 0000000..3fb10ed
+index 00000000..3fb10edd
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/provisioned_test.go
 @@ -0,0 +1,134 @@

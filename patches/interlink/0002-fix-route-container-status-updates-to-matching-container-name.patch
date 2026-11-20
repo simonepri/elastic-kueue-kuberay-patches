@@ -10,10 +10,10 @@ Introduce trackedContainerStatus to look up the exact in-cluster entry by contai
 Upstream status: pending PR.
 ---
 diff --git a/pkg/virtualkubelet/execute.go b/pkg/virtualkubelet/execute.go
-index b3590df..2d1a53a 100644
+index d9afb5e..2381ed9 100644
 --- a/pkg/virtualkubelet/execute.go
 +++ b/pkg/virtualkubelet/execute.go
-@@ -1349,6 +1349,27 @@ func RemoteExecution(ctx context.Context, config Config, p *Provider, pod *v1.Po
+@@ -1458,6 +1458,27 @@ func RemoteExecution(ctx context.Context, config Config, p *Provider, pod *v1.Po
  	}
  	return nil
  }
@@ -41,7 +41,7 @@ index b3590df..2d1a53a 100644
  func handleInitContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus, podRefInCluster *v1.Pod, nInitContainersInPod int) (bool, bool, bool, string, int) {
  	log.G(ctx).Debug("Init containers detected, going to check them first")
  
-@@ -1359,43 +1380,28 @@ func handleInitContainersUpdate(ctx context.Context, podRemoteStatus types.PodSt
+@@ -1468,44 +1489,28 @@ func handleInitContainersUpdate(ctx context.Context, podRemoteStatus types.PodSt
  	podInit := false
  
  	for _, containerRemoteStatus := range podRemoteStatus.InitContainers {
@@ -58,6 +58,7 @@ index b3590df..2d1a53a 100644
 -
 -		if !foundCt {
 -			podRefInCluster.Status.InitContainerStatuses = append(podRefInCluster.Status.InitContainerStatuses, containerRemoteStatus)
+-			index = len(podRefInCluster.Status.InitContainerStatuses) - 1
 -		} else {
 -			podRefInCluster.Status.InitContainerStatuses[index] = containerRemoteStatus
 -		}
@@ -92,7 +93,7 @@ index b3590df..2d1a53a 100644
  		}
  	}
  	if counterOfTerminatedInitContainers == nInitContainersInPod {
-@@ -1412,34 +1418,18 @@ func handleContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus
+@@ -1522,34 +1527,18 @@ func handleContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus
  	podRunning := false
  
  	for _, containerRemoteStatus := range podRemoteStatus.Containers {
@@ -133,7 +134,7 @@ index b3590df..2d1a53a 100644
  			}
  		} else {
  			// if plugin cannot return any non-terminated container set the status to terminated
-@@ -1448,11 +1438,11 @@ func handleContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus
+@@ -1558,11 +1547,11 @@ func handleContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus
  			case containerRemoteStatus.State.Terminated != nil:
  				log.G(ctx).Debug("Pod " + podRemoteStatus.PodName + ": Service " + containerRemoteStatus.Name + " is not running on Plugin side")
  				counterOfTerminatedContainers++
@@ -147,7 +148,7 @@ index b3590df..2d1a53a 100644
  					log.G(ctx).Error("Container " + containerRemoteStatus.Name + " exited with error: " + strconv.Itoa(int(containerRemoteStatus.State.Terminated.ExitCode)))
  				}
  			case containerRemoteStatus.State.Waiting != nil:
-@@ -1461,8 +1451,8 @@ func handleContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus
+@@ -1571,8 +1560,8 @@ func handleContainersUpdate(ctx context.Context, podRemoteStatus types.PodStatus
  				podRunning = true
  				log.G(ctx).Debug("Pod " + podRemoteStatus.PodName + ": Service " + containerRemoteStatus.Name + " is running on Sidecar")
  				podRefInCluster.Status.Phase = v1.PodPhase(v1.PodReady)

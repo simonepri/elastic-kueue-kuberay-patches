@@ -8,7 +8,7 @@
   - KubeRay: `v1.7.2`
   - Ray: `2.60.0`
   - Karpenter: `v1.15.1`
-  - InterLink: `0.6.2`
+  - InterLink: `0.6.3`
 
 # Security & Confidentiality
 

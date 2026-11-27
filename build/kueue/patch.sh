@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-UPSTREAM="${KUEUE_UPSTREAM:-v0.20.7}"
+UPSTREAM="${KUEUE_UPSTREAM:-v0.20.8}"
 TARGET="$ROOT/third_party/kueue"
 PATCH_DIR="$ROOT/patches/kueue"
 

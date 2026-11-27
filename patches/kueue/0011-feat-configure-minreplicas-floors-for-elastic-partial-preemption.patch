@@ -10,7 +10,7 @@ Introduce the kueue.x-k8s.io/reclaim-min-counts annotation and JobWithReclaimMin
 ---
 diff --git a/pkg/constants/reclaim_floors.go b/pkg/constants/reclaim_floors.go
 new file mode 100644
-index 00000000..e50662be
+index 000000000..e50662be4
 --- /dev/null
 +++ b/pkg/constants/reclaim_floors.go
 @@ -0,0 +1,25 @@
@@ -41,7 +41,7 @@ index 00000000..e50662be
 +)
 diff --git a/pkg/controller/jobframework/reclaim_floors.go b/pkg/controller/jobframework/reclaim_floors.go
 new file mode 100644
-index 00000000..1a869e01
+index 000000000..1a869e015
 --- /dev/null
 +++ b/pkg/controller/jobframework/reclaim_floors.go
 @@ -0,0 +1,67 @@
@@ -113,10 +113,10 @@ index 00000000..1a869e01
 +	return workloadslicing.WithReclaimFloors(floors)
 +}
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index 3fda5795..0a9e1aba 100644
+index 2aefa496d..482254579 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -1344,7 +1344,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
+@@ -1331,7 +1331,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
  		// Workload slices allow modifications only to PodSet.Count.
  		// Any other changes will result in the slice being marked as incompatible,
  		// and the workload will fall back to being processed by the original ensureOneWorkload function.
@@ -125,7 +125,7 @@ index 3fda5795..0a9e1aba 100644
  		if err != nil {
  			return nil, err
  		}
-@@ -2239,6 +2239,7 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
+@@ -2232,6 +2232,7 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
  
  	wl := NewWorkload(newWorkloadName(job, extra), object, podSets, labelKeysToCopy, annotationsToCopy)
  	applyPodSetCountSteps(job, wl)
@@ -134,10 +134,10 @@ index 3fda5795..0a9e1aba 100644
  		wl.Labels = make(map[string]string)
  	}
 diff --git a/pkg/controller/jobs/raycluster/common.go b/pkg/controller/jobs/raycluster/common.go
-index aacf084a..c423756b 100644
+index 7b20e1a57..546cbf255 100644
 --- a/pkg/controller/jobs/raycluster/common.go
 +++ b/pkg/controller/jobs/raycluster/common.go
-@@ -98,6 +98,21 @@ func effectiveWorkerCount(wgs *rayv1.WorkerGroupSpec) int32 {
+@@ -99,6 +99,21 @@ func effectiveWorkerCount(wgs *rayv1.WorkerGroupSpec) int32 {
  	return replicas * max(wgs.NumOfHosts, 1)
  }
  
@@ -159,7 +159,7 @@ index aacf084a..c423756b 100644
  // PodSetCountSteps implements jobframework.JobWithPodSetCountSteps. A replica is the unit
  // KubeRay creates and deletes, so a worker group changes by numOfHosts pods.
  func (j *RayCluster) PodSetCountSteps() workload.PodSetsCounts {
-@@ -109,6 +124,10 @@ func (j *RayCluster) PodSetCountSteps() workload.PodSetsCounts {
+@@ -110,6 +125,10 @@ func (j *RayCluster) PodSetCountSteps() workload.PodSetsCounts {
  	return steps
  }
  
@@ -171,7 +171,7 @@ index aacf084a..c423756b 100644
  	return max(wgs.NumOfHosts, 1)
  }
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index 6547f297..d4231e45 100644
+index 6547f2971..d4231e451 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -82,6 +82,7 @@ var _ jobframework.GenericJob = (*RayCluster)(nil)
@@ -183,7 +183,7 @@ index 6547f297..d4231e45 100644
  func (j *RayCluster) CustomEquivalenceOptions(_ context.Context, _ client.Client, _ *kueue.Workload) []equality.ComparePodSetsOption {
  	return EquivalenceOptions()
 diff --git a/pkg/controller/jobs/rayjob/partial_stop.go b/pkg/controller/jobs/rayjob/partial_stop.go
-index b84c350e..9d5546c8 100644
+index b84c350ed..9d5546c8c 100644
 --- a/pkg/controller/jobs/rayjob/partial_stop.go
 +++ b/pkg/controller/jobs/rayjob/partial_stop.go
 @@ -20,6 +20,7 @@ import (
@@ -207,7 +207,7 @@ index b84c350e..9d5546c8 100644
  // workers stop through that RayCluster, as for a RayCluster job; their replicas go
 diff --git a/pkg/workload/reclaim_floors.go b/pkg/workload/reclaim_floors.go
 new file mode 100644
-index 00000000..e03fda3d
+index 000000000..e03fda3d4
 --- /dev/null
 +++ b/pkg/workload/reclaim_floors.go
 @@ -0,0 +1,40 @@
@@ -252,10 +252,10 @@ index 00000000..e03fda3d
 +	wl.Annotations[constants.ReclaimMinCountsAnnotation] = FormatPodSetCounts(counts)
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 0d0b0b9e..c851fd3d 100644
+index d4cede86c..4c868090f 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
-@@ -113,6 +113,13 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -96,6 +96,13 @@ func (r *Manager) EnsureWorkloadSlices(
  			return nil, false, nil
  		}
  
@@ -269,7 +269,7 @@ index 0d0b0b9e..c851fd3d 100644
  		// If counts match, return the existing workload slice or nil if the workload was partially admitted.
  		if jobPodSetsCounts.EqualTo(wlPodSetsCounts) {
  			if workload.IsAdmitted(wl) {
-@@ -123,23 +130,23 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -106,23 +113,23 @@ func (r *Manager) EnsureWorkloadSlices(
  					}
  				}
  			}
@@ -298,8 +298,8 @@ index 0d0b0b9e..c851fd3d 100644
 +				}
  				return wl, true, nil
  			}
- 			applyPodSetCounts(wl)
-@@ -158,14 +165,6 @@ func (r *Manager) EnsureWorkloadSlices(
+ 			workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
+@@ -142,14 +149,6 @@ func (r *Manager) EnsureWorkloadSlices(
  		return nil, true, nil
  
  	default:
@@ -314,7 +314,7 @@ index 0d0b0b9e..c851fd3d 100644
  		selectedWorkload, err := normalizeActiveSlices(ctx, r.Client, r.Clock, workloads)
  		if err != nil {
  			return nil, true, err
-@@ -174,7 +173,26 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -158,7 +157,26 @@ func (r *Manager) EnsureWorkloadSlices(
  			return nil, true, nil
  		}
  
@@ -341,7 +341,7 @@ index 0d0b0b9e..c851fd3d 100644
  		if latestWithQuotaReservation != nil && workload.IsPartiallyPreempted(latestWithQuotaReservation) {
  			targetWorkload := latestWithQuotaReservation
  			targetCounts := workload.ExtractPodSetCountsFromWorkload(targetWorkload)
-@@ -193,6 +211,11 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -177,6 +195,11 @@ func (r *Manager) EnsureWorkloadSlices(
  				}
  				reclaim := newReclaimScaleDown(targetWorkload, jobPodSetsCounts)
  				if reclaim.keepsSlice(targetCounts, jobPodSetsCounts) {
@@ -353,7 +353,7 @@ index 0d0b0b9e..c851fd3d 100644
  					return targetWorkload, true, nil
  				}
  				applyPodSetCounts(targetWorkload)
-@@ -208,12 +231,6 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -192,12 +215,6 @@ func (r *Manager) EnsureWorkloadSlices(
  			}
  		}
  
@@ -366,7 +366,7 @@ index 0d0b0b9e..c851fd3d 100644
  		if jobPodSetsCounts.EqualTo(selectedCounts) {
  			return selectedWorkload, true, nil
  		}
-@@ -224,6 +241,11 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -208,6 +225,11 @@ func (r *Manager) EnsureWorkloadSlices(
  			}
  			reclaim := newReclaimScaleDown(selectedWorkload, jobPodSetsCounts)
  			if reclaim.keepsSlice(selectedCounts, jobPodSetsCounts) {
@@ -377,8 +377,8 @@ index 0d0b0b9e..c851fd3d 100644
 +				}
  				return selectedWorkload, true, nil
  			}
- 			applyPodSetCounts(selectedWorkload)
-@@ -242,3 +264,23 @@ func (r *Manager) EnsureWorkloadSlices(
+ 			workload.ApplyPodSetCounts(selectedWorkload, jobPodSetsCounts)
+@@ -227,3 +249,23 @@ func (r *Manager) EnsureWorkloadSlices(
  		return nil, true, nil
  	}
  }
@@ -403,7 +403,7 @@ index 0d0b0b9e..c851fd3d 100644
 +	return nil
 +}
 diff --git a/pkg/workloadslicing/podset_steps.go b/pkg/workloadslicing/podset_steps.go
-index 5ca98c6f..75a0b7a6 100644
+index 5ca98c6fc..75a0b7a6e 100644
 --- a/pkg/workloadslicing/podset_steps.go
 +++ b/pkg/workloadslicing/podset_steps.go
 @@ -26,8 +26,10 @@ import (
@@ -433,12 +433,6 @@ index 5ca98c6f..75a0b7a6 100644
 -	}
 -	if current == want {
 -		return false
--	}
--	if want == "" {
--		delete(wl.Annotations, constants.PodSetCountStepsAnnotation)
--	} else {
--		if wl.Annotations == nil {
--			wl.Annotations = make(map[string]string, 1)
 +	changed := false
 +	if o.refreshSteps {
 +		current := wl.Annotations[constants.PodSetCountStepsAnnotation]
@@ -456,10 +450,13 @@ index 5ca98c6f..75a0b7a6 100644
 +				wl.Annotations[constants.PodSetCountStepsAnnotation] = want
 +			}
 +			changed = true
- 		}
--		wl.Annotations[constants.PodSetCountStepsAnnotation] = want
++		}
  	}
--	return true
+-	if want == "" {
+-		delete(wl.Annotations, constants.PodSetCountStepsAnnotation)
+-	} else {
+-		if wl.Annotations == nil {
+-			wl.Annotations = make(map[string]string, 1)
 +	if o.refreshFloors {
 +		floors := o.floorsFor(wl)
 +		current := wl.Annotations[constants.ReclaimMinCountsAnnotation]
@@ -470,13 +467,15 @@ index 5ca98c6f..75a0b7a6 100644
 +		if current != want {
 +			workload.SetReclaimMinCounts(wl, floors)
 +			changed = true
-+		}
-+	}
+ 		}
+-		wl.Annotations[constants.PodSetCountStepsAnnotation] = want
+ 	}
+-	return true
 +	return changed
  }
 diff --git a/pkg/workloadslicing/reclaim_floors.go b/pkg/workloadslicing/reclaim_floors.go
 new file mode 100644
-index 00000000..05e058f8
+index 000000000..05e058f88
 --- /dev/null
 +++ b/pkg/workloadslicing/reclaim_floors.go
 @@ -0,0 +1,46 @@
@@ -528,7 +527,7 @@ index 00000000..05e058f8
 +}
 diff --git a/pkg/controller/jobs/raycluster/reclaim_floors_external_test.go b/pkg/controller/jobs/raycluster/reclaim_floors_external_test.go
 new file mode 100644
-index 00000000..8fb04e5f
+index 000000000..8fb04e5f8
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/reclaim_floors_external_test.go
 @@ -0,0 +1,38 @@
@@ -572,7 +571,7 @@ index 00000000..8fb04e5f
 +}
 diff --git a/pkg/controller/jobs/raycluster/reclaim_floors_test.go b/pkg/controller/jobs/raycluster/reclaim_floors_test.go
 new file mode 100644
-index 00000000..da9ba0e7
+index 000000000..da9ba0e75
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/reclaim_floors_test.go
 @@ -0,0 +1,117 @@
@@ -694,7 +693,7 @@ index 00000000..da9ba0e7
 +	}
 +}
 diff --git a/pkg/controller/jobs/rayjob/partial_stop_test.go b/pkg/controller/jobs/rayjob/partial_stop_test.go
-index 26dcdc67..b1533284 100644
+index 26dcdc67b..b15332845 100644
 --- a/pkg/controller/jobs/rayjob/partial_stop_test.go
 +++ b/pkg/controller/jobs/rayjob/partial_stop_test.go
 @@ -28,6 +28,13 @@ func TestReclaimRayJobWorkers(t *testing.T) {
@@ -713,7 +712,7 @@ index 26dcdc67..b1533284 100644
  	for name, entry := range map[string]string{"a": "workers", "b": "workers--2", "head": "head", "submitter": "submitter"} {
 diff --git a/pkg/workload/reclaim_floors_test.go b/pkg/workload/reclaim_floors_test.go
 new file mode 100644
-index 00000000..6c9a8542
+index 000000000..6c9a85422
 --- /dev/null
 +++ b/pkg/workload/reclaim_floors_test.go
 @@ -0,0 +1,69 @@
@@ -788,7 +787,7 @@ index 00000000..6c9a8542
 +}
 diff --git a/pkg/workloadslicing/reclaim_floors_test.go b/pkg/workloadslicing/reclaim_floors_test.go
 new file mode 100644
-index 00000000..47a45d27
+index 000000000..47a45d275
 --- /dev/null
 +++ b/pkg/workloadslicing/reclaim_floors_test.go
 @@ -0,0 +1,242 @@
@@ -1036,7 +1035,7 @@ index 00000000..47a45d27
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
 new file mode 100644
-index 00000000..311b3026
+index 000000000..311b30265
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_reclaim_floors_test.go
 @@ -0,0 +1,196 @@

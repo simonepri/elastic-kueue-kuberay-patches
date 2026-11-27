@@ -8,7 +8,7 @@ When Kueue admits multi-slice elastic workloads on dynamic capacity, long-lived 
 Strip per-attempt Karpenter node selectors and anti-theft tolerations from elastic job pod templates via deferKarpenterPlacementToPods so subsequent slices do not inherit stale placement. In ElasticJobUngater, inject admission check tolerations onto gated elastic pods before releasing their scheduling gates when KarpenterAdmissionCheck is enabled.
 ---
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index cecebf3c..5a42ea93 100644
+index b824baae4..8606f60ad 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -45,6 +45,7 @@ import (
@@ -68,7 +68,7 @@ index cecebf3c..5a42ea93 100644
  	// so the index lookup returns every pod created on behalf of this job.
 diff --git a/pkg/controller/jobframework/karpenter_placement.go b/pkg/controller/jobframework/karpenter_placement.go
 new file mode 100644
-index 00000000..32e05855
+index 000000000..32e058554
 --- /dev/null
 +++ b/pkg/controller/jobframework/karpenter_placement.go
 @@ -0,0 +1,68 @@
@@ -141,10 +141,10 @@ index 00000000..32e05855
 +	}
 +}
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index 71daa5d1..d06ed0a7 100644
+index d759eac1d..ffd941c63 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -1828,6 +1828,7 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
+@@ -1815,6 +1815,7 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
  	infoMap := slices.ToRefMap(info, func(psi *podset.PodSetInfo) kueue.PodSetReference { return psi.Name })
  	runningPodSets := wl.Spec.DeepCopy().PodSets
  	canBePartiallyAdmitted := workload.CanBePartiallyAdmitted(wl)
@@ -152,7 +152,7 @@ index 71daa5d1..d06ed0a7 100644
  	for i := range runningPodSets {
  		ps := &runningPodSets[i]
  		psi, found := infoMap[ps.Name]
-@@ -1936,6 +1937,7 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
+@@ -1929,6 +1930,7 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
  	if err != nil {
  		return err
  	}
@@ -161,10 +161,10 @@ index 71daa5d1..d06ed0a7 100644
  		if err := deferAdmissionCheckNodeSelectorsToPods(ctx, r.client, wl, info); err != nil {
  			return err
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater_test.go b/pkg/controller/elasticjobs/elastic_job_ungater_test.go
-index 9bc912d5..cb087ca5 100644
+index 2c0a3b149..5e54be7c5 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater_test.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater_test.go
-@@ -97,9 +97,14 @@ func makeElasticPodForPodSet(name string, podSet kueue.PodSetReference) *testing
+@@ -98,8 +98,13 @@ func makeElasticPodForPodSet(name string, podSet kueue.PodSetReference) *testing
  		Label(constants.PodSetLabel, string(podSet))
  }
  
@@ -173,13 +173,12 @@ index 9bc912d5..cb087ca5 100644
 +}
 +
  func TestReconcile(t *testing.T) {
- 	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
  	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlicesForProvisioningRequests, true)
 +	features.SetFeatureGateDuringTest(t, features.KarpenterAdmissionCheck, true)
  	now := time.Now().Truncate(time.Second)
- 
- 	testCases := map[string]struct {
-@@ -863,6 +868,56 @@ func TestReconcile(t *testing.T) {
+ 	errPatchPod0 := errors.New("pod-0 patch error")
+ 	errPatchPod2 := errors.New("pod-2 patch error")
+@@ -974,6 +979,56 @@ func TestReconcile(t *testing.T) {
  					NodeSelector("cloud.example.com/provisioning-request", "current-booking").
  					Obj(),
  			},
@@ -238,7 +237,7 @@ index 9bc912d5..cb087ca5 100644
  			// Leftover consume annotations must not permanently gate pods when
 diff --git a/pkg/controller/jobframework/karpenter_placement_test.go b/pkg/controller/jobframework/karpenter_placement_test.go
 new file mode 100644
-index 00000000..f3d97188
+index 000000000..f3d971887
 --- /dev/null
 +++ b/pkg/controller/jobframework/karpenter_placement_test.go
 @@ -0,0 +1,74 @@
@@ -318,7 +317,7 @@ index 00000000..f3d97188
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go
 new file mode 100644
-index 00000000..9d21bf6d
+index 000000000..9d21bf6df
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_check_tolerations_test.go
 @@ -0,0 +1,114 @@

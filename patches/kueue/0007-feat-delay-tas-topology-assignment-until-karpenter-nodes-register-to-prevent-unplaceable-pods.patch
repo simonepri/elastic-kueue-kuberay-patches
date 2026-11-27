@@ -8,7 +8,7 @@ Kueue's Topology-Aware Scheduling (TAS) assigns topology domains to workloads du
 Introduce a delayed topology assignment mechanism that defers TAS domain binding for Karpenter-backed workloads until provisioned nodes register and publish their topology labels. Re-evaluate topology fit against actual registered node labels before ungating workload pods, avoiding scheduling deadlocks.
 ---
 diff --git a/pkg/cache/scheduler/admissioncheck.go b/pkg/cache/scheduler/admissioncheck.go
-index c8d840c1..703ea4f3 100644
+index c8d840c12..703ea4f37 100644
 --- a/pkg/cache/scheduler/admissioncheck.go
 +++ b/pkg/cache/scheduler/admissioncheck.go
 @@ -18,5 +18,6 @@ package scheduler
@@ -20,7 +20,7 @@ index c8d840c1..703ea4f3 100644
 +	KarpenterNodeClass bool
  }
 diff --git a/pkg/cache/scheduler/cache.go b/pkg/cache/scheduler/cache.go
-index bbffcce7..b86533fd 100644
+index 9f3734702..4682057bd 100644
 --- a/pkg/cache/scheduler/cache.go
 +++ b/pkg/cache/scheduler/cache.go
 @@ -41,6 +41,7 @@ import (
@@ -42,7 +42,7 @@ index bbffcce7..b86533fd 100644
  	c.admissionChecks[kueue.AdmissionCheckReference(ac.Name)] = newAC
  
 diff --git a/pkg/cache/scheduler/clusterqueue_snapshot.go b/pkg/cache/scheduler/clusterqueue_snapshot.go
-index 6201608b..5dff7d7e 100644
+index 6201608b1..5dff7d7e2 100644
 --- a/pkg/cache/scheduler/clusterqueue_snapshot.go
 +++ b/pkg/cache/scheduler/clusterqueue_snapshot.go
 @@ -86,7 +86,8 @@ type ClusterQueueSnapshot struct {
@@ -57,7 +57,7 @@ index 6201608b..5dff7d7e 100644
  
 diff --git a/pkg/cache/scheduler/karpenter.go b/pkg/cache/scheduler/karpenter.go
 new file mode 100644
-index 00000000..cc370ff4
+index 000000000..cc370ff48
 --- /dev/null
 +++ b/pkg/cache/scheduler/karpenter.go
 @@ -0,0 +1,51 @@
@@ -113,10 +113,10 @@ index 00000000..cc370ff4
 +	return c.flavorsForKarpenterACs.Has(rf)
 +}
 diff --git a/pkg/cache/scheduler/snapshot.go b/pkg/cache/scheduler/snapshot.go
-index 00c95372..62e889a1 100644
+index fed0152fa..5c5021968 100644
 --- a/pkg/cache/scheduler/snapshot.go
 +++ b/pkg/cache/scheduler/snapshot.go
-@@ -494,6 +494,7 @@ func (c *Cache) snapshotClusterQueue(
+@@ -492,6 +492,7 @@ func (c *Cache) snapshotClusterQueue(
  		TASFlavors:                    make(map[kueue.ResourceFlavorReference]*TASFlavorSnapshot),
  		tasOnly:                       cq.isTASOnly(),
  		flavorsForProvReqACs:          cq.flavorsWithProvReqAdmissionCheck(),
@@ -125,7 +125,7 @@ index 00c95372..62e889a1 100644
  		draBackedResources:            c.draBackedResources,
  	}
 diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
-index df8019af..64956072 100644
+index df8019af6..649560724 100644
 --- a/pkg/controller/admissionchecks/karpenter/controller.go
 +++ b/pkg/controller/admissionchecks/karpenter/controller.go
 @@ -305,7 +305,14 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
@@ -256,7 +256,7 @@ index df8019af..64956072 100644
  			continue
  		}
 diff --git a/pkg/scheduler/flavorassigner/tas_flavorassigner.go b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
-index 3894955f..4f9b86ac 100644
+index 3894955f3..4f9b86ac7 100644
 --- a/pkg/scheduler/flavorassigner/tas_flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
 @@ -102,9 +102,10 @@ func podSetTopologyRequest(psAssignment *PodSetAssignment,
@@ -274,7 +274,7 @@ index 3894955f..4f9b86ac 100644
  	}
 diff --git a/pkg/cache/scheduler/karpenter_test.go b/pkg/cache/scheduler/karpenter_test.go
 new file mode 100644
-index 00000000..cbcc5cbb
+index 000000000..cbcc5cbbd
 --- /dev/null
 +++ b/pkg/cache/scheduler/karpenter_test.go
 @@ -0,0 +1,93 @@
@@ -373,7 +373,7 @@ index 00000000..cbcc5cbb
 +}
 diff --git a/pkg/controller/admissionchecks/karpenter/topology_test.go b/pkg/controller/admissionchecks/karpenter/topology_test.go
 new file mode 100644
-index 00000000..40017717
+index 000000000..40017717d
 --- /dev/null
 +++ b/pkg/controller/admissionchecks/karpenter/topology_test.go
 @@ -0,0 +1,267 @@
@@ -646,7 +646,7 @@ index 00000000..40017717
 +}
 diff --git a/test/integration/singlecluster/tas/karpenter-crds.yaml b/test/integration/singlecluster/tas/karpenter-crds.yaml
 new file mode 100644
-index 00000000..a463f09d
+index 000000000..a463f09d6
 --- /dev/null
 +++ b/test/integration/singlecluster/tas/karpenter-crds.yaml
 @@ -0,0 +1,58 @@
@@ -709,10 +709,10 @@ index 00000000..a463f09d
 +              type: object
 +              x-kubernetes-preserve-unknown-fields: true
 diff --git a/test/integration/singlecluster/tas/suite_test.go b/test/integration/singlecluster/tas/suite_test.go
-index cebb9f61..69291d40 100644
+index b5956a690..8374b5909 100644
 --- a/test/integration/singlecluster/tas/suite_test.go
 +++ b/test/integration/singlecluster/tas/suite_test.go
-@@ -66,6 +66,7 @@ var _ = ginkgo.BeforeSuite(func() {
+@@ -68,6 +68,7 @@ var _ = ginkgo.BeforeSuite(func() {
  		WebhookPath: behavioral.WebhookPath,
  		DepCRDPaths: []string{
  			behavioral.AutoscalerCrds,
@@ -722,10 +722,10 @@ index cebb9f61..69291d40 100644
  	cfg = fwk.Init()
 diff --git a/test/integration/singlecluster/tas/tas_karpenter_test.go b/test/integration/singlecluster/tas/tas_karpenter_test.go
 new file mode 100644
-index 00000000..f55a5246
+index 000000000..62d2e7fb8
 --- /dev/null
 +++ b/test/integration/singlecluster/tas/tas_karpenter_test.go
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,311 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -1026,9 +1026,6 @@ index 00000000..f55a5246
 +		integration.CreateNodesWithStatus(ctx, k8sClient, nodes)
 +		wl := newWorkload()
 +		gomega.Eventually(listClaims, behavioral.Timeout, behavioral.Interval).Should(gomega.HaveLen(2))
-+		// This suite submits Workloads directly. Stand in for the job controller
-+		// completing eviction after the check's Retry, as other TAS specs do.
-+		behavioral.FinishEvictionForWorkloads(ctx, k8sClient, wl)
 +		gomega.Eventually(func(g gomega.Gomega) {
 +			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
 +			g.Expect(workload.IsAdmitted(wl)).To(gomega.BeTrue())

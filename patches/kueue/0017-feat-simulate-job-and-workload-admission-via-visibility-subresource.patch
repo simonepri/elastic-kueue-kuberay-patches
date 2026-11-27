@@ -10,7 +10,7 @@ Determining admission feasibility in Kueue requires evaluating complex queue hie
 Expose a dry-run admission simulation endpoint under /apis/visibility.kueue.x-k8s.io/v1beta2/namespaces/{namespace}/localqueues/{localqueue}/simulate behind the PreSubmissionSimulator feature gate. Allow clients to POST hypothetical Job or Workload manifests and return simulated admission decisions, flavor allocations, pod set counts, and queue placement reasons without mutating cluster state.
 ---
 diff --git a/apis/visibility/openapi/zz_generated.openapi.go b/apis/visibility/openapi/zz_generated.openapi.go
-index f46c0887..b8ecc992 100644
+index f46c0887e..b8ecc9926 100644
 --- a/apis/visibility/openapi/zz_generated.openapi.go
 +++ b/apis/visibility/openapi/zz_generated.openapi.go
 @@ -34,75 +34,82 @@ import (
@@ -601,7 +601,7 @@ index f46c0887..b8ecc992 100644
 +	}
 +}
 diff --git a/apis/visibility/v1beta2/groupversion_info.go b/apis/visibility/v1beta2/groupversion_info.go
-index dc247c70..7f0b532c 100644
+index dc247c70d..7f0b532c5 100644
 --- a/apis/visibility/v1beta2/groupversion_info.go
 +++ b/apis/visibility/v1beta2/groupversion_info.go
 @@ -44,7 +44,7 @@ var (
@@ -615,7 +615,7 @@ index dc247c70..7f0b532c 100644
  }
 diff --git a/apis/visibility/v1beta2/simulation_types.go b/apis/visibility/v1beta2/simulation_types.go
 new file mode 100644
-index 00000000..0b3ade4e
+index 000000000..0b3ade4ec
 --- /dev/null
 +++ b/apis/visibility/v1beta2/simulation_types.go
 @@ -0,0 +1,228 @@
@@ -848,7 +848,7 @@ index 00000000..0b3ade4e
 +	ReclaimTargetCounts map[v1beta2.PodSetReference]int32 `json:"reclaimTargetCounts,omitempty"`
 +}
 diff --git a/apis/visibility/v1beta2/zz_generated.deepcopy.go b/apis/visibility/v1beta2/zz_generated.deepcopy.go
-index 572a6a9d..d74eaaa3 100644
+index 572a6a9dd..d74eaaa35 100644
 --- a/apis/visibility/v1beta2/zz_generated.deepcopy.go
 +++ b/apis/visibility/v1beta2/zz_generated.deepcopy.go
 @@ -21,7 +21,9 @@ limitations under the License.
@@ -1050,7 +1050,7 @@ index 572a6a9d..d74eaaa3 100644
 +	return out
 +}
 diff --git a/apis/visibility/v1beta2/zz_generated.model_name.go b/apis/visibility/v1beta2/zz_generated.model_name.go
-index aebd424a..3ac8d18c 100644
+index aebd424a8..3ac8d18ca 100644
 --- a/apis/visibility/v1beta2/zz_generated.model_name.go
 +++ b/apis/visibility/v1beta2/zz_generated.model_name.go
 @@ -55,3 +55,38 @@ func (in PendingWorkloadOptions) OpenAPIModelName() string {
@@ -1093,7 +1093,7 @@ index aebd424a..3ac8d18c 100644
 +	return "io.k8s.kueue.visibility.v1beta2.WorkloadSimulationStatus"
 +}
 diff --git a/cmd/kueue/main.go b/cmd/kueue/main.go
-index 5ab35129..3710966f 100644
+index a0f542cae..b5526c255 100644
 --- a/cmd/kueue/main.go
 +++ b/cmd/kueue/main.go
 @@ -30,7 +30,6 @@ import (
@@ -1112,7 +1112,7 @@ index 5ab35129..3710966f 100644
  	"sigs.k8s.io/kueue/pkg/util/kubeversion"
  	utillogging "sigs.k8s.io/kueue/pkg/util/logging"
  	"sigs.k8s.io/kueue/pkg/util/roletracker"
-@@ -448,7 +446,12 @@ func main() {
+@@ -450,7 +448,12 @@ func main() {
  		ResourceSliceAPIAvailable: resourceSliceAPIAvailable,
  		ClusterProfileCRDPresent:  clusterProfileCRDPresent,
  	}
@@ -1126,7 +1126,7 @@ index 5ab35129..3710966f 100644
  		setupLog.Error(err, "Unable to setup controllers")
  		os.Exit(1)
  	}
-@@ -461,16 +464,19 @@ func main() {
+@@ -463,16 +466,19 @@ func main() {
  	go queues.CleanUpOnContext(ctx)
  	go cCache.CleanUpOnContext(ctx)
  
@@ -1148,7 +1148,7 @@ index 5ab35129..3710966f 100644
  		setupLog.Error(err, "Could not setup scheduler")
  		os.Exit(1)
  	}
-@@ -541,6 +547,7 @@ func setupControllers(
+@@ -543,6 +549,7 @@ func setupControllers(
  	cfg *configapi.Configuration,
  	serverVersionFetcher *kubeversion.ServerVersionFetcher,
  	integrationManager *jobframework.IntegrationManager,
@@ -1156,7 +1156,7 @@ index 5ab35129..3710966f 100644
  	opts core.SetupControllersOpts,
  ) error {
  	if failedCtrl, err := core.SetupControllers(mgr, queues, cCache, cfg, opts); err != nil {
-@@ -639,30 +646,6 @@ func setupControllers(
+@@ -641,30 +648,6 @@ func setupControllers(
  		}
  	}
  
@@ -1187,7 +1187,7 @@ index 5ab35129..3710966f 100644
  	if err := integrationManager.SetupControllers(ctx, mgr, setupLog, jfOpts...); err != nil {
  		return fmt.Errorf(
  			"unable to create controller or webhook for kubernetesVersion %v: %w",
-@@ -712,30 +695,8 @@ func setupProbeEndpoints(mgr ctrl.Manager, certsReady <-chan struct{}) error {
+@@ -713,30 +696,8 @@ func setupProbeEndpoints(mgr ctrl.Manager, certsReady <-chan struct{}) error {
  	return nil
  }
  
@@ -1222,7 +1222,7 @@ index 5ab35129..3710966f 100644
  	}
 diff --git a/cmd/kueue/simulation_options.go b/cmd/kueue/simulation_options.go
 new file mode 100644
-index 00000000..a595161e
+index 000000000..a595161e0
 --- /dev/null
 +++ b/cmd/kueue/simulation_options.go
 @@ -0,0 +1,92 @@
@@ -1320,7 +1320,7 @@ index 00000000..a595161e
 +}
 diff --git a/pkg/cache/queue/simulate.go b/pkg/cache/queue/simulate.go
 new file mode 100644
-index 00000000..b51e8824
+index 000000000..b51e8824f
 --- /dev/null
 +++ b/pkg/cache/queue/simulate.go
 @@ -0,0 +1,62 @@
@@ -1388,7 +1388,7 @@ index 00000000..b51e8824
 +}
 diff --git a/pkg/cache/scheduler/simulate.go b/pkg/cache/scheduler/simulate.go
 new file mode 100644
-index 00000000..80e764c8
+index 000000000..80e764c83
 --- /dev/null
 +++ b/pkg/cache/scheduler/simulate.go
 @@ -0,0 +1,48 @@
@@ -1442,7 +1442,7 @@ index 00000000..80e764c8
 +}
 diff --git a/pkg/controller/jobframework/simulate.go b/pkg/controller/jobframework/simulate.go
 new file mode 100644
-index 00000000..f6784753
+index 000000000..f6784753a
 --- /dev/null
 +++ b/pkg/controller/jobframework/simulate.go
 @@ -0,0 +1,284 @@
@@ -1731,10 +1731,10 @@ index 00000000..f6784753
 +	return nil
 +}
 diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
-index 198e7d0d..2b450008 100644
+index b1b1db372..f542d033d 100644
 --- a/pkg/features/kube_features.go
 +++ b/pkg/features/kube_features.go
-@@ -214,6 +214,13 @@ const (
+@@ -215,6 +215,13 @@ const (
  	// fit on the flavor of its running pods, through a split PodSet in the same Workload.
  	ElasticJobsViaWorkloadSlicesFlavorSplit featuregate.Feature = "ElasticJobsViaWorkloadSlicesFlavorSplit"
  
@@ -1748,15 +1748,15 @@ index 198e7d0d..2b450008 100644
  	// owner: @pbundyra
  	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/2724-topology-aware-scheduling
  	//
-@@ -1011,6 +1018,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
- 	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {ElasticJobsViaWorkloadSlices},
+@@ -1022,6 +1029,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
  	SchedulerLibraryIntegration:                         {TopologyAwareScheduling},
+ 	FairSharingPreemptWithinClusterQueueFallback:        {FairSharingVerifyFinalTargets},
  	PartialPreemption:                                   {ElasticJobsViaWorkloadSlices, ReclaimablePods},
 +	PreSubmissionSimulator:                              {VisibilityOnDemand},
  }
  
  // defaultVersionedFeatureGates consists of all known Kueue-specific feature keys.
-@@ -1108,6 +1116,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+@@ -1119,6 +1127,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
  	ElasticJobsViaWorkloadSlicesFlavorSplit: {
  		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
  	},
@@ -1767,7 +1767,7 @@ index 198e7d0d..2b450008 100644
  		{Version: version.MustParse("0.13"), Default: false, PreRelease: featuregate.Alpha},
  		{Version: version.MustParse("0.14"), Default: true, PreRelease: featuregate.Beta},
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index 3ae1097d..582fc4c3 100644
+index 01dc1a930..475e9f1e3 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
 @@ -361,12 +361,8 @@ func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
@@ -1786,7 +1786,7 @@ index 3ae1097d..582fc4c3 100644
  		s.requeueHeadsAfterSnapshotError(ctx, heads)
 diff --git a/pkg/scheduler/simulate.go b/pkg/scheduler/simulate.go
 new file mode 100644
-index 00000000..42003b2e
+index 000000000..42003b2ec
 --- /dev/null
 +++ b/pkg/scheduler/simulate.go
 @@ -0,0 +1,348 @@
@@ -2139,7 +2139,7 @@ index 00000000..42003b2e
 +	return s.cache.Snapshot(ctx, snapshotOpts...)
 +}
 diff --git a/pkg/visibility/server.go b/pkg/visibility/server.go
-index b4ad830c..7678d3ee 100644
+index b4ad830c9..7678d3ee5 100644
 --- a/pkg/visibility/server.go
 +++ b/pkg/visibility/server.go
 @@ -45,6 +45,8 @@ import (
@@ -2194,7 +2194,7 @@ index b4ad830c..7678d3ee 100644
  	return server.InstallAPIGroups(&apiGroupInfo)
 diff --git a/pkg/visibility/storage/simulate.go b/pkg/visibility/storage/simulate.go
 new file mode 100644
-index 00000000..f2ebf211
+index 000000000..f2ebf2112
 --- /dev/null
 +++ b/pkg/visibility/storage/simulate.go
 @@ -0,0 +1,463 @@
@@ -2662,7 +2662,7 @@ index 00000000..f2ebf211
 +	return simulated
 +}
 diff --git a/pkg/visibility/storage/storage.go b/pkg/visibility/storage/storage.go
-index 6ac13e38..613b54ef 100644
+index 6ac13e382..613b54efd 100644
 --- a/pkg/visibility/storage/storage.go
 +++ b/pkg/visibility/storage/storage.go
 @@ -17,16 +17,24 @@ limitations under the License.
@@ -2694,7 +2694,7 @@ index 6ac13e38..613b54ef 100644
  }
 diff --git a/pkg/workloadslicing/simulate.go b/pkg/workloadslicing/simulate.go
 new file mode 100644
-index 00000000..3e427b08
+index 000000000..3e427b08e
 --- /dev/null
 +++ b/pkg/workloadslicing/simulate.go
 @@ -0,0 +1,35 @@
@@ -2735,7 +2735,7 @@ index 00000000..3e427b08
 +}
 diff --git a/pkg/controller/jobframework/simulate_internal_test.go b/pkg/controller/jobframework/simulate_internal_test.go
 new file mode 100644
-index 00000000..3601f9ec
+index 000000000..3601f9ec1
 --- /dev/null
 +++ b/pkg/controller/jobframework/simulate_internal_test.go
 @@ -0,0 +1,78 @@
@@ -2819,7 +2819,7 @@ index 00000000..3601f9ec
 +}
 diff --git a/pkg/controller/jobframework/simulate_test.go b/pkg/controller/jobframework/simulate_test.go
 new file mode 100644
-index 00000000..1d989dc3
+index 000000000..1d989dc3d
 --- /dev/null
 +++ b/pkg/controller/jobframework/simulate_test.go
 @@ -0,0 +1,484 @@
@@ -3309,7 +3309,7 @@ index 00000000..1d989dc3
 +}
 diff --git a/pkg/scheduler/simulate_consistency_test.go b/pkg/scheduler/simulate_consistency_test.go
 new file mode 100644
-index 00000000..bd689c0b
+index 000000000..bd689c0bd
 --- /dev/null
 +++ b/pkg/scheduler/simulate_consistency_test.go
 @@ -0,0 +1,264 @@
@@ -3579,7 +3579,7 @@ index 00000000..bd689c0b
 +}
 diff --git a/pkg/scheduler/simulate_test.go b/pkg/scheduler/simulate_test.go
 new file mode 100644
-index 00000000..4a1fbc66
+index 000000000..4a1fbc66d
 --- /dev/null
 +++ b/pkg/scheduler/simulate_test.go
 @@ -0,0 +1,252 @@
@@ -3837,7 +3837,7 @@ index 00000000..4a1fbc66
 +}
 diff --git a/pkg/visibility/server_simulate_test.go b/pkg/visibility/server_simulate_test.go
 new file mode 100644
-index 00000000..01682567
+index 000000000..01682567d
 --- /dev/null
 +++ b/pkg/visibility/server_simulate_test.go
 @@ -0,0 +1,232 @@
@@ -4075,7 +4075,7 @@ index 00000000..01682567
 +}
 diff --git a/pkg/visibility/storage/simulate_job_test.go b/pkg/visibility/storage/simulate_job_test.go
 new file mode 100644
-index 00000000..e5aa4cb2
+index 000000000..e5aa4cb2c
 --- /dev/null
 +++ b/pkg/visibility/storage/simulate_job_test.go
 @@ -0,0 +1,344 @@
@@ -4425,7 +4425,7 @@ index 00000000..e5aa4cb2
 +}
 diff --git a/pkg/visibility/storage/simulate_test.go b/pkg/visibility/storage/simulate_test.go
 new file mode 100644
-index 00000000..29f07d7a
+index 000000000..29f07d7a8
 --- /dev/null
 +++ b/pkg/visibility/storage/simulate_test.go
 @@ -0,0 +1,1132 @@

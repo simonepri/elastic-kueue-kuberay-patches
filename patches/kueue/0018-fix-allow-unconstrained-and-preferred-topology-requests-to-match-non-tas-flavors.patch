@@ -10,7 +10,7 @@ In Kueue's TAS flavor assigner, any workload with a topology request (even uncon
 Allow PodSets with unconstrained or soft topology requests to match non-TAS resource flavors by checking for hard required topology constraints before rejecting flavors lacking a topology.
 ---
 diff --git a/pkg/scheduler/flavorassigner/tas_flavorassigner.go b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
-index 4f9b86ac..0d971793 100644
+index 4f9b86ac7..0d9717936 100644
 --- a/pkg/scheduler/flavorassigner/tas_flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/tas_flavorassigner.go
 @@ -17,6 +17,7 @@ limitations under the License.
@@ -77,10 +77,10 @@ index 4f9b86ac..0d971793 100644
 +	return false
 +}
 diff --git a/pkg/scheduler/flavorassigner/flavorassigner_test.go b/pkg/scheduler/flavorassigner/flavorassigner_test.go
-index 8a06d56a..e95b977a 100644
+index e835706b7..9871d714b 100644
 --- a/pkg/scheduler/flavorassigner/flavorassigner_test.go
 +++ b/pkg/scheduler/flavorassigner/flavorassigner_test.go
-@@ -7559,6 +7559,36 @@ func TestAssignFlavors_NoFitDueToCapacityAndLimits(t *testing.T) {
+@@ -7548,6 +7548,36 @@ func TestAssignFlavors_NoFitDueToCapacityAndLimits(t *testing.T) {
  				"flavor-a": "NoMatchingFlavor",
  			},
  		},

@@ -9,7 +9,7 @@ Defer flavor node selectors and tolerations from elastic job pod templates to in
 ---
 diff --git a/pkg/controller/elasticjobs/elastic_flavor_placement.go b/pkg/controller/elasticjobs/elastic_flavor_placement.go
 new file mode 100644
-index 00000000..628aee71
+index 000000000..628aee713
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/elastic_flavor_placement.go
 @@ -0,0 +1,130 @@
@@ -144,7 +144,7 @@ index 00000000..628aee71
 +	return true, nil
 +}
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index 5a42ea93..91f7dd5a 100644
+index 8606f60ad..882c24e42 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -28,6 +28,7 @@ import (
@@ -178,7 +178,7 @@ index 5a42ea93..91f7dd5a 100644
  	}
  	podHandler := elasticPodHandler{
  		client:            r.client,
-@@ -160,7 +163,7 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
+@@ -161,7 +164,7 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
  		var ungated bool
  		e := utilclient.Patch(ctx, r.client, pod, func() (bool, error) {
  			podSetName := kueue.PodSetReference(pod.Labels[constants.PodSetLabel])
@@ -187,7 +187,7 @@ index 5a42ea93..91f7dd5a 100644
  			if err != nil {
  				return false, err
  			}
-@@ -312,13 +315,18 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
+@@ -313,13 +316,18 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
  			update, found := admissionUpdates[ps]
  			if !found {
  				var err error
@@ -204,14 +204,14 @@ index 5a42ea93..91f7dd5a 100644
 +				} else if recycled {
 +					continue
 +				}
- 				ctrl.LoggerFrom(ctx).Info("leaving elastic pod gated because immutable admission metadata is stale; recycle the pod after its template refreshes",
+ 				log.V(1).Info("Leaving elastic pod gated because immutable admission metadata is stale; recycle the pod after its template refreshes",
  					"pod", klog.KObj(p), "podSet", ps)
  				continue
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index d06ed0a7..0a26b6fd 100644
+index ffd941c63..5d5de82b7 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -1825,6 +1825,9 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
+@@ -1812,6 +1812,9 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
  	if err != nil {
  		return nil
  	}
@@ -221,7 +221,7 @@ index d06ed0a7..0a26b6fd 100644
  	infoMap := slices.ToRefMap(info, func(psi *podset.PodSetInfo) kueue.PodSetReference { return psi.Name })
  	runningPodSets := wl.Spec.DeepCopy().PodSets
  	canBePartiallyAdmitted := workload.CanBePartiallyAdmitted(wl)
-@@ -1943,6 +1946,20 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
+@@ -1936,6 +1939,20 @@ func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object cli
  			return err
  		}
  	}
@@ -242,7 +242,7 @@ index d06ed0a7..0a26b6fd 100644
  	msg := fmt.Sprintf("Admitted by clusterQueue %v", wl.Status.Admission.ClusterQueue)
  
  	log := ctrl.LoggerFrom(ctx)
-@@ -1992,18 +2009,10 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
+@@ -1985,18 +2002,10 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
  	for i := range info {
  		infoByName[info[i].Name] = &info[i]
  	}
@@ -262,7 +262,7 @@ index d06ed0a7..0a26b6fd 100644
  	for _, check := range wl.Status.AdmissionChecks {
  		for _, update := range check.PodSetUpdates {
  			podSetInfo := infoByName[update.Name]
-@@ -2022,6 +2031,100 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
+@@ -2015,6 +2024,100 @@ func deferAdmissionCheckNodeSelectorsToPods(ctx context.Context, c client.Client
  	return nil
  }
  
@@ -363,7 +363,7 @@ index d06ed0a7..0a26b6fd 100644
  // stopJob will suspend the job, and also restore node affinity, reset job status if needed.
  // Returns whether any operation was done to stop the job or an error.
  func (r *JobReconciler) stopJob(ctx context.Context, job GenericJob, wl *kueue.Workload, stopReason StopReason, eventMsg string) error {
-@@ -2199,6 +2302,7 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
+@@ -2192,6 +2295,7 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
  	// associated Job object. This is particularly useful in contexts such as the
  	// MultiKueue workload controller, where the Job may not be immediately available.
  	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)
@@ -371,7 +371,7 @@ index d06ed0a7..0a26b6fd 100644
  
  	// Lookup existing slice for a given job.
  	workloadSlices, err := workloadslicing.FindNotFinishedWorkloads(ctx, clnt, job.Object(), job.GVK())
-@@ -2220,6 +2324,9 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
+@@ -2213,6 +2317,9 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
  			originName = oldSlice.Name
  		}
  		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, kueue.WorkloadSliceNameAnnotation, originName)
@@ -382,7 +382,7 @@ index d06ed0a7..0a26b6fd 100644
  	default:
  		// Any other slices length is invalid. I.E, we expect to have at most 1 "current/old" workload slice.
 diff --git a/pkg/controller/jobs/raycluster/elastic_template_restamp.go b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
-index b0515e73..181f7b12 100644
+index b0515e733..181f7b12b 100644
 --- a/pkg/controller/jobs/raycluster/elastic_template_restamp.go
 +++ b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
 @@ -105,7 +105,8 @@ func podsScheduledTracking() bool {
@@ -407,7 +407,7 @@ index b0515e73..181f7b12 100644
  			if template.Spec.NodeSelector == nil {
 diff --git a/pkg/workloadslicing/flavor_placement.go b/pkg/workloadslicing/flavor_placement.go
 new file mode 100644
-index 00000000..4d90e570
+index 000000000..4d90e570c
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_placement.go
 @@ -0,0 +1,39 @@
@@ -452,7 +452,7 @@ index 00000000..4d90e570
 +}
 diff --git a/pkg/controller/concurrentadmission/controller_flavor_placement_test.go b/pkg/controller/concurrentadmission/controller_flavor_placement_test.go
 new file mode 100644
-index 00000000..b27e5976
+index 000000000..b27e59760
 --- /dev/null
 +++ b/pkg/controller/concurrentadmission/controller_flavor_placement_test.go
 @@ -0,0 +1,43 @@
@@ -501,7 +501,7 @@ index 00000000..b27e5976
 +}
 diff --git a/pkg/controller/elasticjobs/elastic_flavor_placement_test.go b/pkg/controller/elasticjobs/elastic_flavor_placement_test.go
 new file mode 100644
-index 00000000..379cd199
+index 000000000..379cd199d
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/elastic_flavor_placement_test.go
 @@ -0,0 +1,195 @@
@@ -702,7 +702,7 @@ index 00000000..379cd199
 +}
 diff --git a/pkg/controller/jobframework/reconciler_flavor_placement_test.go b/pkg/controller/jobframework/reconciler_flavor_placement_test.go
 new file mode 100644
-index 00000000..ecc902ef
+index 000000000..ecc902ef6
 --- /dev/null
 +++ b/pkg/controller/jobframework/reconciler_flavor_placement_test.go
 @@ -0,0 +1,194 @@
@@ -901,7 +901,7 @@ index 00000000..ecc902ef
 +	}
 +}
 diff --git a/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go b/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go
-index 7cdb1603..64b3a4ae 100644
+index 7cdb16036..64b3a4ae9 100644
 --- a/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go
 +++ b/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go
 @@ -154,6 +154,19 @@ func TestRestampElasticTemplatesOnUpdate(t *testing.T) {
@@ -926,7 +926,7 @@ index 7cdb1603..64b3a4ae 100644
  				c.Spec.WorkerGroupSpecs[0].Template.Spec.NodeSelector = map[string]string{"example.com/class": "mine"}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_elastic_flavor_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_elastic_flavor_test.go
 new file mode 100644
-index 00000000..b14ff572
+index 000000000..b14ff5722
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_elastic_flavor_test.go
 @@ -0,0 +1,212 @@
@@ -1143,7 +1143,7 @@ index 00000000..b14ff572
 +	})
 +})
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go
-index b51c8280..fb270434 100644
+index b51c82806..fb270434a 100644
 --- a/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go
 @@ -42,7 +42,10 @@ import (

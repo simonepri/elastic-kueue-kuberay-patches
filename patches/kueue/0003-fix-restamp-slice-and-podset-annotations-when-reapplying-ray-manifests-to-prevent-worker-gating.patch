@@ -10,7 +10,7 @@ Kueue's RayCluster defaulting webhook stamps the kueue.x-k8s.io/podset label, wo
 Register the RayCluster mutating webhook for UPDATE operations and re-stamp required slice annotations, podset labels, queue labels, scheduling gates, and flavor placement on each modification. Preserve existing slice assignments and first-slice workload annotations so template re-stamping operates idempotently across repeated manifest applications.
 ---
 diff --git a/charts/kueue/templates/webhook/manifests.yaml b/charts/kueue/templates/webhook/manifests.yaml
-index a78cb5cc..a7815cf9 100644
+index a78cb5cc3..a7815cf9b 100644
 --- a/charts/kueue/templates/webhook/manifests.yaml
 +++ b/charts/kueue/templates/webhook/manifests.yaml
 @@ -397,6 +397,7 @@ webhooks:
@@ -22,7 +22,7 @@ index a78cb5cc..a7815cf9 100644
            - rayclusters
      sideEffects: None
 diff --git a/config/components/webhook/manifests.yaml b/config/components/webhook/manifests.yaml
-index 4852a10a..38616746 100644
+index 4852a10ae..386167467 100644
 --- a/config/components/webhook/manifests.yaml
 +++ b/config/components/webhook/manifests.yaml
 @@ -231,6 +231,7 @@ webhooks:
@@ -34,10 +34,10 @@ index 4852a10a..38616746 100644
      - rayclusters
    sideEffects: None
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index ed5f3679..71daa5d1 100644
+index f7584e508..d759eac1d 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -2345,7 +2345,7 @@ func getPodSetsInfoFromStatus(ctx context.Context, c client.Client, w *kueue.Wor
+@@ -2338,7 +2338,7 @@ func getPodSetsInfoFromStatus(ctx context.Context, c client.Client, w *kueue.Wor
  		}
  
  		if features.Enabled(features.AssignQueueLabelsForPods) {
@@ -46,7 +46,7 @@ index ed5f3679..71daa5d1 100644
  		}
  
  		for _, admissionCheck := range w.Status.AdmissionChecks {
-@@ -2379,9 +2379,14 @@ func podSetAssignmentsInSpecOrder(wl *kueue.Workload) ([]kueue.PodSetAssignment,
+@@ -2372,9 +2372,14 @@ func podSetAssignmentsInSpecOrder(wl *kueue.Workload) ([]kueue.PodSetAssignment,
  	return ordered, nil
  }
  
@@ -64,7 +64,7 @@ index ed5f3679..71daa5d1 100644
  	if len(labelValidationErrors) == 0 {
 diff --git a/pkg/controller/jobs/raycluster/elastic_template_restamp.go b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
 new file mode 100644
-index 00000000..b0515e73
+index 000000000..b0515e733
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
 @@ -0,0 +1,161 @@
@@ -230,7 +230,7 @@ index 00000000..b0515e73
 +	template.Annotations[kueue.WorkloadSliceNameAnnotation] = workloadslicing.SliceName(active)
 +}
 diff --git a/pkg/controller/jobs/raycluster/raycluster_webhook.go b/pkg/controller/jobs/raycluster/raycluster_webhook.go
-index 7dbb9acf..31836b8d 100644
+index 9d34e4475..3e1d6c51f 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_webhook.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_webhook.go
 @@ -21,6 +21,7 @@ import (
@@ -262,7 +262,7 @@ index 7dbb9acf..31836b8d 100644
  	}
 diff --git a/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go b/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go
 new file mode 100644
-index 00000000..7cdb1603
+index 000000000..7cdb16036
 --- /dev/null
 +++ b/pkg/controller/jobs/raycluster/elastic_template_restamp_test.go
 @@ -0,0 +1,268 @@
@@ -536,7 +536,7 @@ index 00000000..7cdb1603
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_tas_test.go b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_tas_test.go
 new file mode 100644
-index 00000000..64217d78
+index 000000000..64217d787
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_tas_test.go
 @@ -0,0 +1,126 @@
@@ -668,7 +668,7 @@ index 00000000..64217d78
 +})
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go
 new file mode 100644
-index 00000000..b51c8280
+index 000000000..b51c82806
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/reapply/raycluster_reapply_test.go
 @@ -0,0 +1,254 @@
@@ -928,7 +928,7 @@ index 00000000..b51c8280
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/reapply/suite_test.go b/test/integration/singlecluster/controller/jobs/raycluster/reapply/suite_test.go
 new file mode 100644
-index 00000000..67310273
+index 000000000..673102737
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/reapply/suite_test.go
 @@ -0,0 +1,124 @@
@@ -1058,7 +1058,7 @@ index 00000000..67310273
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/reapply/webhook_manifests_test.go b/test/integration/singlecluster/controller/jobs/raycluster/reapply/webhook_manifests_test.go
 new file mode 100644
-index 00000000..fff4495e
+index 000000000..fff4495e6
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/reapply/webhook_manifests_test.go
 @@ -0,0 +1,79 @@

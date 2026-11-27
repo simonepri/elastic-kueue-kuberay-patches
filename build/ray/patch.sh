@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-UPSTREAM="${RAY_UPSTREAM:-2.60.1}"
+UPSTREAM="${RAY_UPSTREAM:-$(source "$ROOT/patches/ray/upstream.env"; printf '%s' "$RAY_UPSTREAM")}"
 TARGET="$ROOT/third_party/ray"
 PATCH_DIR="$ROOT/patches/ray"
 

@@ -32,17 +32,17 @@ With this patchset applied, the controllers collaborate dynamically:
 
 ```mermaid
 flowchart TD
-    subgraph Kueue ["Kueue (Patched v0.20.8)"]
+    subgraph Kueue ["Kueue (Patched)"]
         K1["1. Karpenter Admission Check<br>• Provisions NodeClaims sized with DaemonSet overhead<br>• Sets anti-theft taints karpenter.sh/claimed-by<br>• Delays TAS placement until nodes register"]
         K2["2. Partial Preemption<br>• Reclaims elastic workers to minReplicas floor<br>• Keeps Ray head alive; releases quota dynamically<br>• Submits scale-up probes to regrow once quota frees"]
         K3["3. Greedy Flavor Fill<br>• Splits scale-up across ResourceFlavors on refusal notes<br>• Proposes ordered flavor fills without mutating scheduler inputs"]
     end
 
-    subgraph KubeRay ["KubeRay (Patched v1.8.0)"]
+    subgraph KubeRay ["KubeRay (Patched)"]
         KR1["ScaleGate Reconciler<br>• Clamps maxReplicas to ClusterQueue quota limit<br>• Creates worker pods in concurrent exponential batches"]
     end
 
-    subgraph RayCore ["Ray (Patched 2.60.1)"]
+    subgraph RayCore ["Ray (Patched)"]
         RC1["GCS Syncer & Agent Stability<br>• Prunes dead nodes on reconnect to stop broadcast storms<br>• Exponential backoff + jitter on reconnect<br>• Jittered reporter agent intervals<br>• Proxied State API / agent communication"]
     end
 
@@ -56,7 +56,7 @@ flowchart TD
 
 Every patch is atomic, self-contained, and tested. In each patch file, production code changes appear first, followed strictly by accompanying unit and integration tests.
 
-### 1. Ray (`2.60.1`)
+### 1. Ray
 All Ray patches address core cluster stability in high-churn and multi-region environments.
 
 | # | Patch File | Severity | Upstream Problem / Failure Mode | Solution | Validating Tests |
@@ -68,7 +68,7 @@ All Ray patches address core cluster stability in high-churn and multi-region en
 
 ---
 
-### 2. KubeRay Operator (`v1.8.0`)
+### 2. KubeRay Operator
 
 | # | Patch File | Kind & Severity | Upstream Problem / Failure Mode | Solution | Validating Tests |
 | :-: | :--- | :---: | :--- | :--- | :--- |
@@ -77,7 +77,7 @@ All Ray patches address core cluster stability in high-churn and multi-region en
 
 ---
 
-### 3. Kueue (`v0.20.8`)
+### 3. Kueue
 
 #### Part 1: Bug Fixes (Ordered by Severity)
 | # | Patch File | Severity | Upstream Problem / Failure Mode | Solution | Validating Tests |
@@ -107,7 +107,7 @@ All Ray patches address core cluster stability in high-churn and multi-region en
 
 ---
 
-### 4. InterLink Virtual Kubelet (`0.6.3`)
+### 4. InterLink Virtual Kubelet
 
 | # | Patch File | Kind & Severity | Upstream Problem / Failure Mode | Solution | Validating Tests |
 | :-: | :--- | :--- | :--- | :--- | :--- |
@@ -121,7 +121,7 @@ All Ray patches address core cluster stability in high-churn and multi-region en
 
 ## Development & Testing Workflow
 
-This repository uses [`mise`](https://mise.jdx.dev) to manage dependencies and task automation.
+This repository uses [`mise`](https://mise.jdx.dev) to manage dependencies and task automation. The upstream version for each released component lives in `patches/<component>/upstream.env`; the Karpenter version lives in `mise.toml`.
 
 ### Prerequisites
 - Go 1.27+

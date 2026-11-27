@@ -213,11 +213,11 @@ jobs:
           TAG: ${{ needs.release-please.outputs.ray_tag_name }}
         run: |
           git fetch --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG"
-          for var in RAY_UPSTREAM RAY_PATCH_VERSION; do
-            line="$(git show "$TAG:mise.toml" | grep "^$var = ")"
-            sed -i "s|^$var = .*|$line|" mise.toml
-          done
-          grep -E "^RAY_(UPSTREAM|PATCH_VERSION) =" mise.toml
+          git show "$TAG:patches/ray/upstream.env" > patches/ray/upstream.env
+          line="$(git show "$TAG:mise.toml" | grep '^RAY_PATCH_VERSION = ')"
+          sed -i "s|^RAY_PATCH_VERSION = .*|$line|" mise.toml
+          cat patches/ray/upstream.env
+          grep '^RAY_PATCH_VERSION = ' mise.toml
 
       - name: Free Disk Space for the CUDA Base Image
         if: ${{ matrix.variant != '' }}

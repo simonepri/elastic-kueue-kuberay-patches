@@ -4,11 +4,8 @@
 
 - **Governs patch development across Kueue, KubeRay, and Ray**: this document defines authoritative architectural invariants, patch engineering standards, diff conventions, and verification workflows for the `elastic-kueue-kuberay-patches` repository.
 - **Pinned upstream versions**:
-  - Kueue: `v0.20.8`
-  - KubeRay: `v1.8.0`
-  - Ray: `2.60.1`
-  - Karpenter: `v1.15.1`
-  - InterLink: `0.6.3`
+  - Kueue, KubeRay, Ray, and InterLink: `patches/<component>/upstream.env`
+  - Karpenter: `mise.toml`
 
 # Security & Confidentiality
 

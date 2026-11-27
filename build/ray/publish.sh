@@ -3,8 +3,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TAG="${RAY_IMAGE_TAG:-2.60.1-patched}"
-BASE_IMAGE="${RAY_BASE_IMAGE:-rayproject/ray:2.60.1-py313}"
+RAY_UPSTREAM="${RAY_UPSTREAM:-$(source "$ROOT/patches/ray/upstream.env"; printf '%s' "$RAY_UPSTREAM")}"
+TAG="${RAY_IMAGE_TAG:-${RAY_UPSTREAM}-patched}"
+BASE_IMAGE="${RAY_BASE_IMAGE:-rayproject/ray:${RAY_UPSTREAM}-${RAY_PYTHON:-py313}${RAY_VARIANT:-}}"
 PLATFORMS="${RAY_PLATFORMS:-linux/amd64,linux/arm64}"
 DOCKERFILE="$ROOT/build/ray/Dockerfile"
 

@@ -12,7 +12,7 @@
 <!-- renovate: datasource=github-releases depName=interlink-hq/interLink -->
 [![Tested on interLink](https://img.shields.io/badge/tested%20on%20interlink-0.6.3-blue)](https://github.com/interlink-hq/interLink/releases/tag/v0.6.3)
 <!-- renovate: datasource=github-releases depName=ray-project/ray -->
-[![Tested on Ray](https://img.shields.io/badge/tested%20on%20ray-2.60.0-blue)](https://github.com/ray-project/ray/releases/tag/ray-2.60.0)
+[![Tested on Ray](https://img.shields.io/badge/tested%20on%20ray-2.60.1-blue)](https://github.com/ray-project/ray/releases/tag/ray-2.60.1)
 
 Production patchsets for running multi-tenant, elastic [Ray](https://github.com/ray-project/ray) clusters on Kubernetes with [Kueue](https://github.com/kubernetes-sigs/kueue), [KubeRay](https://github.com/ray-project/kuberay), and [Karpenter](https://github.com/kubernetes-sigs/karpenter).
 

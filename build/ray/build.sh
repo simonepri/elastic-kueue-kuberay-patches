@@ -3,8 +3,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TAG="${RAY_IMAGE_TAG:-2.60.0-patched}"
-BASE_IMAGE="${RAY_BASE_IMAGE:-rayproject/ray:2.60.0-py313}"
+TAG="${RAY_IMAGE_TAG:-2.60.1-patched}"
+BASE_IMAGE="${RAY_BASE_IMAGE:-rayproject/ray:2.60.1-py313}"
 SRC="$ROOT/third_party/ray"
 DOCKERFILE="$ROOT/build/ray/Dockerfile"
 

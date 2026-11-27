@@ -14,7 +14,7 @@ spec:
   entrypoint: "python -c 'import time; time.sleep(120)'"
   shutdownAfterJobFinishes: true
   rayClusterSpec:
-    rayVersion: "2.60.0"
+    rayVersion: "2.60.1"
     headGroupSpec:
       rayStartParams:
         dashboard-host: "0.0.0.0"

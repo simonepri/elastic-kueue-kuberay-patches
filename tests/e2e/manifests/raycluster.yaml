@@ -10,7 +10,7 @@ metadata:
     kueue.x-k8s.io/elastic-job-scale-up-strategy: partial
     kueue.x-k8s.io/reclaim-min-counts: '{"workers":1}'
 spec:
-  rayVersion: "2.60.0"
+  rayVersion: "2.60.1"
   headGroupSpec:
     rayStartParams:
       dashboard-host: "0.0.0.0"

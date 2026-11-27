@@ -12,7 +12,7 @@
 <!-- renovate: datasource=github-releases depName=interlink-hq/interLink -->
 [![Tested on interLink](https://img.shields.io/badge/tested%20on%20interlink-0.6.3-blue)](https://github.com/interlink-hq/interLink/releases/tag/v0.6.3)
 <!-- renovate: datasource=github-releases depName=ray-project/ray -->
-[![Tested on Ray](https://img.shields.io/badge/tested%20on%20ray-2.60.0-blue)](https://github.com/ray-project/ray/releases/tag/ray-2.60.0)
+[![Tested on Ray](https://img.shields.io/badge/tested%20on%20ray-2.60.1-blue)](https://github.com/ray-project/ray/releases/tag/ray-2.60.1)
 
 Production patchsets for running multi-tenant, elastic [Ray](https://github.com/ray-project/ray) clusters on Kubernetes with [Kueue](https://github.com/kubernetes-sigs/kueue), [KubeRay](https://github.com/ray-project/kuberay), and [Karpenter](https://github.com/kubernetes-sigs/karpenter).
 
@@ -42,7 +42,7 @@ flowchart TD
         KR1["ScaleGate Reconciler<br>• Clamps maxReplicas to ClusterQueue quota limit<br>• Creates worker pods in concurrent exponential batches"]
     end
 
-    subgraph RayCore ["Ray (Patched 2.60.0)"]
+    subgraph RayCore ["Ray (Patched 2.60.1)"]
         RC1["GCS Syncer & Agent Stability<br>• Prunes dead nodes on reconnect to stop broadcast storms<br>• Exponential backoff + jitter on reconnect<br>• Jittered reporter agent intervals<br>• Proxied State API / agent communication"]
     end
 
@@ -56,7 +56,7 @@ flowchart TD
 
 Every patch is atomic, self-contained, and tested. In each patch file, production code changes appear first, followed strictly by accompanying unit and integration tests.
 
-### 1. Ray (`2.60.0`)
+### 1. Ray (`2.60.1`)
 All Ray patches address core cluster stability in high-churn and multi-region environments.
 
 | # | Patch File | Severity | Upstream Problem / Failure Mode | Solution | Validating Tests |

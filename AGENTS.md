@@ -6,7 +6,7 @@
 - **Pinned upstream versions**:
   - Kueue: `v0.20.7`
   - KubeRay: `v1.7.2`
-  - Ray: `2.60.0`
+  - Ray: `2.60.1`
   - Karpenter: `v1.15.1`
   - InterLink: `0.6.3`
 

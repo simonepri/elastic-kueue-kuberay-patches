@@ -614,7 +614,7 @@ spec:
                   kueue.x-k8s.io/elastic-job: "true"
                   kueue.x-k8s.io/elastic-job-scale-up-strategy: partial
               spec:
-                rayVersion: "2.60.0"
+                rayVersion: "2.60.1"
                 headGroupSpec:
                   rayStartParams: {}
                   template:

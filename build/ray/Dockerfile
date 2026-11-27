@@ -2,7 +2,7 @@
 # patched Python sources from a sparse upstream checkout. The build context is third_party/ray, which holds only the
 # files patches/ray touches; the wheel comes from RAY_WHEEL_BASE_URL or from a "wheels" build context.
 
-ARG BASE_IMAGE=rayproject/ray:2.60.0-py313
+ARG BASE_IMAGE=rayproject/ray:2.60.1-py313
 
 # Empty unless a build supplies the wheel directory with --build-context wheels=<dir>.
 FROM scratch AS wheels

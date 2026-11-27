@@ -6,7 +6,7 @@
 <!-- renovate: datasource=github-releases depName=kubernetes-sigs/kueue -->
 [![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.20.7-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.7)
 <!-- renovate: datasource=github-releases depName=ray-project/kuberay -->
-[![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.7.2-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.7.2)
+[![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.8.0-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.8.0)
 <!-- renovate: datasource=github-releases depName=kubernetes-sigs/karpenter -->
 [![Tested on Karpenter](https://img.shields.io/badge/tested%20on%20karpenter-v1.15.1-blue)](https://github.com/kubernetes-sigs/karpenter/releases/tag/v1.15.1)
 <!-- renovate: datasource=github-releases depName=interlink-hq/interLink -->

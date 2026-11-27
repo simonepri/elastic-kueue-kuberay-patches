@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-UPSTREAM="${KUBERAY_UPSTREAM:-v1.7.2}"
+UPSTREAM="${KUBERAY_UPSTREAM:-v1.8.0}"
 TARGET="$ROOT/third_party/kuberay"
 PATCH_DIR="$ROOT/patches/kuberay"
 

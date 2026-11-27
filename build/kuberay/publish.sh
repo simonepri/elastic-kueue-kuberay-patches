@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TAG="${KUBERAY_UPSTREAM:-v1.7.2}-p${KUBERAY_PATCH_VERSION:-0.5.0}"
+TAG="${KUBERAY_UPSTREAM:-v1.8.0}-p${KUBERAY_PATCH_VERSION:-0.5.0}"
 DOCKERFILE="$ROOT/build/kuberay/Dockerfile"
 
 "$ROOT/build/kuberay/patch.sh"

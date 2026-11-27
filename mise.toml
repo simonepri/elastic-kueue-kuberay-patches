@@ -17,7 +17,7 @@ KUBECONFIG = "{{config_root}}/.local/kind/kubeconfig"
 # renovate: datasource=github-releases depName=kubernetes-sigs/kueue
 KUEUE_UPSTREAM = "v0.20.7"
 # renovate: datasource=github-releases depName=ray-project/kuberay
-KUBERAY_UPSTREAM = "v1.7.2"
+KUBERAY_UPSTREAM = "v1.8.0"
 # renovate: datasource=github-releases depName=kubernetes-sigs/karpenter
 KARPENTER_UPSTREAM = "v1.15.1"
 # renovate: datasource=github-releases depName=interlink-hq/interLink

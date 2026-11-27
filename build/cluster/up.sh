@@ -7,7 +7,7 @@ cd "$ROOT"
 
 CLUSTER_NAME="${CLUSTER_NAME:-elastic-scale-lab}"
 KUEUE_UPSTREAM="${KUEUE_UPSTREAM:-v0.20.7}"
-KUBERAY_UPSTREAM="${KUBERAY_UPSTREAM:-v1.7.2}"
+KUBERAY_UPSTREAM="${KUBERAY_UPSTREAM:-v1.8.0}"
 KARPENTER_UPSTREAM="${KARPENTER_UPSTREAM:-v1.15.1}"
 KUEUE_LOG_LEVEL="${KUEUE_LOG_LEVEL:-}"
 KUEUE_FEATURE_GATES="${KUEUE_FEATURE_GATES:-ConcurrentAdmission=true,ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp=true,ElasticJobsViaWorkloadSlicesFlavorChangeFromZero=true,PartialPreemption=true,ElasticJobsViaWorkloadSlicesFlavorSplit=true,KarpenterAdmissionCheck=true,MutableDeploymentQueue=true,VisibilityOnDemand=true,PreSubmissionSimulator=true}"

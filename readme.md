@@ -6,7 +6,7 @@
 <!-- renovate: datasource=github-releases depName=kubernetes-sigs/kueue -->
 [![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.20.7-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.7)
 <!-- renovate: datasource=github-releases depName=ray-project/kuberay -->
-[![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.7.2-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.7.2)
+[![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.8.0-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.8.0)
 <!-- renovate: datasource=github-releases depName=kubernetes-sigs/karpenter -->
 [![Tested on Karpenter](https://img.shields.io/badge/tested%20on%20karpenter-v1.15.1-blue)](https://github.com/kubernetes-sigs/karpenter/releases/tag/v1.15.1)
 <!-- renovate: datasource=github-releases depName=interlink-hq/interLink -->
@@ -38,7 +38,7 @@ flowchart TD
         K3["3. Greedy Flavor Fill<br>• Splits scale-up across ResourceFlavors on refusal notes<br>• Proposes ordered flavor fills without mutating scheduler inputs"]
     end
 
-    subgraph KubeRay ["KubeRay (Patched v1.7.2)"]
+    subgraph KubeRay ["KubeRay (Patched v1.8.0)"]
         KR1["ScaleGate Reconciler<br>• Clamps maxReplicas to ClusterQueue quota limit<br>• Creates worker pods in concurrent exponential batches"]
     end
 
@@ -68,12 +68,12 @@ All Ray patches address core cluster stability in high-churn and multi-region en
 
 ---
 
-### 2. KubeRay Operator (`v1.7.2`)
+### 2. KubeRay Operator (`v1.8.0`)
 
 | # | Patch File | Kind & Severity | Upstream Problem / Failure Mode | Solution | Validating Tests |
 | :-: | :--- | :---: | :--- | :--- | :--- |
 | **0001** | [`0001-fix-create-raycluster-worker-pods-in-concurrent-batches-to-prevent-reconciler-timeouts.patch`](patches/kuberay/0001-fix-create-raycluster-worker-pods-in-concurrent-batches-to-prevent-reconciler-timeouts.patch) | **Fix: P1 (High)** | `reconcilePods` creates missing worker pods 1-by-1 sequentially. Scaling groups with 100+ pods takes minutes and exceeds controller reconciliation timeouts. | Replaces sequential creation with concurrent batch creation in slow-start increments (1, 2, 4, 8...). | `ray-operator/controllers/ray/slow_start_batch_unit_test.go` |
-| **0002** | [`0002-feat-clamp-raycluster-worker-scale-up-to-kueue-clusterqueue-quota.patch`](patches/kuberay/0002-feat-clamp-raycluster-worker-scale-up-to-kueue-clusterqueue-quota.patch) | **Feat: P0 (Essential)** | Ray autoscaler requests scale-up beyond ClusterQueue quota and cohort limits, resulting in stuck pending pods and quota starvation for other tenants. | ScaleGate reconciler inspects Kueue ClusterQueue quota and borrowing limits, clamping `maxReplicas` to available quota before pod creation. | `ray-operator/controllers/ray/scalegate_controller_unit_test.go` |
+| **0002** | [`0002-feat-clamp-raycluster-worker-scale-up-to-kueue-clusterqueue-quota.patch`](patches/kuberay/0002-feat-clamp-raycluster-worker-scale-up-to-kueue-clusterqueue-quota.patch) | **Feat: P0 (Essential)** | Ray autoscaler requests scale-up beyond ClusterQueue quota and cohort limits, resulting in stuck pending pods and quota starvation for other tenants. | ScaleGate reconciler inspects Kueue ClusterQueue quota and borrowing limits, clamping `maxReplicas` to available quota before pod creation. Upstream `scaleStrategy.scaleGate` is a different mechanism for autoscaler fallback. | `ray-operator/controllers/ray/scalegate_controller_unit_test.go` |
 
 ---
 

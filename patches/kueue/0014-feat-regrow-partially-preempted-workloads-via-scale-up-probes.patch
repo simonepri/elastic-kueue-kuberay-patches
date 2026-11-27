@@ -1,8 +1,8 @@
 diff --git a/pkg/cache/queue/cluster_queue.go b/pkg/cache/queue/cluster_queue.go
-index 5748029e..8131ccba 100644
+index 5966fea83..f5965f498 100644
 --- a/pkg/cache/queue/cluster_queue.go
 +++ b/pkg/cache/queue/cluster_queue.go
-@@ -854,7 +854,7 @@ func (c *ClusterQueue) RequeueIfNotPresent(ctx context.Context, wInfo *workload.
+@@ -862,7 +862,7 @@ func (c *ClusterQueue) RequeueIfNotPresent(ctx context.Context, wInfo *workload.
  	log := ctrl.LoggerFrom(ctx)
  	var immediate bool
  	if c.queueingStrategy == kueue.StrictFIFO {
@@ -13,7 +13,7 @@ index 5748029e..8131ccba 100644
  			reason == RequeueReasonSnapshotFailed ||
 diff --git a/pkg/cache/queue/regrow_after_reclaim.go b/pkg/cache/queue/regrow_after_reclaim.go
 new file mode 100644
-index 00000000..f9ea8bb7
+index 000000000..f9ea8bb7c
 --- /dev/null
 +++ b/pkg/cache/queue/regrow_after_reclaim.go
 @@ -0,0 +1,24 @@
@@ -42,7 +42,7 @@ index 00000000..f9ea8bb7
 +// queues too, so it does not block the workloads behind it while it waits.
 +const RequeueReasonRegrowthHeld RequeueReason = "RegrowthHeld"
 diff --git a/pkg/controller/jobframework/partial_stop.go b/pkg/controller/jobframework/partial_stop.go
-index 30e8210e..889f2d3f 100644
+index 30e8210e8..889f2d3f2 100644
 --- a/pkg/controller/jobframework/partial_stop.go
 +++ b/pkg/controller/jobframework/partial_stop.go
 @@ -26,7 +26,6 @@ import (
@@ -124,10 +124,10 @@ index 30e8210e..889f2d3f 100644
  		return ctrl.Result{}, false, nil
  	}
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index 0a9e1aba..ebbc05aa 100644
+index 482254579..02f09bf24 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -1357,7 +1357,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
+@@ -1344,7 +1344,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
  					return nil, err
  				}
  			}
@@ -136,7 +136,7 @@ index 0a9e1aba..ebbc05aa 100644
  		}
  		// Fallback.
  	}
-@@ -2279,7 +2279,7 @@ func prepareWorkloadSliceForScaleUp(ctx context.Context, c client.Client, job Ge
+@@ -2272,7 +2272,7 @@ func prepareWorkloadSliceForScaleUp(ctx context.Context, c client.Client, job Ge
  			// Matched by name, not position: predecessor PodSets can be reordered, added,
  			// or removed, so index-aligned comparison (including a same-length check) would misfire.
  			prevPodSet := prevPodSets[podSets[i].Name]
@@ -145,7 +145,7 @@ index 0a9e1aba..ebbc05aa 100644
  				extra = ""
  			}
  			// The baseline is copied forward from the matching predecessor's own floor, not
-@@ -2289,14 +2289,16 @@ func prepareWorkloadSliceForScaleUp(ctx context.Context, c client.Client, job Ge
+@@ -2282,14 +2282,16 @@ func prepareWorkloadSliceForScaleUp(ctx context.Context, c client.Client, job Ge
  			// predecessor's live grant while it's still around (see getInitialAssignments).
  			// Capped at the new Count in case this PodSet shrank while another grew.
  			if prevPodSet != nil && prevPodSet.MinCount != nil {
@@ -166,7 +166,7 @@ index 0a9e1aba..ebbc05aa 100644
  	return extra, nil
 diff --git a/pkg/controller/jobframework/regrow_after_reclaim.go b/pkg/controller/jobframework/regrow_after_reclaim.go
 new file mode 100644
-index 00000000..017515ac
+index 000000000..017515ac9
 --- /dev/null
 +++ b/pkg/controller/jobframework/regrow_after_reclaim.go
 @@ -0,0 +1,97 @@
@@ -269,7 +269,7 @@ index 00000000..017515ac
 +}
 diff --git a/pkg/scheduler/regrow_after_reclaim.go b/pkg/scheduler/regrow_after_reclaim.go
 new file mode 100644
-index 00000000..446af4b6
+index 000000000..446af4b65
 --- /dev/null
 +++ b/pkg/scheduler/regrow_after_reclaim.go
 @@ -0,0 +1,180 @@
@@ -454,7 +454,7 @@ index 00000000..446af4b6
 +	}
 +}
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index 7c19c36e..856da69d 100644
+index eaf4a0e13..5458abd0b 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
 @@ -105,6 +105,9 @@ type Scheduler struct {
@@ -475,7 +475,7 @@ index 7c19c36e..856da69d 100644
  
  	log.V(logLevelForSchedulerMainLoop()).Info("Workload processing done", "duration", s.clock.Since(phaseStartTime))
  	s.reportSkippedPreemptions(skippedPreemptions)
-@@ -864,6 +868,10 @@ func (s *Scheduler) nominateWorkload(ctx context.Context, log logr.Logger, h qca
+@@ -863,6 +867,10 @@ func (s *Scheduler) nominateWorkload(ctx context.Context, log logr.Logger, h qca
  				e.requeueReason = qcache.RequeueReasonNamespaceMismatch
  			}
  		}
@@ -486,7 +486,7 @@ index 7c19c36e..856da69d 100644
  	} else {
  		assignment, targets := s.getAssignments(ctx, &e.Info, snap)
  		e.recordAssignment(assignment, targets)
-@@ -1647,7 +1655,7 @@ func effectiveReducerPodSets(podSets []kueue.PodSet, replaceableWorkloadSlice *w
+@@ -1643,7 +1651,7 @@ func effectiveReducerPodSets(podSets []kueue.PodSet, replaceableWorkloadSlice *w
  	if !mustGrow {
  		return podSets
  	}
@@ -496,10 +496,10 @@ index 7c19c36e..856da69d 100644
  		return podSets
  	}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index c851fd3d..59e14a68 100644
+index 4c868090f..ac4c42c14 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
-@@ -113,35 +113,19 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -96,35 +96,19 @@ func (r *Manager) EnsureWorkloadSlices(
  			return nil, false, nil
  		}
  
@@ -539,7 +539,7 @@ index c851fd3d..59e14a68 100644
  				if options.apply(wl) {
  					if err := r.Client.Update(ctx, wl); err != nil {
  						return nil, true, fmt.Errorf("failed to update workload slice steps: %w", err)
-@@ -161,6 +145,27 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -145,6 +129,27 @@ func (r *Manager) EnsureWorkloadSlices(
  			return wl, true, nil
  		}
  
@@ -567,7 +567,7 @@ index c851fd3d..59e14a68 100644
  		// Scale-up on admitted workload → create a new slice.
  		return nil, true, nil
  
-@@ -172,20 +177,18 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -156,20 +161,18 @@ func (r *Manager) EnsureWorkloadSlices(
  		if selectedWorkload == nil {
  			return nil, true, nil
  		}
@@ -593,7 +593,7 @@ index c851fd3d..59e14a68 100644
  			scaleDownTarget = selectedWorkload
  		}
  
-@@ -193,42 +196,8 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -177,42 +180,8 @@ func (r *Manager) EnsureWorkloadSlices(
  			return nil, true, err
  		}
  
@@ -639,7 +639,7 @@ index c851fd3d..59e14a68 100644
  
  		if jobPodSetsCounts.EqualTo(selectedCounts) {
 diff --git a/pkg/workloadslicing/partial_preemption.go b/pkg/workloadslicing/partial_preemption.go
-index 61448699..c755e432 100644
+index 61448699d..c755e4326 100644
 --- a/pkg/workloadslicing/partial_preemption.go
 +++ b/pkg/workloadslicing/partial_preemption.go
 @@ -34,7 +34,6 @@ import (
@@ -661,7 +661,7 @@ index 61448699..c755e432 100644
  	targets := workload.ReclaimTargetCounts(wl)
 diff --git a/pkg/workloadslicing/regrow_after_reclaim.go b/pkg/workloadslicing/regrow_after_reclaim.go
 new file mode 100644
-index 00000000..192b689e
+index 000000000..192b689eb
 --- /dev/null
 +++ b/pkg/workloadslicing/regrow_after_reclaim.go
 @@ -0,0 +1,128 @@
@@ -795,7 +795,7 @@ index 00000000..192b689e
 +}
 diff --git a/pkg/controller/jobframework/regrow_after_reclaim_external_test.go b/pkg/controller/jobframework/regrow_after_reclaim_external_test.go
 new file mode 100644
-index 00000000..92639937
+index 000000000..926399379
 --- /dev/null
 +++ b/pkg/controller/jobframework/regrow_after_reclaim_external_test.go
 @@ -0,0 +1,145 @@
@@ -946,7 +946,7 @@ index 00000000..92639937
 +}
 diff --git a/pkg/controller/jobframework/regrow_after_reclaim_test.go b/pkg/controller/jobframework/regrow_after_reclaim_test.go
 new file mode 100644
-index 00000000..51e898a1
+index 000000000..51e898a1c
 --- /dev/null
 +++ b/pkg/controller/jobframework/regrow_after_reclaim_test.go
 @@ -0,0 +1,129 @@
@@ -1080,7 +1080,7 @@ index 00000000..51e898a1
 +	}
 +}
 diff --git a/pkg/controller/jobs/raycluster/partial_stop_test.go b/pkg/controller/jobs/raycluster/partial_stop_test.go
-index 9ca5d52a..7d1f6161 100644
+index 9ca5d52a5..7d1f61611 100644
 --- a/pkg/controller/jobs/raycluster/partial_stop_test.go
 +++ b/pkg/controller/jobs/raycluster/partial_stop_test.go
 @@ -56,9 +56,11 @@ func TestReconcileStopsWorkersAboveReclaimTargets(t *testing.T) {
@@ -1099,7 +1099,7 @@ index 9ca5d52a..7d1f6161 100644
  	for name, tc := range testCases {
 diff --git a/pkg/scheduler/regrow_after_reclaim_test.go b/pkg/scheduler/regrow_after_reclaim_test.go
 new file mode 100644
-index 00000000..34c2ffc7
+index 000000000..34c2ffc72
 --- /dev/null
 +++ b/pkg/scheduler/regrow_after_reclaim_test.go
 @@ -0,0 +1,296 @@
@@ -1400,7 +1400,7 @@ index 00000000..34c2ffc7
 +	}
 +}
 diff --git a/pkg/workloadslicing/partial_preemption_test.go b/pkg/workloadslicing/partial_preemption_test.go
-index e4a6d2e0..7ea1ea9e 100644
+index e4a6d2e0f..7ea1ea9e8 100644
 --- a/pkg/workloadslicing/partial_preemption_test.go
 +++ b/pkg/workloadslicing/partial_preemption_test.go
 @@ -125,11 +125,12 @@ func TestEnsureWorkloadSlicesReclaimScaleDown(t *testing.T) {
@@ -1429,7 +1429,7 @@ index e4a6d2e0..7ea1ea9e 100644
  				objects = append(objects, probe)
 diff --git a/pkg/workloadslicing/regrow_after_reclaim_test.go b/pkg/workloadslicing/regrow_after_reclaim_test.go
 new file mode 100644
-index 00000000..842ffba4
+index 000000000..842ffba41
 --- /dev/null
 +++ b/pkg/workloadslicing/regrow_after_reclaim_test.go
 @@ -0,0 +1,319 @@
@@ -1753,7 +1753,7 @@ index 00000000..842ffba4
 +	}
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
-index 37ed3d58..cd3b2a4a 100644
+index 37ed3d588..cd3b2a4ae 100644
 --- a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_partial_preemption_test.go
 @@ -346,18 +346,40 @@ var _ = ginkgo.Describe("RayCluster with partial preemption", ginkgo.Label("job:
@@ -1826,7 +1826,7 @@ index 37ed3d58..cd3b2a4a 100644
  	})
 diff --git a/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go
 new file mode 100644
-index 00000000..25a5d5e4
+index 000000000..25a5d5e40
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/raycluster/raycluster_controller_regrow_after_reclaim_test.go
 @@ -0,0 +1,587 @@

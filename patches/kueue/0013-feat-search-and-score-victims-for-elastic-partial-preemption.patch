@@ -8,7 +8,7 @@ When higher-priority workloads require capacity from cohorts, standard preemptio
 Introduce partial preemption victim search in the classical preemption strategy behind the PartialPreemption feature gate. Offer elastic candidates shrunk to their minReplicas floors, escalate to full eviction only when partial shrinkage fails to fit the preemptor, and grow survivors back in steps during fill-back.
 ---
 diff --git a/pkg/scheduler/assignment/native/native.go b/pkg/scheduler/assignment/native/native.go
-index 678e0656..5c610605 100644
+index 678e06562..5c610605d 100644
 --- a/pkg/scheduler/assignment/native/native.go
 +++ b/pkg/scheduler/assignment/native/native.go
 @@ -28,6 +28,7 @@ import (
@@ -37,7 +37,7 @@ index 678e0656..5c610605 100644
  				ctx,
  				cq,
 diff --git a/pkg/scheduler/preemption/classical/cache_candidate_generator.go b/pkg/scheduler/preemption/classical/cache_candidate_generator.go
-index 656fd27a..14c8ba54 100644
+index 656fd27a6..14c8ba548 100644
 --- a/pkg/scheduler/preemption/classical/cache_candidate_generator.go
 +++ b/pkg/scheduler/preemption/classical/cache_candidate_generator.go
 @@ -26,6 +26,7 @@ import (
@@ -66,7 +66,7 @@ index 656fd27a..14c8ba54 100644
  	evictedHierarchy, nonEvictedHierarchy := buildBuckets(hierarchyClasses)
  	evictedPriority, nonEvictedPriority := buildBuckets(priorityClasses)
 diff --git a/pkg/scheduler/preemption/classical/candidate_generator.go b/pkg/scheduler/preemption/classical/candidate_generator.go
-index 4358917f..c1ecf627 100644
+index 4358917f4..c1ecf627c 100644
 --- a/pkg/scheduler/preemption/classical/candidate_generator.go
 +++ b/pkg/scheduler/preemption/classical/candidate_generator.go
 @@ -29,6 +29,7 @@ import (
@@ -127,7 +127,7 @@ index 4358917f..c1ecf627 100644
  	allCandidates = append(allCandidates, evictedHierarchicalReclaimCandidates...)
  	allCandidates = append(allCandidates, evictedSTCandidates...)
 diff --git a/pkg/scheduler/preemption/classical_strategy.go b/pkg/scheduler/preemption/classical_strategy.go
-index 6da3b270..3c1cc74b 100644
+index f5cfbbdd8..34156c73f 100644
 --- a/pkg/scheduler/preemption/classical_strategy.go
 +++ b/pkg/scheduler/preemption/classical_strategy.go
 @@ -80,7 +80,7 @@ func classicalPreemptionAttempts(ctx context.Context, preemptor *Preemptor, pree
@@ -156,14 +156,14 @@ index 6da3b270..3c1cc74b 100644
  			allowBorrowing: allowBorrowing,
 -			candidates:     eligibleCandidates(candidatesGenerator, allowBorrowing),
 +			candidates:     eligibleCandidates(preemptionCtx, candidatesGenerator, allowBorrowing),
- 			strategy: func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy {
+ 			strategy: func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) iter.Seq[PreemptionStrategy] {
  				iterator := reorderedIterator(func(a, b *workload.Info) int {
 -					return policy.CandidatesPreferenceOrdering(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, preferred.Has)
 +					return policy.ClassicalCandidatesPreferenceOrdering(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, now, preferred.Has)
  				}, keep)
- 				return newPreemptionStrategy(func(yieldCandidate func(*Target) bool) {
- 					iterateOverCandidates(ctx, preemptionCtx, iterator, allowBorrowing, yieldCandidate)
-@@ -150,11 +151,15 @@ func iterateOverCandidates(
+ 				return func(yield func(PreemptionStrategy) bool) {
+ 					yield(newPreemptionStrategy(func(yieldCandidate func(*Target) bool) {
+@@ -152,11 +153,15 @@ func iterateOverCandidates(
  	yield = policy.YieldFromSnapshot(preemptionCtx.snapshot, yield)
  	iterator.Reset()
  	for candidateWl, reason := iterator.Next(allowBorrowing); candidateWl != nil; candidateWl, reason = iterator.Next(allowBorrowing) {
@@ -179,7 +179,7 @@ index 6da3b270..3c1cc74b 100644
  		if !yield(candidate) {
  			return
  		}
-@@ -164,11 +169,13 @@ func iterateOverCandidates(
+@@ -166,11 +171,13 @@ func iterateOverCandidates(
  
  // eligibleCandidates returns every candidate the iterator offers for the
  // given borrowing option, ignoring the order.
@@ -197,7 +197,7 @@ index 6da3b270..3c1cc74b 100644
  }
 diff --git a/pkg/scheduler/preemption/partial_preemption.go b/pkg/scheduler/preemption/partial_preemption.go
 new file mode 100644
-index 00000000..2ebe4529
+index 000000000..2ebe45297
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption.go
 @@ -0,0 +1,276 @@
@@ -479,7 +479,7 @@ index 00000000..2ebe4529
 +}
 diff --git a/pkg/scheduler/preemption/policy/partial.go b/pkg/scheduler/preemption/policy/partial.go
 new file mode 100644
-index 00000000..62c4b878
+index 000000000..62c4b8781
 --- /dev/null
 +++ b/pkg/scheduler/preemption/policy/partial.go
 @@ -0,0 +1,198 @@
@@ -682,7 +682,7 @@ index 00000000..62c4b878
 +	)
 +}
 diff --git a/pkg/scheduler/preemption/policy/types.go b/pkg/scheduler/preemption/policy/types.go
-index 666564b8..8ab4c911 100644
+index 666564b82..8ab4c9113 100644
 --- a/pkg/scheduler/preemption/policy/types.go
 +++ b/pkg/scheduler/preemption/policy/types.go
 @@ -37,6 +37,12 @@ type Target struct {
@@ -708,7 +708,7 @@ index 666564b8..8ab4c911 100644
  	}
  }
 diff --git a/pkg/scheduler/preemption/preempted_workloads.go b/pkg/scheduler/preemption/preempted_workloads.go
-index cb1b8af5..6ef7d021 100644
+index cb1b8af5a..6ef7d0215 100644
 --- a/pkg/scheduler/preemption/preempted_workloads.go
 +++ b/pkg/scheduler/preemption/preempted_workloads.go
 @@ -23,7 +23,7 @@ import (
@@ -738,7 +738,7 @@ index cb1b8af5..6ef7d021 100644
  	return slices.Collect(maps.Values(p))
  }
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index 76a77dfc..251eadce 100644
+index 426ecd6f7..17ddb84c1 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
 @@ -309,6 +309,16 @@ func (p *Preemptor) IssuePreemptions(
@@ -758,7 +758,7 @@ index 76a77dfc..251eadce 100644
  		preemptorPath := buildCQPath(string(preemptor.ClusterQueue), snap)
  		preempteePath := buildCQPath(string(target.WorkloadInfo.ClusterQueue), target.WorkloadCq)
  
-@@ -398,30 +408,45 @@ type preemptionAttemptOpts struct {
+@@ -397,31 +407,46 @@ type preemptionAttemptOpts struct {
  func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[PreemptionStrategy]) []*Target {
  	log := log.FromContext(ctx)
  	for strategy := range strategies {
@@ -788,7 +788,10 @@ index 76a77dfc..251eadce 100644
 +		fit := false
  		for candidate := range strategy.candidates {
  			targets = append(targets, candidate)
--			if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
++			if candidate.Remaining != nil {
++				partial = append(partial, candidate)
++			}
+ 			if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
 -				targets = fillBackWorkloads(ctx, strategy.pCtx, targets, strategy.allowBorrowing)
 -				if strategy.verify != nil {
 -					if valid, reason := strategy.verify(targets); !valid {
@@ -800,7 +803,9 @@ index 76a77dfc..251eadce 100644
 -						}
 -						break
 -					}
--				}
++				if accept(false) {
++					return targets
+ 				}
 -				restoreSnapshot(strategy.pCtx.snapshot, targets)
 -				if logV := log.V(5); logV.Enabled() {
 -					logV.Info("Preemption target search succeeded",
@@ -808,24 +813,18 @@ index 76a77dfc..251eadce 100644
 -						"targets", logging.GetObjectReferences(targets))
 -				}
 -				return targets
-+			if candidate.Remaining != nil {
-+				partial = append(partial, candidate)
- 			}
-+			if workloadFitsNotingTopology(ctx, strategy.pCtx, strategy.allowBorrowing) {
-+				if accept(false) {
-+					return targets
-+				}
 +				fit = true
 +				break
-+			}
-+		}
+ 			}
+ 		}
 +		// A shrunk target that is not enough is evicted whole.
 +		if !fit && escalatePartialTargets(ctx, strategy.pCtx, partial, strategy.allowBorrowing) && accept(true) {
 +			return targets
- 		}
++		}
  		restoreSnapshot(strategy.pCtx.snapshot, targets)
  	}
-@@ -431,22 +456,31 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
+ 	log.V(5).Info("Preemption target search found no suitable targets")
+@@ -430,22 +455,31 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
  
  func restoreSnapshot(snapshot *schdcache.Snapshot, targets []*Target) {
  	for _, t := range targets {
@@ -864,7 +863,7 @@ index 76a77dfc..251eadce 100644
  }
  
 diff --git a/pkg/scheduler/preemption/preemption_oracle.go b/pkg/scheduler/preemption/preemption_oracle.go
-index d6288aa3..b1ebf56d 100644
+index d6288aa30..b1ebf56d4 100644
 --- a/pkg/scheduler/preemption/preemption_oracle.go
 +++ b/pkg/scheduler/preemption/preemption_oracle.go
 @@ -69,11 +69,7 @@ func (p *PreemptionOracle) SimulatePreemption(
@@ -881,7 +880,7 @@ index d6288aa3..b1ebf56d 100644
  	revertRemoval()
  
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index 340e0aea..7c19c36e 100644
+index 844bd24aa..eaf4a0e13 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
 @@ -21,7 +21,6 @@ import (
@@ -900,7 +899,7 @@ index 340e0aea..7c19c36e 100644
  	afs "sigs.k8s.io/kueue/pkg/util/admissionfairsharing"
  	"sigs.k8s.io/kueue/pkg/util/api"
  	"sigs.k8s.io/kueue/pkg/util/expectations"
-@@ -947,7 +947,7 @@ func (s *Scheduler) updateAssignmentIfNeeded(
+@@ -946,7 +946,7 @@ func (s *Scheduler) updateAssignmentIfNeeded(
  func fits(snapshot *schdcache.Snapshot, cq *schdcache.ClusterQueueSnapshot, usage *workload.Usage, preemptedWorkloads preemption.PreemptedWorkloads,
  	newTargets []*preemption.Target) schdcache.FitsCheck {
  	merged := preemptedWorkloads.MergeWithTargets(newTargets)
@@ -909,7 +908,7 @@ index 340e0aea..7c19c36e 100644
  	defer revertUsage()
  	return cq.Fits(*usage)
  }
-@@ -1008,9 +1008,9 @@ func (s *Scheduler) evictWorkloadAfterFailedTASReplacement(ctx context.Context,
+@@ -1006,9 +1006,9 @@ func (s *Scheduler) evictWorkloadAfterFailedTASReplacement(ctx context.Context,
  // out of the snapshot and returns the single undo. Freeing their quota is not enough:
  // until the simulator is told, it still reports their Pods and their host ports.
  func simulateOtherPreemptions(ctx context.Context, log logr.Logger, snapshot *schdcache.Snapshot, preemptedWorkloads preemption.PreemptedWorkloads) func() {
@@ -924,7 +923,7 @@ index 340e0aea..7c19c36e 100644
  		revertUsage()
 diff --git a/pkg/scheduler/preemption/partial_preemption_property_test.go b/pkg/scheduler/preemption/partial_preemption_property_test.go
 new file mode 100644
-index 00000000..83fb2ded
+index 000000000..83fb2ded3
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption_property_test.go
 @@ -0,0 +1,273 @@
@@ -1203,7 +1202,7 @@ index 00000000..83fb2ded
 +}
 diff --git a/pkg/scheduler/preemption/partial_preemption_test.go b/pkg/scheduler/preemption/partial_preemption_test.go
 new file mode 100644
-index 00000000..a3aa6502
+index 000000000..a3aa6502f
 --- /dev/null
 +++ b/pkg/scheduler/preemption/partial_preemption_test.go
 @@ -0,0 +1,930 @@
@@ -2138,7 +2137,7 @@ index 00000000..a3aa6502
 +	}
 +}
 diff --git a/pkg/scheduler/preemption/preempted_workloads_test.go b/pkg/scheduler/preemption/preempted_workloads_test.go
-index 24610078..554ab4c7 100644
+index 246100783..554ab4c70 100644
 --- a/pkg/scheduler/preemption/preempted_workloads_test.go
 +++ b/pkg/scheduler/preemption/preempted_workloads_test.go
 @@ -30,18 +30,18 @@ func TestWorkloadsToRemove(t *testing.T) {
@@ -2187,7 +2186,7 @@ index 24610078..554ab4c7 100644
  }
 diff --git a/pkg/scheduler/scheduler_partial_preemption_test.go b/pkg/scheduler/scheduler_partial_preemption_test.go
 new file mode 100644
-index 00000000..a101c47c
+index 000000000..a101c47c7
 --- /dev/null
 +++ b/pkg/scheduler/scheduler_partial_preemption_test.go
 @@ -0,0 +1,324 @@
@@ -2516,10 +2515,10 @@ index 00000000..a101c47c
 +	return got
 +}
 diff --git a/pkg/scheduler/scheduler_test.go b/pkg/scheduler/scheduler_test.go
-index 53afd48a..6fc06df4 100644
+index bf27e85b2..00b8a208c 100644
 --- a/pkg/scheduler/scheduler_test.go
 +++ b/pkg/scheduler/scheduler_test.go
-@@ -12702,7 +12702,7 @@ func TestFitsDedupsOverlappingVictims(t *testing.T) {
+@@ -12689,7 +12689,7 @@ func TestFitsDedupsOverlappingVictims(t *testing.T) {
  		},
  	}
  	preempted := preemption.PreemptedWorkloads{

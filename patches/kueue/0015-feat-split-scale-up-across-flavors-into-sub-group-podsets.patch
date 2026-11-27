@@ -8,7 +8,7 @@ When an elastic workload scales up, the scheduler assigns flavors per PodSet. If
 Split elastic worker groups into sub-group PodSets with deterministic numeric suffixes upon scheduler refusal. Each split entry preserves the original group's template and properties while allowing independent flavor assignment and ungate tracking. Update workload slicing, flavor assignment, preemption scoring, and pod admission ungating to reconcile split entries transparently without altering the parent job specification.
 ---
 diff --git a/charts/kueue/templates/webhook/manifests.yaml b/charts/kueue/templates/webhook/manifests.yaml
-index a7815cf9..a5093a53 100644
+index a7815cf9b..a5093a535 100644
 --- a/charts/kueue/templates/webhook/manifests.yaml
 +++ b/charts/kueue/templates/webhook/manifests.yaml
 @@ -429,6 +429,7 @@ webhooks:
@@ -20,7 +20,7 @@ index a7815cf9..a5093a53 100644
            - rayjobs
      sideEffects: None
 diff --git a/config/components/webhook/manifests.yaml b/config/components/webhook/manifests.yaml
-index 38616746..9a349b86 100644
+index 386167467..9a349b862 100644
 --- a/config/components/webhook/manifests.yaml
 +++ b/config/components/webhook/manifests.yaml
 @@ -251,6 +251,7 @@ webhooks:
@@ -32,7 +32,7 @@ index 38616746..9a349b86 100644
      - rayjobs
    sideEffects: None
 diff --git a/pkg/controller/elasticjobs/elastic_flavor_placement.go b/pkg/controller/elasticjobs/elastic_flavor_placement.go
-index 628aee71..8c68756f 100644
+index 628aee713..8c68756f7 100644
 --- a/pkg/controller/elasticjobs/elastic_flavor_placement.go
 +++ b/pkg/controller/elasticjobs/elastic_flavor_placement.go
 @@ -53,7 +53,7 @@ func (r *elasticJobUngater) admissionUpdate(ctx context.Context, wl *kueue.Workl
@@ -55,7 +55,7 @@ index 628aee71..8c68756f 100644
  	if err != nil {
  		return fmt.Errorf("reading the ResourceFlavors of PodSet %q: %w", podSetName, err)
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index 7721599b..6c0869bc 100644
+index 79da82479..62e2f5bbb 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -146,7 +146,7 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
@@ -67,7 +67,7 @@ index 7721599b..6c0869bc 100644
  	if err != nil {
  		return reconcile.Result{}, err
  	}
-@@ -166,11 +166,18 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
+@@ -167,11 +167,18 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
  		var ungated bool
  		e := utilclient.Patch(ctx, r.client, pod, func() (bool, error) {
  			podSetName := kueue.PodSetReference(pod.Labels[constants.PodSetLabel])
@@ -103,8 +103,8 @@ index 7721599b..6c0869bc 100644
 +		return nil, nil, fmt.Errorf("listing pods for workload slice: %w", err)
  	}
  
- 	granted := workload.ExtractGrantedPodSetCounts(wl)
-@@ -321,13 +328,13 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
+ 	log := ctrl.LoggerFrom(ctx)
+@@ -322,13 +329,13 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
  				var err error
  				update, err = r.admissionUpdate(ctx, wl, ps)
  				if err != nil {
@@ -121,7 +121,7 @@ index 7721599b..6c0869bc 100644
  					continue
  				}
 @@ -345,7 +352,11 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
- 	log := ctrl.LoggerFrom(ctx)
+ 
  	steps := workload.PodSetCountSteps(wl)
  	var gated []*corev1.Pod
 +	groups := splitGroupsOf(wl)
@@ -152,7 +152,7 @@ index 7721599b..6c0869bc 100644
  // sortCandidates orders by completion index, or by name if any Pod lacks a valid index.
 diff --git a/pkg/controller/elasticjobs/ungate_split_entries.go b/pkg/controller/elasticjobs/ungate_split_entries.go
 new file mode 100644
-index 00000000..e0dec0dd
+index 000000000..e0dec0dd1
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/ungate_split_entries.go
 @@ -0,0 +1,118 @@
@@ -276,7 +276,7 @@ index 00000000..e0dec0dd
 +}
 diff --git a/pkg/controller/jobframework/flavor_split.go b/pkg/controller/jobframework/flavor_split.go
 new file mode 100644
-index 00000000..722868ab
+index 000000000..722868ab7
 --- /dev/null
 +++ b/pkg/controller/jobframework/flavor_split.go
 @@ -0,0 +1,237 @@
@@ -518,7 +518,7 @@ index 00000000..722868ab
 +	return kept
 +}
 diff --git a/pkg/controller/jobframework/reclaim_floors.go b/pkg/controller/jobframework/reclaim_floors.go
-index 1a869e01..b291551f 100644
+index 1a869e015..b291551f6 100644
 --- a/pkg/controller/jobframework/reclaim_floors.go
 +++ b/pkg/controller/jobframework/reclaim_floors.go
 @@ -53,6 +53,7 @@ func applyReclaimFloors(job GenericJob, wl *kueue.Workload) {
@@ -530,10 +530,10 @@ index 1a869e01..b291551f 100644
  }
  
 diff --git a/pkg/controller/jobframework/reconciler.go b/pkg/controller/jobframework/reconciler.go
-index ebbc05aa..df68c828 100644
+index 02f09bf24..3a000bc57 100644
 --- a/pkg/controller/jobframework/reconciler.go
 +++ b/pkg/controller/jobframework/reconciler.go
-@@ -2229,6 +2229,14 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
+@@ -2222,6 +2222,14 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
  	if err != nil {
  		return nil, err
  	}
@@ -548,7 +548,7 @@ index ebbc05aa..df68c828 100644
  	extra := ""
  	if ElasticPartialScaleUpEnabled(job) {
  		extra, err = prepareWorkloadSliceForScaleUp(ctx, c, job, podSets)
-@@ -2479,7 +2487,7 @@ func getPodSetsInfoFromStatus(ctx context.Context, c client.Client, w *kueue.Wor
+@@ -2472,7 +2480,7 @@ func getPodSetsInfoFromStatus(ctx context.Context, c client.Client, w *kueue.Wor
  		}
  		podSetsInfo[i] = info
  	}
@@ -557,7 +557,7 @@ index ebbc05aa..df68c828 100644
  }
  
  // podSetAssignmentsInSpecOrder reorders the admission, which lists the members
-@@ -2722,7 +2730,7 @@ func GetPodSetsInfoFromWorkload(wl *kueue.Workload) []podset.PodSetInfo {
+@@ -2747,7 +2755,7 @@ func GetPodSetsInfoFromWorkload(wl *kueue.Workload) []podset.PodSetInfo {
  		return nil
  	}
  
@@ -567,7 +567,7 @@ index ebbc05aa..df68c828 100644
  
  type ReconcilerSetup func(*builder.Builder, client.Client) *builder.Builder
 diff --git a/pkg/controller/jobs/raycluster/elastic_template_restamp.go b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
-index 181f7b12..7b6ebb42 100644
+index 181f7b12b..7b6ebb422 100644
 --- a/pkg/controller/jobs/raycluster/elastic_template_restamp.go
 +++ b/pkg/controller/jobs/raycluster/elastic_template_restamp.go
 @@ -22,6 +22,7 @@ import (
@@ -637,7 +637,7 @@ index 181f7b12..7b6ebb42 100644
  		template.Labels = make(map[string]string, 3)
  	}
 diff --git a/pkg/controller/jobs/raycluster/partial_stop.go b/pkg/controller/jobs/raycluster/partial_stop.go
-index ddc22fd5..201b90a9 100644
+index ddc22fd50..201b90a9b 100644
 --- a/pkg/controller/jobs/raycluster/partial_stop.go
 +++ b/pkg/controller/jobs/raycluster/partial_stop.go
 @@ -66,54 +66,56 @@ func StopWorkersAbove(ctx context.Context, c client.Client, wl *kueue.Workload,
@@ -839,7 +839,7 @@ index ddc22fd5..201b90a9 100644
  	if replicas < current {
  		wgs.Replicas = ptr.To(replicas)
 diff --git a/pkg/controller/jobs/rayjob/rayjob_webhook.go b/pkg/controller/jobs/rayjob/rayjob_webhook.go
-index f288243d..3be4c090 100644
+index ec1cf869f..57e9bc6e3 100644
 --- a/pkg/controller/jobs/rayjob/rayjob_webhook.go
 +++ b/pkg/controller/jobs/rayjob/rayjob_webhook.go
 @@ -20,6 +20,8 @@ import (
@@ -886,10 +886,10 @@ index f288243d..3be4c090 100644
  	if err := w.integrationManager.ApplyDefaultLocalQueue(ctx, w.client, job.Object(), w.queues.DefaultLocalQueueExist, w.managedJobsNamespaceSelector); err != nil {
  		return err
  	}
-@@ -93,6 +101,62 @@ func (w *RayJobWebhook) Default(ctx context.Context, obj *rayv1.RayJob) error {
+@@ -95,6 +103,62 @@ func (w *RayJobWebhook) Default(ctx context.Context, obj *rayv1.RayJob) error {
+ 	if err := jobframework.ApplyDefaultForManagedBy(ctx, job, w.queues, w.cache, w.client, w.managedJobsNamespaceSelector, log); err != nil {
  		return err
  	}
- 	jobframework.ApplyDefaultForManagedBy(job, w.queues, w.cache, log)
 +
 +	if isAnElasticJob(obj) && job.Spec.RayClusterSpec != nil {
 +		utilpod.GateTemplate(&job.Spec.RayClusterSpec.HeadGroupSpec.Template, kueue.ElasticJobSchedulingGate)
@@ -950,10 +950,10 @@ index f288243d..3be4c090 100644
  }
  
 diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
-index 445aa036..198e7d0d 100644
+index 624cd088e..b1b1db372 100644
 --- a/pkg/features/kube_features.go
 +++ b/pkg/features/kube_features.go
-@@ -207,6 +207,13 @@ const (
+@@ -208,6 +208,13 @@ const (
  	// while it was empty.
  	ElasticJobsViaWorkloadSlicesFlavorChangeFromZero featuregate.Feature = "ElasticJobsViaWorkloadSlicesFlavorChangeFromZero"
  
@@ -967,7 +967,7 @@ index 445aa036..198e7d0d 100644
  	// owner: @pbundyra
  	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/2724-topology-aware-scheduling
  	//
-@@ -987,6 +994,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
+@@ -997,6 +1004,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
  	TASRecomputeAssignmentWithinSchedulingCycle:         {TopologyAwareScheduling},
  	ElasticJobsViaWorkloadSlicesWithTAS:                 {ElasticJobsViaWorkloadSlices, TopologyAwareScheduling},
  	ElasticJobsViaWorkloadSlicesFlavorChangeFromZero:    {ElasticJobsViaWorkloadSlices},
@@ -975,7 +975,7 @@ index 445aa036..198e7d0d 100644
  	MultiKueueRayInTreeAutoscaling:                      {MultiKueue, ElasticJobsViaWorkloadSlices, SkipChildJobSuspension},
  	KueueDRAIntegrationExtendedResource:                 {KueueDRAIntegration},
  	KueueDRAIntegrationPartitionableDevices:             {KueueDRAIntegration},
-@@ -1097,6 +1105,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+@@ -1108,6 +1116,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
  	ElasticJobsViaWorkloadSlicesFlavorChangeFromZero: {
  		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
  	},
@@ -987,7 +987,7 @@ index 445aa036..198e7d0d 100644
  		{Version: version.MustParse("0.14"), Default: true, PreRelease: featuregate.Beta},
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
 new file mode 100644
-index 00000000..bc28229b
+index 000000000..bc28229bf
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
 @@ -0,0 +1,74 @@
@@ -1066,10 +1066,10 @@ index 00000000..bc28229b
 +	return fits && grows
 +}
 diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
-index 0ae38c2f..c381c95d 100644
+index 0c9453045..adb0dedc6 100644
 --- a/pkg/scheduler/flavorassigner/flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/flavorassigner.go
-@@ -64,10 +64,13 @@ const (
+@@ -65,10 +65,13 @@ const (
  	reasonSeverityExceedsMaxQuota
  	reasonSeverityUnrecordableResourceUsage
  	reasonSeverityNoMatchingFlavor
@@ -1083,7 +1083,7 @@ index 0ae38c2f..c381c95d 100644
  	case kueue.WorkloadQuotaReservedReasonNoMatchingFlavor:
  		return reasonSeverityNoMatchingFlavor
  	case kueue.WorkloadQuotaReservedReasonExceedsMaxQuota:
-@@ -889,6 +892,10 @@ func (a *FlavorAssigner) findFlavorForPodSets(
+@@ -890,6 +893,10 @@ func (a *FlavorAssigner) findFlavorForPodSets(
  						// Flavor mismatch. Skip further checks for this resource.
  						representativeMode = worstGranularMode()
  						msg := fmt.Sprintf("could not assign %s flavor since the original workload is assigned: %s", fName, originalFlavor)
@@ -1096,7 +1096,7 @@ index 0ae38c2f..c381c95d 100644
  						flavorNoFitReason = mostSevereReason(flavorNoFitReason, kueue.WorkloadQuotaReservedReasonNoMatchingFlavor)
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
 new file mode 100644
-index 00000000..bfff290a
+index 000000000..bfff290a4
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split.go
 @@ -0,0 +1,362 @@
@@ -1463,7 +1463,7 @@ index 00000000..bfff290a
 +	return changed
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 59e14a68..05835f9f 100644
+index ac4c42c14..a61c9c8b5 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
 @@ -21,12 +21,16 @@ import (
@@ -1483,18 +1483,16 @@ index 59e14a68..05835f9f 100644
  	"sigs.k8s.io/kueue/pkg/metrics"
  	"sigs.k8s.io/kueue/pkg/util/roletracker"
  	"sigs.k8s.io/kueue/pkg/workload"
-@@ -57,8 +61,8 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -57,7 +61,7 @@ func (r *Manager) EnsureWorkloadSlices(
  	opts ...EnsureOption,
  ) (*kueue.Workload, bool, error) {
  	options := newEnsureOptions(opts)
 -	jobPodSetsCounts := workload.ExtractPodSetCounts(jobPodSets)
--	applyPodSetCounts := func(wl *kueue.Workload) {
 +	jobBaseCounts := workload.ExtractPodSetCounts(jobPodSets)
-+	applyPodSetCounts := func(wl *kueue.Workload, jobPodSetsCounts workload.PodSetsCounts) {
- 		workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
- 		// Only initial admission follows the job's current minimum. Replacements
- 		// and readmissions retain their baseline, even after a zero-second admission.
-@@ -107,6 +111,16 @@ func (r *Manager) EnsureWorkloadSlices(
+ 
+ 	workloads, err := FindNotFinishedWorkloads(ctx, r.Client, jobObject, jobObjectGVK)
+ 	if err != nil {
+@@ -90,6 +94,16 @@ func (r *Manager) EnsureWorkloadSlices(
  		// A single active workload was found.
  		wl := &workloads[0]
  		wlPodSetsCounts := workload.ExtractPodSetCountsFromWorkload(wl)
@@ -1511,16 +1509,7 @@ index 59e14a68..05835f9f 100644
  
  		// Check if pod sets are structurally compatible (same number and names).
  		if !jobPodSetsCounts.HasSamePodSetKeys(wlPodSetsCounts) {
-@@ -133,7 +147,7 @@ func (r *Manager) EnsureWorkloadSlices(
- 				}
- 				return wl, true, nil
- 			}
--			applyPodSetCounts(wl)
-+			applyPodSetCounts(wl, jobPodSetsCounts)
- 			options.apply(wl)
- 			reclaim.apply(wl)
- 			if err := r.Client.Update(ctx, wl); err != nil {
-@@ -177,12 +191,21 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -161,12 +175,21 @@ func (r *Manager) EnsureWorkloadSlices(
  		if selectedWorkload == nil {
  			return nil, true, nil
  		}
@@ -1543,7 +1532,7 @@ index 59e14a68..05835f9f 100644
  		if !jobPodSetsCounts.HasSamePodSetKeys(selectedCounts) {
  			return nil, false, nil
  		}
-@@ -201,6 +224,9 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -185,6 +208,9 @@ func (r *Manager) EnsureWorkloadSlices(
  		}
  
  		if jobPodSetsCounts.EqualTo(selectedCounts) {
@@ -1553,16 +1542,7 @@ index 59e14a68..05835f9f 100644
  			return selectedWorkload, true, nil
  		}
  
-@@ -217,7 +243,7 @@ func (r *Manager) EnsureWorkloadSlices(
- 				}
- 				return selectedWorkload, true, nil
- 			}
--			applyPodSetCounts(selectedWorkload)
-+			applyPodSetCounts(selectedWorkload, jobPodSetsCounts)
- 			options.apply(selectedWorkload)
- 			reclaim.apply(selectedWorkload)
- 			if err := r.Client.Update(ctx, selectedWorkload); err != nil {
-@@ -234,6 +260,44 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -219,6 +245,44 @@ func (r *Manager) EnsureWorkloadSlices(
  	}
  }
  
@@ -1608,7 +1588,7 @@ index 59e14a68..05835f9f 100644
  // job's, when the caller asked for that. It writes metadata only.
  func (r *Manager) refreshFloors(ctx context.Context, active []kueue.Workload, options ensureOptions, skip ...*kueue.Workload) error {
 diff --git a/pkg/workloadslicing/podset_steps.go b/pkg/workloadslicing/podset_steps.go
-index 75a0b7a6..716a1695 100644
+index 75a0b7a6e..716a16953 100644
 --- a/pkg/workloadslicing/podset_steps.go
 +++ b/pkg/workloadslicing/podset_steps.go
 @@ -52,10 +52,11 @@ func newEnsureOptions(opts []EnsureOption) ensureOptions {
@@ -1634,7 +1614,7 @@ index 75a0b7a6..716a1695 100644
  		want := workload.FormatPodSetCounts(floors)
  		if len(floors) == 0 {
 diff --git a/pkg/workloadslicing/regrow_after_reclaim.go b/pkg/workloadslicing/regrow_after_reclaim.go
-index 192b689e..e0105e29 100644
+index 192b689eb..e0105e291 100644
 --- a/pkg/workloadslicing/regrow_after_reclaim.go
 +++ b/pkg/workloadslicing/regrow_after_reclaim.go
 @@ -86,7 +86,8 @@ func (r *Manager) dropProbeAfterScaleDown(ctx context.Context, workloads []kueue
@@ -1657,7 +1637,7 @@ index 192b689e..e0105e29 100644
  			return true
 diff --git a/pkg/controller/elasticjobs/ungate_split_entries_test.go b/pkg/controller/elasticjobs/ungate_split_entries_test.go
 new file mode 100644
-index 00000000..bbacca84
+index 000000000..bbacca847
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/ungate_split_entries_test.go
 @@ -0,0 +1,168 @@
@@ -1831,7 +1811,7 @@ index 00000000..bbacca84
 +}
 diff --git a/pkg/controller/jobframework/flavor_split_external_test.go b/pkg/controller/jobframework/flavor_split_external_test.go
 new file mode 100644
-index 00000000..f4e4f47c
+index 000000000..f4e4f47c4
 --- /dev/null
 +++ b/pkg/controller/jobframework/flavor_split_external_test.go
 @@ -0,0 +1,284 @@
@@ -2121,7 +2101,7 @@ index 00000000..f4e4f47c
 +}
 diff --git a/pkg/controller/jobframework/flavor_split_test.go b/pkg/controller/jobframework/flavor_split_test.go
 new file mode 100644
-index 00000000..a1b71652
+index 000000000..a1b71652b
 --- /dev/null
 +++ b/pkg/controller/jobframework/flavor_split_test.go
 @@ -0,0 +1,68 @@
@@ -2194,7 +2174,7 @@ index 00000000..a1b71652
 +	}
 +}
 diff --git a/pkg/controller/jobs/raycluster/partial_stop_test.go b/pkg/controller/jobs/raycluster/partial_stop_test.go
-index 7d1f6161..95f6f712 100644
+index 7d1f61611..95f6f7122 100644
 --- a/pkg/controller/jobs/raycluster/partial_stop_test.go
 +++ b/pkg/controller/jobs/raycluster/partial_stop_test.go
 @@ -18,6 +18,7 @@ limitations under the License.
@@ -2644,7 +2624,7 @@ index 7d1f6161..95f6f712 100644
 +	}
 +}
 diff --git a/pkg/controller/jobs/rayjob/rayjob_webhook_test.go b/pkg/controller/jobs/rayjob/rayjob_webhook_test.go
-index 9ec10788..a6f302d0 100644
+index daf823a2e..297921d80 100644
 --- a/pkg/controller/jobs/rayjob/rayjob_webhook_test.go
 +++ b/pkg/controller/jobs/rayjob/rayjob_webhook_test.go
 @@ -18,6 +18,7 @@ package rayjob
@@ -2655,7 +2635,7 @@ index 9ec10788..a6f302d0 100644
  	"testing"
  	"time"
  
-@@ -910,3 +911,35 @@ func TestValidateUpdate(t *testing.T) {
+@@ -907,3 +908,35 @@ func TestValidateUpdate(t *testing.T) {
  		})
  	}
  }
@@ -2693,7 +2673,7 @@ index 9ec10788..a6f302d0 100644
 +}
 diff --git a/pkg/scheduler/flavorassigner/flavor_split_test.go b/pkg/scheduler/flavorassigner/flavor_split_test.go
 new file mode 100644
-index 00000000..dd5ac5a9
+index 000000000..dd5ac5a98
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/flavor_split_test.go
 @@ -0,0 +1,295 @@
@@ -2994,7 +2974,7 @@ index 00000000..dd5ac5a9
 +}
 diff --git a/pkg/scheduler/preemption/flavor_split_test.go b/pkg/scheduler/preemption/flavor_split_test.go
 new file mode 100644
-index 00000000..590423c1
+index 000000000..590423c1f
 --- /dev/null
 +++ b/pkg/scheduler/preemption/flavor_split_test.go
 @@ -0,0 +1,100 @@
@@ -3100,7 +3080,7 @@ index 00000000..590423c1
 +}
 diff --git a/pkg/workloadslicing/flavor_split_test.go b/pkg/workloadslicing/flavor_split_test.go
 new file mode 100644
-index 00000000..703a5d8a
+index 000000000..703a5d8ac
 --- /dev/null
 +++ b/pkg/workloadslicing/flavor_split_test.go
 @@ -0,0 +1,561 @@

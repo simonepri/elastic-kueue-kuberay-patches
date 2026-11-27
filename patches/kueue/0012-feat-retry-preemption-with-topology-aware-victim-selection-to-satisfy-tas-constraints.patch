@@ -10,7 +10,7 @@ Introduce a topology-aware preemption retry mechanism that searches candidate pl
 ---
 diff --git a/pkg/cache/scheduler/snapshot_workload_usage.go b/pkg/cache/scheduler/snapshot_workload_usage.go
 new file mode 100644
-index 00000000..4c11a51d
+index 000000000..4c11a51dc
 --- /dev/null
 +++ b/pkg/cache/scheduler/snapshot_workload_usage.go
 @@ -0,0 +1,43 @@
@@ -59,7 +59,7 @@ index 00000000..4c11a51d
 +}
 diff --git a/pkg/cache/scheduler/tas_flavor_snapshot_fingerprint.go b/pkg/cache/scheduler/tas_flavor_snapshot_fingerprint.go
 new file mode 100644
-index 00000000..7a3fd978
+index 000000000..7a3fd978c
 --- /dev/null
 +++ b/pkg/cache/scheduler/tas_flavor_snapshot_fingerprint.go
 @@ -0,0 +1,86 @@
@@ -150,7 +150,7 @@ index 00000000..7a3fd978
 +	return sum
 +}
 diff --git a/pkg/scheduler/assignment/native/native.go b/pkg/scheduler/assignment/native/native.go
-index bb4cea0c..678e0656 100644
+index bb4cea0c4..678e06562 100644
 --- a/pkg/scheduler/assignment/native/native.go
 +++ b/pkg/scheduler/assignment/native/native.go
 @@ -22,11 +22,13 @@ import (
@@ -226,7 +226,7 @@ index bb4cea0c..678e0656 100644
  	log := log.FromContext(ctx)
  	cq := p.snapshot.ClusterQueue(p.wl.ClusterQueue)
 diff --git a/pkg/scheduler/assignment/planner.go b/pkg/scheduler/assignment/planner.go
-index 8fd630e6..b48d1f16 100644
+index 8fd630e65..b48d1f16c 100644
 --- a/pkg/scheduler/assignment/planner.go
 +++ b/pkg/scheduler/assignment/planner.go
 @@ -38,6 +38,12 @@ type Plan struct {
@@ -243,7 +243,7 @@ index 8fd630e6..b48d1f16 100644
  
  func (p *Plan) CanFit() bool {
 diff --git a/pkg/scheduler/preemption/classical/candidate_generator.go b/pkg/scheduler/preemption/classical/candidate_generator.go
-index 58a5d603..4358917f 100644
+index 58a5d6036..4358917f4 100644
 --- a/pkg/scheduler/preemption/classical/candidate_generator.go
 +++ b/pkg/scheduler/preemption/classical/candidate_generator.go
 @@ -51,6 +51,8 @@ type candidateIterator struct {
@@ -309,7 +309,7 @@ index 58a5d603..4358917f 100644
  }
  
 diff --git a/pkg/scheduler/preemption/classical_strategy.go b/pkg/scheduler/preemption/classical_strategy.go
-index 05871068..6da3b270 100644
+index 05871068a..f5cfbbdd8 100644
 --- a/pkg/scheduler/preemption/classical_strategy.go
 +++ b/pkg/scheduler/preemption/classical_strategy.go
 @@ -20,6 +20,7 @@ import (
@@ -352,7 +352,7 @@ index 05871068..6da3b270 100644
  	log := log.FromContext(ctx)
  	hierarchicalReclaimCtx := &classical.HierarchicalPreemptionCtx{
  		Log:               log,
-@@ -81,26 +107,37 @@ func classicalPreemptionStrategy(ctx context.Context, preemptor *Preemptor, pree
+@@ -81,26 +107,39 @@ func classicalPreemptionStrategy(ctx context.Context, preemptor *Preemptor, pree
  	default:
  		attemptPossibleOpts = []preemptionAttemptOpts{{true}, {false}}
  	}
@@ -371,12 +371,6 @@ index 05871068..6da3b270 100644
 -						func() bool { return workloadQuotaFits(preemptionCtx, allowBorrowing) },
 -						yieldCandidate,
 -					)
--				}
--			}
--			if !yieldStrategy(newPreemptionStrategy(candidateIter, allowBorrowing, preemptionCtx)) {
--				return
--			}
--		}
 +// classicalTopologyRetryAttempts returns, for each borrowing option of the
 +// classical heuristic, the candidates it may preempt and a strategy that
 +// offers the kept candidates, the preferred ones first, within the same policy
@@ -394,13 +388,20 @@ index 05871068..6da3b270 100644
 +		attempts = append(attempts, topologyRetryAttempt{
 +			allowBorrowing: allowBorrowing,
 +			candidates:     eligibleCandidates(candidatesGenerator, allowBorrowing),
-+			strategy: func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy {
++			strategy: func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) iter.Seq[PreemptionStrategy] {
 +				iterator := reorderedIterator(func(a, b *workload.Info) int {
 +					return policy.CandidatesPreferenceOrdering(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, preferred.Has)
 +				}, keep)
-+				return newPreemptionStrategy(func(yieldCandidate func(*Target) bool) {
-+					iterateOverCandidates(ctx, preemptionCtx, iterator, allowBorrowing, yieldCandidate)
-+				}, allowBorrowing, preemptionCtx)
++				return func(yield func(PreemptionStrategy) bool) {
++					yield(newPreemptionStrategy(func(yieldCandidate func(*Target) bool) {
++						iterateOverCandidates(ctx, preemptionCtx, iterator, allowBorrowing, yieldCandidate)
++					}, allowBorrowing, preemptionCtx))
+ 				}
+-			}
+-			if !yieldStrategy(newPreemptionStrategy(candidateIter, allowBorrowing, preemptionCtx)) {
+-				return
+-			}
+-		}
 +			},
 +		})
  	}
@@ -408,7 +409,7 @@ index 05871068..6da3b270 100644
  }
  
  func iterateOverCandidates(
-@@ -124,3 +161,14 @@ func iterateOverCandidates(
+@@ -124,3 +163,14 @@ func iterateOverCandidates(
  	}
  	return true
  }
@@ -424,29 +425,26 @@ index 05871068..6da3b270 100644
 +	return candidates
 +}
 diff --git a/pkg/scheduler/preemption/fair_strategy.go b/pkg/scheduler/preemption/fair_strategy.go
-index eb81adbf..ab8c21e7 100644
+index e5e8a240a..c07c22701 100644
 --- a/pkg/scheduler/preemption/fair_strategy.go
 +++ b/pkg/scheduler/preemption/fair_strategy.go
-@@ -61,12 +61,45 @@ func fairPreemptionStrategy(
+@@ -64,12 +64,43 @@ func fairPreemptionStrategy(
  	preemptionCtx *preemptionCtx,
  	fsStrategies []fairsharing.Strategy,
  ) iter.Seq[PreemptionStrategy] {
--	log := log.FromContext(ctx)
--	allowBorrowing := true
 +	candidateWls, found := fairPreemptionCandidates(ctx, preemptor, preemptionCtx)
 +	if !found {
 +		return func(yieldStrategy func(PreemptionStrategy) bool) {}
 +	}
-+	return func(yieldStrategy func(PreemptionStrategy) bool) {
-+		yieldStrategy(fairStrategy(ctx, preemptionCtx, fsStrategies, candidateWls))
-+	}
++	return fairStrategies(ctx, preemptionCtx, fsStrategies, candidateWls)
 +}
- 
++
 +// fairTopologyRetryAttempts returns the fair sharing candidates and a strategy
 +// that offers the kept candidates, the preferred ones first, within the order
 +// of ClusterQueues by share; the fair sharing rules still apply.
 +func fairTopologyRetryAttempts(ctx context.Context, preemptor *Preemptor, preemptionCtx *preemptionCtx, fsStrategies []fairsharing.Strategy) []topologyRetryAttempt {
-+	log := log.FromContext(ctx)
+ 	log := log.FromContext(ctx)
+-	allowBorrowing := true
 +	candidateWls, found := fairPreemptionCandidates(ctx, preemptor, preemptionCtx)
 +	if !found {
 +		return nil
@@ -454,16 +452,16 @@ index eb81adbf..ab8c21e7 100644
 +	return []topologyRetryAttempt{{
 +		allowBorrowing: true,
 +		candidates:     candidateWls,
-+		strategy: func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy {
++		strategy: func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) iter.Seq[PreemptionStrategy] {
 +			ordered := slices.DeleteFunc(slices.Clone(candidateWls), func(wl *workload.Info) bool { return !keep(wl) })
 +			slices.SortStableFunc(ordered, func(a, b *workload.Info) int {
-+				return policy.CandidatesPreferenceOrdering(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, preferred.Has)
++				return cmp.Or(cmp.Compare(a.ClusterQueue, b.ClusterQueue), policy.CandidatesPreferenceOrdering(log, preemptor.enabledAfs, a, b, preemptionCtx.preemptorCQ.Name, preferred.Has))
 +			})
-+			return fairStrategy(ctx, preemptionCtx, fsStrategies, ordered)
++			return fairStrategies(ctx, preemptionCtx, fsStrategies, ordered)
 +		},
 +	}}
 +}
-+
+ 
 +// fairPreemptionCandidates returns the candidates fair sharing may preempt, in
 +// the default order. It returns false when neither a candidate nor a
 +// configurable preemption rule can free capacity.
@@ -474,9 +472,9 @@ index eb81adbf..ab8c21e7 100644
 -		return func(yieldStrategy func(PreemptionStrategy) bool) {}
 +		return nil, false
  	}
- 	slices.SortFunc(candidateWls, preemptor.candidatesOrdering(log, preemptionCtx.preemptorCQ.Name))
- 	if logV := log.V(5); logV.Enabled() {
-@@ -80,7 +113,20 @@ func fairPreemptionStrategy(
+ 	// With AdmissionFairSharing, candidatesOrdering compares LocalQueue usage
+ 	// only between Workloads of the same ClusterQueue, so it can't order
+@@ -90,7 +121,20 @@ func fairPreemptionStrategy(
  			klog.KObj(preemptionCtx.preemptor.Obj),
  		)
  	}
@@ -486,44 +484,19 @@ index eb81adbf..ab8c21e7 100644
 +// fairStrategy builds the fair sharing strategy that offers candidateWls in
 +// the given order, within the order of ClusterQueues by share. The strategy
 +// consumes candidateWls, so each strategy needs its own slice.
-+func fairStrategy(
++func fairStrategies(
 +	ctx context.Context,
 +	preemptionCtx *preemptionCtx,
 +	fsStrategies []fairsharing.Strategy,
 +	candidateWls []*workload.Info,
-+) PreemptionStrategy {
++) iter.Seq[PreemptionStrategy] {
 +	log := log.FromContext(ctx)
 +	allowBorrowing := true
- 	candidatesIter := func(yieldCandidate func(*Target) bool) {
+ 	iterateCandidates := func(candidateWls []*workload.Info, yieldCandidate func(*Target) bool) {
  		var cont bool
  		targetsInPreemptorCQ := false
-@@ -148,16 +194,14 @@ func fairPreemptionStrategy(
- 		}
- 	}
- 
--	return func(yieldStrategy func(PreemptionStrategy) bool) {
--		yieldStrategy(newPreemptionStrategy(
--			candidatesIter,
--			allowBorrowing,
--			preemptionCtx,
--			withVerify(func(targets []*Target) (bool, string) {
--				return verifyFairSharingTargets(preemptionCtx, targets, fsStrategies)
--			}),
--		))
--	}
-+	return newPreemptionStrategy(
-+		candidatesIter,
-+		allowBorrowing,
-+		preemptionCtx,
-+		withVerify(func(targets []*Target) (bool, string) {
-+			return verifyFairSharingTargets(preemptionCtx, targets, fsStrategies)
-+		}),
-+	)
- }
- 
- // verifyFairSharingTargets checks that every cross-ClusterQueue target in targets
 diff --git a/pkg/scheduler/preemption/policy/ordering.go b/pkg/scheduler/preemption/policy/ordering.go
-index 558ed944..3d4afd7c 100644
+index 5f29507e8..40cfae9f6 100644
 --- a/pkg/scheduler/preemption/policy/ordering.go
 +++ b/pkg/scheduler/preemption/policy/ordering.go
 @@ -41,6 +41,49 @@ import (
@@ -600,7 +573,7 @@ index 558ed944..3d4afd7c 100644
  }
  
 diff --git a/pkg/scheduler/preemption/preemption.go b/pkg/scheduler/preemption/preemption.go
-index dbcd04dc..76a77dfc 100644
+index 63d20cc8e..426ecd6f7 100644
 --- a/pkg/scheduler/preemption/preemption.go
 +++ b/pkg/scheduler/preemption/preemption.go
 @@ -74,6 +74,7 @@ type Preemptor struct {
@@ -630,7 +603,7 @@ index dbcd04dc..76a77dfc 100644
  	}
  	return p
  }
-@@ -395,7 +401,7 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
+@@ -394,7 +400,7 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
  		var targets []*Target
  		for candidate := range strategy.candidates {
  			targets = append(targets, candidate)
@@ -639,7 +612,7 @@ index dbcd04dc..76a77dfc 100644
  				targets = fillBackWorkloads(ctx, strategy.pCtx, targets, strategy.allowBorrowing)
  				if strategy.verify != nil {
  					if valid, reason := strategy.verify(targets); !valid {
-@@ -575,6 +581,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
+@@ -574,6 +580,19 @@ func workloadFits(ctx context.Context, preemptionCtx *preemptionCtx, allowBorrow
  	return workloadQuotaFits(preemptionCtx, allowBorrowing) && workloadTopologyFits(ctx, preemptionCtx)
  }
  
@@ -661,10 +634,10 @@ index dbcd04dc..76a77dfc 100644
  func workloadQuotaFits(preemptionCtx *preemptionCtx, allowBorrowing bool) bool {
 diff --git a/pkg/scheduler/preemption/topology_retry.go b/pkg/scheduler/preemption/topology_retry.go
 new file mode 100644
-index 00000000..8dd3283f
+index 000000000..562dd6ce4
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry.go
-@@ -0,0 +1,550 @@
+@@ -0,0 +1,552 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -687,6 +660,7 @@ index 00000000..8dd3283f
 +import (
 +	"cmp"
 +	"context"
++	"iter"
 +	"math/bits"
 +	"slices"
 +
@@ -722,8 +696,9 @@ index 00000000..8dd3283f
 +// GetTargets returns the targets of ordinary preemption for wl. When ordinary
 +// preemption finds no targets because the quota fits but no topology placement
 +// does, it also returns a TopologyRetry. The caller runs it only once every
-+// other way to admit wl failed, so ordinary preemption wins whenever it
-+// succeeds. A retry that already failed for wl in the same state is not run
++// other way to admit wl failed, so ordinary preemption, including the fair
++// sharing same-ClusterQueue fallback, wins whenever it succeeds. Each topology
++// placement also runs that fallback if its fair-sharing targets are rejected. A retry that already failed for wl in the same state is not run
 +// again.
 +func (p *Preemptor) GetTargets(
 +	ctx context.Context,
@@ -750,7 +725,7 @@ index 00000000..8dd3283f
 +type topologyRetryAttempt struct {
 +	allowBorrowing bool
 +	candidates     []*workload.Info
-+	strategy       func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) PreemptionStrategy
++	strategy       func(preferred sets.Set[*workload.Info], keep func(*workload.Info) bool) iter.Seq[PreemptionStrategy]
 +}
 +
 +// topologyRetryTargets takes victims by topology placement instead of by
@@ -1177,7 +1152,7 @@ index 00000000..8dd3283f
 +	var bestCost []int64
 +	for _, placement := range placements {
 +		strategy := attempt.strategy(placement, keep)
-+		targets := p.getTargets(ctx, func(yield func(PreemptionStrategy) bool) { yield(strategy) })
++		targets := p.getTargets(ctx, strategy)
 +		if len(targets) == 0 {
 +			continue
 +		}
@@ -1217,7 +1192,7 @@ index 00000000..8dd3283f
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_failures.go b/pkg/scheduler/preemption/topology_retry_failures.go
 new file mode 100644
-index 00000000..10e95bfd
+index 000000000..10e95bfdd
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_failures.go
 @@ -0,0 +1,255 @@
@@ -1478,7 +1453,7 @@ index 00000000..10e95bfd
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_limits.go b/pkg/scheduler/preemption/topology_retry_limits.go
 new file mode 100644
-index 00000000..07880bba
+index 000000000..07880bba1
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_limits.go
 @@ -0,0 +1,201 @@
@@ -1684,10 +1659,10 @@ index 00000000..07880bba
 +	return g.members
 +}
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index e79ff2f9..340e0aea 100644
+index 02d1bfb91..844bd24aa 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
-@@ -1597,6 +1597,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1593,6 +1593,7 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  	initialAssignment := flvAssigner.AssignFlavors(ctx, log, nil)
  	planner := nativeplanner.NewPlanner(wl, snap, s.preemptor, flvAssigner)
  	assignmentPlan := planner.Plan(ctx, &initialAssignment)
@@ -1695,7 +1670,7 @@ index e79ff2f9..340e0aea 100644
  
  	if !assignmentPlan.CanFit() && workload.MinCountsUsable(wl.Obj) && wl.CanBePartiallyAdmitted() {
  		// bestPA is tracked here, not returned by fitsFn(), so it can't drift from
-@@ -1624,6 +1625,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1620,6 +1621,11 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  			assignmentPlan = *bestPartialPlan
  		}
  	}
@@ -1709,7 +1684,7 @@ index e79ff2f9..340e0aea 100644
  	if assignmentPlan.CanFit() {
 diff --git a/pkg/scheduler/preemption/preemption_tas_bench_test.go b/pkg/scheduler/preemption/preemption_tas_bench_test.go
 new file mode 100644
-index 00000000..39dbe35b
+index 000000000..39dbe35bd
 --- /dev/null
 +++ b/pkg/scheduler/preemption/preemption_tas_bench_test.go
 @@ -0,0 +1,162 @@
@@ -1877,7 +1852,7 @@ index 00000000..39dbe35b
 +}
 diff --git a/pkg/scheduler/preemption/preemption_tas_test.go b/pkg/scheduler/preemption/preemption_tas_test.go
 new file mode 100644
-index 00000000..f9d72c9a
+index 000000000..f9d72c9a9
 --- /dev/null
 +++ b/pkg/scheduler/preemption/preemption_tas_test.go
 @@ -0,0 +1,256 @@
@@ -2139,7 +2114,7 @@ index 00000000..f9d72c9a
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_limits_test.go b/pkg/scheduler/preemption/topology_retry_limits_test.go
 new file mode 100644
-index 00000000..8aca0c58
+index 000000000..8aca0c58a
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_limits_test.go
 @@ -0,0 +1,357 @@
@@ -2502,10 +2477,10 @@ index 00000000..8aca0c58
 +}
 diff --git a/pkg/scheduler/preemption/topology_retry_test.go b/pkg/scheduler/preemption/topology_retry_test.go
 new file mode 100644
-index 00000000..4df57baa
+index 000000000..02ea0120a
 --- /dev/null
 +++ b/pkg/scheduler/preemption/topology_retry_test.go
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,402 @@
 +/*
 +Copyright The Kubernetes Authors.
 +
@@ -2538,6 +2513,7 @@ index 00000000..4df57baa
 +	corev1 "k8s.io/api/core/v1"
 +	"k8s.io/apimachinery/pkg/api/resource"
 +	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/sets"
 +	clocktesting "k8s.io/utils/clock/testing"
 +
 +	config "sigs.k8s.io/kueue/apis/config/v1beta2"
@@ -2680,14 +2656,17 @@ index 00000000..4df57baa
 +		name         string
 +		cacheEnabled bool
 +		fairSharing  *config.FairSharing
++		fairFallback bool
 +	}{
 +		{name: "classical/cache=false"},
 +		{name: "classical/cache=true", cacheEnabled: true},
 +		{name: "fairsharing", fairSharing: &config.FairSharing{}},
++		{name: "fairsharing/fallback", fairSharing: &config.FairSharing{}, fairFallback: true},
 +	}
 +	for _, mode := range modes {
 +		t.Run(mode.name, func(t *testing.T) {
 +			features.SetFeatureGateDuringTest(t, features.ClassicalPreemptionCandidateOrderCache, mode.cacheEnabled)
++			features.SetFeatureGateDuringTest(t, features.FairSharingPreemptWithinClusterQueueFallback, mode.fairFallback)
 +			for name, tc := range cases {
 +				t.Run(name, func(t *testing.T) {
 +					features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, true)
@@ -2707,6 +2686,41 @@ index 00000000..4df57baa
 +						t.Errorf("unexpected preemption targets (-want/+got):\n%s", diff)
 +					}
 +				})
++			}
++		})
++	}
++}
++
++func TestTopologyRetryPreservesFairSharingFallback(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("fallback=%t", enabled), func(t *testing.T) {
++			features.SetFeatureGateDuringTest(t, features.FairSharingPreemptWithinClusterQueueFallback, enabled)
++			ctx, log := utiltesting.ContextWithLog(t)
++			now := time.Now()
++			cqs, cohorts := fsFallbackTree("24", "0", false, kueue.PreemptionPolicyLowerPriority)
++			fixture := newStrategyFixture(ctx, t, log, strategyFixtureCfg{
++				flavors:       []*kueue.ResourceFlavor{utiltestingapi.MakeResourceFlavor("default").Obj()},
++				clusterQueues: cqs, cohorts: cohorts,
++				admitted: fsFallbackAdmitted(now, fsFallbackReproWls), incoming: fsFallbackIncoming("4"),
++				targetCQ:    fsFallbackPreemptorCQ,
++				fairSharing: &config.FairSharing{PreemptionStrategies: fsRejectedPlanStrategies}, now: now,
++			})
++			attempts := fairTopologyRetryAttempts(ctx, fixture.preemptor, fixture.pCtx, fixture.preemptor.fsStrategies)
++			if len(attempts) != 1 {
++				t.Fatalf("got %d topology attempts, want one", len(attempts))
++			}
++			strategies := attempts[0].strategy(sets.New[*workload.Info](), func(*workload.Info) bool { return true })
++			targets := fixture.preemptor.getTargets(ctx, strategies)
++			var got []string
++			for _, target := range targets {
++				got = append(got, target.WorkloadInfo.Obj.Name)
++			}
++			var want []string
++			if enabled {
++				want = []string{"p_low"}
++			}
++			if diff := gocmp.Diff(want, got); diff != "" {
++				t.Errorf("targets (-want/+got):\n%s", diff)
 +			}
 +		})
 +	}
@@ -2871,7 +2885,7 @@ index 00000000..4df57baa
 +}
 diff --git a/pkg/scheduler/scheduler_tas_topology_retry_test.go b/pkg/scheduler/scheduler_tas_topology_retry_test.go
 new file mode 100644
-index 00000000..78c9b62a
+index 000000000..78c9b62af
 --- /dev/null
 +++ b/pkg/scheduler/scheduler_tas_topology_retry_test.go
 @@ -0,0 +1,157 @@
@@ -3034,7 +3048,7 @@ index 00000000..78c9b62a
 +}
 diff --git a/test/integration/singlecluster/tas/tas_preemption_topology_test.go b/test/integration/singlecluster/tas/tas_preemption_topology_test.go
 new file mode 100644
-index 00000000..ab54e42c
+index 000000000..ab54e42c0
 --- /dev/null
 +++ b/test/integration/singlecluster/tas/tas_preemption_topology_test.go
 @@ -0,0 +1,305 @@

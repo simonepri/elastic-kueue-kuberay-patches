@@ -10,7 +10,7 @@ Upstream Kueue requires strict immutability of queue and priority labels on acti
 Introduce the MutableDeploymentQueue feature gate (off by default) and relax immutability validation in the Deployment webhook when enabled. Allow updating queue names and adding or changing workload priority classes on running Deployments while preserving deletion checks, enabling rolling updates to apply new queue and priority assignments to subsequent pods.
 ---
 diff --git a/pkg/controller/jobs/deployment/deployment_webhook.go b/pkg/controller/jobs/deployment/deployment_webhook.go
-index 1039f973..ff5d6f90 100644
+index 1039f9730..ff5d6f908 100644
 --- a/pkg/controller/jobs/deployment/deployment_webhook.go
 +++ b/pkg/controller/jobs/deployment/deployment_webhook.go
 @@ -172,17 +172,34 @@ func (wh *Webhook) ValidateUpdate(ctx context.Context, oldObj, newObj *appsv1.De
@@ -58,13 +58,13 @@ index 1039f973..ff5d6f90 100644
  	if features.Enabled(features.AdmissionGatedBy) {
  		allErrs = append(allErrs, webhook.ValidateAdmissionGatedByAnnotationOnUpdate(oldDeployment.Object(), newDeployment.Object())...)
 diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
-index dd635c6e..69bbd91b 100644
+index 7a1eb9db5..9631bdafc 100644
 --- a/pkg/features/kube_features.go
 +++ b/pkg/features/kube_features.go
-@@ -945,6 +945,10 @@ const (
- 	// sets back a priority changed directly on the Workload. Disable this gate to
- 	// keep such a priority until the class is reconciled again.
- 	WorkloadPriorityClassWatchesWorkloads featuregate.Feature = "WorkloadPriorityClassWatchesWorkloads"
+@@ -955,6 +955,10 @@ const (
+ 	// room but the final verification of FairSharingVerifyFinalTargets rejects
+ 	// them. The fallback runs the same search over those workloads only.
+ 	FairSharingPreemptWithinClusterQueueFallback featuregate.Feature = "FairSharingPreemptWithinClusterQueueFallback"
 +
 +	// Enables updating queue and priority on running Deployments by relaxing
 +	// immutability checks in the Deployment validation webhook.
@@ -72,7 +72,7 @@ index dd635c6e..69bbd91b 100644
  )
  
  func init() {
-@@ -1377,6 +1381,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
+@@ -1388,6 +1392,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
  		{Version: version.MustParse("0.20"), Default: true, PreRelease: featuregate.Beta},
  	},
  
@@ -84,10 +84,10 @@ index dd635c6e..69bbd91b 100644
  		{Version: version.MustParse("0.20"), Default: true, PreRelease: featuregate.Beta},
  	},
 diff --git a/pkg/controller/jobs/deployment/deployment_webhook_test.go b/pkg/controller/jobs/deployment/deployment_webhook_test.go
-index 5ff6e838..4817a3ac 100644
+index 699e61c8f..34507948a 100644
 --- a/pkg/controller/jobs/deployment/deployment_webhook_test.go
 +++ b/pkg/controller/jobs/deployment/deployment_webhook_test.go
-@@ -570,6 +570,33 @@ func TestValidateUpdate(t *testing.T) {
+@@ -569,6 +569,33 @@ func TestValidateUpdate(t *testing.T) {
  				},
  			}.ToAggregate(),
  		},
@@ -121,7 +121,7 @@ index 5ff6e838..4817a3ac 100644
  		"update priority-class when suspended": {
  			oldDeployment: testingdeployment.MakeDeployment("test-pod", "").
  				Queue("test-queue").
-@@ -597,6 +624,18 @@ func TestValidateUpdate(t *testing.T) {
+@@ -596,6 +623,18 @@ func TestValidateUpdate(t *testing.T) {
  				},
  			}.ToAggregate(),
  		},

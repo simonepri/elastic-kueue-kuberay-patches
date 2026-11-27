@@ -26,7 +26,7 @@ move, which splits the workers into more PodSets than needed. A proposal
 therefore records no scan progress.
 ---
 diff --git a/pkg/controller/elasticjobs/elastic_job_ungater.go b/pkg/controller/elasticjobs/elastic_job_ungater.go
-index 6c0869bc..a265e47e 100644
+index 62e2f5bbb..1ef878503 100644
 --- a/pkg/controller/elasticjobs/elastic_job_ungater.go
 +++ b/pkg/controller/elasticjobs/elastic_job_ungater.go
 @@ -378,7 +378,7 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
@@ -39,7 +39,7 @@ index 6c0869bc..a265e47e 100644
  		return nil, nil, err
  	}
 diff --git a/pkg/controller/elasticjobs/ungate_split_entries.go b/pkg/controller/elasticjobs/ungate_split_entries.go
-index e0dec0dd..a8602c8d 100644
+index e0dec0dd1..a8602c8d7 100644
 --- a/pkg/controller/elasticjobs/ungate_split_entries.go
 +++ b/pkg/controller/elasticjobs/ungate_split_entries.go
 @@ -72,10 +72,12 @@ func (r *elasticJobUngater) ungateSplitGroups(
@@ -82,7 +82,7 @@ index e0dec0dd..a8602c8d 100644
  			if entry != base {
  				for _, p := range slices.SortedFunc(slices.Values(gated[entry]), byName) {
 diff --git a/pkg/controller/jobs/raycluster/raycluster_controller.go b/pkg/controller/jobs/raycluster/raycluster_controller.go
-index d4231e45..70643639 100644
+index d4231e451..706436398 100644
 --- a/pkg/controller/jobs/raycluster/raycluster_controller.go
 +++ b/pkg/controller/jobs/raycluster/raycluster_controller.go
 @@ -31,6 +31,7 @@ import (
@@ -103,7 +103,7 @@ index d4231e45..70643639 100644
  )
  
 diff --git a/pkg/scheduler/flavorassigner/flavor_split.go b/pkg/scheduler/flavorassigner/flavor_split.go
-index bc28229b..1dd9c288 100644
+index bc28229bf..1dd9c288d 100644
 --- a/pkg/scheduler/flavorassigner/flavor_split.go
 +++ b/pkg/scheduler/flavorassigner/flavor_split.go
 @@ -14,61 +14,305 @@ See the License for the specific language governing permissions and
@@ -145,10 +145,7 @@ index bc28229b..1dd9c288 100644
 -// only when its QuotaReserved condition reason matches this (see workloadslicing.SplitGrowth), so
 -// a slice that no other flavor would take keeps its PodSets.
 -const GrowthFitsOtherFlavorReason = "GrowthFitsOtherFlavor"
-+// GrowthFitsOtherFlavorReason identifies a refusal proposal for the job reconciler. Structured
-+// proposals retain its legacy spelling so status readers can recognize both controller versions.
-+const GrowthFitsOtherFlavorReason = "its growth fits this flavor"
- 
+-
 -// growthFits reports whether the growth of the PodSets psIDs over the slice that the workload
 -// replaces fits on the flavor fName without preemption, for every resource in requests. PodSets
 -// that do not grow report false, since only growth can move to a split PodSet.
@@ -157,6 +154,14 @@ index bc28229b..1dd9c288 100644
 -	requests.ForEach(func(rName corev1.ResourceName, val resources.Amount) {
 -		if !fits {
 -			return
+-		}
+-		for _, psID := range psIDs {
+-			if replaced := podSetResourcesByName(a.replaceWorkloadSlice.TotalRequests, a.wl.Obj.Spec.PodSets[psID].Name); replaced != nil && replaced.Requests != nil {
+-				val = val.Sub(replaced.Requests.ResourceValue(rName))
++// GrowthFitsOtherFlavorReason identifies a refusal proposal for the job reconciler. Structured
++// proposals retain its legacy spelling so status readers can recognize both controller versions.
++const GrowthFitsOtherFlavorReason = "its growth fits this flavor"
++
 +// FlavorFill describes a count that fits without preemption. Flavor names its representative
 +// resource group; Flavors records each resource when several groups have independent flavors.
 +type FlavorFill struct {
@@ -214,10 +219,7 @@ index bc28229b..1dd9c288 100644
 +	for name, amount := range ips.podSet.Requests.Iter() {
 +		if amount.Sign() > 0 && a.cq.RGByResource(name) == nil && !IgnoreUndeclaredResources(a.quotaCheckStrategy) {
 +			return nil
- 		}
--		for _, psID := range psIDs {
--			if replaced := podSetResourcesByName(a.replaceWorkloadSlice.TotalRequests, a.wl.Obj.Spec.PodSets[psID].Name); replaced != nil && replaced.Requests != nil {
--				val = val.Sub(replaced.Requests.ResourceValue(rName))
++		}
 +	}
 +	for i := range a.cq.ResourceGroups {
 +		rg := &a.cq.ResourceGroups[i]
@@ -230,9 +232,7 @@ index bc28229b..1dd9c288 100644
  		}
 -		if val.Sign() > 0 {
 -			grows = true
-+		if requested {
-+			groups = append(groups, rg)
- 		}
+-		}
 -		if len(psIDs) == 1 && a.wl.Obj.Spec.PodSets[psIDs[0]].MinCount != nil &&
 -			!tas.HasTopologyConstraint(a.wl.Obj.Spec.PodSets[psIDs[0]].TopologyRequest) &&
 -			workload.PodSetCountSteps(a.wl.Obj)[a.wl.Obj.Spec.PodSets[psIDs[0]].Name] <= 1 {
@@ -241,6 +241,9 @@ index bc28229b..1dd9c288 100644
 -				podVal := psRes.PerPodRequests.ResourceValue(rName)
 -				if val.Cmp(podVal) >= 0 {
 -					val = podVal
++		if requested {
++			groups = append(groups, rg)
++		}
 +	}
 +	if len(groups) == 0 {
 +		return nil
@@ -450,7 +453,7 @@ index bc28229b..1dd9c288 100644
 +		tr.PodSetGroupName != nil || tr.PodSetSliceRequiredTopology != nil)
  }
 diff --git a/pkg/scheduler/flavorassigner/flavorassigner.go b/pkg/scheduler/flavorassigner/flavorassigner.go
-index c381c95d..7d7d118d 100644
+index adb0dedc6..14ef660ad 100644
 --- a/pkg/scheduler/flavorassigner/flavorassigner.go
 +++ b/pkg/scheduler/flavorassigner/flavorassigner.go
 @@ -18,6 +18,7 @@ package flavorassigner
@@ -461,7 +464,7 @@ index c381c95d..7d7d118d 100644
  	"fmt"
  	"maps"
  	"math"
-@@ -339,6 +340,7 @@ func (a *FlavorAssigner) AssignFlavors(
+@@ -340,6 +341,7 @@ func (a *FlavorAssigner) AssignFlavors(
  	for i, podSet := range requests {
  		if a.cq.RGByResource(corev1.ResourcePods) != nil {
  			if podSet.Requests != nil {
@@ -469,7 +472,7 @@ index c381c95d..7d7d118d 100644
  				podSet.Requests.Set(corev1.ResourcePods, resources.NewAmount(int64(podSet.Count)))
  			} else {
  				podSet.Requests = resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourcePods: int64(podSet.Count)})
-@@ -407,6 +409,26 @@ func (a *FlavorAssigner) AssignFlavors(
+@@ -408,6 +410,26 @@ func (a *FlavorAssigner) AssignFlavors(
  			}
  		}
  
@@ -496,7 +499,7 @@ index c381c95d..7d7d118d 100644
  		requests := resources.NewRequests()
  		psIDs := make([]int, len(podSets))
  		for idx, podset := range podSets {
-@@ -892,10 +914,7 @@ func (a *FlavorAssigner) findFlavorForPodSets(
+@@ -893,10 +915,7 @@ func (a *FlavorAssigner) findFlavorForPodSets(
  						// Flavor mismatch. Skip further checks for this resource.
  						representativeMode = worstGranularMode()
  						msg := fmt.Sprintf("could not assign %s flavor since the original workload is assigned: %s", fName, originalFlavor)
@@ -509,10 +512,10 @@ index c381c95d..7d7d118d 100644
  						flavorQuotaReasons = append(flavorQuotaReasons, msg)
  						flavorNoFitReason = mostSevereReason(flavorNoFitReason, kueue.WorkloadQuotaReservedReasonNoMatchingFlavor)
 diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
-index 856da69d..3ae1097d 100644
+index 5458abd0b..01dc1a930 100644
 --- a/pkg/scheduler/scheduler.go
 +++ b/pkg/scheduler/scheduler.go
-@@ -1607,7 +1607,8 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
+@@ -1603,7 +1603,8 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap
  	assignmentPlan := planner.Plan(ctx, &initialAssignment)
  	topologyRetry := assignmentPlan.TopologyRetry
  
@@ -523,7 +526,7 @@ index 856da69d..3ae1097d 100644
  		// the counts Reduce returns.
  		var bestPartialPlan *assignment.Plan
 diff --git a/pkg/workloadslicing/flavor_split.go b/pkg/workloadslicing/flavor_split.go
-index bfff290a..1ae87c09 100644
+index bfff290a4..1ae87c092 100644
 --- a/pkg/workloadslicing/flavor_split.go
 +++ b/pkg/workloadslicing/flavor_split.go
 @@ -286,13 +286,16 @@ func ExpandToSplitEntries(podSets []kueue.PodSet, floors, steps workload.PodSets
@@ -652,21 +655,10 @@ index bfff290a..1ae87c09 100644
 +	}
 +}
 diff --git a/pkg/workloadslicing/manager.go b/pkg/workloadslicing/manager.go
-index 05835f9f..66ac5989 100644
+index a61c9c8b5..1cd3d5c4d 100644
 --- a/pkg/workloadslicing/manager.go
 +++ b/pkg/workloadslicing/manager.go
-@@ -70,6 +70,10 @@ func (r *Manager) EnsureWorkloadSlices(
- 			wl.Status.AccumulatedPastExecutionTimeSeconds != nil || ScaledUp(wl) {
- 			return
- 		}
-+		if HasSplitEntries(wl.Spec.PodSets) {
-+			refreshInitialSplitMinCounts(wl, jobPodSets)
-+			return
-+		}
- 		for i := range wl.Spec.PodSets {
- 			for _, jobPodSet := range jobPodSets {
- 				if wl.Spec.PodSets[i].Name == jobPodSet.Name {
-@@ -177,6 +181,9 @@ func (r *Manager) EnsureWorkloadSlices(
+@@ -161,6 +161,9 @@ func (r *Manager) EnsureWorkloadSlices(
  					}
  				}
  			}
@@ -676,7 +668,7 @@ index 05835f9f..66ac5989 100644
  			return wl, true, nil
  		}
  
-@@ -270,7 +277,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
+@@ -255,7 +258,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
  		return nil
  	}
  	replaced := admittedPredecessor(workloads, probe)
@@ -685,7 +677,7 @@ index 05835f9f..66ac5989 100644
  		return nil
  	}
  	// The scheduler writes the probe's status while the reconciler decides, so a conflict
-@@ -284,7 +291,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
+@@ -269,7 +272,7 @@ func (r *Manager) splitRefusedProbe(ctx context.Context, jobObject client.Object
  			return nil
  		}
  		ctrl.LoggerFrom(ctx).V(2).Info("Splitting the growth of a refused workload slice into PodSets that may take another flavor",
@@ -694,9 +686,24 @@ index 05835f9f..66ac5989 100644
  		if err := r.Client.Update(ctx, split); err != nil {
  			if apierrors.IsConflict(err) {
  				if getErr := r.Client.Get(ctx, client.ObjectKeyFromObject(probe), probe); getErr != nil {
+diff --git a/pkg/workloadslicing/initial_min_counts.go b/pkg/workloadslicing/initial_min_counts.go
+index 241041de5..174bc7ab5 100644
+--- a/pkg/workloadslicing/initial_min_counts.go
++++ b/pkg/workloadslicing/initial_min_counts.go
+@@ -35,6 +35,10 @@ func syncInitialMinCounts(wl *kueue.Workload, jobPodSets []kueue.PodSet) {
+ 		}
+ 		return
+ 	}
++	if HasSplitEntries(wl.Spec.PodSets) {
++		refreshInitialSplitMinCounts(wl, jobPodSets)
++		return
++	}
+ 	for i := range wl.Spec.PodSets {
+ 		for _, jobPodSet := range jobPodSets {
+ 			if wl.Spec.PodSets[i].Name == jobPodSet.Name {
 diff --git a/pkg/controller/elasticjobs/ungate_split_steps_test.go b/pkg/controller/elasticjobs/ungate_split_steps_test.go
 new file mode 100644
-index 00000000..24ea21d3
+index 000000000..24ea21d36
 --- /dev/null
 +++ b/pkg/controller/elasticjobs/ungate_split_steps_test.go
 @@ -0,0 +1,72 @@
@@ -773,7 +780,7 @@ index 00000000..24ea21d3
 +	}
 +}
 diff --git a/pkg/scheduler/flavorassigner/flavor_split_test.go b/pkg/scheduler/flavorassigner/flavor_split_test.go
-index dd5ac5a9..8b0091a9 100644
+index dd5ac5a98..8b0091a99 100644
 --- a/pkg/scheduler/flavorassigner/flavor_split_test.go
 +++ b/pkg/scheduler/flavorassigner/flavor_split_test.go
 @@ -23,11 +23,11 @@ import (
@@ -853,7 +860,7 @@ index dd5ac5a9..8b0091a9 100644
  	assigner := New(probe, snapshot.ClusterQueue("cq"), flavors, false, &testOracle{}, workload.NewInfo(log, replaced),
 diff --git a/pkg/scheduler/flavorassigner/greedy_split_test.go b/pkg/scheduler/flavorassigner/greedy_split_test.go
 new file mode 100644
-index 00000000..8b666868
+index 000000000..8b6668684
 --- /dev/null
 +++ b/pkg/scheduler/flavorassigner/greedy_split_test.go
 @@ -0,0 +1,321 @@
@@ -1180,7 +1187,7 @@ index 00000000..8b666868
 +}
 diff --git a/pkg/scheduler/greedy_split_scanstate_test.go b/pkg/scheduler/greedy_split_scanstate_test.go
 new file mode 100644
-index 00000000..4fe6fba9
+index 000000000..4fe6fba9f
 --- /dev/null
 +++ b/pkg/scheduler/greedy_split_scanstate_test.go
 @@ -0,0 +1,177 @@
@@ -1361,9 +1368,26 @@ index 00000000..4fe6fba9
 +		})
 +	}
 +}
+diff --git a/pkg/workloadslicing/flavor_split_test.go b/pkg/workloadslicing/flavor_split_test.go
+index 703a5d8ac..e9caf5ca6 100644
+--- a/pkg/workloadslicing/flavor_split_test.go
++++ b/pkg/workloadslicing/flavor_split_test.go
+@@ -290,6 +290,12 @@ func TestSplitGrowth(t *testing.T) {
+ 			replaced: admitted(plainPodSet("workers", 8)),
+ 			want:     workload.PodSetsCounts{"workers": 12},
+ 		},
++		"a grouped indexed PodSet is not split": {
++			probe: utiltestingapi.MakeWorkload("probe", "ns").
++				PodSets(*utiltestingapi.MakePodSet("workers", 12).PodSetGroup("group").PodIndexLabel(ptr.To("index")).Request(corev1.ResourceCPU, "1").Obj()).Obj(),
++			replaced: admitted(plainPodSet("workers", 8)),
++			want:     workload.PodSetsCounts{"workers": 12},
++		},
+ 		"a PodSet whose topology request only names pod index labels is split": {
+ 			probe: utiltestingapi.MakeWorkload("probe", "ns").
+ 				PodSets(*utiltestingapi.MakePodSet("workers", 12).PodIndexLabel(ptr.To("ray.io/worker-group-replica-index")).Request(corev1.ResourceCPU, "1").Obj()).Obj(),
 diff --git a/pkg/workloadslicing/greedy_split_test.go b/pkg/workloadslicing/greedy_split_test.go
 new file mode 100644
-index 00000000..cce7800d
+index 000000000..cce7800d4
 --- /dev/null
 +++ b/pkg/workloadslicing/greedy_split_test.go
 @@ -0,0 +1,142 @@
@@ -1511,7 +1535,7 @@ index 00000000..cce7800d
 +}
 diff --git a/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
 new file mode 100644
-index 00000000..3427395d
+index 000000000..3427395d6
 --- /dev/null
 +++ b/test/integration/singlecluster/controller/jobs/rayjob/greedy_split_test.go
 @@ -0,0 +1,82 @@
@@ -1599,7 +1623,7 @@ index 00000000..3427395d
 +})
 diff --git a/test/integration/singlecluster/scheduler/greedy_split_test.go b/test/integration/singlecluster/scheduler/greedy_split_test.go
 new file mode 100644
-index 00000000..6d2e18f3
+index 000000000..6d2e18f31
 --- /dev/null
 +++ b/test/integration/singlecluster/scheduler/greedy_split_test.go
 @@ -0,0 +1,93 @@

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TAG="${KUEUE_UPSTREAM:-v0.20.7}-p${KUEUE_PATCH_VERSION:-0.10.4}"
+TAG="${KUEUE_UPSTREAM:-v0.20.8}-p${KUEUE_PATCH_VERSION:-0.10.4}"
 DOCKERFILE="$ROOT/build/kueue/Dockerfile"
 
 "$ROOT/build/kueue/patch.sh"

@@ -9,10 +9,10 @@ Introduce a ScaleGate reconciler guarded by the ScaleGate feature gate that insp
 A RayJob owns the Workloads of its RayCluster, so their admission, such as a scale-up slice granting more workers than the current cap, never reconciled ScaleGate and the cap held until an unrelated RayCluster, ClusterQueue, or LocalQueue event, leaving the Ray autoscaler unable to create workers Kueue had already admitted. Map a Workload owned by a RayJob to that job's RayCluster, read from the RayJob's recorded cluster name or, before it is recorded, from the RayCluster the job owns.
 ---
 diff --git a/helm-chart/kuberay-operator/templates/_helpers.tpl b/helm-chart/kuberay-operator/templates/_helpers.tpl
-index cd6443e..fc5c5d1 100644
+index 9fc914c..5726563 100644
 --- a/helm-chart/kuberay-operator/templates/_helpers.tpl
 +++ b/helm-chart/kuberay-operator/templates/_helpers.tpl
-@@ -316,6 +316,17 @@ rules:
+@@ -369,6 +369,17 @@ rules:
    - list
    - update
    - watch
@@ -31,23 +31,23 @@ index cd6443e..fc5c5d1 100644
    - networking.k8s.io
    resources:
 diff --git a/helm-chart/kuberay-operator/values.yaml b/helm-chart/kuberay-operator/values.yaml
-index 570971a..672520f 100644
+index 643767d..87f9b07 100644
 --- a/helm-chart/kuberay-operator/values.yaml
 +++ b/helm-chart/kuberay-operator/values.yaml
-@@ -163,6 +163,8 @@ featureGates:
+@@ -183,6 +183,8 @@ featureGates:
    enabled: false
- - name: RayClusterHistoryServer
+ - name: NodeLabelDelivery
    enabled: false
 +- name: ScaleGate
 +  enabled: false
  
- # Configurations for KubeRay operator metrics.
- metrics:
+ # Configurations for KubeRay node event forwarder controller.
+ # The controller forwards Kubernetes Node events to the corresponding RayCluster custom resources.
 diff --git a/ray-operator/config/rbac/role.yaml b/ray-operator/config/rbac/role.yaml
-index 953bf6f..98f933f 100644
+index ecb59c4..725570d 100644
 --- a/ray-operator/config/rbac/role.yaml
 +++ b/ray-operator/config/rbac/role.yaml
-@@ -162,6 +162,17 @@ rules:
+@@ -170,6 +170,17 @@ rules:
    - list
    - update
    - watch
@@ -944,10 +944,10 @@ index 0000000..e0de39a
 +	return bld.Complete(r)
 +}
 diff --git a/ray-operator/main.go b/ray-operator/main.go
-index d033987..d2e259d 100644
+index fa2192e..c926d28 100644
 --- a/ray-operator/main.go
 +++ b/ray-operator/main.go
-@@ -368,6 +368,12 @@ func main() {
+@@ -436,6 +436,12 @@ func main() {
  		setupLog.Info("RayClusterNetworkPolicy feature gate is disabled, skipping NetworkPolicy controller setup")
  	}
  
@@ -961,13 +961,13 @@ index d033987..d2e259d 100644
  
  	exitOnError(mgr.AddHealthzCheck("healthz", healthz.Ping), "unable to set up health check")
 diff --git a/ray-operator/pkg/features/features.go b/ray-operator/pkg/features/features.go
-index 8b1db76..b5811de 100644
+index c342997..ef010ec 100644
 --- a/ray-operator/pkg/features/features.go
 +++ b/ray-operator/pkg/features/features.go
-@@ -96,6 +96,13 @@ const (
- 	// selects the scheduler; it is mutually exclusive with --batch-scheduler and --enable-batch-scheduler.
- 	// Requires a Kubernetes cluster that serves the scheduling.k8s.io API with GenericWorkload enabled.
- 	KubernetesWAS featuregate.Feature = "KubernetesWAS"
+@@ -120,6 +120,13 @@ const (
+ 	// Enables delivery of Kubernetes Node labels to Ray node labels (workerGroupSpecs[].labelRefs).
+ 	// Requires ENABLE_WEBHOOKS=true and Ray 2.45.0 or later.
+ 	NodeLabelDelivery featuregate.Feature = "NodeLabelDelivery"
 +
 +	// owner: @simonepri
 +	// rep: N/A
@@ -978,20 +978,20 @@ index 8b1db76..b5811de 100644
  )
  
  func init() {
-@@ -114,6 +121,7 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
- 	RayClusterMTLS:                   {Default: false, PreRelease: featuregate.Alpha},
- 	RayClusterHistoryServer:          {Default: false, PreRelease: featuregate.Alpha},
- 	KubernetesWAS:                    {Default: false, PreRelease: featuregate.Alpha},
-+	ScaleGate:                        {Default: false, PreRelease: featuregate.Alpha},
+@@ -141,6 +148,7 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
+ 	GCSFaultToleranceActivePassiveHead: {Default: false, PreRelease: featuregate.Alpha},
+ 	RayNodeEventForwarder:              {Default: false, PreRelease: featuregate.Alpha},
+ 	NodeLabelDelivery:                  {Default: false, PreRelease: featuregate.Alpha},
++	ScaleGate:                          {Default: false, PreRelease: featuregate.Alpha},
  }
  
  // SetFeatureGateDuringTest is a helper method to override feature gates in tests.
 diff --git a/ray-operator/controllers/ray/scalegate_controller_unit_test.go b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
 new file mode 100644
-index 0000000..657cc97
+index 0000000..8d4b031
 --- /dev/null
 +++ b/ray-operator/controllers/ray/scalegate_controller_unit_test.go
-@@ -0,0 +1,1055 @@
+@@ -0,0 +1,1072 @@
 +package ray
 +
 +import (
@@ -1397,6 +1397,23 @@ index 0000000..657cc97
 +				}
 +			}
 +		})
++	}
++}
++
++// ScaleGate preserves existing upstream scale gates when it clamps maxReplicas.
++func TestScaleGatePreservesUpstreamScaleGates(t *testing.T) {
++	queue := sgClusterQueue("team-queue", "", sgResourceGroups([]sgFlavor{
++		{name: "on-demand", resources: []map[string]interface{}{sgResource("cpu", "1000"), sgResource("nvidia.com/gpu", "8")}},
++	}))
++	rc := sgRayCluster("team-queue", 16, 1, 32)
++	gates := []rayv1.ScaleGate{{Type: "kueue.k8s.io/quota-exceeded"}, {Type: "example.com/other"}}
++	rc.Spec.WorkerGroupSpecs[0].ScaleStrategy.ScaleGate = gates
++	got, clamped := sgReconcile(t, queue, rc)
++	if !clamped || *got.Spec.WorkerGroupSpecs[0].MaxReplicas != 8 {
++		t.Fatal("expected quota clamp to update maxReplicas")
++	}
++	if !reflect.DeepEqual(got.Spec.WorkerGroupSpecs[0].ScaleStrategy.ScaleGate, gates) {
++		t.Errorf("scaleGate = %v; want %v", got.Spec.WorkerGroupSpecs[0].ScaleStrategy.ScaleGate, gates)
 +	}
 +}
 +
@@ -2047,3 +2064,5 @@ index 0000000..657cc97
 +		})
 +	}
 +}
+-- 
+2.56.0

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TAG="${KUBERAY_IMAGE_TAG:-v1.7.2-patched}"
+TAG="${KUBERAY_IMAGE_TAG:-v1.8.0-patched}"
 SRC="$ROOT/third_party/kuberay/ray-operator"
 DOCKERFILE="$ROOT/build/kuberay/Dockerfile"
 

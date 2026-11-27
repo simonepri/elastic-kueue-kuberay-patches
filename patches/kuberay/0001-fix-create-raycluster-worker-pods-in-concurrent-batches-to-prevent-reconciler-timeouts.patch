@@ -10,29 +10,28 @@ The KubeRay operator's reconcilePods function creates missing worker pods sequen
 Implement a slow-start batching mechanism that creates missing worker pods in concurrent batches of 1, 2, 4, 8, and larger powers of two, mirroring the Kubernetes Job and ReplicaSet controllers. Pre-allocate replica indices when multi-host indexing is enabled to ensure concurrency safety, clone worker sidecar specifications per pod to prevent shared slice mutations, and abort remaining batches immediately upon encountering an API error to prevent server overload.
 ---
 diff --git a/ray-operator/controllers/ray/raycluster_controller.go b/ray-operator/controllers/ray/raycluster_controller.go
-index 869a78a8..fc800069 100644
+index 14cbb6d..d3e2ec0 100644
 --- a/ray-operator/controllers/ray/raycluster_controller.go
 +++ b/ray-operator/controllers/ray/raycluster_controller.go
-@@ -1189,29 +1189,36 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
+@@ -1250,31 +1250,31 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
  					return fmt.Errorf("mTLS secrets not ready: %w", err)
  				}
  			}
-+			// Create the missing workers of this group concurrently, in batches of 1, 2, 4, ... Pods.
-+			var createWorker func(i int) error
++			var createWorker func(int) error
  			if features.Enabled(features.RayMultiHostIndexing) {
-+				// Pick every replica index before creating any Pod, since validReplicaIndices is not safe for concurrent use.
 +				replicaIndices := make([]int, diff)
  				newReplicaIndex := 0
 -				// create all workers of this group
  				for i := range diff {
- 					// Find the next available replica index.
+-					// Find the next available replica index.
  					for validReplicaIndices[newReplicaIndex] {
  						newReplicaIndex++
  					}
  					validReplicaIndices[newReplicaIndex] = true
 -					logger.Info("reconcilePods", "creating worker for group", worker.GroupName, "index", i, "total", diff, "replicaIndex", newReplicaIndex)
 -					if err := r.createWorkerPodWithIndex(ctx, *instance, *worker.DeepCopy(), "", newReplicaIndex, 0); err != nil {
--						return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
+-						errs = append(errs, errstd.Join(utils.ErrFailedCreateWorkerPod, err))
+-						break // move to the next group
 -					}
 +					replicaIndices[i] = newReplicaIndex
 +				}
@@ -46,27 +45,25 @@ index 869a78a8..fc800069 100644
 +				createWorker = func(i int) error {
  					logger.Info("reconcilePods", "creating worker for group", worker.GroupName, "index", i, "total", diff)
 -					if err := r.createWorkerPod(ctx, *instance, *worker.DeepCopy()); err != nil {
--						return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
+-						errs = append(errs, errstd.Join(utils.ErrFailedCreateWorkerPod, err))
+-						break // move to the next group
 -					}
 +					return r.createWorkerPod(ctx, *instance, *worker.DeepCopy())
  				}
  			}
-+			// A failed batch ends this reconcile; the next one creates only the Pods still missing,
-+			// because the scale expectations already record the Pods created here.
 +			if created, err := slowStartBatch(diff, createWorker); err != nil {
 +				logger.Info("reconcilePods: stopped creating workers after a failed batch", "group", worker.GroupName, "created", created, "total", diff)
-+				return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
++				errs = append(errs, errstd.Join(utils.ErrFailedCreateWorkerPod, err))
 +			}
  		} else if diff == 0 {
  			logger.Info("reconcilePods", "all workers already exist for group", worker.GroupName)
  			continue
-@@ -1771,8 +1778,9 @@ func (r *RayClusterReconciler) buildWorkerPod(ctx context.Context, instance rayv
- 	headPort := common.GetHeadPort(instance.Spec.HeadGroupSpec.RayStartParams)
+@@ -1894,8 +1894,8 @@ func (r *RayClusterReconciler) buildWorkerPod(ctx context.Context, instance rayv
  	autoscalingEnabled := utils.IsAutoscalingEnabled(&instance.Spec)
  	podTemplateSpec := common.DefaultWorkerPodTemplate(ctx, instance, worker, podName, fqdnRayIP, headPort, replicaGrpName, replicaIndex, hostIndex)
+ 	common.SetDefaultCollectorImage(&instance, &podTemplateSpec, r.options.CollectorImage)
 -	if len(r.options.WorkerSidecarContainers) > 0 {
 -		podTemplateSpec.Spec.Containers = append(podTemplateSpec.Spec.Containers, r.options.WorkerSidecarContainers...)
-+	// Copy each sidecar so Pods built concurrently never share the slices that building a Pod appends to.
 +	for _, sidecar := range r.options.WorkerSidecarContainers {
 +		podTemplateSpec.Spec.Containers = append(podTemplateSpec.Spec.Containers, *sidecar.DeepCopy())
  	}
@@ -74,7 +71,7 @@ index 869a78a8..fc800069 100644
  		if podTemplateSpec.Annotations == nil {
 diff --git a/ray-operator/controllers/ray/slow_start_batch.go b/ray-operator/controllers/ray/slow_start_batch.go
 new file mode 100644
-index 00000000..c845592c
+index 0000000..c845592
 --- /dev/null
 +++ b/ray-operator/controllers/ray/slow_start_batch.go
 @@ -0,0 +1,36 @@
@@ -116,10 +113,10 @@ index 00000000..c845592c
 +}
 diff --git a/ray-operator/controllers/ray/slow_start_batch_unit_test.go b/ray-operator/controllers/ray/slow_start_batch_unit_test.go
 new file mode 100644
-index 00000000..486d3d0f
+index 0000000..d44d31a
 --- /dev/null
 +++ b/ray-operator/controllers/ray/slow_start_batch_unit_test.go
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,274 @@
 +package ray
 +
 +import (
@@ -362,6 +359,37 @@ index 00000000..486d3d0f
 +		}
 +	}
 +}
++
++func TestSlowStartBatchFailureDoesNotBlockOtherGroup(t *testing.T) {
++	for _, indexing := range []bool{false, true} {
++		t.Run(fmt.Sprintf("RayMultiHostIndexing=%t", indexing), func(t *testing.T) {
++			setupTest(t)
++			features.SetFeatureGateDuringTest(t, features.RayMultiHostIndexing, indexing)
++			cluster := testRayCluster.DeepCopy()
++			cluster.Spec.EnableInTreeAutoscaling = new(false)
++			first := &cluster.Spec.WorkerGroupSpecs[0]
++			first.GroupName = "first"
++			first.Replicas = new(int32(5))
++			first.ScaleStrategy.WorkersToDelete = nil
++			second := *first.DeepCopy()
++			second.GroupName = "second"
++			cluster.Spec.WorkerGroupSpecs = append(cluster.Spec.WorkerGroupSpecs, second)
++			fakeClient := clientFake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
++				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
++					if obj.GetLabels()[utils.RayNodeGroupLabelKey] == "first" {
++						return errstd.New("quota exceeded")
++					}
++					return c.Create(ctx, obj, opts...)
++				},
++			}).WithRuntimeObjects(testPods[0].DeepCopyObject()).Build()
++			r := newSlowStartBatchTestReconciler(fakeClient, events.NewFakeRecorder(100))
++			err := r.reconcilePods(context.Background(), cluster)
++			require.ErrorIs(t, err, utils.ErrFailedCreateWorkerPod)
++			pods := corev1.PodList{}
++			require.NoError(t, fakeClient.List(context.Background(), &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels{utils.RayNodeGroupLabelKey: "second"}))
++			assert.Len(t, pods.Items, 5)
++		})
++	}
++}
 -- 
 2.56.0
-
